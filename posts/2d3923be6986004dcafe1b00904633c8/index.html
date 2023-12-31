@@ -1,0 +1,1516 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>V8引擎Promise源码全面解读（深度好文） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="V8引擎Promise源码全面解读（深度好文）" />
+<meta property="og:description" content="作者：月夕
+原文：https://juejin.cn/post/7055202073511460895
+写在前面的话 阅读本文你将收获什么？
+了解 V8 Promise 源码全过程，世界上不再有能困住你的 Promise 题目，我就是这么肯定这篇文章的干货
+仅仅了解或者实现了 Promise/A&#43; 规范，这与 JavaScript 的 Promise 中间还有很大的差距
+如果你在面试时将 Promise 回答到本文的深度，一定是收获 SP 或者 SSP offer 的利器，因为面试官大概率也不知道这些知识。
+你知道 浏览器 &amp; Node 中真正的 Promise 执行顺序是怎么样的吗，如果你只是看过 Promise/A&#43; 规范的 Promise 实现，那么我肯定的告诉你，你对 Promise 执行顺序的认知是错误的。不信的话你就看看下面这两道题。
+Promise.resolve().then(() =&gt; { console.log(0); return Promise.resolve(4) }).then(res =&gt; { console.log(res); }) Promise.resolve().then(() =&gt; { console.log(1); }).then(() =&gt; { console.log(2); }).then(() =&gt; { console.log(3); }).then(() =&gt; { console.log(5); }).then(() =&gt; { console.log(6); }) // 0 1 2 3 4 5 6 new Promise((resolve, reject) =&gt; { Promise." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/2d3923be6986004dcafe1b00904633c8/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-08-02T07:47:10+08:00" />
+<meta property="article:modified_time" content="2023-08-02T07:47:10+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">V8引擎Promise源码全面解读（深度好文）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <blockquote> 
+  <p>作者：月夕</p> 
+  <p>原文：https://juejin.cn/post/7055202073511460895</p> 
+ </blockquote> 
+ <h3>写在前面的话</h3> 
+ <p><strong>阅读本文你将收获什么？</strong></p> 
+ <ul><li><p>了解 V8 Promise 源码全过程，世界上不再有能困住你的 Promise 题目，我就是这么肯定这篇文章的干货</p></li><li><p>仅仅了解或者实现了 Promise/A+ 规范，这与 JavaScript 的 Promise 中间还有很大的差距</p></li><li><p>如果你在面试时将 Promise 回答到本文的深度，一定是收获 SP 或者 SSP offer 的利器，因为面试官大概率也不知道这些知识。</p></li></ul> 
+ <p>你知道 浏览器 &amp; Node 中真正的 <code>Promise</code> 执行顺序是怎么样的吗，如果你只是看过 <code>Promise/A+</code> 规范的 <code>Promise</code> 实现，那么我肯定的告诉你，你对 <code>Promise</code> 执行顺序的认知是错误的。不信的话你就看看下面这两道题。</p> 
+ <pre class="has"><code class="language-go">Promise.resolve().then(() =&gt; {
+    console.log(0);
+    return Promise.resolve(4)
+}).then(res =&gt; {
+    console.log(res);
+})
+
+Promise.resolve().then(() =&gt; {
+    console.log(1);
+}).then(() =&gt; {
+    console.log(2);
+}).then(() =&gt; {
+    console.log(3);
+}).then(() =&gt; {
+    console.log(5);
+}).then(() =&gt; {
+    console.log(6);
+})
+// 0 1 2 3 4 5 6
+
+
+new Promise((resolve, reject) =&gt; {
+    Promise.resolve().then(() =&gt; {
+        resolve({
+            then: (resolve, reject) =&gt; resolve(1)
+        });
+        Promise.resolve().then(() =&gt; console.log(2));
+    });
+}).then(v =&gt; console.log(v));
+// 2 1</code></pre> 
+ <p>按照 <code>Promise/A+</code> 规范来说，上面的代码打印的结果应该是 0 1 2 4 3 5 6，因为当 <code>then</code> 返回一个 <code>Promise</code> 的时候需要等待这个 <code>Promise</code> 完成后再同步状态和值给 <code>then</code> 的结果。</p> 
+ <p>但是在 <code>V8</code> 甚至 各大支持 <code>Promise</code> 的主流浏览器中的执行结果都是 0 1 2 3 4 5 6</p> 
+ <blockquote> 
+  <p>他们是如何做到与 <code>Promise/A+</code> 规范不一样（也不能说一样，因为 <code>Promise</code> 没有明确描述他们的执行逻辑，只是给出一些规范）且保持一致的？</p> 
+ </blockquote> 
+ <p>要知道， <code>Promise</code> 属于 <code>JavaScript</code> 中的一部分， 而 <code>JavaScript</code> 中 <code>Promise</code> 的实现规范并非来源于 <code>Promise/A+</code>，而是来自 <code>ECMAScript</code> 规范。</p> 
+ <p>所以要知道这个问题的答案，我们不能仅仅看 <code>Promise/A+</code> ，对于代码的执行过程和顺序我们的关注点应该是在 <code>ECMAScript</code> 或者 <code>V8</code> 上。</p> 
+ <p>接下来我就结合 <code>ECMAScript</code> 规范来对 <code>V8</code> 中 <code>Promise</code> 源码进行全面的解读。</p> 
+ <p><strong>还有三件事需要提前说一下:</strong></p> 
+ <ol><li><p>本文更加适合有一定 Promise 基础的同学阅读，如果对 Promise 不了解的同学可以先看看这些文章</p></li></ol> 
+ <ul><li><p>【翻译】promise<sup>[1]</sup></p></li><li><p>Promise不会？？看这里！！！史上最通俗易懂的Promise！！！<sup>[2]</sup></p></li></ul> 
+ <p>对于后续贴出的 c++ 代码大家只需要着重看带有中文注释的地方即可</p> 
+ <p>因为代码块不会自动换行，所以建议 PC 端阅读可以有更好的阅读体验</p> 
+ <p>文章很长，可以收藏，有时间静下心来慢慢看也可以。</p> 
+ <p>点赞👍🏻、点赞👍🏻、点赞👍🏻</p> 
+ <p>进入正题</p> 
+ <h3>PromiseState</h3> 
+ <p>Promise 的 3 种状态，<code>pending</code>、 <code>fulfilled</code> 和 <code>rejected</code> ，源码如下<sup>[3]</sup>：</p> 
+ <pre class="has"><code class="language-go">// Promise constants
+extern enum PromiseState extends int31 constexpr 'Promise::PromiseState' {
+  kPending,// 等待状态
+  kFulfilled,// 成功状态
+  kRejected// 失败状态
+}</code></pre> 
+ <p>一个新创建的 <code>Promise</code> 处于 <code>pending</code> 状态。当调用 <code>resolve</code> 或 <code>reject</code> 函数后，<code>Promise</code> 处于 <code>fulfilled</code> 或 <code>rejected</code> 状态，此后 <code>Promise</code> 的状态保持不变，也就是说 <code>Promise</code> 的状态改变是不可逆的，如果再次调用 <code>resolve</code> 或者 <code>reject</code> 将不会发生任何事，<code>Promise</code> 源码中出现了多处状态相关的 assert（断言），这个就不赘述了，想必对于 <code>Promise</code> 的三种状态大家都比较熟悉了。</p> 
+ <h4>JSPromise</h4> 
+ <p>JSPromise 描述 <code>Promise</code> 的基本信息，源码如下<sup>[4]</sup>：</p> 
+ <pre class="has"><code class="language-go">bitfield struct JSPromiseFlags extends uint31 {
+  // Promise 的状态，kPending/kFulfilled/kRejected
+  status: PromiseState: 2 bit; 
+  // 是否有onFulfilled/onRejected处理函数，
+  // 没有调用过 then 方法的 Promise 没有处理函数
+  //（catch方法的本质是then方法，后面会介绍）
+  has_handler: bool: 1 bit; 
+  handled_hint: bool: 1 bit; 
+  async_task_id: int32: 22 bit;
+}
+
+@generateCppClass
+extern class JSPromise extends JSObject {
+  macro Status(): PromiseState {
+    // 获取 Promise 的状态，返回 
+    // kPending/kFulfilled/kRejected 中的一个
+    return this.flags.status;
+  }
+
+  macro SetStatus(status: constexpr PromiseState): void {
+    // 只有 pending 状态的 Promise 才可以被改变状态
+    assert(this.Status() == PromiseState::kPending);
+    // Promise 创建成功后，不可将 Promise 设置为 pending 状态
+    assert(status != PromiseState::kPending);
+    this.flags.status = status;
+  }
+
+  macro HasHandler(): bool {
+    // 判断 Promise 是否有处理函数
+    return this.flags.has_handler;
+  }
+
+  macro SetHasHandler(): void {
+    this.flags.has_handler = true;
+  }
+
+  // promise 处理函数或结果，可以是:
+  // 空
+  // onFulfilled/onRejected构成的链表
+  // promise的确认值（resolve的参数）
+  reactions_or_result: Zero|PromiseReaction|JSAny;
+  flags: SmiTagged&lt;JSPromiseFlags&gt;;
+}</code></pre> 
+ <p>当 <code>Promise</code> 状态改变时，比如调用了 <code>resolve/reject</code> 函数，<code>SetStatus</code> 方法会被调用；<code>Javascript</code> 层调用 <code>resolve</code> 方法时，<code>reactions_or_result</code> 字段会被赋值为 <code>resolve</code> 传入的参数；<code>Javascript</code> 层调用 <code>then</code> 方法时，说明已经有了处理函数，<code>SetHasHandler()</code> 会被调用。<code>Status/SetStatus</code> 这两个方法一个获取 <code>Promise</code> 状态，一个设置 <code>Promise</code> 状态；</p> 
+ <h4>其它</h4> 
+ <ul><li><p>executor：是一个函数，<code>Promise</code> 构造函数接收的参数，调用 <code>executor</code> 时传入的参数分别是 <code>resolve</code> 和 <code>reject</code>。</p></li><li><p>PromiseReaction：是对象，表示 <code>Promise</code> 的处理函数，因为一个 <code>Promise</code> 多次调用 <code>then </code>方法就会有多个处理函数，所以底层数据结构是个链表，每一个节点都存储着 <code>onFulfilled</code> 和 <code>onRejected</code> 函数。</p></li></ul> 
+ <pre class="has"><code class="language-go">let p = new Promise((resolve, reject) =&gt; {
+  resolve(123)
+  // 会将 reactions_or_result 设置为 123
+  // 会调用 SetHasHandler
+  resolve(234)// 不会发生任何事，相当于没写
+  reject(234)// 也不会发生任何事，相当于没写
+})</code></pre> 
+ <h3>构造函数</h3> 
+ <p>构造函数源码如下<sup>[5]</sup>：</p> 
+ <pre class="has"><code class="language-go">PromiseConstructor(
+    js-implicit context: NativeContext, receiver: JSAny,
+    newTarget: JSAny)(executor: JSAny): JSAny {
+  // 1. 如果不存在 new 关键字, throw a TypeError exception.
+  if (newTarget == Undefined) {
+    ThrowTypeError(MessageTemplate::kNotAPromise, newTarget);
+  }
+
+  // 2. 如果传入的参数不是一个回调函数, throw a TypeError exception.
+  if (!Is&lt;Callable&gt;(executor)) {
+    ThrowTypeError(MessageTemplate::kResolverNotAFunction, executor);
+  }
+
+  let result: JSPromise;
+  // 构造一个 Promise 对象
+  result = NewJSPromise();
+  // 从 Promise 对象身上，获取它的 resolve 和 reject 函数
+  const funcs = CreatePromiseResolvingFunctions(result, True, context);
+  const resolve = funcs.resolve;
+  const reject = funcs.reject;
+  try {
+    // 直接同步调用 executor 函数，resolve 和 reject 做为参数
+    Call(context, UnsafeCast&lt;Callable&gt;(executor), Undefined, resolve, reject);
+  } catch (e) {
+    // 如果出现异常则调用 reject 函数
+    Call(context, reject, Undefined, e);
+  }
+  return result;
+}</code></pre> 
+ <p>首先分析两个 <code>ThrowTypeError</code>，以下代码可触发第一个 <code>ThrowTypeError</code>。</p> 
+ <pre class="has"><code class="language-go">Promise()  // Uncaught TypeError: undefined is not a promise</code></pre> 
+ <p>原因是没有使用 <code>new</code> 操作符调用 <code>Promise</code> 构造函数，此时 <code>newTarget</code> 等于 <code>Undefined</code>，触发了 <code>ThrowTypeError(MessageTemplate::kNotAPromise, newTarget)</code>。</p> 
+ <p>以下代码可触发第二个 <code>ThrowTypeError</code>。</p> 
+ <pre class="has"><code class="language-go">new Promise() // Uncaught TypeError: Promise resolver undefined is not a function</code></pre> 
+ <p>此时 <code>newTarget</code> 不等于 <code>Undefined</code>，不会触发第一个 <code>ThrowTypeError</code>。但调用 <code>Promise</code> 构造函数时没传参数 <code>executor</code>，触发了第二个 <code>ThrowTypeError</code>。</p> 
+ <p><code>executor</code> 的类型是函数，在 JavaScript 的世界里，回调函数通常是异步调用，但 <code>executor</code> 是同步调用。在 <code>Call(context, UnsafeCast(executor), Undefined, resolve, reject)</code> 这一行，同步调用了 <code>executor</code>。</p> 
+ <pre class="has"><code class="language-go">console.log('同步执行开始')
+new Promise((resolve, reject) =&gt; {
+  resolve()
+  console.log('executor 同步执行')
+})
+
+console.log('同步执行结束')
+// 本段代码的打印顺序是:
+// 同步执行开始
+// executor 同步执行
+// 同步执行结束</code></pre> 
+ <blockquote> 
+  <p>Promise 构造函数接收的参数 <code>executor</code>，是被同步调用的</p> 
+ </blockquote> 
+ <h3>then</h3> 
+ <p>ECMAScript 规范<sup>[6]</sup></p> 
+ <h4>PromisePrototypeThen</h4> 
+ <p><code>Promise</code> 的 <code>then</code> 方法传入两个回调函数 <code>onFulfilled</code> 和 <code>onRejected</code>，分别用于处理 <code>fulfilled</code> 和 <code>rejected</code> 状态，并返回一个新的 <code>Promise</code>。</p> 
+ <p>JavaScript 层的 <code>then</code> 函数实际上是 <code>V8</code> 中的 <code>PromisePrototypeThen</code> 函数，源码如下<sup>[7]</sup>：</p> 
+ <pre class="has"><code class="language-go">PromisePrototypeThen(js-implicit context: NativeContext, receiver: JSAny)(
+    onFulfilled: JSAny, onRejected: JSAny): JSAny {
+  const promise = Cast&lt;JSPromise&gt;(receiver) otherwise ThrowTypeError(
+      MessageTemplate::kIncompatibleMethodReceiver, 'Promise.prototype.then',
+      receiver);
+
+  const promiseFun = UnsafeCast&lt;JSFunction&gt;(
+      context[NativeContextSlot::PROMISE_FUNCTION_INDEX]);
+
+  let resultPromiseOrCapability: JSPromise|PromiseCapability;
+  let resultPromise: JSAny;
+  label AllocateAndInit {
+    // 创建一个新的 promise 用于当做本次 then 的调用结果返回
+    //（上面有提到then的返回值是一个promise）
+    const resultJSPromise = NewJSPromise(promise);
+    resultPromiseOrCapability = resultJSPromise;
+    resultPromise = resultJSPromise;
+  }
+  // onFulfilled 和 onRejected 是 then 接收的两个参数
+  // 如果不传则默认值为 Undefined
+  const onFulfilled = CastOrDefault&lt;Callable&gt;(onFulfilled, Undefined);
+  const onRejected = CastOrDefault&lt;Callable&gt;(onRejected, Undefined);
+
+  // 调用 PerformPromiseThenImpl 函数
+  PerformPromiseThenImpl(
+      promise, onFulfilled, onRejected, resultPromiseOrCapability);
+  // 返回一个新的 Promise
+  return resultPromise;
+}</code></pre> 
+ <p><code>PromisePrototypeThen</code> 函数创建了一个新的 <code>Promise</code> 对象，获取 <code>then</code> 接收到的两个参数，调用 <code>PerformPromiseThenImpl</code> 完成大部分工作。这里有一点值得注意，<code>then</code> 方法返回的是一个新创建的 <code>Promise</code>。</p> 
+ <pre class="has"><code class="language-go">const myPromise2 = new Promise((resolve, reject) =&gt; {
+  resolve('foo')
+})
+
+const myPromise3 = myPromise2.then(console.log)
+
+// myPromise2 和 myPromise3 是两个不同的对象
+// 有不同的状态和不同的处理函数
+console.log(myPromise2 === myPromise3) // 打印 false</code></pre> 
+ <blockquote> 
+  <p>then 方法返回的是一个新的 Promise</p> 
+ </blockquote> 
+ <h4>PerformPromiseThenImpl</h4> 
+ <p>ECMAScript 规范<sup>[8]</sup></p> 
+ <p><code>PerformPromiseThenImpl</code> 有4个参数，因为 <code>PerformPromiseThenImpl</code> 是在调用 <code>then</code> 调用，所以它的前三个参数分别是被调用 <code>then</code> 方法的 <code>Promise</code> 对象，以及这个 <code>Promise</code> 对象即将被绑定的两个处理函数 <code>onFulfilled</code> 和 <code>onRejected</code>（值就是调用 <code>then(onFulfilled, onRejected)</code> 时传递的两个参数），最后一个参数为调用这个 <code>then</code> 返回的新 <code>Promise</code> 对象 <code>resultPromiseOrCapability</code>。</p> 
+ <p>PerformPromiseThenImpl 源码如下<sup>[9]</sup>：</p> 
+ <pre class="has"><code class="language-go">transitioning macro PerformPromiseThenImpl(implicit context: Context)(
+    promise: JSPromise, 
+   onFulfilled: Callable|Undefined,
+    onRejected: Callable|Undefined,
+    resultPromiseOrCapability: JSPromise|PromiseCapability|Undefined): void {
+  if (promise.Status() == PromiseState::kPending) {
+    // pending 状态的分支
+    // 如果当前 Promise 还是 pending 状态
+    // 那么只需要将本次 then 绑定的处理函数存储起来即可
+    const handlerContext = ExtractHandlerContext(onFulfilled, onRejected);
+    // 拿到 Promise 的 reactions_or_result 字段
+    const promiseReactions =
+        UnsafeCast&lt;(Zero | PromiseReaction)&gt;(promise.reactions_or_result);
+    // 考虑一个 Promise 可能会有多个 then 的情况
+    // reaction 是个链表，每次绑定处理函数都在链表的头部插入
+    // 存 Promise 的所有处理函数
+    const reaction = NewPromiseReaction(
+        handlerContext, promiseReactions, resultPromiseOrCapability,
+        onFulfilled, onRejected);
+    // reactions_or_result 可以存 Promise 的处理函数的链表，也可以存
+    // Promise 的最终结果，因为现在 Promise 处于 pending 状态，
+    // 所以存的是处理函数 reaction 构成的链表
+    promise.reactions_or_result = reaction;
+  } else {
+    // fulfilled 和 rejected 状态的分支
+    const reactionsOrResult = promise.reactions_or_result;
+    let microtask: PromiseReactionJobTask;
+    let handlerContext: Context;
+    // fulfilled 分支
+    if (promise.Status() == PromiseState::kFulfilled) {
+      handlerContext = ExtractHandlerContext(onFulfilled, onRejected);
+      // 生成 microtask 任务
+      microtask = NewPromiseFulfillReactionJobTask(
+          handlerContext, reactionsOrResult, onFulfilled,
+          resultPromiseOrCapability);
+    } else // rejected 分支
+      deferred {
+        assert(promise.Status() == PromiseState::kRejected);
+        handlerContext = ExtractHandlerContext(onRejected, onFulfilled);
+       // 生成 microtask 任务
+        microtask = NewPromiseRejectReactionJobTask(
+            handlerContext, reactionsOrResult, onRejected,
+            resultPromiseOrCapability);
+       // 如果当前 promise 还未绑定过处理函数
+        if (!promise.HasHandler()) {
+          // 规范中的 HostPromiseRejectionTracker(promise, "reject")，
+          // 作用是产生一个检测的 microtask 任务，后面会单独介绍。
+          runtime::PromiseRevokeReject(promise);
+        }
+      }
+    // 即使调用 then 方法时 promise 已经处于 fulfilled 或 rejected 状态，
+    // then 方法的 onFulfilled 或 onRejected 参数也不会立刻执行，
+    // 而是进入 microtask 队列后执行
+    EnqueueMicrotask(handlerContext, microtask);
+  }
+  promise.SetHasHandler();
+}</code></pre> 
+ <h4>PerformPromiseThenImpl 函数的 pending 分支</h4> 
+ <p>PerformPromiseThenImpl 有三个分支，分别对应 Promise 的三个状态，当被调用 then 方法的 Promise 处于 pending 状态时则进入 pending分支。pending 分支调用 <code>NewPromiseReaction</code> 函数，在接收到的 onFulfilled 和 onRejected 参数的基础上，生成 <code>PromiseReaction</code> 对象，存储 Promise 的处理函数，并赋值给 <code>JSPromise</code> 的 <code>reactions_or_result</code> 字段，然后调用 <code>promise.SetHasHandler()</code> 将 <code>has_handler</code> 设置为 <code>true</code>（表示这个 Promise 对象已经绑定了处理函数）</p> 
+ <p>考虑一个 Promise 可以会连续调用多个 then 的情况，比如：</p> 
+ <pre class="has"><code class="language-go">const p = new Promise((resolve, reject) =&gt; {
+  setTimeout(_ =&gt; {
+    resolve('my code delay 2000 ms') 
+  }, 2000)
+})
+
+p.then(result =&gt; {
+  console.log('第 1 个 then')
+})
+
+p.then(result =&gt; {
+  console.log('第 2 个 then')
+})</code></pre> 
+ <p>p 调用了两次 then 方法，每个 then 方法都会生成一个 <code>PromiseReaction</code> 对象。第一次调用 then 方法时生成对象 PromiseReaction1，此时 p 的 <code>reactions_or_result</code> 存的是 PromiseReaction1。</p> 
+ <p>第二次调用 then 方法时生成对象 PromiseReaction2，调用 <code>NewPromiseReaction</code> 函数时，<code>PromiseReaction2.next = PromiseReaction1</code>，PromiseReaction1 变成了 PromiseReaction2 的下一个节点，最后 p 的 <code>reactions_or_result</code> 存的是 PromiseReaction2。PromiseReaction2 后进入 Promise 处理函数的链表，却是链表的头结点。<code>NewPromiseReaction</code> 函数源码如下<sup>[10]</sup>：</p> 
+ <pre class="has"><code class="language-go">macro NewPromiseReaction(implicit context: Context)(
+    handlerContext: Context, next: Zero|PromiseReaction,
+    promiseOrCapability: JSPromise|PromiseCapability|Undefined,
+    fulfillHandler: Callable|Undefined,
+    rejectHandler: Callable|Undefined): PromiseReaction {
+  const nativeContext = LoadNativeContext(handlerContext);
+  return new PromiseReaction{
+    map: PromiseReactionMapConstant(),
+    next: next, // next 字段存的是链表中的下一个节点
+    reject_handler: rejectHandler,// 失败处理函数
+    fulfill_handler: fulfillHandler,// 成功处理函数
+    promise_or_capability: promiseOrCapability,// 产生的新Promise对象
+    continuation_preserved_embedder_data: nativeContext
+        [NativeContextSlot::CONTINUATION_PRESERVED_EMBEDDER_DATA_INDEX]
+  };
+}</code></pre> 
+ <p>在 p 处于 pending 状态时，p 的 reactions_or_result 字段大致内容如下图。</p> 
+ <blockquote> 
+  <p><strong>下图不是 microtask 队列，下图不是 microtask 队列，下图不是 microtask 队列。</strong></p> 
+ </blockquote> 
+ <img src="https://images2.imgbox.com/eb/70/eeDqk0Sb_o.jpg" alt="44e0232af84f84cb0fae8801cb5d6b05.jpeg"> 
+ <figcaption>
+   reactions 
+ </figcaption> 
+ <blockquote> 
+  <p>图中使用 onFulfilled 代替 fulfill_handler 是为了方便理解，onRejected也是如此，且只包含于当前内容相关的字段，不用太过于纠结。</p> 
+ </blockquote> 
+ <h4>PerformPromiseThenImpl 函数的 fulfilled 分支</h4> 
+ <p>fulfilled 分支逻辑则简单的多，处理的是当 Promise 处于 fulfilled 状态时，调用 then 方法的逻辑：</p> 
+ <p>先调用 <code>NewPromiseFulfillReactionJobTask</code> 生成 <code>microtask</code>，然后 <code>EnqueueMicrotask(handlerContext, microtask)</code> 将刚才生成的 <code>microtask</code> 放入 <code>microtask 队列</code>，最后调用 <code>promise.SetHasHandler()</code> 将 <code>has_handler</code> 设置为 <code>true</code>。</p> 
+ <pre class="has"><code class="language-go">new Promise((resolve, reject) =&gt; {
+  resolve()
+}).then(result =&gt; {
+  console.log('进入 microtask 队列后执行')
+})
+
+console.log('同步执行结束')
+// 本段代码的打印顺序是:
+// 同步执行结束
+// 进入 microtask 队列后执行</code></pre> 
+ <p>尽管调用 then 方法时，Promise 已经处于 fulfilled 状态，但 then 方法的 onFulfilled 回调函数不会立即执行，而是进入 microtask 队列等待执行。</p> 
+ <h4>PerformPromiseThenImpl 函数的 rejected 分支</h4> 
+ <p>rejected 分支逻辑与 fulfilled 分支的逻辑大致相同，但是 rejected 分支中将 onRejected 处理函数加入 microtask 队列之前，会先判断当前 promise 是否已经存在处理函数，如果已经存在则会先调用 <code>runtime::PromiseRevokeReject(promise)</code>，最后调用 <code>promise.SetHasHandler()</code> 将 <code>has_handler</code> 设置为 <code>true</code>。</p> 
+ <pre class="has"><code class="language-go">if (!promise.HasHandler()) {
+       runtime::PromiseRevokeReject(promise);
+   }</code></pre> 
+ <p>这里的<code>runtime::PromiseRevokeReject(promise)</code> 就是 ECMAScript 规范<sup>[11]</sup> 中的 <code>HostPromiseRejectionTracker(promise, "handle")</code>，<code>HostPromiseRejectionTracker</code> 是一个抽象方法，这表示没有规定它的具体的逻辑。大致的作用是标记一下 <code>promise</code> 已经绑定了 <code>rejected</code> 状态的处理函数。不用疑惑为什么要这么做，后面会单独重点说。</p> 
+ <blockquote> 
+  <p>注意 1 HostPromiseRejectionTracker 在两种情况下被调用：</p> 
+  <p>当一个 promise 在没有任何处理程序的情况下被拒绝时，它的操作参数设置为“reject”。</p> 
+  <p>当第一次将处理程序添加到被拒绝的 Promise 中时，将调用它并将其操作参数设置为“handle”。</p> 
+  <p>引至 ——ECMAScript 规范<sup>[12]</sup>(作者翻译)</p> 
+ </blockquote> 
+ <h4>小结</h4> 
+ <ol><li><p>当一个 Promise 被调用 then 方法时，会创建一个新的 Promise 对象 <code>resultPromise</code></p></li><li><p>然后根据当前 <code>promise</code> 的不同状态执行不同的逻辑</p></li></ol> 
+ <ul><li><p>pending状态：会将 <code>then</code> 传递的两个处理函数变成一个 <code>PromiseReaction</code> 节点插入到<code>promise.reactions_or_result</code> 头部（<code>PromiseReaction</code>是一个链表结构），这个步骤就是在搜集依赖，等待 <code>promise</code> 状态完成时再触发。</p></li><li><p>fulfilled状态：会创建一个 microtask 来调用传入的 onFulfilled 处理函数，并将 reactions_or_result 作为调用的参数（此时 <code>reactions_or_result</code> 是 <code>promise</code> 的值，也就是调用 <code>resolve</code> 时传入的参数 <code>value</code> ），并将其插入 microtask 队列。</p></li><li><p>rejected状态：与 fulfilled 状态类似，会将创建一个 microtask 来调用传入的 <code>onRejected</code> 处理函数，并将 <code>reactions_or_result</code> 作为调用的参数，如果当前 Promise 不存在处理函数（也就是 fulfilled 状态的Promsie 首次被调用 then 方法），会将其标记为已经绑定 <code>onRejected</code> 函数，然后将其 microtask 插入 microtask 队列。</p></li></ul> 
+ <p>调用 <code>promise.SetHasHandler()</code> 将 Promise 的 <code>has_handler</code> 设置为 <code>true</code>，表示其被调用的 then 方法绑定了处理函数。</p> 
+ <p>最后返回新的 Promise 对象。</p> 
+ <blockquote> 
+  <p>再来回顾一下 <code>reactions_or_result</code> 的3个值状态（空、链表、promise的值）:</p> 
+  <p>当 promise 刚刚被创建时，reactions_or_result的值的空，</p> 
+  <p>当promise的状态改变为 <code>fulfilled</code>/<code>rejected</code> 时，其值是调用对应 <code>resolve(value)</code>/<code>reject(value)</code> 函数传入的参数 <code>value</code>，也就是 <code>promise</code> 的值。</p> 
+  <p>当 promise 为 pending 状态且被调用 <code>then</code> 后，<code>reactions_or_result</code> 为一个链表，链表的每一项存储的是调用 <code>then</code> 时传入的处理函数。</p> 
+ </blockquote> 
+ <h3>reslove</h3> 
+ <pre class="has"><code class="language-go">new Promise((resolve, reject) =&gt; {
+  setTimeout(_ =&gt; resolve('fulfilled'), 5000)
+}).then(value =&gt; {
+  console.log(value)
+}, reason =&gt; {
+  console.log('rejected')
+})</code></pre> 
+ <p>上述代码 5s 后执行 resolve 函数，控制台打印 fulfilled。</p> 
+ <h4>FulfillPromise</h4> 
+ <p>ECMAScript 规范<sup>[13]</sup></p> 
+ <p><code>reslove(value)</code> 就是规范中的 <code>FulfillPromise(promise, value)</code> 函数，他的作用是将一个 Promise 的状态由 pending 改变为 fulfilled，并且将这个 Promise 的所有处理函数都变成 microtask 加入到 microtask 队列中等待执行。</p> 
+ <p>resolve 函数归根到底调用了 V8 的 FulfillPromise 函数，源码如下<sup>[14]</sup>：</p> 
+ <pre class="has"><code class="language-go">// https://tc39.es/ecma262/#sec-fulfillpromise
+transitioning builtin
+FulfillPromise(implicit context: Context)(
+    promise: JSPromise, value: JSAny): Undefined {
+  // 断案当前promise状态一定是 pending，因为promise 的状态改变是不可逆的
+  assert(promise.Status() == PromiseState::kPending);
+
+  // 取 Promise 的处理函数，在这之前 Promise 的状态还是 pending
+  // 所以 reactions_or_result 中存的是 reactions 链表，
+  // reactions 节点中存储的是里函数
+  const reactions =
+      UnsafeCast&lt;(Zero | PromiseReaction)&gt;(promise.reactions_or_result);
+
+  // Promise 需要修改为 fulfilled 状态，所以 reactions_or_result 存储的
+  // 不再是处理函数，而是 Promise 的结果，也就是调用 resolve 时传入的参数
+  promise.reactions_or_result = value;
+
+  // 设置 Promise 的状态为 fulfilled
+  promise.SetStatus(PromiseState::kFulfilled);
+
+  // Promise 的处理函数，Promise 的结果都拿到了，开始正式处理
+  TriggerPromiseReactions(reactions, value, kPromiseReactionFulfill);
+  return Undefined;
+}</code></pre> 
+ <p><code>FulfillPromise</code> 的逻辑是获取 Promise 的处理函数到 <code>reactions</code>，<code>reactions</code> 的类型是 <code>PromiseReaction</code>，是个链表，忘记的同学可以回看上面的那张链表图片；设置<code> promise</code> 的 <code>reactions_or_result</code> 为 <code>value</code>，这个 <code>value</code> 就是 JavaScript 层传给 <code>resolve</code> 的参数；调用 <code>promise.SetStatus(PromiseState::kFulfilled)</code> 设置 <code>promise</code> 的状态为 <code>fulfilled</code>，最后调用 <code>TriggerPromiseReactions</code> 来将 <code>reactions</code> 中的处理函数添加到 microtask 队列。</p> 
+ <h4>TriggerPromiseReactions</h4> 
+ <p>源码如下<sup>[15]</sup>：</p> 
+ <pre class="has"><code class="language-go">// https://tc39.es/ecma262/#sec-triggerpromisereactions
+transitioning macro TriggerPromiseReactions(implicit context: Context)(
+    reactions: Zero|PromiseReaction, argument: JSAny,
+    reactionType: constexpr PromiseReactionType): void {
+  // We need to reverse the {reactions} here, since we record them on the
+  // JSPromise in the reverse order.
+  let current = reactions;
+  let reversed: Zero|PromiseReaction = kZero;
+  // 链表反转
+  while (true) {
+    typeswitch (current) {
+      case (Zero): {
+        break;
+      }
+      case (currentReaction: PromiseReaction): {
+        current = currentReaction.next;
+        currentReaction.next = reversed;
+        reversed = currentReaction;
+      }
+    }
+  }
+  current = reversed;
+  // 链表反转后，调用 MorphAndEnqueuePromiseReaction
+  // 把链接中的每一项都进入 microtask 队列
+  while (true) {
+    typeswitch (current) {
+      case (Zero): {
+        break;
+      }
+      case (currentReaction: PromiseReaction): {
+        current = currentReaction.next;
+        MorphAndEnqueuePromiseReaction(currentReaction, argument, reactionType);
+      }
+    }
+  }
+}</code></pre> 
+ <p><code>TriggerPromiseReactions</code> 做了两件事：</p> 
+ <ul><li><p>反转 <code>reactions</code> 链表，前文有分析过 then 方法的实现，then 方法的参数最终存在链表中。最后被调用的 then 方法，它接收的参数被包装后会位于链表的头部，这不符合规范，所以需要反转</p></li><li><p>遍历 <code>reactions</code> 对象，调用 MorphAndEnqueuePromiseReaction 将每个元素放入 microtask 队列</p></li></ul> 
+ <h4>MorphAndEnqueuePromiseReaction</h4> 
+ <p>MorphAndEnqueuePromiseReaction<sup>[16]</sup> 将 PromiseReaction 转为 microtask，最终插入 microtask 队列，morph 本身有转变/转化的意思，比如 Polymorphism (多态)。</p> 
+ <p>MorphAndEnqueuePromiseReaction 接收 3 个参数，PromiseReaction 是前面提到的包装了 Promise 处理函数的链表对象，argument 是 resolve/reject 的参数，reactionType 表示 Promise 最终的状态，fulfilled 状态对应的值是 kPromiseReactionFulfill，rejected 状态对应的值是 kPromiseReactionReject。</p> 
+ <p>MorphAndEnqueuePromiseReaction 的逻辑很简单，因为此时已经知道了 Promise 的最终状态，所以可以从 promiseReaction 对象得到 promiseReactionJobTask 对象，promiseReactionJobTask 的变量命名与 ECMAScript 规范相关描述一脉相承，其实就是传说中的 microtask。MorphAndEnqueuePromiseReaction 源码如下，仅保留了和本小节相关的内容。</p> 
+ <pre class="has"><code class="language-go">transitioning macro MorphAndEnqueuePromiseReaction(implicit context: Context)(
+    promiseReaction: PromiseReaction, argument: JSAny,
+    reactionType: constexpr PromiseReactionType): void {
+  let primaryHandler: Callable|Undefined;
+  let secondaryHandler: Callable|Undefined;
+  // 根据不同的 Promise 状态选取不同的回调执行
+  if constexpr (reactionType == kPromiseReactionFulfill) {
+    primaryHandler = promiseReaction.fulfill_handler;
+    secondaryHandler = promiseReaction.reject_handler;
+  } else {
+    primaryHandler = promiseReaction.reject_handler;
+    secondaryHandler = promiseReaction.fulfill_handler;
+  }
+  const handlerContext: Context =
+      ExtractHandlerContext(primaryHandler, secondaryHandler);
+  if constexpr (reactionType == kPromiseReactionFulfill) {// fulfilled 分支
+    * UnsafeConstCast(&amp; promiseReaction.map) =
+        PromiseFulfillReactionJobTaskMapConstant();
+    const promiseReactionJobTask =
+        UnsafeCast&lt;PromiseFulfillReactionJobTask&gt;(promiseReaction);
+    // argument 是 reject 的参数
+    promiseReactionJobTask.argument = argument;
+    // handler 是 JS 层面 then 方法的第二个参数，或 catch 方法的参数
+    promiseReactionJobTask.context = handlerContext;
+    // promiseReactionJobTask 就是那个工作中经常被反复提起的 microtask
+    // EnqueueMicrotask 将 microtask 插入 microtask 队列
+    EnqueueMicrotask(handlerContext, promiseReactionJobTask);
+    // 删除
+  } else {// rejected 分支
+      // 逻辑与 fulfilled 分支前面一致
+    * UnsafeConstCast(&amp; promiseReaction.map) =
+        PromiseRejectReactionJobTaskMapConstant();
+    const promiseReactionJobTask =
+        UnsafeCast&lt;PromiseRejectReactionJobTask&gt;(promiseReaction);
+    promiseReactionJobTask.argument = argument;
+    promiseReactionJobTask.context = handlerContext;
+    promiseReactionJobTask.handler = primaryHandler;
+    EnqueueMicrotask(handlerContext, promiseReactionJobTask);
+  }
+}</code></pre> 
+ <p>MorphAndEnqueuePromiseReaction 的功能很简单，就是根据 Promise 的状态选取 onFulfilled 还是 onRejected 放到 microtask 队列准备执行。这里走的是 fulfilled 分支，所以选取的是 onFulfilled。</p> 
+ <pre class="has"><code class="language-go">const myPromise4 = new Promise((resolve, reject) =&gt; {
+  setTimeout(_ =&gt; {
+    resolve('my code delay 1000') 
+  }, 1000)
+})
+
+myPromise4.then(result =&gt; {
+  console.log('第 1 个 then')
+})
+
+myPromise4.then(result =&gt; {
+  console.log('第 2 个 then')
+})
+// 打印顺序：
+// 第 1 个 then
+// 第 2 个 then
+// 如果把 TriggerPromiseReactions 中链表反转的代码注释掉，打印顺序为
+// 第 2 个 then
+// 第 1 个 then</code></pre> 
+ <h4>小结</h4> 
+ <p>resolve 只会处理状态为 pending 的 Promise，会将 Promise 的 <code>reactions_or_result</code> 设置为传入的 <code>value</code>，用来作为 Promise 的值，并且会将 Promise 的状态修改为 fulfilled。</p> 
+ <p>在调用 resolve 之前 <code>reactions_or_result</code> 其实是一个链表，存储的是当前 Promise 的所有处理函数，因为 promise 在使用 then 收集依赖时是将最新的依赖存放到链表头部，所以还需要先对链表进行反转，然后将其挨个放入 microtask 队列中等待执行</p> 
+ <blockquote> 
+  <p>resolve 的主要工作是遍历上节调用 then 方法时收集到的依赖，放入 microtask 队列中等待执行。</p> 
+ </blockquote> 
+ <h3>reject</h3> 
+ <p>reject 与 reslove 没什么太大差别</p> 
+ <p>ECMAScript 规范<sup>[17]</sup></p> 
+ <pre class="has"><code class="language-go">new Promise((resolve, reject) =&gt; {
+  setTimeout(_ =&gt; reject('rejected'), 5000)
+}).then(_ =&gt; {
+  console.log('fulfilled')
+}, reason =&gt; {
+  console.log(reason)
+})</code></pre> 
+ <p>上述代码 5s 后执行 reject 函数，控制台打印 rejected。</p> 
+ <h4>RejectPromise</h4> 
+ <p>ECMAScript 规范<sup>[18]</sup></p> 
+ <p><code>reject(season)</code> 函数调用了 V8 的 <code>RejectPromise(promise, season)</code> 函数，源码如下<sup>[19]</sup> ：</p> 
+ <pre class="has"><code class="language-go">// https://tc39.es/ecma262/#sec-rejectpromise
+transitioning builtin
+RejectPromise(implicit context: Context)(
+    promise: JSPromise, reason: JSAny, debugEvent: Boolean): JSAny {
+ 
+  // 如果当前 Promise 没有绑定处理函数，
+  // 则会调用 runtime::RejectPromise
+  if (IsPromiseHookEnabledOrDebugIsActiveOrHasAsyncEventDelegate() ||
+      !promise.HasHandler()) {
+    return runtime::RejectPromise(promise, reason, debugEvent);
+  }
+ 
+  // 取出 Promise 的处理对象 PromiseReaction
+  const reactions =
+      UnsafeCast&lt;(Zero | PromiseReaction)&gt;(promise.reactions_or_result);
+  // 这里的 reason 就是 reject 函数的参数
+  promise.reactions_or_result = reason;
+  // 设置 Promise 的状态为 rejected
+  promise.SetStatus(PromiseState::kRejected);
+  // 将 Promise 的处理函数都添加到 microtask 队列
+  TriggerPromiseReactions(reactions, reason, kPromiseReactionReject);
+  return Undefined;
+}</code></pre> 
+ <h4>HostPromiseRejectionTracker</h4> 
+ <p>与 ReslovePromise 相比，RejectPromise 中多出一个判断 Promsie 是否绑定了处理函数的判断，如果没有绑定处理函数则会先执行 <code>runtime::RejectPromise(promise, reason, debugEvent)</code>，这是其实是 ECMAScript 规范中的 <code>HostPromiseRejectionTracker(promise, "reject") </code>，这已经是第二次提到 <code>HostPromiseRejectionTracker</code>了。</p> 
+ <blockquote> 
+  <p>在 <strong>PerformPromiseThenImpl 函数的 rejected 分支</strong> 处有提到过一次。</p> 
+ </blockquote> 
+ <p>在 ECMAScript 规范中 HostPromiseRejectionTracker 是一个抽象方法，他甚至没有明确的执行过程，好在规范中描述了他的作用。</p> 
+ <p>HostPromiseRejectionTracker 用于跟踪 Promise 的 rejected，例如全局的 <code>rejectionHandled</code> 事件就是由它实现。</p> 
+ <blockquote> 
+  <p>注1 HostPromiseRejectionTracker 在两种情况下被调用：</p> 
+  <p>当一个 Promise 在没有任何处理函数的情况下被调用 reject 时，调用它并且第二个参数传递 “reject”。</p> 
+  <p>当第一次为 rejected 状态的 Promise 绑定处理函数时，调用它并且第二个参数传递 “handle”。</p> 
+ </blockquote> 
+ <p>所以在这里，当传递 <code>“handle”</code> 就相对于为这个 Promise 对象标记为已经绑定了处理函数，当传递 <code>“reject”</code> 相对于标记这个 Promise 对象还没有处理函数。</p> 
+ <p>我们先来看几段代码看看他的实际作用</p> 
+ <p>当我们调用一个 Promise 的状态为 reject 且未为其绑定 onRejected 的处理函数时， JavaScript会抛出错误</p> 
+ <pre class="has"><code class="language-go">const myPromise1 = new Promise((resolve, reject) =&gt; {
+    reject()
+})
+// 报错</code></pre> 
+ <p>并且检测是否绑定处理函数是一个异步的过程</p> 
+ <pre class="has"><code class="language-go">console.log(1);
+const myPromise1 = new Promise((resolve, reject) =&gt; {
+    reject()
+})
+console.log(2);
+// 1
+// 2
+// 报错</code></pre> 
+ <p>我们可以为其绑定一个 onRejected 处理函数来解决我们报错</p> 
+ <pre class="has"><code class="language-go">const myPromise1 = new Promise((resolve, reject) =&gt; {
+    reject()
+})// 得到一个 rejected 状态的 Promise
+myPromise1.then(undefined, console.log)</code></pre> 
+ <p>你一定会疑惑，Promise 是在何时检测它是否绑定了 onRejected 处理函数，如何检测的？</p> 
+ <p>这就是 HostPromiseRejectionTracker 的作用，在 ECMAScript 规范中还提到，当调用 <code>HostPromiseRejectionTracker(promise, 'reject')</code> 时， 如果 promsie 不存在处理函数，则会为其设置一个处理函数。</p> 
+ <p>回到上面的逻辑，当一个 Promise 的 reject 函数被调用时， 如果没有 onRejected 处理函数，则会调用 <code>runtime::RejectPromise</code> 来为其添加一个处理函数，然后后面会调用 <code>TriggerPromiseReactions</code> 将这个处理函数加入到 microtask 队列，这个处理函数执行时做的事情就是再次检测 Promise 是否被绑定了新的 onRejected（也就是有没有在此期间执行了 <code>HostPromiseRejectionTracker(promise, 'handle')</code> ），如果没有则抛出错误，如果有则什么也不发生。</p> 
+ <pre class="has"><code class="language-go">// 不可运行的js伪代码
+function HostPromiseRejectionTracker(promise, status) {
+  if (status === 'handle') {
+    promise.HasHandler = true
+  } else if (status === 'reject'){
+    promise.catch(() =&gt; {
+      if (!promise.HasHandler) {
+        throw new Error('Uncaught (in promise) ' + promise.value)
+      }
+    })
+  }
+}
+
+RejectPromise(){
+  //...
+  if (!promise.HasHandler) {
+    HostPromiseRejectionTracker(promise, 'reject')
+  }
+  //...
+}
+
+FulfillPromise(){
+  //...
+  if (!promise.HasHandler) {
+    HostPromiseRejectionTracker(promise, 'handle')
+  }
+  //...
+}</code></pre> 
+ <p>所以在对一个 reject 状态的 Promise 调用 then 方法时需要对其调用 <code>runtime::PromiseRevokeReject(promise)</code> 来表示这个 Promise 绑定了新的 onRejected，防止错误被抛出。</p> 
+ <p>所以你必须要赶在这个检测的 microtask 执行之前绑定处理函数才能防止这个错误的抛出。</p> 
+ <pre class="has"><code class="language-go">const myPromise1 = new Promise((resolve, reject) =&gt; {
+    // 同步执行
+    reject()
+    // 会向 microtask 队列中插入一个检查 myPromise1 
+    // 是否绑定了新的 onRejected 处理函数的 microtask
+})
+
+// macrotask
+setTimeout(() =&gt; {
+   // 此时 microtask 已经执行，错误已经抛出，来不及了
+    myPromise1.then(undefined, console.log)
+}, 0)</code></pre> 
+ <blockquote> 
+  <p><strong>注意：</strong>  浏览器控制台有一个非常奇怪的特性，如果在这个错误输出后在为其绑定 onrejected 处理函数，浏览器会将控制台的错误覆盖掉。所以如果你在浏览器执行这段代码，<strong>请将setTimeout的时间设置长一点</strong>，这样效果更加容易肉眼可见，或者切换到 node 环境中来运行。</p> 
+ </blockquote> 
+ <h4>小结</h4> 
+ <p>reject 和 resolve 的逻辑基本相同，分为 4 步：</p> 
+ <ul><li><p>设置 Promise 的 reason，也就是 reject 的参数</p></li><li><p>设置 Promise 的状态：rejected</p></li><li><p>如果 Promise 没有 onRejected 处理函数，则会为其添加一个再次检测 Promise 是否绑定 onRejected 的处理函数，这个处理函数会被放入 microtask 队列，如果其执行时 Promise 还未绑定 onRejected，则会抛出一个错误。</p></li><li><p>由之前调用 then/catch 方法时收集到的依赖存储到 <code>reactions_or_result</code> 的处理函数，也就是许多 promiseReaction 节点对象，得到一个个 microtask，最后将这些 microtask 插入 microtask 队列</p></li></ul> 
+ <h3>catch</h3> 
+ <pre class="has"><code class="language-go">new Promise((resolve, reject) =&gt; {
+    setTimeout(reject, 2000)
+}).catch(_ =&gt; {
+    console.log('rejected')
+})</code></pre> 
+ <h4>PromisePrototypeCatch</h4> 
+ <p>以上面代码为例，当 catch 方法执行时，调用了 V8 的 PromisePrototypeCatch<sup>[20]</sup> 方法，源码如下：</p> 
+ <pre class="has"><code class="language-go">transitioning javascript builtin
+PromisePrototypeCatch(
+    js-implicit context: Context, receiver: JSAny)(onRejected: JSAny): JSAny {
+  const nativeContext = LoadNativeContext(context);
+  return UnsafeCast&lt;JSAny&gt;(
+      InvokeThen(nativeContext, receiver, Undefined, onRejected));
+}</code></pre> 
+ <p>PromisePrototypeCatch 的源码确实只有就这几行，除了调用 InvokeThen 方法再无其它 。</p> 
+ <h4>InvokeThen</h4> 
+ <p>从名字可以推测出，InvokeThen 调用的是 Promise 的 then 方法，InvokeThen<sup>[21]</sup> 源码如下：</p> 
+ <pre class="has"><code class="language-go">transitioning
+macro InvokeThen&lt;F: type&gt;(implicit context: Context)(
+    nativeContext: NativeContext, receiver: JSAny, arg1: JSAny, arg2: JSAny,
+    callFunctor: F): JSAny {
+  if (!Is&lt;Smi&gt;(receiver) &amp;&amp;
+      IsPromiseThenLookupChainIntact(
+          nativeContext, UnsafeCast&lt;HeapObject&gt;(receiver).map)) {
+    const then =
+        UnsafeCast&lt;JSAny&gt;(nativeContext[NativeContextSlot::PROMISE_THEN_INDEX]);
+    // 重点在下面一行，调用 then 方法并返回，两个分支都一样
+    return callFunctor.Call(nativeContext, then, receiver, arg1, arg2);
+  } else
+    deferred {
+      const then = UnsafeCast&lt;JSAny&gt;(GetProperty(receiver, kThenString));
+      // 重点在下面一行，调用 then 方法并返回，两个分支都一样
+      return callFunctor.Call(nativeContext, then, receiver, arg1, arg2);
+    }
+}</code></pre> 
+ <p>InvokeThen 方法有 if/else 两个分支，两个分支的逻辑差不多，本小节的 JS 示例代码走的是 if 分支。先是拿到 V8 原生的 then 方法，然后通过 <code>callFunctor.Call(nativeContext, then, receiver, arg1, arg2)</code> 调用 then 方法。then 方法之前有介绍，这里不再赘述。</p> 
+ <p>既然 catch 方法底层调用了 then 方法，那么 catch 方法也有和 then 方法一样的返回值，catch 方法可以继续抛出异常，可以继续链式调用。</p> 
+ <pre class="has"><code class="language-go">new Promise((resolve, reject) =&gt; {
+    setTimeout(reject, 2000)
+}).catch(_ =&gt; {
+    throw 'rejected'
+}).catch(_ =&gt; {
+    console.log('last catch')
+})</code></pre> 
+ <p>上面的代码第 2 个 catch 捕获第 1 个 catch 抛出的异常，最后打印 last catch。</p> 
+ <h4>小结</h4> 
+ <p>catch 方法通过底层调用 then 方法来实现 假如 obj 是一个 Promise 对象，JS 层面 obj.catch(onRejected) 等价于 obj.then(undefined, onRejected)</p> 
+ <h3>then 的链式调用与 microtask 队列（重要）</h3> 
+ <pre class="has"><code class="language-go">Promise.resolve('123')
+    .then(() =&gt; {throw new Error('456')})
+    .then(_ =&gt; {
+        console.log('shouldnot be here')
+    })
+    .catch((e) =&gt; console.log(e))
+    .then((data) =&gt; console.log(data));</code></pre> 
+ <p>以上代码运行后，打印 Error: 456 和 undefined。为了便于叙述，将 then 的链式调用写法改为啰嗦写法。</p> 
+ <pre class="has"><code class="language-go">const p0 = Promise.resolve('123')
+const p1 = p0.then(() =&gt; {throw new Error('456')})
+const p2 = p1.then(_ =&gt; {
+    console.log('shouldnot be here')
+})
+const p3 = p2.catch((e) =&gt; console.log(e))
+const p4 = p3.then((data) =&gt; console.log(data));</code></pre> 
+ <p>then 方法返回新的 Promise，所以 p0、p1、p2、p3 和 p4 这 5 个 Promise 互不相等。</p> 
+ <blockquote> 
+  <p>当一个 Promise 处于 rejected 状态时，如果找不到 onRejected 处理函数则会将 rejected 的状态和其值往下传递，直到找到为止。（resolve也是一样），这个过程后面会介绍</p> 
+  <p>catch 方法的作用就是绑定 onRejected 函数</p> 
+ </blockquote> 
+ <h4>microtask 的执行</h4> 
+ <p>所有同步代码执行完毕，开始执行取 microtask 队列中的 microtask 执行，核心方法是 MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask<sup>[22]</sup> ，由于 microtask 的类型由很多种，所以 RunSingleMicrotask 的分支有许多。这里就不列出代码了。</p> 
+ <h4>PromiseReactionJob</h4> 
+ <p>在执行 microtask 的过程中，MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask 会调用 PromiseReactionJob<sup>[23]</sup>，源码如下：</p> 
+ <pre class="has"><code class="language-go">transitioning
+macro PromiseReactionJob(
+    context: Context, argument: JSAny, handler: Callable|Undefined,
+    promiseOrCapability: JSPromise|PromiseCapability|Undefined,
+    reactionType: constexpr PromiseReactionType): JSAny {
+  if (handler == Undefined) {
+    // 没有处理函数的 case，透传上一个 Promise 的 argument
+    if constexpr (reactionType == kPromiseReactionFulfill) {
+      // 基本类同 JS 层的 resolve
+      return FuflfillPromiseReactionJob(
+          context, promiseOrCapability, argument, reactionType);
+    } else {
+      // 基本类同 JS 层的 reject
+      return RejectPromiseReactionJob(
+          context, promiseOrCapability, argument, reactionType);
+    }
+  } else {
+    try {
+      // 试图调用 Promise 处理函数，相当于 handler(argument)
+      const result =
+          Call(context, UnsafeCast&lt;Callable&gt;(handler), Undefined, argument);
+        // 基本类同 JS 层的 resolve
+        return FuflfillPromiseReactionJob(
+            context, promiseOrCapability, result, reactionType);
+    } catch (e) {
+      // 基本类同 JS 层的 reject，当执行 handler 是抛出异常会触发
+      return RejectPromiseReactionJob(
+          context, promiseOrCapability, e, reactionType);
+    }
+  }
+}</code></pre> 
+ <p>PromiseReactionJob 中会判断当前任务是否存在需要执行的处理函数，如果不存在则直接将上一个 Promise 的值作为参数调用 FuflfillPromiseReactionJob ，如果存在则执行这个处理函数，将执行结果当做参数调用 FuflfillPromiseReactionJob。</p> 
+ <p>也就是说，只要一个 Promise 的 onFulfilled 或者 onRejected 在执行过程中只要没有抛出异常，这个 Promise 就会执行 FuflfillPromiseReactionJob 将状态修改为 fulfilled。如果抛出异常则执行 RejectPromiseReactionJob。</p> 
+ <pre class="has"><code class="language-go">let p0 = new Promise((resolve, reject) =&gt; {
+    reject(123)
+})
+// p1 的状态为 reject
+
+let p1 = p0.then(value =&gt; {
+    console.log(value);
+}, reason =&gt; {
+    console.log(reason);
+   return 2
+})
+// 将 reason =&gt; {console.log(reason)} 加入 microtask 队列
+
+p1.then(_ =&gt; {
+    console.log('p1');
+})
+// 为 p1 添加 PromiseReaction
+
+// 取  microtask 队列 第一个执行，
+// handler 为 reason =&gt; {console.log(reason)}，
+
+// 成功执行 handler, 所以调用 FuflfillPromiseReactionJob 
+// 执行 p1 的 resolve</code></pre> 
+ <blockquote> 
+  <p>注意：FuflfillPromiseReactionJob 做的事情很多，执行 resolve 只是其中的一个分支</p> 
+ </blockquote> 
+ <p>我们来看看 FuflfillPromiseReactionJob 具体做了哪些事情。</p> 
+ <h4>FuflfillPromiseReactionJob</h4> 
+ <p>源码如下：</p> 
+ <pre class="has"><code class="language-go">transitioning
+macro FuflfillPromiseReactionJob(
+    context: Context,
+    promiseOrCapability: JSPromise|PromiseCapability|Undefined, result: JSAny,
+    reactionType: constexpr PromiseReactionType): JSAny {
+  typeswitch (promiseOrCapability) {
+    case (promise: JSPromise): {
+      // 调用 ResolvePromise，也就是 promise 的 resolve(result)
+      return ResolvePromise(context, promise, result);
+    }
+    case (Undefined): {
+      return Undefined;
+    }
+    case (capability: PromiseCapability): {
+      const resolve = UnsafeCast&lt;Callable&gt;(capability.resolve);
+      try {
+        return Call(context, resolve, Undefined, result);
+      } catch (e) {
+        return RejectPromiseReactionJob(
+            context, promiseOrCapability, e, reactionType);
+      }
+    }
+  }
+}</code></pre> 
+ <p>FuflfillPromiseReactionJob 有3个分支，这里走的是第一个分支，调用 ResolvePromise<sup>[24]</sup>，这个方法很重要，他是规范中的 Promise Resolve Functions<sup>[25]</sup>，他的作用是同步当前处理函数的结果（值和状态）给其产生的promsie。promiseOrCapability。</p> 
+ <blockquote> 
+  <p>上面例子中 promiseOrCapability 就是 p1, 值是 2</p> 
+ </blockquote> 
+ <h4>ResolvePromise（重要）</h4> 
+ <p>这是一个很重要的方法，基本上每一个 Promise 的状态需要变成 fulfilled 都会调用它（调用resolve()时也会调用他），它的逻辑也产生了许多 PromiseA+ 中没有的特性。 下面的代码我删除了不重要的部分</p> 
+ <pre class="has"><code class="language-go">// https://tc39.es/ecma262/#sec-promise-resolve-functions
+transitioning builtin
+ResolvePromise(implicit context: Context)(
+    promise: JSPromise, resolution: JSAny): JSAny {
+ // 删
+  let then: Object = Undefined;
+  try {
+    // 调用 FulfillPromise
+    const heapResolution = UnsafeCast&lt;HeapObject&gt;(resolution);
+    const resolutionMap = heapResolution.map;
+    if (!IsJSReceiverMap(resolutionMap)) {
+      return FulfillPromise(promise, resolution);
+    }
+    // 删
+    const promisePrototype =
+        *NativeContextSlot(ContextSlot::PROMISE_PROTOTYPE_INDEX);
+    // 重要：如果 resolution 是一个 Promise 对象
+    if (resolutionMap.prototype == promisePrototype) {
+      then = *NativeContextSlot(ContextSlot::PROMISE_THEN_INDEX);
+      static_assert(nativeContext == LoadNativeContext(context));
+      goto Enqueue;
+    }
+    goto Slow;
+  } label Slow deferred {
+    // 如果 resolution 是一个包含then属性的对象，会来到这
+    try {
+      // 获取 then 属性
+      then = GetProperty(resolution, kThenString);
+    } catch (e) {
+      return RejectPromise(promise, e, False);
+    }
+    // 如果 then 属性不是一个可执行的方法
+    if (!Is&lt;Callable&gt;(then)) {
+      // 将执行结果同步到 promise
+      return FulfillPromise(promise, resolution);
+    }
+    goto Enqueue;
+  } label Enqueue {
+    // 重要：如果 执行结果是一个 Promise 对象
+    // 或者包含可执行的 then 方法的对象，会来到这
+    const task = NewPromiseResolveThenableJobTask(
+        promise, UnsafeCast&lt;JSReceiver&gt;(resolution),
+        UnsafeCast&lt;Callable&gt;(then));
+    return EnqueueMicrotask(task.context, task);
+  }
+}</code></pre> 
+ <p>ResolvePromise 方法中有几个很重要的逻辑，一个是调用 FulfillPromise，这个在resolve的时候已经介绍过了，作用是修改 promise 的状态为 fulfilled 并为其设置值，然后将 promise 的处理函数推到微任务队列。</p> 
+ <pre class="has"><code class="language-go">let p0 = Promise.resolve()
+let p1 = p0.then(() =&gt; {
+  return 1;
+})
+
+p1.then(console.log)
+
+// p0 then 中 onFulfilled 回调进入队列
+// PromiseReactionJob 中调用 p0 的 onFulfilled ，得到结果为1
+// 调用 FuflfillPromiseReactionJob ，然后调用 ResolvePromise
+// ResolvePromise 做如下操作
+// 将 p1 变成 fulfilled, 并将 p1 的处理函数 console.log 加到队列，参数为 1
+// p1 的 onFulfilled 出队列执行，输出 1</code></pre> 
+ <p>还有一种情况就是 <strong>当 resolution 的值是一个 Promise 对象或者是一个包含 then 方法的对象时。会调用 NewPromiseResolveThenableJobTask 生成一个 microtask，然后将其加入 microtask 队列中。</strong></p> 
+ <pre class="has"><code class="language-go">let p0 = Promise.resolve()
+// 两种特殊情况
+let p1 = p0.then(() =&gt; {
+  return Promise.resolve(1);// 返回值是 Promise 对象
+})
+let p2 = p0.then(() =&gt; {
+  return {then(resolve, reject){resolve(1)};// 返回值包含 then 方法
+})
+
+p1.then(console.log)</code></pre> 
+ <h4>NewPromiseResolveThenableJobTask（重要）</h4> 
+ <p>NewPromiseResolveThenableJobTask 的目的是调用 resolution 的 then 方法，在回调函数中同步状态给 promise。 这可能不是很好理解，我把他转化为js来大致就是这样的。</p> 
+ <pre class="has"><code class="language-go">microtask(() =&gt; {
+  resolution.then((value) =&gt; {
+    ReslovePromise(promise, value) 
+  })
+})</code></pre> 
+ <p>这个任务中会调用 resolution.then ，然后同步到 promsie。但是这个整体的过程需要加入 microtask 队列中等待运行，当这个任务运行时，如果 resolution 也是一个 Promise 的话，则 <code>(value) =&gt; {ReslovePromise(promise, value) }</code> 又会被作为一个 microtask 加入 microtask 队列中等待运行。</p> 
+ <p>你可以会疑惑为什么要这样做？为什么不同步调用 <code>resolution.then((value) =&gt; {ReslovePromise(promise, value) })</code>，而是把他封装为一个 microtask 呢？我一开始也感到疑惑，好在规范中给出了一个原因。</p> 
+ <blockquote> 
+  <p>注意: 此作业使用提供的 thenable 及其 then 方法来解决给定的 Promise。 此过程必须作为作业进行，以确保在对任何周围代码的评估完成后对 then 方法进行评估。</p> 
+  <p>引至 ECMAScript NewPromiseResolveThenableJobTask 规范<sup>[26]</sup>(作者翻译)</p> 
+ </blockquote> 
+ <blockquote> 
+  <p><strong>什么是 thenable：</strong></p> 
+  <p>Javascript 为了识别 Promise 产生的一个概念，简单来说就是所有包含 then 方法的对象都是 thenable。</p> 
+ </blockquote> 
+ <p>『以确保在对任何周围代码的评估完成后对 then 方法进行评估』指的是什么呢？我唯一能想到的就是下面这种情况。</p> 
+ <pre class="has"><code class="language-go">const p1 = new Promise((resolve, reject) =&gt; {
+    const p2 = Promise.resolve().then(() =&gt; {
+        resolve({
+            then: (resolve, reject) =&gt; resolve(1)
+        });
+        const p3 = Promise.resolve().then(() =&gt; console.log(2));
+    });
+}).then(v =&gt; console.log(v));
+// 2 1</code></pre> 
+ <p>上面 p2 的 onFulfilled回调 会先进入 microtask 队列，等待其执行时 调用 p1 的 resolve，但是参数是一个包含 then 方法的对象。这时 p1 不会立即改变为 fulfilled，而是创建一个 microtask 来执行这个then方法，然后将 p2的 onFulfilled 加入 microtask 队列。这时 microtask 队列中有两个 microtask，一个是执行 resolve 返回值中的 then函数，另一个则是 p3的 onFulfilled 函数。</p> 
+ <p>然后取出第一个 microtask 执行（取出后 microtask 队列中只剩下 p3的 onFulfilled），执行后 p1 的状态变为 fulfilled，然后 p1 的 onFulfilled 进入队列。后面可想而知是相继输出 2和1（因为 p1 的 onFulfilled 函数在 p3 的 onFulfilled 函数之后进入 microtask 队列）。</p> 
+ <p>如果没有将 NewPromiseResolveThenableJobTask 作为一个 microtask。也就变成了 p2.then 中的回调执行时同步触发 resolve 参数中的 then 方法，fulfilled 的状态会立即同步到 p1,这时 p1 的 onFulfilled 就会先进入 microtask，导致结果变为 12。这样的执行结果可以会让JavaScript开发者感到疑惑。</p> 
+ <p>所以 ECMAScript 将其作为一个异步任务来执行。</p> 
+ <blockquote> 
+  <p>似乎 返回 Promsie 对象会产生两个 microtask 似乎会更让人感到疑惑。</p> 
+ </blockquote> 
+ <h4>RejectPromiseReactionJob</h4> 
+ <p>PromiseReactionJob 中如果处理函数 handler 执行时抛出异常则会执行 RejectPromiseReactionJob，也就是下面这种情况</p> 
+ <pre class="has"><code class="language-go">let p0 = Promise.resolve()
+let p1 = p0.then(() =&gt; {
+    throw 'error'; // handler 执行时出错
+})</code></pre> 
+ <p>这是会调用 RejectPromiseReactionJob，其源码如下</p> 
+ <pre class="has"><code class="language-go">macro RejectPromiseReactionJob(
+    context: Context,
+    promiseOrCapability: JSPromise|PromiseCapability|Undefined, reason: JSAny,
+    reactionType: constexpr PromiseReactionType): JSAny {
+  if constexpr (reactionType == kPromiseReactionReject) {
+    typeswitch (promiseOrCapability) {
+      case (promise: JSPromise): {
+// promiseOrCapability 就是 p1，是一个 Promise 对象
+// 执行 RejectPromise，调用 p1 的 reject 方法
+        return RejectPromise(promise, reason, False);
+      }
+      case (Undefined): {
+        return Undefined;
+      }
+      case (capability: PromiseCapability): {
+        const reject = UnsafeCast&lt;Callable&gt;(capability.reject);
+        return Call(context, reject, Undefined, reason);
+      }
+    }
+  } else {
+    StaticAssert(reactionType == kPromiseReactionFulfill);
+    return PromiseRejectReactionJob(reason, Undefined, promiseOrCapability);
+  }
+}</code></pre> 
+ <p>RejectPromiseReactionJob 与 FuflfillPromiseReactionJob 是类似的，就是调用 RejectPromise 来调用 Promsie 的 reject 方法，这个在上面 reject 的地方介绍过了。</p> 
+ <h4>PromiseReactionJob的handler == Undefined分支</h4> 
+ <p>PromiseReactionJob 中还有一个 handler == Undefined 的分支也很重要，当一个 task 中的 handler 为 undefined时会进入这个分支，为了方便阅读，这里再贴一下代码</p> 
+ <pre class="has"><code class="language-go">transitioning
+macro PromiseReactionJob(
+    context: Context, argument: JSAny, handler: Callable|Undefined,
+    promiseOrCapability: JSPromise|PromiseCapability|Undefined,
+    reactionType: constexpr PromiseReactionType): JSAny {
+  if (handler == Undefined) {
+    // 没有处理函数的 case，透传上一个 Promise 的 argument
+    if constexpr (reactionType == kPromiseReactionFulfill) {
+      // 基本类同 JS 层的 resolve
+      return FuflfillPromiseReactionJob(
+          context, promiseOrCapability, argument, reactionType);
+    } else {
+      // 基本类同 JS 层的 reject
+      return RejectPromiseReactionJob(
+          context, promiseOrCapability, argument, reactionType);
+    }
+  } else {
+    // 删除
+  }
+}</code></pre> 
+ <p>进入分支后会直接获取上一个 Promise 对象的 value 和 状态 同步到当前 promise 来，我们来通过一段js了解他</p> 
+ <pre class="has"><code class="language-go">let p0 = new Promise((resolve, reject) =&gt; {
+    reject(123)
+})
+// p0 的状态为 rejected
+
+let p1 = p0.then(_ =&gt; {console.log('p0 onFulfilled')})
+// p0 的 onRejected 作为 handler 进入 microtask 队列
+// 但是因为 then 没有传递第二个参数
+// 所以 onRejected 是 undefined，那么 handler 也是 undefined
+
+let p2 = p1.then(_ =&gt; {console.log('p1 onFulfilled')})
+/*
+为p1绑定 
+PromiseReaction{
+  onFulfilled:_ =&gt; {console.log('p1 onFulfilled')}, 
+  onRejected:undefined
+}
+*/
+let p3 = p2.then(_ =&gt; {console.log('p2 onFulfilled')}, _ =&gt; {console.log('p2 onRejected')})
+/*
+为p2绑定 
+PromiseReaction{
+  onFulfilled:_ =&gt; {console.log('p2 onFulfilled')}, 
+  onRejected:_ =&gt; {console.log('p2 onRejected')
+}
+*/
+let p4 = p3.then(_ =&gt; {console.log('p3 onFulfilled')}, _ =&gt; {console.log('p3 onRejected')})
+/*
+为p3绑定 
+PromiseReaction{
+  onFulfilled:_ =&gt; {console.log('p3 onFulfilled')}, 
+  onRejected:_ =&gt; {console.log('p3 onRejected')
+}
+*/
+
+//p2 onRejected
+//p3 onFulfilled</code></pre> 
+ <p>同步代码执行完毕后（执行过程大致如注释）,开启取 microtask 执行，此时 microtask 队列中只有一个 handler 为 undefined 的任务。进入 PromiseReactionJob 的 handler == Undefined 分支。</p> 
+ <p>因为此时 p0 状态为 rejected，所以执行 <code>RejectPromiseReactionJob(context, promiseOrCapability, argument, reactionType)</code>，其中 promiseOrCapability 就是p1, argument 就是 p0 的值 123，reactionType 为 rejected。</p> 
+ <p>执行后 p0 的状态也变为 reactionType 也就是 rejected，p1 的值为 argument（相当于吧p0的状态和值都转移到了p1）。</p> 
+ <p>然后执行 p1 的 reject 函数（<code>FulfillPromise(p1, 123)</code>），会吧 p1 绑定的 PromiseReaction 链表中的 onRejected（还是undefined） 当做 handler 进入microtask 队列（因为 p1 的状态是 rejected，所以是onRejected）</p> 
+ <p>同样还是取 microtask 任务执行，handler 还是 undefined，后面就和上面一样，把状态 rejected 和值 123 继续同步给 p2，..........</p> 
+ <p>再次取 microtask 执行，因为 p2 绑定了 onRejected 函数，所以 handler 不是 undefined，则不走 handler == Undefined 分支，另一个分支的逻辑刚刚已经描述过了。大概就是执行 onRejected(123)，然后将其结果设置到 p3 的value，p3 变为 fulfilled 状态。</p> 
+ <blockquote> 
+  <p>输出 p2 onRejected</p> 
+ </blockquote> 
+ <p>因为 onRejected(123) 的返回值是 undefined，所以 p3 变为 fulfilled 状态，且值为 undefined</p> 
+ <p>后面还是一样的，但是 handler 就是 onFulfilled 了，因为 p3 的状态是 fulfilled嘛，这里就相当于 <code>onFulfilled(undefined)</code>(因为 p3 的值的 undefined)。</p> 
+ <blockquote> 
+  <p>输出 p3 onFulfilled</p> 
+ </blockquote> 
+ <p>而后 p4 的状态也变成了 fulfilled，值也是 undefined，因为 p3 的 onFulfilled 返回值是 undefined</p> 
+ <p>然后 p4 的 onFulfilled 变成 handler 队列，因为 p4 没有调用 then 绑定过 onFulfilled 处理函数。但是因为没有调用 then 方法，所以也没有产生新的 Promsie 对象，这次在执行 FuflfillPromiseReactionJob 方法的时候进入 promiseOrCapability 为 Undefined 分支就结束了</p> 
+ <p>至此所有相关的任务全部执行完成</p> 
+ <p>如果上面你看懂了，那么下面这段代码我想你也应该能知道结果</p> 
+ <pre class="has"><code class="language-go">Promise.resolve('123')
+    .then(() =&gt; {throw new Error('456')})
+    .then(_ =&gt; {
+        console.log('shouldnot be here')
+    })
+    .catch((e) =&gt; console.log(e))
+    .then((data) =&gt; console.log(data));</code></pre> 
+ <blockquote> 
+  <p>catch(onRejected) 的本质是 then(undefined, onRejected)</p> 
+ </blockquote> 
+ <p>这就是 Promise 的 rejected 传递机制，不断向下传递直到遇见 onRejected 处理函数为止</p> 
+ <h3>Promise 的几个高难度题目</h3> 
+ <h4>题目1</h4> 
+ <pre class="has"><code class="language-go">Promise.resolve().then(() =&gt; {
+    console.log(0);
+    return Promise.resolve(4);
+}).then((res) =&gt; {
+    console.log(res)
+})
+
+Promise.resolve().then(() =&gt; {
+    console.log(1);
+}).then(() =&gt; {
+    console.log(2);
+}).then(() =&gt; {
+    console.log(3);
+}).then(() =&gt; {
+    console.log(5);
+}).then(() =&gt; {
+    console.log(6);
+})
+// 0 1 2 3 4 5 6</code></pre> 
+ <blockquote> 
+  <p>主要考察 当 Promise 的值是 promsie 对象时会如何处理，在本文 的 <strong>then 的链式调用与 microtask 队列</strong>&gt; <strong>ResolvePromise</strong> 目录末尾处开始介绍</p> 
+  <p>关键字：<strong>thenable</strong>、<strong>NewPromiseResolveThenableJobTask</strong></p> 
+ </blockquote> 
+ <p><strong>题解</strong></p> 
+ <p>为了方便描述，我们将上面的代码转化为下面这样</p> 
+ <pre class="has"><code class="language-go">let p1 = Promise.resolve()
+let p2 = p1.then(() =&gt; {
+    console.log(0);
+    let p3 = Promise.resolve(4)
+    return p3;
+})
+let p4 = p2.then((res) =&gt; {
+    console.log(res)
+})
+
+let p5 = Promise.resolve()
+let p6 = p5.then(() =&gt; {
+    console.log(1);
+})
+let p7 = p6.then(() =&gt; {
+    console.log(2);
+})
+let p8 = p7.then(() =&gt; {
+    console.log(3);
+})
+let p9 = p8.then(() =&gt; {
+    console.log(5);
+})
+let p10 = p9.then(() =&gt; {
+    console.log(6);
+})</code></pre> 
+ <p>先执行所有的同步代码，执行过程如下面的注释</p> 
+ <pre class="has"><code class="language-go">let p1 = Promise.resolve()
+// 1. p1 的状态为 fulfilled
+
+let p2 = p1.then(() =&gt; {
+    console.log(0);
+    let p3 = Promise.resolve(4)
+    return p3;
+})
+// 2. 因为 p1 的状态已经是 fulfilled，所以调用 then 后立即将 onFulfilled 放入 microtask 队列
+// 此时 microtask 只有p1的 onFulfilled： [p1.onFulfilled]
+
+let p4 = p2.then((res) =&gt; {
+    console.log(res)
+})
+// 3. p2的状态还是 pending，所以调用 then 后是为 p2 收集依赖，此时 p2 的 reactions 如下
+/*{
+    onFulfilled: (res) =&gt; {console.log(res)},
+    onRejected: undefined
+}*/
+
+
+let p5 = Promise.resolve()
+// 4. p5 的状态为 fulfilled
+
+let p6 = p5.then(() =&gt; {
+    console.log(1);
+})
+// 5. 同第2步，将 onFulfilled 加入 microtask 队列
+// 此时 microtask 是： [p1.onFulfilled, p5.onFulfilled]
+
+let p7 = p6.then(() =&gt; {
+    console.log(2);
+})
+// 6. 同第3步，是给 p6 添加 reactions
+
+let p8 = p7.then(() =&gt; {
+    console.log(3);
+})
+// 7. 同上，是给 p7 添加 reactions
+
+let p9 = p8.then(() =&gt; {
+    console.log(5);
+})
+// 8. 同上，是给 p8 添加 reactions
+
+let p10 = p9.then(() =&gt; {
+    console.log(6);
+})
+// 9. 同上，是给 p9 添加 reactions</code></pre> 
+ <ol><li><p>当同步代码执行完成后，microtask 队列只有</p></li></ol> 
+ <pre class="has"><code class="language-go">[p1.onFulfilled, p5.onFulfilled]</code></pre> 
+ <ol><li><p>然后取出 p1.onFulfilled 来执行，此时输出 <code>0</code>，但是发现 p1.onFulfilled 返回值的 p3 是一个 Promise 对象。所以会执行 ResolvePromise 的 Enqueue 代码块，里面会调用 NewPromiseResolveThenableJobTask 产生一个微任务，这个微任务的要做的事情上面已经介绍过，大致就是下面这样</p></li></ol> 
+ <pre class="has"><code class="language-go">let promiseResolveThenableJobTask = () =&gt; {
+    p3.then((value) =&gt; { // p3的value是4
+        ReslovePromise(p2, value) 
+    })
+}</code></pre> 
+ <p>然后将其加入 microtask 队列， 这时 microtask 队列就变成了 :</p> 
+ <pre class="has"><code class="language-go">[p5.onFulfilled, promiseResolveThenableJobTask]</code></pre> 
+ <ol><li><p>继续取出 p5.onFulfilled 执行，此时输出 <code>1</code>，因为 p5.onFulfilled 返回值是 undefined，所以就将 undefined 作为 p6 的值，然后将 p6 的状态变为 fulfilled。</p></li></ol> 
+ <p>因为 p6 的状态被改变，所以它的 reactions 也会加入 microtask 队列，这时 microtask 队列就变成这样：</p> 
+ <pre class="has"><code class="language-go">[promiseResolveThenableJobTask，p6.onFulfilled]</code></pre> 
+ <ol><li><p>同样是取 promiseResolveThenableJobTask 执行，因为 promiseResolveThenableJobTask 的内容是下面这样</p></li></ol> 
+ <pre class="has"><code class="language-go">let promiseResolveThenableJobTask = () =&gt; {
+    p3.then((value) =&gt; { 
+        ReslovePromise(p2, value) // ReslovePromise 的作用上面有介绍
+    })
+}</code></pre> 
+ <p>所以执行 promiseResolveThenableJobTask 时就相当于执行了 <code>p3.then((value) =&gt; {ReslovePromise(p2, value)})</code></p> 
+ <p>因为 p3 的状态是 fulfilled ，所以会将其 onFulfilled 加入 microtask 队列（value参数就是 p3 的值 4，后序他将传递给p2），这时 microtask 队列就变成这样：</p> 
+ <pre class="has"><code class="language-go">[p6.onFulfilled，p3.onFulfilled]</code></pre> 
+ <ol><li><p>同样是取 p6.onFulfilled 执行，然后输出 <code>2</code> 并将其返回值 undefined 设置为 p7 的值，并将 p7 变为 fulfilled 状态，所以 p7 的 reactions 也会加入 microtask 队列，这时 microtask 队列就变成这样：</p></li></ol> 
+ <pre class="has"><code class="language-go">[p3.onFulfilled，p7.onFulfilled]</code></pre> 
+ <ol><li><p>p3.onFulfilled 出队执行，p3.onFulfilled 是 <code>(value) =&gt; {ReslovePromise(p2, value)}</code>, 参数 value 是 4，所以此时就执行 <code>ReslovePromise(p2, 4)</code>,这就相当于调用了 p2 的 resolve。</p></li></ol> 
+ <p>所以此时 p2 的 值变为 4， 状态为变 fulfilled，然后将其 reactions 挨个加入 microtask 队列，这时 microtask 队列就变成这样：</p> 
+ <pre class="has"><code class="language-go">[p7.onFulfilled，p2.onFulfilled]</code></pre> 
+ <ol><li><p>p7.onFulfilled 出队列执行，输出 <code>3</code>，p8 状态变为 fulfille，值变为 undefined，然后 p8.onFulfilled 加入队列</p></li></ol> 
+ <pre class="has"><code class="language-go">[p2.onFulfilled，p8.onFulfilled]</code></pre> 
+ <ol><li><p>p2.onFulfilled 出队列执行，输出 <code>4</code>，因为 p2 没有被在此调用 then 方法，所以就没有产生下一个 Promise 对象，所以也就没有后序了。</p></li></ol> 
+ <pre class="has"><code class="language-go">[p8.onFulfilled]</code></pre> 
+ <ol><li><p>后面就不用说了</p></li></ol> 
+ <h4>题目2</h4> 
+ <pre class="has"><code class="language-go">Promise.resolve().then(() =&gt; {
+    console.log(0);
+    return {then(resolve){resolve(4)}};
+}).then((res) =&gt; {
+    console.log(res)
+})
+
+Promise.resolve().then(() =&gt; {
+    console.log(1);
+}).then(() =&gt; {
+    console.log(2);
+}).then(() =&gt; {
+    console.log(3);
+}).then(() =&gt; {
+    console.log(5);
+}).then(() =&gt; {
+    console.log(6);
+})
+// 0 1 2 4 3 5 6</code></pre> 
+ <blockquote> 
+  <p>与上题知识点一致，考察的是 Promise 的值是一个包含 then 方法的对象时发生的逻辑</p> 
+  <p>关键字：<strong>thenable</strong>、<strong>NewPromiseResolveThenableJobTask</strong></p> 
+ </blockquote> 
+ <h4>题目3</h4> 
+ <pre class="has"><code class="language-go">const p1 = new Promise((resolve, reject) =&gt; {
+    reject(0)
+})
+console.log(1);
+setTimeout(() =&gt; {
+    p1.then(undefined, console.log)
+}, 0)
+console.log(2);
+// 1
+// 2
+// 输出报错 UnhandledPromiseRejection: This error originated either
+
+const p1 = new Promise((resolve, reject) =&gt; {
+    reject(0)
+})
+console.log(1);
+p1.then(undefined, console.log)
+console.log(2);
+// 1
+// 2
+// 0</code></pre> 
+ <blockquote> 
+  <p>为什么第一种方式会报错？</p> 
+  <p>考察的是规范中的 HostPromiseRejectionTracker，当一个没有绑定处理函数的 Promsie 被调用 reject 则会创建一个 微任务来再次检测这个 Promise 是否存在处理函数，如果此时还不存在则输出报错，setTimeout回调执行在微任务之后。</p> 
+  <p>本文 <strong>reject</strong> &gt; <strong>HostPromiseRejectionTracker</strong> 目录处有详细介绍。</p> 
+ </blockquote> 
+ <blockquote> 
+  <p><strong>注意：</strong> 浏览器控制台有一个非常奇怪的特性，如果在这个错误输出后在为其绑定 onrejected 处理函数，浏览器会将控制台的错误覆盖掉。所以如果你在浏览器执行这段代码，请将setTimeout的时间设置长一点，这样效果更加容易肉眼可见。</p> 
+ </blockquote> 
+ <h4>题目四</h4> 
+ <p>为什么 async1 end 输出在 promise3 之后？</p> 
+ <pre class="has"><code class="language-go">async function async1() { 
+    console.log("async1 start"); 
+    await async2(); 
+    console.log("async1 end"); 
+} 
+async function async2() { 
+    console.log("async2"); 
+    return Promise.resolve().then(() =&gt; { 
+        console.log("async2-inner"); 
+    }); 
+} 
+
+console.log("script start"); 
+setTimeout(function () { 
+    console.log("settimeout"); 
+}); 
+
+async1(); 
+new Promise(function (resolve) { 
+    console.log("promise1"); 
+    resolve(); 
+}) 
+.then(function () { 
+    console.log("promise2"); 
+}) 
+.then(function () { 
+    console.log("promise3"); 
+}) 
+.then(function () { 
+    console.log("promise4"); 
+}); 
+console.log("script end");</code></pre> 
+ <blockquote> 
+  <p>感谢评论区贡献的题目</p> 
+ </blockquote> 
+ <p><strong>题解</strong></p> 
+ <p>这个问题，这里面涉及 async 中使用 await 会产生多个Promise链路的问题以及 resolve 值为 Promise 对象的问题，重点看 async2，我把他转化为这样（setTimeout对于本题悬念不大，就删除了）。</p> 
+ <pre class="has"><code class="language-go">async function async1() {
+    console.log("async1 start");
+    let a2 = async2();
+    await a2
+    console.log("async1 end");
+}
+async function async2() {
+    console.log("async2");
+    let p1 = Promise.resolve()
+    let p2 = p1.then(() =&gt; {
+        console.log("async2-inner");
+    })
+    return p2;
+}
+
+let a1 = async1();
+
+let p3 = new Promise(function (resolve) {
+    console.log("promise1");
+    resolve();
+})
+
+let p4 = p3.then(function () {
+    console.log("promise2");
+})
+// 为 p3 添加 reactions
+let p5 = p4.then(function () {
+    console.log("promise3");
+})
+// 为 p4 添加 reactions
+let p6 = p5.then(function () {
+    console.log("promise4");
+});
+// 为 p5 添加 reactions
+console.log("script end");</code></pre> 
+ <p>想必你也发现了 async 函数中 await 语句之前的代码都是同步执行的（相当于Promsie的executor）</p> 
+ <ol><li><p>先调用 async1，输出 <code>async1 start</code>， 同步执行到 <code>async2()</code> 的位置，然后去同步执行 async2。</p></li></ol> 
+ <p>然后输出 <code>async2</code>，里面创建一个 fulfilled 状态的 p1，然后为 p1 绑定 then，因为 p1 是 fulfilled 状态所以 p1.onFulfilled 会立即进入 microtask 队列。这时 microtask 队列就变成这样：</p> 
+ <pre class="has"><code class="language-go">[p1.onFulfilled]</code></pre> 
+ <p>然后返回 p2（resolve(p2)），又因为 p2 是一个 Promise 对象，所以创建一个如下的 promiseResolveThenableJobTask</p> 
+ <pre class="has"><code class="language-go">let promiseResolveThenableJobTask = () =&gt; {
+    p2.then((value) =&gt; { 
+        ReslovePromise(a2, value) // ReslovePromise 的作用上面有介绍
+    })
+}</code></pre> 
+ <pre class="has"><code class="language-go">[p1.onFulfilled，promiseResolveThenableJobTask]</code></pre> 
+ <ol><li><p>然后执行 await a2，这里很关键，await 会等待一个 Promsie 进入 fulfilled 状态后才执行后面的代码，其实就相当于下面这样</p></li></ol> 
+ <pre class="has"><code class="language-go">a2.then(_ =&gt; {
+ // 这里是 async1 中 await 后的代码
+})
+// 为 a2 绑定了 reactions，这里的 onFulfill 暂时就叫 『async1后半段』吧
+// 其实这里面做的事情很多，我后面可能会单独讲解 async/await 的原理</code></pre> 
+ <p>注意此时 a2 还不是 fulfilled 状态，因为他需要等待 promiseResolveThenableJobTask 执行时来调用他的 resolve 才会变成 fulfilled。</p> 
+ <ol><li><p>这时 async1() 触发的同步代码才执行完毕，继续执行后面的 new Promise</p></li></ol> 
+ <p>同步执行这段代码</p> 
+ <pre class="has"><code class="language-go">function (resolve) {
+    console.log("promise1");
+    resolve();
+}</code></pre> 
+ <p>输出 <code>promise1</code>, 执行 resolve， 然后 p3 状态变为 fulfilled，p3.onFulfilled 进入队列，后面的 then 都是给对应的 promsie 绑定 reactions 这个就不说了，最后输出 <code>script end</code></p> 
+ <p>到此时所有同步代码执行完成， microtask 队列是这样的：</p> 
+ <pre class="has"><code class="language-go">[p1.onFulfilled，promiseResolveThenableJobTask，p3.onFulfilled]</code></pre> 
+ <ol><li><p>至此所有同步代码执行完成，开始取 microtask 执行，首先是 p1.onFulfilleed ，执行输出 <code>async2-inner</code>, 然后 将其返回值 undefined 作为 p2 的值，并将 p2 变成 fulfilled 状态。因为 p2 此时没有 reactions （也就是没有被调用过then方法），所以不会发生什么事情</p></li></ol> 
+ <pre class="has"><code class="language-go">[promiseResolveThenableJobTask，p3.onFulfilled]</code></pre> 
+ <ol><li><p>promiseResolveThenableJobTask 出队列执行， 其内容如下，上面已经说过了</p></li></ol> 
+ <pre class="has"><code class="language-go">let promiseResolveThenableJobTask = () =&gt; {
+    p2.then((value) =&gt; { 
+        ReslovePromise(a2, value) // ReslovePromise 的作用上面有介绍
+    })
+}</code></pre> 
+ <p>执行是执行 p2 的 then 方法为其绑定 onFulfilled 处理函数，但是 p2 已经是 fulfilled 状态，所以会直接将 p2.onFulfilled 加入 microtask 队列。</p> 
+ <pre class="has"><code class="language-go">[p3.onFulfilled, p2.onFulfilled]</code></pre> 
+ <ol><li><p>p3.onFulfilled 出队执行，输出 <code>promise2</code> ，将 p4 的状态变为 fulfilled，p4的值为其1返回值也就是undefined，然后 p4 的 onFulfilled 也会加入 microtask 队列</p></li></ol> 
+ <pre class="has"><code class="language-go">[p2.onFulfilled, p4.onFulfilled]</code></pre> 
+ <ol><li><p>p2.onFulfilled 出队列执行， p2.onFulfilled 的内容如下，这个上面说过</p></li></ol> 
+ <pre class="has"><code class="language-go">(value) =&gt; { 
+    ReslovePromise(a2, value) // 也就是 a2 的 resolve(value)
+}</code></pre> 
+ <p>所以执行 ReslovePromise 后，a2 会变成 fulfilled 状态，a2.onFulfilled 也就是 『async1后半段』 也理所当然的进入 microtask 队列</p> 
+ <pre class="has"><code class="language-go">[p4.onFulfilled, async1后半段]</code></pre> 
+ <ol><li><p>后面的结果就没有什么难点了，p4.onFulfilled 出队执行，输出 <code>promise3</code>，然后 p5.onFulfilled 入队</p></li></ol> 
+ <pre class="has"><code class="language-go">[async1后半段,p5.onFulfilled]</code></pre> 
+ <ol><li><p>async1后半段 出队执行，输出 <code>async1 end</code>， 然后 a1 状态变为 fulfilled，但是没有绑定任何处理函数，所以 a1 就没有后续了</p></li></ol> 
+ <pre class="has"><code class="language-go">[p5.onFulfilled]</code></pre> 
+ <ol><li><p>p5.onFulfilled 出队执行输出 <code>promise4</code>，同理 p6 没有绑定任何处理函数，至此所有代码执行完成</p></li></ol> 
+ <h4>最后几件事</h4> 
+ <ol><li><p>如果对本文有任何问题请评论留言</p></li><li><p>如果你回顾了本文还是无法得到上述题目的答案，请评论区告知，我后序会给出详细的执行过程介绍</p></li><li><p>如果你有任何 Promise 问题，可评论，作者免费承包所有 Promise 问题</p></li><li><p>如果你看到了这里却还没有点赞，请点赞，非常感谢。</p></li><li><p>v8 promise 相关的代码可以再这里搜索和阅读 source.chromium.org/chromium/ch…<sup>[27]</sup></p></li></ol> 
+ <h3>相关链接</h3> 
+ <p>Promise V8 源码分析(一)——徐鹏跃<sup>[28]</sup></p> 
+ <p>promise.then 中 return Promise.resolve 后，发生了什么？<sup>[29]</sup></p> 
+ <p>Chromium Code Search<sup>[30]</sup></p> 
+ <p>ECMA-262, 11th edition, June 2020<sup>[31]</sup></p> 
+ <h4>参考资料</h4> 
+ <p>[1] </p> 
+ <p>https://juejin.cn/post/7054931900074295310#heading-7: https://juejin.cn/post/7054931900074295310#heading-7</p> 
+ [2]  
+ <p>https://juejin.cn/post/6844903607968481287: https://juejin.cn/post/6844903607968481287</p> 
+ [3]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/base.tq#190: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fbase.tq%23190</p> 
+ [4]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-promise.tq#13: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fobjects%2Fjs-promise.tq%2313</p> 
+ [5]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-constructor.tq#47: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-constructor.tq%2347</p> 
+ [6]  
+ <p>https://262.ecma-international.org/11.0/#sec-promise.prototype.then: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-promise.prototype.then</p> 
+ [7]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-then.tq#21: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-then.tq%2321</p> 
+ [8]  
+ <p>https://262.ecma-international.org/11.0/#sec-performpromisethen: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-performpromisethen</p> 
+ [9]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-abstract-operations.tq#409: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-abstract-operations.tq%23409</p> 
+ [10]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-misc.tq#134: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-misc.tq%23134</p> 
+ [11]  
+ <p>https://262.ecma-international.org/11.0/#sec-performpromisethen: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-performpromisethen</p> 
+ [12]  
+ <p>https://262.ecma-international.org/11.0/#sec-host-promise-rejection-tracker: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-host-promise-rejection-tracker</p> 
+ [13]  
+ <p>https://262.ecma-international.org/11.0/#sec-fulfillpromise: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-fulfillpromise</p> 
+ [14]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-abstract-operations.tq#182: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-abstract-operations.tq%23182</p> 
+ [15]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-abstract-operations.tq#140: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-abstract-operations.tq%23140</p> 
+ [16]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-abstract-operations.tq#84: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-abstract-operations.tq%2384</p> 
+ [17]  
+ <p>https://262.ecma-international.org/11.0/#sec-rejectpromise: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-rejectpromise</p> 
+ [18]  
+ <p>https://262.ecma-international.org/11.0/#sec-rejectpromise: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-rejectpromise</p> 
+ [19]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-abstract-operations.tq#210: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-abstract-operations.tq%23210</p> 
+ [20]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-constructor.tq#100: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-constructor.tq%23100</p> 
+ [21]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-misc.tq#199: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-misc.tq%23199</p> 
+ [22]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/builtins-microtask-queue-gen.cc#114: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fbuiltins-microtask-queue-gen.cc%23114</p> 
+ [23]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/promise-reaction-job.tq#43: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2Fpromise-reaction-job.tq%2343</p> 
+ [24]  
+ <p>https://chromium.googlesource.com/v8/v8.git/+/refs/heads/9.0-lkgr/src/builtins/promise-resolve.tq#88: https://link.juejin.cn?target=https%3A%2F%2Fchromium.googlesource.com%2Fv8%2Fv8.git%2F%2B%2Frefs%2Fheads%2F9.0-lkgr%2Fsrc%2Fbuiltins%2Fpromise-resolve.tq%2388</p> 
+ [25]  
+ <p>https://262.ecma-international.org/11.0/#sec-promise-resolve-functions: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-promise-resolve-functions</p> 
+ [26]  
+ <p>https://262.ecma-international.org/11.0/#sec-newpromisereactionjob: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F%23sec-newpromisereactionjob</p> 
+ [27]  
+ <p>https://source.chromium.org/chromium/chromium/src/+/main:v8/src/builtins/: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc%2F%2B%2Fmain%3Av8%2Fsrc%2Fbuiltins%2F</p> 
+ [28]  
+ <p>https://zhuanlan.zhihu.com/p/264944183: https://link.juejin.cn?target=https%3A%2F%2Fzhuanlan.zhihu.com%2Fp%2F264944183</p> 
+ [29]  
+ <p>https://www.zhihu.com/question/453677175/answer/1841325386: https://link.juejin.cn?target=https%3A%2F%2Fwww.zhihu.com%2Fquestion%2F453677175%2Fanswer%2F1841325386</p> 
+ [30]  
+ <p>https://source.chromium.org/chromium/chromium/src: https://link.juejin.cn?target=https%3A%2F%2Fsource.chromium.org%2Fchromium%2Fchromium%2Fsrc</p> 
+ [31]  
+ <p>https://262.ecma-international.org/11.0/: https://link.juejin.cn?target=https%3A%2F%2F262.ecma-international.org%2F11.0%2F</p> 
+ <h4>最后</h4> 
+ <p>如果你觉得这篇内容对你挺有启发，我想邀请你帮我个小忙：<br></p> 
+ <ol><li><p>点个「<strong>喜欢</strong>」或「<strong>在看</strong>」，让更多的人也能看到这篇内容</p></li><li><p>我组建了个氛围非常好的前端群，里面有很多前端小伙伴，欢迎加我微信「<strong>sherlocked_93</strong>」拉你加群，一起交流和学习</p></li><li><p>关注公众号「<strong>前端下午茶</strong>」，持续为你推送精选好文，也可以加我为好友，随时聊骚。</p></li></ol> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/00/56/B5q9MPqA_o.png" alt="90620a37aeaa78957755ab2ea59ce74f.png"></p> 
+ <p><img src="https://images2.imgbox.com/3e/ca/jh9XwKZZ_o.png" alt="57a681841912d3bf31ae86f5b71a7f5f.png"></p> 
+ <p>点个喜欢支持我吧，在看就更好了</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/f6b018d72a389f608ea31806d1d68602/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">【Python】PySpark 数据计算 ③ ( RDD#reduceByKey 函数概念 | RDD#reduceByKey 方法工作流程 | RDD#reduceByKey 语法 | 代码示例 )</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5d4a64bba0cdd2e64906d4477ae15bfd/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Python&#43;Playwright(Nuitka、Pyinstaller打包)</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

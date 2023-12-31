@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>基于注解优雅的实现接口幂等性 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="基于注解优雅的实现接口幂等性" />
+<meta property="og:description" content="一、什么是幂等性 简单来说，就是对一个接口执行重复的多次请求，与一次请求所产生的结果是相同的，听起来非常容易理解，但要真正的在系统中要始终保持这个目标，是需要很严谨的设计的，在实际的生产环境下，我们应该保证任何接口都是幂等的，而如何正确的实现幂等，就是本文要讨论的内容。
+二、哪些请求天生就是幂等的 首先，我们要知道查询类的请求一般都是天然幂等的，除此之外，删除请求在大多数情况下也是幂等的，但是ABA场景下除外。
+举一个简单的例子
+比如，先请求了一次删除A的操作，但由于响应超时，又自动请求了一次删除A的操作，如果在两次请求之间，又插入了一次A，而实际上新插入的这一次A，是不应该被删除的，这就是ABA问题，不过，在大多数业务场景中，ABA问题都是可以忽略的。
+除了查询和删除之外，还有更新操作，同样的更新操作在大多数场景下也是天然幂等的，其例外是也会存在ABA的问题，更重要的是，比如执行update table set a = a &#43; 1 where v = 1这样的更新就非幂等了。
+最后，就还剩插入了，插入大多数情况下都是非幂等的，除非是利用数据库唯一索引来保证数据不会重复产生。
+三、为什么需要幂等 1.超时重试 当发起一次RPC请求时，难免会因为网络不稳定而导致请求失败，一般遇到这样的问题我们希望能够重新请求一次，正常情况下没有问题，但有时请求实际上已经发出去了，只是在请求响应时网络异常或者超时，此时，请求方如果再重新发起一次请求，那被请求方就需要保证幂等了。
+2.异步回调 异步回调是提升系统接口吞吐量的一种常用方式，很明显，此类接口一定是需要保证幂等性的。
+3.消息队列 现在常用的消息队列框架，比如：Kafka、RocketMQ、RabbitMQ在消息传递时都会采取At least once原则（也就是至少一次原则，在消息传递时，不允许丢消息，但是允许有重复的消息），既然消息队列不保证不会出现重复的消息，那消费者自然要保证处理逻辑的幂等性了。
+四、实现幂等的关键因素 关键因素1 幂等唯一标识，可以叫它幂等号或者幂等令牌或者全局ID，总之就是客户端与服务端一次请求时的唯一标识，一般情况下由客户端来生成，也可以让第三方来统一分配。
+关键因素2 有了唯一标识以后，服务端只需要确保这个唯一标识只被使用一次即可，一种常见的方式就是利用数据库的唯一索引。
+五、注解实现幂等性 定义DistributedLock注解 @Target({ElementType.METHOD}) @Retention(RetentionPolicy.RUNTIME) @Documented public @interface DistributedLock { /** * 保证业务接口的key的唯一性，否则失去了分布式锁的意义 锁key * 支持使用spEl表达式 */ String key(); /** * 保证业务接口的key的唯一性，否则失去了分布式锁的意义 锁key 前缀 */ String keyPrefix() default &#34;&#34;; /** * 是否在等待时间内获取锁，如果在等待时间内无法获取到锁，则返回失败 */ boolean tryLok() default false; /** * 获取锁的最大尝试时间 ，会尝试tryTime时间获取锁，在该时间内获取成功则返回，否则抛出获取锁超时异常，tryLok=true时，该值必须大于0。 * */ long tryTime() default 0; /** * 加锁的时间，超过这个时间后锁便自动解锁 */ long lockTime() default 30; /** * tryTime 和 lockTime的时间单位 */ TimeUnit unit() default TimeUnit." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/1fef236378511fcecc3efb2e1f6fb2db/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-08-17T13:37:06+08:00" />
+<meta property="article:modified_time" content="2023-08-17T13:37:06+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">基于注解优雅的实现接口幂等性</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2><strong>一、什么是幂等性</strong></h2> 
+<p>简单来说，就是对一个接口执行重复的多次请求，与一次请求所产生的结果是相同的，听起来非常容易理解，但要真正的在系统中要始终保持这个目标，是需要很严谨的设计的，在实际的生产环境下，我们应该保证任何接口都是幂等的，而如何正确的实现幂等，就是本文要讨论的内容。</p> 
+<h2><strong>二、哪些请求天生就是幂等的</strong></h2> 
+<p>首先，我们要知道查询类的请求一般都是天然幂等的，除此之外，删除请求在大多数情况下也是幂等的，但是ABA场景下除外。</p> 
+<p><strong>举一个简单的例子</strong></p> 
+<p>比如，先请求了一次删除A的操作，但由于响应超时，又自动请求了一次删除A的操作，如果在两次请求之间，又插入了一次A，而实际上新插入的这一次A，是不应该被删除的，这就是ABA问题，不过，在大多数业务场景中，ABA问题都是可以忽略的。</p> 
+<p>除了查询和删除之外，还有更新操作，同样的更新操作在大多数场景下也是天然幂等的，其例外是也会存在ABA的问题，更重要的是，比如执行<code>update table set a = a + 1 where v = 1</code>这样的更新就非幂等了。</p> 
+<p>最后，就还剩插入了，插入大多数情况下都是非幂等的，除非是利用数据库唯一索引来保证数据不会重复产生。</p> 
+<h2><strong>三、为什么需要幂等</strong></h2> 
+<h3><strong>1.超时重试</strong></h3> 
+<p>当发起一次RPC请求时，难免会因为网络不稳定而导致请求失败，一般遇到这样的问题我们希望能够重新请求一次，正常情况下没有问题，但有时请求实际上已经发出去了，只是在请求响应时网络异常或者超时，此时，请求方如果再重新发起一次请求，那被请求方就需要保证幂等了。</p> 
+<h3><strong>2.异步回调</strong></h3> 
+<p>异步回调是提升系统接口吞吐量的一种常用方式，很明显，此类接口一定是需要保证幂等性的。</p> 
+<h3><strong>3.消息队列</strong></h3> 
+<p>现在常用的消息队列框架，比如：Kafka、RocketMQ、RabbitMQ在消息传递时都会采取At least once原则（也就是至少一次原则，在消息传递时，不允许丢消息，但是允许有重复的消息），既然消息队列不保证不会出现重复的消息，那消费者自然要保证处理逻辑的幂等性了。</p> 
+<h2><strong>四、实现幂等的关键因素</strong></h2> 
+<h3><strong>关键因素1</strong></h3> 
+<p>幂等唯一标识，可以叫它幂等号或者幂等令牌或者全局ID，总之就是客户端与服务端一次请求时的唯一标识，一般情况下由客户端来生成，也可以让第三方来统一分配。</p> 
+<h3><strong>关键因素2</strong></h3> 
+<p>有了唯一标识以后，服务端只需要确保这个唯一标识只被使用一次即可，一种常见的方式就是利用数据库的唯一索引。</p> 
+<h2><strong>五、注解实现幂等性</strong></h2> 
+<ol><li> <h3><strong> 定义DistributedLock注解</strong></h3> <pre><code class="language-java">@Target({ElementType.METHOD})
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+public @interface DistributedLock {
+ 
+    /**
+     * 保证业务接口的key的唯一性，否则失去了分布式锁的意义 锁key
+     * 支持使用spEl表达式
+     */
+    String key();
+ 
+    /**
+     * 保证业务接口的key的唯一性，否则失去了分布式锁的意义 锁key 前缀
+     */
+    String keyPrefix() default "";
+ 
+    /**
+     * 是否在等待时间内获取锁，如果在等待时间内无法获取到锁，则返回失败
+     */
+    boolean tryLok() default false;
+ 
+    /**
+     * 获取锁的最大尝试时间 ，会尝试tryTime时间获取锁，在该时间内获取成功则返回，否则抛出获取锁超时异常，tryLok=true时，该值必须大于0。
+     *
+     */
+    long tryTime() default 0;
+ 
+    /**
+     * 加锁的时间，超过这个时间后锁便自动解锁
+     */
+    long lockTime() default 30;
+ 
+    /**
+     * tryTime 和 lockTime的时间单位
+     */
+    TimeUnit unit() default TimeUnit.SECONDS;
+ 
+    /**
+     * 是否公平锁，false:非公平锁，true:公平锁
+     */
+    boolean fair() default false;
+}</code></pre> </li><li> <h3><strong>定义DistributedLockAspect Lock切面</strong></h3> <pre><code class="language-java">@Aspect
+@Slf4j
+public class DistributedLockAspect {
+ 
+    @Resource
+    private IDistributedLock distributedLock;
+ 
+    /**
+     * SpEL表达式解析
+     */
+    private SpelExpressionParser spelExpressionParser = new SpelExpressionParser();
+ 
+    /**
+     * 用于获取方法参数名字
+     */
+    private DefaultParameterNameDiscoverer nameDiscoverer = new DefaultParameterNameDiscoverer();
+ 
+    @Pointcut("@annotation(com.yt.bi.common.redis.distributedlok.annotation.DistributedLock)")
+    public void distributorLock() {
+    }
+ 
+    @Around("distributorLock()")
+    public Object around(ProceedingJoinPoint pjp) throws Throwable {
+        // 获取DistributedLock
+        DistributedLock distributedLock = this.getDistributedLock(pjp);
+        // 获取 lockKey
+        String lockKey = this.getLockKey(pjp, distributedLock);
+        ILock lockObj = null;
+        try {
+            // 加锁，tryLok = true,并且tryTime &gt; 0时，尝试获取锁，获取不到超时异常
+            if (distributedLock.tryLok()) {
+                if(distributedLock.tryTime() &lt;= 0){
+                    throw new IdempotencyException("tryTime must be greater than 0");
+                }
+                lockObj = this.distributedLock.tryLock(lockKey, distributedLock.tryTime(), distributedLock.lockTime(), distributedLock.unit(), distributedLock.fair());
+            } else {
+                lockObj = this.distributedLock.lock(lockKey, distributedLock.lockTime(), distributedLock.unit(), distributedLock.fair());
+            }
+ 
+            if (Objects.isNull(lockObj)) {
+                throw new IdempotencyException("Duplicate request for method still in process");
+            }
+ 
+            return pjp.proceed();
+        } catch (Exception e) {
+            throw e;
+        } finally {
+            // 解锁
+            this.unLock(lockObj);
+        }
+    }
+ 
+    /**
+     * @param pjp
+     * @return
+     * @throws NoSuchMethodException
+     */
+    private DistributedLock getDistributedLock(ProceedingJoinPoint pjp) throws NoSuchMethodException {
+        String methodName = pjp.getSignature().getName();
+        Class clazz = pjp.getTarget().getClass();
+        Class&lt;?&gt;[] par = ((MethodSignature) pjp.getSignature()).getParameterTypes();
+        Method lockMethod = clazz.getMethod(methodName, par);
+        DistributedLock distributedLock = lockMethod.getAnnotation(DistributedLock.class);
+        return distributedLock;
+    }
+ 
+    /**
+     * 解锁
+     *
+     * @param lockObj
+     */
+    private void unLock(ILock lockObj) {
+        if (Objects.isNull(lockObj)) {
+            return;
+        }
+ 
+        try {
+            this.distributedLock.unLock(lockObj);
+        } catch (Exception e) {
+            log.error("分布式锁解锁异常", e);
+        }
+    }
+ 
+    /**
+     * 获取 lockKey
+     *
+     * @param pjp
+     * @param distributedLock
+     * @return
+     */
+    private String getLockKey(ProceedingJoinPoint pjp, DistributedLock distributedLock) {
+        String lockKey = distributedLock.key();
+        String keyPrefix = distributedLock.keyPrefix();
+        if (StringUtils.isBlank(lockKey)) {
+            throw new IdempotencyException("Lok key cannot be empty");
+        }
+        if (lockKey.contains("#")) {
+            this.checkSpEL(lockKey);
+            MethodSignature methodSignature = (MethodSignature) pjp.getSignature();
+            // 获取方法参数值
+            Object[] args = pjp.getArgs();
+            lockKey = getValBySpEL(lockKey, methodSignature, args);
+        }
+        lockKey = StringUtils.isBlank(keyPrefix) ? lockKey : keyPrefix + lockKey;
+        return lockKey;
+    }
+ 
+    /**
+     * 解析spEL表达式
+     *
+     * @param spEL
+     * @param methodSignature
+     * @param args
+     * @return
+     */
+    private String getValBySpEL(String spEL, MethodSignature methodSignature, Object[] args) {
+        // 获取方法形参名数组
+        String[] paramNames = nameDiscoverer.getParameterNames(methodSignature.getMethod());
+        if (paramNames == null || paramNames.length &lt; 1) {
+            throw new IdempotencyException("Lok key cannot be empty");
+        }
+        Expression expression = spelExpressionParser.parseExpression(spEL);
+        // spring的表达式上下文对象
+        EvaluationContext context = new StandardEvaluationContext();
+        // 给上下文赋值
+        for (int i = 0; i &lt; args.length; i++) {
+            context.setVariable(paramNames[i], args[i]);
+        }
+        return expression.getValue(context).toString();
+    }
+ 
+    /**
+     * SpEL 表达式校验
+     *
+     * @param spEL
+     * @return
+     */
+    private void checkSpEL(String spEL) {
+        try {
+            ExpressionParser parser = new SpelExpressionParser();
+            parser.parseExpression(spEL, new TemplateParserContext());
+        } catch (Exception e) {
+            log.error("spEL表达式解析异常", e);
+            throw new IdempotencyException("Invalid SpEL expression [" + spEL + "]");
+        }
+    }
+}</code></pre> </li><li> <h3><strong>定义分布式锁注解版启动元注解</strong></h3> <pre><code class="language-java">@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Import({DistributedLockAspect.class})
+public @interface EnableDistributedLock {
+}</code></pre> </li><li> <h3>定义IDistributedLock分布式锁接口</h3> <pre><code class="language-java">public interface IDistributedLock {
+    /**
+     * 获取锁，默认30秒失效，失败一直等待直到获取锁
+     *
+     * @param key 锁的key
+     * @return 锁对象
+     */
+    ILock lock(String key);
+ 
+    /**
+     * 获取锁,失败一直等待直到获取锁
+     *
+     * @param key      锁的key
+     * @param lockTime 加锁的时间，超过这个时间后锁便自动解锁； 如果lockTime为-1，则保持锁定直到显式解锁
+     * @param unit     {@code lockTime} 参数的时间单位
+     * @param fair     是否公平锁
+     * @return 锁对象
+     */
+    ILock lock(String key, long lockTime, TimeUnit unit, boolean fair);
+ 
+    /**
+     * 尝试获取锁，30秒获取不到超时异常，锁默认30秒失效
+     *
+     * @param key     锁的key
+     * @param tryTime 获取锁的最大尝试时间
+     * @return
+     * @throws Exception
+     */
+    ILock tryLock(String key, long tryTime) throws Exception;
+ 
+    /**
+     * 尝试获取锁，获取不到超时异常
+     *
+     * @param key      锁的key
+     * @param tryTime  获取锁的最大尝试时间
+     * @param lockTime 加锁的时间
+     * @param unit     {@code tryTime @code lockTime} 参数的时间单位
+     * @param fair     是否公平锁
+     * @return
+     * @throws Exception
+     */
+    ILock tryLock(String key, long tryTime, long lockTime, TimeUnit unit, boolean fair) throws Exception;
+ 
+    /**
+     * 解锁
+     *
+     * @param lock
+     * @throws Exception
+     */
+    void unLock(Object lock);
+ 
+ 
+    /**
+     * 释放锁
+     *
+     * @param lock
+     * @throws Exception
+     */
+    default void unLock(ILock lock) {
+        if (lock != null) {
+            unLock(lock.getLock());
+        }
+    }
+ 
+ 
+}</code></pre> </li><li> <h3>IDistributedLock实现类</h3> <pre><code class="language-java">@Slf4j
+@Component
+public class RedissonDistributedLock implements IDistributedLock {
+ 
+    @Resource
+    private RedissonClient redissonClient;
+    /**
+     * 统一前缀
+     */
+    @Value("${redisson.lock.prefix:bi:distributed:lock}")
+    private String prefix;
+ 
+    @Override
+    public ILock lock(String key) {
+        return this.lock(key, 0L, TimeUnit.SECONDS, false);
+    }
+ 
+    @Override
+    public ILock lock(String key, long lockTime, TimeUnit unit, boolean fair) {
+        RLock lock = getLock(key, fair);
+        // 获取锁,失败一直等待,直到获取锁,不支持自动续期
+        if (lockTime &gt; 0L) {
+            lock.lock(lockTime, unit);
+        } else {
+            // 具有Watch Dog 自动延期机制 默认续30s 每隔30/3=10 秒续到30s
+            lock.lock();
+        }
+        return new ILock(lock, this);
+    }
+ 
+    @Override
+    public ILock tryLock(String key, long tryTime) throws Exception {
+        return this.tryLock(key, tryTime, 0L, TimeUnit.SECONDS, false);
+    }
+ 
+    @Override
+    public ILock tryLock(String key, long tryTime, long lockTime, TimeUnit unit, boolean fair)
+            throws Exception {
+        RLock lock = getLock(key, fair);
+        boolean lockAcquired;
+        // 尝试获取锁，获取不到超时异常,不支持自动续期
+        if (lockTime &gt; 0L) {
+            lockAcquired = lock.tryLock(tryTime, lockTime, unit);
+        } else {
+            // 具有Watch Dog 自动延期机制 默认续30s 每隔30/3=10 秒续到30s
+            lockAcquired = lock.tryLock(tryTime, unit);
+        }
+        if (lockAcquired) {
+            return new ILock(lock, this);
+        }
+        return null;
+    }
+ 
+    /**
+     * 获取锁
+     *
+     * @param key
+     * @param fair
+     * @return
+     */
+    private RLock getLock(String key, boolean fair) {
+        RLock lock;
+        String lockKey = prefix + ":" + key;
+        if (fair) {
+            // 获取公平锁
+            lock = redissonClient.getFairLock(lockKey);
+        } else {
+            // 获取普通锁
+            lock = redissonClient.getLock(lockKey);
+        }
+        return lock;
+    }
+ 
+    @Override
+    public void unLock(Object lock) {
+        if (!(lock instanceof RLock)) {
+            throw new IllegalArgumentException("Invalid lock object");
+        }
+        RLock rLock = (RLock) lock;
+        if (rLock.isLocked()) {
+            try {
+                rLock.unlock();
+            } catch (IllegalMonitorStateException e) {
+                log.error("释放分布式锁异常", e);
+            }
+        }
+    }
+}</code></pre> </li><li> <h3>定义ILock锁对象</h3> <pre><code class="language-java">import lombok.AllArgsConstructor;
+import lombok.Getter;
+ 
+import java.util.Objects;
+ 
+/**
+ * &lt;p&gt;
+ * RedissonLock 包装的锁对象 实现AutoCloseable接口，在java7的try(with resource)语法，不用显示调用close方法
+ * &lt;/p&gt;
+ * @since 2023-06-08 16:57
+ */
+@AllArgsConstructor
+public class ILock implements AutoCloseable {
+    /**
+     * 持有的锁对象
+     */
+    @Getter
+    private Object lock;
+    /**
+     * 分布式锁接口
+     */
+    @Getter
+    private IDistributedLock distributedLock;
+ 
+    @Override
+    public void close() throws Exception {
+        if(Objects.nonNull(lock)){
+            distributedLock.unLock(lock);
+        }
+    }
+}</code></pre> </li></ol> 
+<h2>六、使用示例 </h2> 
+<p><strong> 启动类添加@EnableDistributedLock启用注解支持</strong></p> 
+<pre><code class="language-java">@SpringBootApplication
+@EnableDistributedLock
+public class BiCenterGoodsApplication {
+ 
+    public static void main(String[] args) {
+        
+        SpringApplication.run(BiCenterGoodsApplication.class, args);
+        
+    }
+}</code></pre> 
+<p><strong>@DistributedLock标注需要使用分布式锁的方法 </strong></p> 
+<pre><code class="language-java">    @ApiOperation("编辑SKU供应商供货信息")
+    
+    @PostMapping("/editSupplierInfo")
+    //@DistributedLock(key = "#dto.sku + '-' + #dto.skuId", lockTime = 10L, keyPrefix = "sku-")
+    @DistributedLock(key = "#dto.sku", lockTime = 10L, keyPrefix = "sku-")
+    public R&lt;Boolean&gt; editSupplierInfo(@RequestBody @Validated ProductSkuSupplierInfoDTO dto) {
+        return R.ok(productSkuSupplierMeasureService.editSupplierInfo(dto));
+    }</code></pre> 
+<pre>#dto.sku是 SpEL表达式。Spring中支持的它都支持的。比如调用静态方法，三目表达式。SpEL 可以使用方法中的任何参数。<a href="https://blog.csdn.net/u012060033/article/details/101978149" title="SpEL表达式参考">SpEL表达式参考</a></pre> 
+<hr> 
+<p><a href="https://blog.csdn.net/Ascend1977/article/details/131221941?spm=1001.2014.3001.5502" title="从原理到实践，分析 Redis 分布式锁的多种实现方案（一）">从原理到实践，分析 Redis 分布式锁的多种实现方案（一）</a></p> 
+<p><a href="https://blog.csdn.net/Ascend1977/article/details/131373419?spm=1001.2014.3001.5502" title="从原理到实践，分析 Redisson 分布式锁的实现方案（二）_Ascend1797的博客-CSDN博客">从原理到实践，分析 Redisson 分布式锁的实现方案（二）</a></p> 
+<p><a href="https://blog.csdn.net/Ascend1977/article/details/131126047?spm=1001.2014.3001.5502" title="Spring Boot 集成 Redisson分布式锁（注解版）_springboot 集成redisson分布式锁_Ascend1797的博客-CSDN博客">Spring Boot 集成 Redisson分布式锁</a></p> 
+<hr> 
+<p>参考文章：<a href="https://mp.weixin.qq.com/s/fqOB5YIDlaD8jjBpHzUuLQ" rel="nofollow" title="一个注解，优雅的实现接口幂等性！">一个注解，优雅的实现接口幂等性！</a> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/0327897d4da061bfc1050f182d8425c1/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">android 屏幕适配</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/d3a4c667e627220b21180aa399c77de3/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">SimpleITK常用指令</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>exfat 分配单元大小_伙伴分配器的一个极简实现 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="exfat 分配单元大小_伙伴分配器的一个极简实现" />
+<meta property="og:description" content="(感谢网友 @我的上铺叫路遥 投稿)
+提起buddy system相信很多人不会陌生，它是一种经典的内存分配算法，大名鼎鼎的Linux底层的内存管理用的就是它。这里不探讨内核这么复杂实现，而仅仅是将该算法抽象提取出来，同时给出一份及其简洁的源码实现，以便定制扩展。
+伙伴分配的实质就是一种特殊的“分离适配”，即将内存按2的幂进行划分，相当于分离出若干个块大小一致的空闲链表，搜索该链表并给出同需求最佳匹配的大小。其优点是快速搜索合并(O(logN)时间复杂度)以及低外部碎片(最佳适配best-fit)；其缺点是内部碎片，因为按2的幂划分块，如果碰上66单位大小，那么必须划分128单位大小的块。但若需求本身就按2的幂分配，比如可以先分配若干个内存池，在其基础上进一步细分就很有吸引力了。
+可以在维基百科上找到该算法的描述，大体如是：
+分配内存：
+1.寻找大小合适的内存块(大于等于所需大小并且最接近2的幂，比如需要27，实际分配32)
+1.如果找到了，分配给应用程序。
+2.如果没找到，分出合适的内存块。
+1.对半分离出高于所需大小的空闲内存块
+2.如果分到最低限度，分配这个大小。
+3.回溯到步骤1(寻找合适大小的块)
+4.重复该步骤直到一个合适的块
+释放内存：
+1.释放该内存块
+1.寻找相邻的块，看其是否释放了。
+2.如果相邻块也释放了，合并这两个块，重复上述步骤直到遇上未释放的相邻块，或者达到最高上限(即所有内存都释放了)。
+上面这段文字对你来说可能看起来很费劲，没事，我们看个内存分配和释放的示意图你就知道了：
+上图中，首先我们假设我们一个内存块有1024K，当我们需要给A分配70K内存的时候，
+我们发现1024K的一半大于70K，然后我们就把1024K的内存分成两半，一半512K。然后我们发现512K的一半仍然大于70K，于是我们再把512K的内存再分成两半，一半是128K。此时，我们发现128K的一半小于70K，于是我们就分配为A分配128K的内存。 后面的，B，C，D都这样，而释放内存时，则会把相邻的块一步一步地合并起来(合并也必需按分裂的逆操作进行合并)。
+我们可以看见，这样的算法，用二叉树这个数据结构来实现再合适不过了。
+我在网上分别找到cloudwu和wuwenbin写的两份开源实现和测试用例。实际上后一份是对前一份的精简和优化，本文打算从后一份入手讲解，因为这份实现真正体现了“极简”二字，追求突破常规的，极致简单的设计。网友对其评价甚高，甚至可用作教科书标准实现，看完之后回过头来看cloudwu的代码就容易理解了。
+分配器的整体思想是，通过一个数组形式的完全二叉树来监控管理内存，二叉树的节点用于标记相应内存块的使用状态，高层节点对应大的块，低层节点对应小的块，在分配和释放中我们就通过这些节点的标记属性来进行块的分离合并。如图所示，假设总大小为16单位的内存，我们就建立一个深度为5的满二叉树，根节点从数组下标[0]开始，监控大小16的块；它的左右孩子节点下标[1~2]，监控大小8的块；第三层节点下标[3~6]监控大小4的块……依此类推。
+在分配阶段，首先要搜索大小适配的块，假设第一次分配3，转换成2的幂是4，我们先要对整个内存进行对半切割，从16切割到4需要两步，那么从下标[0]节点开始深度搜索到下标[3]的节点并将其标记为已分配。第二次再分配3那么就标记下标[4]的节点。第三次分配6，即大小为8，那么搜索下标[2]的节点，因为下标[1]所对应的块被下标[3~4]占用了。
+在释放阶段，我们依次释放上述第一次和第二次分配的块，即先释放[3]再释放[4]，当释放下标[4]节点后，我们发现之前释放的[3]是相邻的，于是我们立马将这两个节点进行合并，这样一来下次分配大小8的时候，我们就可以搜索到下标[1]适配了。若进一步释放下标[2]，同[1]合并后整个内存就回归到初始状态。
+还是看一下源码实现吧，首先是伙伴分配器的数据结构：
+struct buddy2 {
+unsigned size;
+unsigned longest[1];
+};
+这里的成员size表明管理内存的总单元数目(测试用例中是32)，成员longest就是二叉树的节点标记，表明所对应的内存块的空闲单位，在下文中会分析这是整个算法中最精妙的设计。此处数组大小为1表明这是可以向后扩展的(注：在GCC环境下你可以写成longest[0]，不占用空间，这里是出于可移植性考虑)，我们在分配器初始化的buddy2_new可以看到这种用法。
+struct buddy2* buddy2_new( int size ) {
+struct buddy2* self;
+unsigned node_size;
+int i;
+if (size &lt; 1 || !IS_POWER_OF_2(size))
+return NULL;
+self = (struct buddy2*)ALLOC( 2 * size * sizeof(unsigned));" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/009295b4ffb74764743ae960181f21af/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-11-24T07:30:16+08:00" />
+<meta property="article:modified_time" content="2020-11-24T07:30:16+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">exfat 分配单元大小_伙伴分配器的一个极简实现</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div style="font-size:16px;"> 
+ <p class="ql-align-justify"><strong>(感谢网友 @我的上铺叫路遥 投稿)</strong></p> 
+ <p class="ql-align-justify">提起buddy system相信很多人不会陌生，它是一种经典的内存分配算法，大名鼎鼎的Linux底层的内存管理用的就是它。这里不探讨内核这么复杂实现，而仅仅是将该算法抽象提取出来，同时给出一份及其简洁的源码实现，以便定制扩展。</p> 
+ <p class="ql-align-justify">伙伴分配的实质就是一种特殊的<strong>“分离适配”</strong>，即将内存按2的幂进行划分，相当于分离出若干个块大小一致的空闲链表，搜索该链表并给出同需求最佳匹配的大小。其优点是快速搜索合并(O(logN)时间复杂度)以及低外部碎片(最佳适配best-fit)；其缺点是内部碎片，因为按2的幂划分块，如果碰上66单位大小，那么必须划分128单位大小的块。但若需求本身就按2的幂分配，比如可以先分配若干个内存池，在其基础上进一步细分就很有吸引力了。</p> 
+ <p class="ql-align-justify">可以在维基百科上找到该算法的描述，大体如是：</p> 
+ <p class="ql-align-justify"><strong>分配内存：</strong></p> 
+ <p class="ql-align-justify">1.寻找大小合适的内存块(大于等于所需大小并且最接近2的幂，比如需要27，实际分配32)</p> 
+ <p class="ql-align-justify">1.如果找到了，分配给应用程序。</p> 
+ <p class="ql-align-justify">2.如果没找到，分出合适的内存块。</p> 
+ <p class="ql-align-justify">1.对半分离出高于所需大小的空闲内存块</p> 
+ <p class="ql-align-justify">2.如果分到最低限度，分配这个大小。</p> 
+ <p class="ql-align-justify">3.回溯到步骤1(寻找合适大小的块)</p> 
+ <p class="ql-align-justify">4.重复该步骤直到一个合适的块</p> 
+ <p class="ql-align-justify"><strong>释放内存：</strong></p> 
+ <p class="ql-align-justify">1.释放该内存块</p> 
+ <p class="ql-align-justify">1.寻找相邻的块，看其是否释放了。</p> 
+ <p class="ql-align-justify">2.如果相邻块也释放了，合并这两个块，重复上述步骤直到遇上未释放的相邻块，或者达到最高上限(即所有内存都释放了)。</p> 
+ <p class="ql-align-justify">上面这段文字对你来说可能看起来很费劲，没事，我们看个内存分配和释放的示意图你就知道了：</p> 
+ <div class="pgc-img"> 
+  <img src="https://images2.imgbox.com/02/6b/MnYW2L2t_o.png" alt="f795a7325d2816df9727a23233356232.png"> 
+ </div> 
+ <p class="ql-align-justify">上图中，首先我们假设我们一个内存块有1024K，当我们需要给A分配70K内存的时候，</p> 
+ <ol><li class="ql-align-justify">我们发现1024K的一半大于70K，然后我们就把1024K的内存分成两半，一半512K。</li><li class="ql-align-justify">然后我们发现512K的一半仍然大于70K，于是我们再把512K的内存再分成两半，一半是128K。</li><li class="ql-align-justify">此时，我们发现128K的一半小于70K，于是我们就分配为A分配128K的内存。</li></ol> 
+ <p class="ql-align-justify">后面的，B，C，D都这样，而释放内存时，则会把相邻的块一步一步地合并起来(合并也必需按分裂的逆操作进行合并)。</p> 
+ <p class="ql-align-justify">我们可以看见，这样的算法，用二叉树这个数据结构来实现再合适不过了。</p> 
+ <p class="ql-align-justify">我在网上分别找到cloudwu和wuwenbin写的两份开源实现和测试用例。实际上后一份是对前一份的精简和优化，本文打算从后一份入手讲解，<strong>因为这份实现真正体现了“极简”二字，追求突破常规的，极致简单的设计。</strong>网友对其评价甚高，甚至可用作教科书标准实现，看完之后回过头来看cloudwu的代码就容易理解了。</p> 
+ <p class="ql-align-justify">分配器的整体思想是，通过一个数组形式的完全二叉树来监控管理内存，二叉树的节点用于标记相应内存块的使用状态，高层节点对应大的块，低层节点对应小的块，在分配和释放中我们就通过这些节点的标记属性来进行块的分离合并。如图所示，假设总大小为16单位的内存，我们就建立一个深度为5的满二叉树，根节点从数组下标[0]开始，监控大小16的块；它的左右孩子节点下标[1~2]，监控大小8的块；第三层节点下标[3~6]监控大小4的块……依此类推。</p> 
+ <div class="pgc-img"> 
+  <img src="https://images2.imgbox.com/39/7d/gn2QO2XQ_o.png" alt="cf201dd9c58901325615681c59c7b37a.png"> 
+ </div> 
+ <p class="ql-align-justify">在分配阶段，首先要搜索大小适配的块，假设第一次分配3，转换成2的幂是4，我们先要对整个内存进行对半切割，从16切割到4需要两步，那么从下标[0]节点开始深度搜索到下标[3]的节点并将其标记为已分配。第二次再分配3那么就标记下标[4]的节点。第三次分配6，即大小为8，那么搜索下标[2]的节点，因为下标[1]所对应的块被下标[3~4]占用了。</p> 
+ <p class="ql-align-justify">在释放阶段，我们依次释放上述第一次和第二次分配的块，即先释放[3]再释放[4]，当释放下标[4]节点后，我们发现之前释放的[3]是相邻的，于是我们立马将这两个节点进行合并，这样一来下次分配大小8的时候，我们就可以搜索到下标[1]适配了。若进一步释放下标[2]，同[1]合并后整个内存就回归到初始状态。</p> 
+ <p class="ql-align-justify">还是看一下源码实现吧，首先是伙伴分配器的数据结构：</p> 
+ <p class="ql-align-justify"><strong>struct</strong> buddy2 {<!-- --></p> 
+ <p class="ql-align-justify"> unsigned size;</p> 
+ <p class="ql-align-justify"> unsigned longest[1];</p> 
+ <p class="ql-align-justify">};</p> 
+ <p class="ql-align-justify">这里的成员size表明管理内存的总单元数目(测试用例中是32)，成员longest就是二叉树的节点标记，表明所对应的内存块的空闲单位，<strong>在下文中会分析这是整个算法中最精妙的设计。</strong>此处数组大小为1表明这是可以向后扩展的(注：在GCC环境下你可以写成longest[0]，不占用空间，这里是出于可移植性考虑)，我们在分配器初始化的buddy2_new可以看到这种用法。</p> 
+ <p class="ql-align-justify"><strong>struct</strong> buddy2* buddy2_new( <strong>int</strong> size ) {<!-- --></p> 
+ <p class="ql-align-justify"> <strong>struct</strong> buddy2* self;</p> 
+ <p class="ql-align-justify"> unsigned node_size;</p> 
+ <p class="ql-align-justify"> <strong>int</strong> i;</p> 
+ <p class="ql-align-justify"> <strong>if</strong> (size &lt; 1 || !IS_POWER_OF_2(size))</p> 
+ <p class="ql-align-justify"> <strong>return</strong> NULL;</p> 
+ <p class="ql-align-justify"> self = (<strong>struct</strong> buddy2*)ALLOC( 2 * size * <strong>sizeof</strong>(unsigned));</p> 
+ <p class="ql-align-justify"> self-&gt;size = size;</p> 
+ <p class="ql-align-justify"> node_size = size * 2;</p> 
+ <p class="ql-align-justify"> <strong>for</strong> (i = 0; i &lt; 2 * size - 1; ++i) {<!-- --></p> 
+ <p class="ql-align-justify"> <strong>if</strong> (IS_POWER_OF_2(i+1))</p> 
+ <p class="ql-align-justify"> node_size /= 2;</p> 
+ <p class="ql-align-justify"> self-&gt;longest[i] = node_size;</p> 
+ <p class="ql-align-justify"> }</p> 
+ <p class="ql-align-justify"> <strong>return</strong> self;</p> 
+ <p class="ql-align-justify">}</p> 
+ <p class="ql-align-justify">整个分配器的大小就是满二叉树节点数目，即所需管理内存单元数目的2倍。一个节点对应4个字节，longest记录了节点所对应的的内存块大小。</p> 
+ <p class="ql-align-justify">内存分配的alloc中，入参是分配器指针和需要分配的大小，返回值是内存块索引。alloc函数首先将size调整到2的幂大小，并检查是否超过最大限度。然后进行适配搜索，深度优先遍历，当找到对应节点后，<strong>将其longest标记为0，即分离适配的块出来，</strong>并转换为内存块索引offset返回，依据二叉树排列序号，比如内存总体大小32，我们找到节点下标[8]，内存块对应大小是4，则offset = (8+1)*4-32 = 4，那么分配内存块就从索引4开始往后4个单位。</p> 
+ <p class="ql-align-justify"><strong>int</strong> buddy2_alloc(<strong>struct</strong> buddy2* self, <strong>int</strong> size) {<!-- --></p> 
+ <p class="ql-align-justify"> unsigned index = 0;</p> 
+ <p class="ql-align-justify"> unsigned node_size;</p> 
+ <p class="ql-align-justify"> unsigned offset = 0;</p> 
+ <p class="ql-align-justify"> <strong>if</strong> (self==NULL)</p> 
+ <p class="ql-align-justify"> <strong>return</strong> -1;</p> 
+ <p class="ql-align-justify"> <strong>if</strong> (size &lt;= 0)</p> 
+ <p class="ql-align-justify"> size = 1;</p> 
+ <p class="ql-align-justify"> <strong>else</strong> <strong>if</strong> (!IS_POWER_OF_2(size))</p> 
+ <p class="ql-align-justify"> size = fixsize(size);</p> 
+ <p class="ql-align-justify"> <strong>if</strong> (self-&gt;longest[index] &lt; size)</p> 
+ <p class="ql-align-justify"> <strong>return</strong> -1;</p> 
+ <p class="ql-align-justify"> <strong>for</strong>(node_size = self-&gt;size; node_size != size; node_size /= 2 ) {<!-- --></p> 
+ <p class="ql-align-justify"> <strong>if</strong> (self-&gt;longest[LEFT_LEAF(index)] &gt;= size)</p> 
+ <p class="ql-align-justify"> index = LEFT_LEAF(index);</p> 
+ <p class="ql-align-justify"> <strong>else</strong></p> 
+ <p class="ql-align-justify"> index = RIGHT_LEAF(index);</p> 
+ <p class="ql-align-justify"> }</p> 
+ <p class="ql-align-justify"> self-&gt;longest[index] = 0;</p> 
+ <p class="ql-align-justify"> offset = (index + 1) * node_size - self-&gt;size;</p> 
+ <p class="ql-align-justify"> <strong>while</strong> (index) {<!-- --></p> 
+ <p class="ql-align-justify"> index = PARENT(index);</p> 
+ <p class="ql-align-justify"> self-&gt;longest[index] =</p> 
+ <p class="ql-align-justify"> MAX(self-&gt;longest[LEFT_LEAF(index)], self-&gt;longest[RIGHT_LEAF(index)]);</p> 
+ <p class="ql-align-justify"> }</p> 
+ <p class="ql-align-justify"> <strong>return</strong> offset;</p> 
+ <p class="ql-align-justify">}</p> 
+ <p class="ql-align-justify">在函数返回之前需要回溯，因为小块内存被占用，大块就不能分配了，比如下标[8]标记为0分离出来，那么其父节点下标[0]、[1]、[3]也需要相应大小的分离。<strong>将它们的longest进行折扣计算，取左右子树较大值，</strong>下标[3]取4，下标[1]取8，下标[0]取16，表明其对应的最大空闲值。</p> 
+ <p class="ql-align-justify">在内存释放的free接口，我们只要传入之前分配的内存地址索引，并确保它是有效值。之后就跟alloc做反向回溯，从最后的节点开始一直往上找到longest为0的节点，即当初分配块所适配的大小和位置。<strong>我们将longest恢复到原来满状态的值。继续向上回溯，检查是否存在合并的块，依据就是左右子树longest的值相加是否等于原空闲块满状态的大小，如果能够合并，就将父节点longest标记为相加的和</strong>(多么简单！)。</p> 
+ <p class="ql-align-justify"><strong>void</strong> buddy2_free(<strong>struct</strong> buddy2* self, <strong>int</strong> offset) {<!-- --></p> 
+ <p class="ql-align-justify"> unsigned node_size, index = 0;</p> 
+ <p class="ql-align-justify"> unsigned left_longest, right_longest;</p> 
+ <p class="ql-align-justify"> <strong>assert</strong>(self &amp;&amp; offset &gt;= 0 &amp;&amp; offset &lt; size);</p> 
+ <p class="ql-align-justify"> node_size = 1;</p> 
+ <p class="ql-align-justify"> index = offset + self-&gt;size - 1;</p> 
+ <p class="ql-align-justify"> <strong>for</strong> (; self-&gt;longest[index] ; index = PARENT(index)) {<!-- --></p> 
+ <p class="ql-align-justify"> node_size *= 2;</p> 
+ <p class="ql-align-justify"> <strong>if</strong> (index == 0)</p> 
+ <p class="ql-align-justify"> <strong>return</strong>;</p> 
+ <p class="ql-align-justify"> }</p> 
+ <p class="ql-align-justify"> self-&gt;longest[index] = node_size;</p> 
+ <p class="ql-align-justify"> <strong>while</strong> (index) {<!-- --></p> 
+ <p class="ql-align-justify"> index = PARENT(index);</p> 
+ <p class="ql-align-justify"> node_size *= 2;</p> 
+ <p class="ql-align-justify"> left_longest = self-&gt;longest[LEFT_LEAF(index)];</p> 
+ <p class="ql-align-justify"> right_longest = self-&gt;longest[RIGHT_LEAF(index)];</p> 
+ <p class="ql-align-justify"> <strong>if</strong> (left_longest + right_longest == node_size)</p> 
+ <p class="ql-align-justify"> self-&gt;longest[index] = node_size;</p> 
+ <p class="ql-align-justify"> <strong>else</strong></p> 
+ <p class="ql-align-justify"> self-&gt;longest[index] = MAX(left_longest, right_longest);</p> 
+ <p class="ql-align-justify"> }</p> 
+ <p class="ql-align-justify">}</p> 
+ <p class="ql-align-justify">上面两个成对alloc/free接口的时间复杂度都是O(logN)，保证了程序运行性能。然而这段程序设计的独特之处就在于<strong>使用加权来标记内存空闲状态，而不是一般的有限状态机，实际上longest既可以表示权重又可以表示状态，状态机就毫无必要了，所谓“少即是多”嘛！</strong>反观cloudwu的实现，将节点标记为UNUSED/USED/SPLIT/FULL四个状态机，反而会带来额外的条件判断和管理实现，而且还不如数值那样精确。从逻辑流程上看，wuwenbin的实现简洁明了如同教科书一般，特别是左右子树的走向，内存块的分离合并，块索引到节点下标的转换都是一步到位，不像cloudwu充斥了大量二叉树的深度和长度的间接计算，让代码变得晦涩难读，这些都是longest的功劳。<strong>一个“极简”的设计往往在于你想不到的突破常规思维的地方。</strong></p> 
+ <p class="ql-align-justify">这份代码唯一的缺陷就是longest的大小是4字节，内存消耗大。但cloudwu的博客上有人提议用logN来保存值，这样就能实现uint8_t大小了，<strong>看，又是一个“极简”的设计！</strong></p> 
+ <p class="ql-align-justify">说实话，很难在网上找到比这更简约更优雅的buddy system实现了——至少在Google上如此。</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/bc2171a8e075ed11dba3ab6552acfb8b/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">python列表写入字典_python  – 将列表字典写入CSV文件</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/683e43a3790d975d2710f6a15f2b6eac/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">python用递归方式实现最大公约数_Python实现求两数最大公约数(四种方法)</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

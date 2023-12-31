@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>boost库中优秀的网络库asio - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="boost库中优秀的网络库asio" />
+<meta property="og:description" content="文章目录 一、须知二、ASIO三、我们将从研究同步操作开始四、当使用异步操作时，会发生不同的事件序列五、Proactor模型六、常用内容七、C&#43;&#43; 建立本地网络服务器 （Boost.Asio库）1.服务器用例1.建造（Build）2.聆听（Listen）3.处理（Operation）4.异步（Async） 八、简易并发服务器类总诉 一、须知 开发大型项目，肯定需要使用一些框架，这些框架可以由你自己亲自手工实现，也可以直接引用第三方库。
+1、自己实现框架
+优点：程序的所有细节都能非常清楚的掌握。
+缺点：工作量大、难度高。
+2、引用第三方库
+优点：选择一个稳定、靠谱的第三方框架，将很大程度降低工作量、提高开发效率，将精力重点放在业务逻辑。
+缺点：库本身有功能和性能问题。
+因此，请尽量使用优秀的第三方库，避免重复造轮子（自己造的轮子问题频发）。
+二、ASIO asio 是boost库中优秀的网络库。asio是一个异步的io库，支持以同步或异步的方式处理事件，也可以用于基于tcp或udp的网络通信。
+（1）可移植到windows、linux、FreeBSD。
+（2）可扩展性。
+（3）效率很高。
+（4）易使用，类 Socket API 编程模型。
+支持同步、异步通信方式。
+三、我们将从研究同步操作开始 asio可以进行io对象（比如socket套接字）进行同步操作和异步操作。 在使用Asio之前，对Asio的各个部分、你的程序以及它们是如何一起工作的有个概念的了解是很有用的。作为一个介绍性的例子，让我们考虑一下在套接字上执行连接操作时会发生什么。
+你的程序至少会有一个I/O执行上下文，比如asio::io_context对象，asio::thread_pool对象，或者asio::system_context。这个I/O执行上下文表示程序到操作系统I/O服务的链接。
+asio::io_context io_context; 要执行I/O操作，你的程序需要一个I/O对象，比如一个TCP套接字:
+asio::ip::tcp::socket socket(io_context); 当执行同步连接操作时，会发生以下事件序列:
+你的程序通过调用I/O对象来启动连接操作 socket.connect(server_endpoint); I/O对象将请求转发给I/O执行上下文。
+I/O执行上下文调用操作系统来执行连接操作。
+操作系统将操作的结果返回给I/O执行上下文。
+I/O执行上下文将操作产生的任何错误转换为asio::error_code类型的对象。error_code可以与特定的值进行比较，或者作为布尔值进行比较(如果结果为假，则表示没有发生错误)。然后将结果转发回I/O对象。
+如果操作失败，I/O对象会抛出一个asio::system_error类型的异常。如果初始化操作的代码被写成:
+asio::error_code ec; socket.connect(server_endpoint, ec); 然后error_code变量ec将被设置为操作的结果，并且不会抛出异常。
+四、当使用异步操作时，会发生不同的事件序列 你的程序通过调用I/O对象来初始化连接操作 socket.async_connect(server_endpoint, your_completion_handler); 其中your_completion_handler是一个带有签名的函数或函数对象:
+void your_completion_handler(const asio::error_code&amp; ec); 所需的确切签名取决于正在执行的异步操作。参考文档指出了每个操作的适当形式。
+I/O对象将请求转发给I/O执行上下文。
+I/O执行上下文向操作系统发出信号，说明它应该启动异步连接。
+操作系统通过将结果放置在一个队列中表示连接操作已经完成，准备由I/O执行上下文获取。
+当使用io_context作为I/O执行上下文时，你的程序必须调用io_context::run()(或类似的io_context成员函数)以便检索结果。当有未完成的异步操作时，调用io_context::run()会阻塞，所以你通常会在你开始第一个异步操作时调用它。
+在调用io_context::run()时，I/O执行上下文会将操作的结果从队列中取出，转换成一个error_code，然后将其传递给完成处理程序。
+五、Proactor模型 各部分内容 — Asynchronous Operation (异步操作) 定义一个异步执行的操作，如Socket异步读写。 Asynchronous Operation Processor (异步操作执行器) 执行一个异步操作，并执行完成事件队列中的队列事件，从更高层次上说，像reactive_socket_service的服务就是一个异步操作处理器。 Completion Event Queue (事件完成队列) 缓存完成事件直到被异步事件分离器弹出队列。 Completion Handler (处理器) 处理异步操作的结果，处理器是函数对象，往往使用bind创建。 Asynchronous Event Demultiplexer (异步事件分离器) 阻塞等待在完成事件队列中事件发生，之后向调用者返回完成事件。 Proactor 调用异步事件信号分离器将事件移出队列，并分配一个关联的处理器(如调用函数对象)，这个功能封装在io_service类中。 Initiator 执行特定程序代码启动异步操作，初始化器通过如basic_stream_socket等高层次接口与异步操作处理器交互，并返回reactive_socket_service等类型的服务代理。 六、常用内容 asio::io_context asio提供的一个基本的io对象，只有调用其run方法的线程才会被asio调度去执行任务，可以通过post方法添加一个任务。 asio::io_context main; //make_work_guard作用，创建一个executor_work_guard对象，在构造时通知io_context有任务开始，保证run方法不会退出 //析构时相反，让run方法在没有未完成任务时退出 auto i = aso::make_work_guard(main); another." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/61d784851023905bd6545fe06b7176f1/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-08-29T16:18:16+08:00" />
+<meta property="article:modified_time" content="2022-08-29T16:18:16+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">boost库中优秀的网络库asio</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><a href="#_1" rel="nofollow">一、须知</a></li><li><a href="#ASIO_14" rel="nofollow">二、ASIO</a></li><li><a href="#_25" rel="nofollow">三、我们将从研究同步操作开始</a></li><li><a href="#_61" rel="nofollow">四、当使用异步操作时，会发生不同的事件序列</a></li><li><a href="#Proactor_87" rel="nofollow">五、Proactor模型</a></li><li><a href="#_119" rel="nofollow">六、常用内容</a></li><li><a href="#C__BoostAsio_239" rel="nofollow">七、C++ 建立本地网络服务器 （Boost.Asio库）</a></li><li><ul><li><ul><li><a href="#1_242" rel="nofollow">1.服务器用例</a></li><li><ul><li><a href="#1Build_249" rel="nofollow">1.建造（Build）</a></li><li><a href="#2Listen_280" rel="nofollow">2.聆听（Listen）</a></li><li><a href="#3Operation_321" rel="nofollow">3.处理（Operation）</a></li><li><a href="#4Async_372" rel="nofollow">4.异步（Async）</a></li></ul> 
+   </li></ul> 
+  </li></ul> 
+  </li><li><a href="#_455" rel="nofollow">八、简易并发服务器类</a></li><li><a href="#_776" rel="nofollow">总诉</a></li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_1"></a>一、须知</h2> 
+<p>开发大型项目，肯定需要使用一些框架，这些框架可以由你自己亲自手工实现，也可以直接引用第三方库。</p> 
+<p>1、自己实现框架<br> 优点：程序的所有细节都能非常清楚的掌握。<br> 缺点：工作量大、难度高。</p> 
+<p>2、引用第三方库<br> 优点：选择一个稳定、靠谱的第三方框架，将很大程度降低工作量、提高开发效率，将精力重点放在业务逻辑。<br> 缺点：库本身有功能和性能问题。</p> 
+<p>因此，请尽量使用优秀的第三方库，避免重复造轮子（自己造的轮子问题频发）。</p> 
+<h2><a id="ASIO_14"></a>二、ASIO</h2> 
+<p>asio 是boost库中优秀的网络库。asio是一个异步的io库，支持以同步或异步的方式处理事件，也可以用于基于tcp或udp的网络通信。</p> 
+<p>（1）可移植到windows、linux、FreeBSD。<br> （2）可扩展性。<br> （3）效率很高。<br> （4）易使用，类 Socket API 编程模型。</p> 
+<p>支持同步、异步通信方式。</p> 
+<h2><a id="_25"></a>三、我们将从研究同步操作开始</h2> 
+<p>asio可以进行io对象（比如socket套接字）进行同步操作和异步操作。 在使用Asio之前，对Asio的各个部分、你的程序以及它们是如何一起工作的有个概念的了解是很有用的。作为一个介绍性的例子，让我们考虑一下在套接字上执行连接操作时会发生什么。<br> <img src="https://images2.imgbox.com/de/7c/6d96lSo0_o.png" alt="在这里插入图片描述"><br> 你的程序至少会有一个I/O执行上下文，比如asio::io_context对象，asio::thread_pool对象，或者asio::system_context。这个I/O执行上下文表示程序到操作系统I/O服务的链接。</p> 
+<pre><code class="prism language-cpp">asio<span class="token double-colon punctuation">::</span>io_context io_context<span class="token punctuation">;</span>
+</code></pre> 
+<p>要执行I/O操作，你的程序需要一个I/O对象，比如一个TCP套接字:</p> 
+<pre><code class="prism language-cpp">asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>io_context<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>当执行同步连接操作时，会发生以下事件序列:</p> 
+<ol><li>你的程序通过调用I/O对象来启动连接操作</li></ol> 
+<pre><code class="prism language-cpp">socket<span class="token punctuation">.</span><span class="token function">connect</span><span class="token punctuation">(</span>server_endpoint<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<ol start="2"><li> <p>I/O对象将请求转发给I/O执行上下文。</p> </li><li> <p>I/O执行上下文调用操作系统来执行连接操作。</p> </li><li> <p>操作系统将操作的结果返回给I/O执行上下文。</p> </li><li> <p>I/O执行上下文将操作产生的任何错误转换为asio::error_code类型的对象。error_code可以与特定的值进行比较，或者作为布尔值进行比较(如果结果为假，则表示没有发生错误)。然后将结果转发回I/O对象。</p> </li><li> <p>如果操作失败，I/O对象会抛出一个asio::system_error类型的异常。如果初始化操作的代码被写成:</p> </li></ol> 
+<pre><code class="prism language-cpp">asio<span class="token double-colon punctuation">::</span>error_code ec<span class="token punctuation">;</span>
+socket<span class="token punctuation">.</span><span class="token function">connect</span><span class="token punctuation">(</span>server_endpoint<span class="token punctuation">,</span> ec<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>然后error_code变量ec将被设置为操作的结果，并且不会抛出异常。</p> 
+<h2><a id="_61"></a>四、当使用异步操作时，会发生不同的事件序列</h2> 
+<p><img src="https://images2.imgbox.com/1e/00/00yTgbvt_o.png" alt="在这里插入图片描述"></p> 
+<ol><li>你的程序通过调用I/O对象来初始化连接操作</li></ol> 
+<pre><code class="prism language-cpp">socket<span class="token punctuation">.</span><span class="token function">async_connect</span><span class="token punctuation">(</span>server_endpoint<span class="token punctuation">,</span> your_completion_handler<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>其中your_completion_handler是一个带有签名的函数或函数对象:</p> 
+<pre><code class="prism language-cpp"><span class="token keyword">void</span> <span class="token function">your_completion_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> asio<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> ec<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>所需的确切签名取决于正在执行的异步操作。参考文档指出了每个操作的适当形式。</p> 
+<ol start="2"><li> <p>I/O对象将请求转发给I/O执行上下文。</p> </li><li> <p>I/O执行上下文向操作系统发出信号，说明它应该启动异步连接。<br> <img src="https://images2.imgbox.com/46/92/0Ti1phR5_o.png" alt="在这里插入图片描述"></p> </li><li> <p>操作系统通过将结果放置在一个队列中表示连接操作已经完成，准备由I/O执行上下文获取。</p> </li><li> <p>当使用io_context作为I/O执行上下文时，你的程序必须调用io_context::run()(或类似的io_context成员函数)以便检索结果。当有未完成的异步操作时，调用io_context::run()会阻塞，所以你通常会在你开始第一个异步操作时调用它。</p> </li><li> <p>在调用io_context::run()时，I/O执行上下文会将操作的结果从队列中取出，转换成一个error_code，然后将其传递给完成处理程序。</p> </li></ol> 
+<h2><a id="Proactor_87"></a>五、Proactor模型</h2> 
+<p><img src="https://images2.imgbox.com/5e/e3/COZ1sRwV_o.png" alt="在这里插入图片描述"></p> 
+<ul><li>各部分内容</li></ul> 
+<ol><li>— Asynchronous Operation (异步操作)</li></ol> 
+<ul><li>定义一个异步执行的操作，如Socket异步读写。</li></ul> 
+<ol start="2"><li>Asynchronous Operation Processor (异步操作执行器)</li></ol> 
+<ul><li>执行一个异步操作，并执行完成事件队列中的队列事件，从更高层次上说，像reactive_socket_service的服务就是一个异步操作处理器。</li></ul> 
+<ol start="3"><li>Completion Event Queue (事件完成队列)</li></ol> 
+<ul><li>缓存完成事件直到被异步事件分离器弹出队列。</li></ul> 
+<ol start="4"><li>Completion Handler (处理器)</li></ol> 
+<ul><li>处理异步操作的结果，处理器是函数对象，往往使用bind创建。</li></ul> 
+<ol start="5"><li>Asynchronous Event Demultiplexer (异步事件分离器)</li></ol> 
+<ul><li>阻塞等待在完成事件队列中事件发生，之后向调用者返回完成事件。</li></ul> 
+<ol start="6"><li>Proactor</li></ol> 
+<ul><li>调用异步事件信号分离器将事件移出队列，并分配一个关联的处理器(如调用函数对象)，这个功能封装在io_service类中。</li></ul> 
+<ol start="7"><li>Initiator</li></ol> 
+<ul><li>执行特定程序代码启动异步操作，初始化器通过如basic_stream_socket等高层次接口与异步操作处理器交互，并返回reactive_socket_service等类型的服务代理。</li></ul> 
+<h2><a id="_119"></a>六、常用内容</h2> 
+<ol><li>asio::io_context</li></ol> 
+<ul><li>asio提供的一个基本的io对象，只有调用其run方法的线程才会被asio调度去执行任务，可以通过post方法添加一个任务。</li></ul> 
+<pre><code class="prism language-cpp"> asio<span class="token double-colon punctuation">::</span>io_context main<span class="token punctuation">;</span>
+    <span class="token comment">//make_work_guard作用，创建一个executor_work_guard对象，在构造时通知io_context有任务开始，保证run方法不会退出</span>
+    <span class="token comment">//析构时相反，让run方法在没有未完成任务时退出</span>
+    <span class="token keyword">auto</span> i <span class="token operator">=</span> aso<span class="token double-colon punctuation">::</span><span class="token function">make_work_guard</span><span class="token punctuation">(</span>main<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    another<span class="token punctuation">.</span><span class="token function">post</span><span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token operator">&amp;</span>main<span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"111"</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+        main<span class="token punctuation">.</span><span class="token function">post</span><span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+</code></pre> 
+<ol start="2"><li>定时器asio::steady_timer</li></ol> 
+<ul><li>一个定时器，可以使用同步和异步等待两种方式。</li></ul> 
+<pre><code class="prism language-cpp">  <span class="token keyword">void</span> <span class="token function">callback</span><span class="token punctuation">(</span><span class="token keyword">const</span> asio<span class="token double-colon punctuation">::</span>error_code <span class="token operator">&amp;</span>error<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+	    std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token number">1</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    asio<span class="token double-colon punctuation">::</span>io_context io<span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span>steady_timer <span class="token function">time</span><span class="token punctuation">(</span>io<span class="token punctuation">,</span> std<span class="token double-colon punctuation">::</span>chrono<span class="token double-colon punctuation">::</span><span class="token function">seconds</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    time<span class="token punctuation">.</span><span class="token function">wait</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>    <span class="token comment">//同步等待，定时器到时继续执行</span>
+    time<span class="token punctuation">.</span><span class="token function">async_wait</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>callback<span class="token punctuation">)</span>  <span class="token comment">//异步等待，到时回调callback</span>
+
+</code></pre> 
+<ol start="3"><li>信号集asio::singal_set</li></ol> 
+<ul><li>信号集，可以注册相应信号的处理事件。</li></ul> 
+<pre><code class="prism language-cpp">asio<span class="token double-colon punctuation">::</span>signal_set <span class="token function">signal</span><span class="token punctuation">(</span>io<span class="token punctuation">,</span> SIGINT<span class="token punctuation">,</span> SIGTERM<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	signal<span class="token punctuation">.</span><span class="token function">async_wait</span><span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token operator">&amp;</span>io<span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token keyword">const</span> asio<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> err<span class="token punctuation">,</span> <span class="token keyword">int</span> sig<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		io<span class="token punctuation">.</span><span class="token function">stop</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+</code></pre> 
+<ol start="4"><li>Tcp通信框架</li></ol> 
+<ul><li>服务端tcp通信需要通过acceptor接受链接，客户端需要通过resolver解析服务器端口及ip地址。</li></ul> 
+<pre><code class="prism language-cpp"><span class="token comment">//服务器注册一个链接接收器acceptor和一个用于tcp通信的socket</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>acceptor <span class="token function">acceptor</span><span class="token punctuation">(</span>io<span class="token punctuation">,</span> asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token operator">:</span><span class="token function">endpoint</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">5005</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>io<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//同步接受链接</span>
+    acceptor<span class="token punctuation">.</span><span class="token function">accept</span><span class="token punctuation">(</span>socket<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//异步接受链接</span>
+    acceptor<span class="token punctuation">.</span><span class="token function">async_accept</span><span class="token punctuation">(</span>socket<span class="token punctuation">,</span> <span class="token operator">&amp;</span>callback<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//客户端使用resolver解析ip与端口，并注册与服务器通信的socket</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>resolver <span class="token function">resolver</span><span class="token punctuation">(</span>io<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>io<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">/**
+     * @ param hostname
+     * @ param port
+     */</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>resolver<span class="token double-colon punctuation">::</span>results_type endpoints <span class="token operator">=</span> resolver<span class="token punctuation">.</span><span class="token function">resolve</span><span class="token punctuation">(</span><span class="token string">"127.0.0.1"</span><span class="token punctuation">,</span> <span class="token number">5005</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span><span class="token function">connect</span><span class="token punctuation">(</span>socket<span class="token punctuation">,</span> endpoints<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//socket同步的读写，buffer对象可以接受string、array、vector</span>
+    socket<span class="token punctuation">.</span><span class="token function">write_some</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">,</span> error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    size_t len <span class="token operator">=</span> socket<span class="token punctuation">.</span><span class="token function">read_some</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>buf<span class="token punctuation">)</span><span class="token punctuation">,</span> error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//socket异步的读写</span>
+    socket<span class="token punctuation">.</span><span class="token function">async_write_some</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token operator">&amp;</span>callback<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    socket<span class="token punctuation">.</span><span class="token function">async_read_some</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>buf<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token operator">&amp;</span>callback<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+</code></pre> 
+<ol start="5"><li>udp通信</li></ol> 
+<ul><li>udp无连接，因此只需用resolver解析出对端ip与端口。</li></ul> 
+<pre><code class="prism language-cpp"><span class="token comment">//解析对端ip和端口，udp的resolver会返回一个符合名字和端口的list的迭代器</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span>resolver <span class="token function">resolver</span><span class="token punctuation">(</span>io<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span>endpoint server_endpoint <span class="token operator">=</span> <span class="token operator">*</span>resolver<span class="token punctuation">.</span><span class="token function">resolve</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token string">"127.0.0.1"</span><span class="token punctuation">,</span> <span class="token string">"5005"</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">begin</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>io<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    socket<span class="token punctuation">.</span><span class="token function">open</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//服务器创建socket并绑定端口</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>io<span class="token punctuation">,</span> asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span><span class="token function">endpoint</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">5005</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//同步发送与接受数据</span>
+    socket<span class="token punctuation">.</span><span class="token function">send_to</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">,</span> server_endpoint<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>udp<span class="token double-colon punctuation">::</span>endpoint from_endpoint<span class="token punctuation">;</span>
+    size_t len <span class="token operator">=</span> socket<span class="token punctuation">.</span><span class="token function">receive_from</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>buf<span class="token punctuation">)</span><span class="token punctuation">,</span> from_endpoint<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//异步发送与接受</span>
+    socket<span class="token punctuation">.</span><span class="token function">async_send_to</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">,</span> endpoint<span class="token punctuation">,</span> <span class="token operator">&amp;</span>callback<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    socket<span class="token punctuation">.</span><span class="token function">async_receive_from</span><span class="token punctuation">(</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>buf<span class="token punctuation">)</span><span class="token punctuation">,</span> from_endpoint<span class="token punctuation">,</span> <span class="token operator">&amp;</span>callback<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+</code></pre> 
+<p><code>test.cpp</code></p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;asio.hpp&gt;</span></span>
+
+
+
+<span class="token keyword">class</span> <span class="token class-name">tcpServer</span>
+<span class="token punctuation">{<!-- --></span>
+
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+    asio<span class="token double-colon punctuation">::</span>io_context io<span class="token punctuation">;</span>
+
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<h2><a id="C__BoostAsio_239"></a>七、C++ 建立本地网络服务器 （Boost.Asio库）</h2> 
+<p>今天我们利用Boost库中Asio部分，浅尝网络服务器。此处不做过于深入的开展，为达成学习目的，只做简单的异步并发服务器。本篇代码没有直接引用boost等命名空间，为的是新入门Boost的同学能够更好的了解每个参数在boost的具体命名空间位置，有助于更好的理解boost的布局。</p> 
+<h4><a id="1_242"></a>1.服务器用例</h4> 
+<p>我们在做服务器之前，首先细想一下，服务器应具备哪些基本特质。</p> 
+<ol><li><strong>构建：</strong> 一个服务器应该具备被连接的IP地址（网络地址）、可以被访问的Port（端口号）。</li><li><strong>聆听：</strong> 服务器应该能够实时处理基本的连接请求。</li><li><strong>处理：</strong> 交互才是目的，可以与客户端实现基本的交互。</li><li><strong>异步：</strong> 处理客户端的请求时，不会因为客户端的延迟响应而导致程序假死。</li></ol> 
+<h5><a id="1Build_249"></a>1.建造（Build）</h5> 
+<p>电脑里有非常多的端口，而客户端只会把消息传到约定的地址与端口，只有在正确的端口等待，才能接到自己预期的客户。</p> 
+<p>就好像楼房里有非常多层楼一样，而快递员只会把物品送到约定的楼层，只有在正确的楼层等待，才能达成预期的结果。</p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;iostream&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+ 
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server start."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// asio程序必须的io_service对象</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service ios<span class="token punctuation">;</span>
+		<span class="token comment">// 具体的服务器地址与端口</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>endpoint <span class="token function">endpotion</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">13695</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 创建acceptor对象，当前的IPV4作为服务器地址(127.0.0.1 || 0.0.0.0)，接受端口13695的消息.</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>acceptor <span class="token function">acceptor</span><span class="token punctuation">(</span>ios<span class="token punctuation">,</span> endpotion<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 打印当前服务器地址</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"addr: "</span> <span class="token operator">&lt;&lt;</span> acceptor<span class="token punctuation">.</span><span class="token function">local_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// 打印当前服务器端口</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"port: "</span> <span class="token operator">&lt;&lt;</span> acceptor<span class="token punctuation">.</span><span class="token function">local_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">port</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server exceptional."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server end."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token function">getchar</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="2Listen_280"></a>2.聆听（Listen）</h5> 
+<p>一个基本的连接，在正常的情况下，应该由客户端发起，服务器应该处于实时监听的状态，因为能接到客户端发起的连接请求，这才是网络操作的根本。</p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;iostream&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+ 
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server start."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// asio程序必须的io_service对象</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service ios<span class="token punctuation">;</span>
+		<span class="token comment">// 具体的服务器地址与端口</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>endpoint <span class="token function">endpotion</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">13695</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 创建acceptor对象，当前的IPV4作为服务器地址(127.0.0.1 || 0.0.0.0)，接受端口13695的消息.</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>acceptor <span class="token function">acceptor</span><span class="token punctuation">(</span>ios<span class="token punctuation">,</span> endpotion<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 打印当前服务器地址</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"addr: "</span> <span class="token operator">&lt;&lt;</span> acceptor<span class="token punctuation">.</span><span class="token function">local_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// 打印当前服务器端口</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"port: "</span> <span class="token operator">&lt;&lt;</span> acceptor<span class="token punctuation">.</span><span class="token function">local_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">port</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+ 
+		<span class="token comment">// 循环执行服务</span>
+		<span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// 一个临时的socket对象</span>
+			boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>ios<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// 阻塞等待客户端连接，连接成功后返回socket, accept这个函数使用引用来调取socket.</span>
+			acceptor<span class="token punctuation">.</span><span class="token function">accept</span><span class="token punctuation">(</span>socket<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// 打印与本机服务器取得连接的客户端IP地址</span>
+			std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"client: "</span> <span class="token operator">&lt;&lt;</span> socket<span class="token punctuation">.</span><span class="token function">remote_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>exception<span class="token operator">&amp;</span> _e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server exceptional."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> _e<span class="token punctuation">.</span><span class="token function">what</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server end."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token function">getchar</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="3Operation_321"></a>3.处理（Operation）</h5> 
+<p>一旦服务器收到客户端发起的连接请求，便为客户端建立服务。与客户端建立连接的目的，始终是为了交互，我们不能本末倒置。我们尝试一下，第一次交互的滋味。</p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;iostream&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+ 
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server start."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// asio程序必须的io_service对象</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service ios<span class="token punctuation">;</span>
+		<span class="token comment">// 具体的服务器地址与端口</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>endpoint <span class="token function">endpotion</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">13695</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 创建acceptor对象，当前的IPV4作为服务器地址(127.0.0.1 || 0.0.0.0)，接受端口13695的消息.</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>acceptor <span class="token function">acceptor</span><span class="token punctuation">(</span>ios<span class="token punctuation">,</span> endpotion<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 打印当前服务器地址</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"addr: "</span> <span class="token operator">&lt;&lt;</span> acceptor<span class="token punctuation">.</span><span class="token function">local_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// 打印当前服务器端口</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"port: "</span> <span class="token operator">&lt;&lt;</span> acceptor<span class="token punctuation">.</span><span class="token function">local_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">port</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+ 
+		<span class="token comment">// 循环执行服务</span>
+		<span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// 一个临时的socket对象</span>
+			boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket <span class="token function">socket</span><span class="token punctuation">(</span>ios<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// 阻塞等待客户端连接，连接成功后返回socket, accept这个函数使用引用来调取socket.</span>
+			acceptor<span class="token punctuation">.</span><span class="token function">accept</span><span class="token punctuation">(</span>socket<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// 打印与本机服务器取得连接的客户端IP地址</span>
+			std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"client: "</span> <span class="token operator">&lt;&lt;</span> socket<span class="token punctuation">.</span><span class="token function">remote_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+ 
+ 
+			<span class="token comment">//处理/</span>
+			std<span class="token double-colon punctuation">::</span>string msg<span class="token punctuation">;</span>
+			<span class="token comment">// 阻塞发送作者名称到客户端</span>
+			socket<span class="token punctuation">.</span><span class="token function">write_some</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span><span class="token string">"hello CSND_Ayo"</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// 阻塞接收客户端发来的数据</span>
+			socket<span class="token punctuation">.</span><span class="token function">read_some</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// 打印客户端发来的数据</span>
+			std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"client reply: "</span> <span class="token operator">&lt;&lt;</span> msg<span class="token punctuation">.</span><span class="token function">c_str</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>exception<span class="token operator">&amp;</span> _e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server exceptional."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> _e<span class="token punctuation">.</span><span class="token function">what</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server end."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token function">getchar</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="4Async_372"></a>4.异步（Async）</h5> 
+<p>处理客户端的请求时，不会因为客户端的延迟响应而导致程序假死。</p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;iostream&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/bind.hpp&gt;</span></span>
+ 
+<span class="token comment">// 异步服务器类</span>
+<span class="token keyword">class</span> <span class="token class-name">Server</span> <span class="token punctuation">{<!-- --></span>
+ 
+<span class="token keyword">private</span><span class="token operator">:</span>
+ 
+	<span class="token comment">// 服务实例</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service<span class="token operator">&amp;</span> ios_<span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 接收器实例</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>acceptor acceptor_<span class="token punctuation">;</span>
+ 
+	<span class="token comment">// socket智能指针</span>
+	<span class="token keyword">typedef</span> boost<span class="token double-colon punctuation">::</span>shared_ptr<span class="token operator">&lt;</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket<span class="token operator">&gt;</span> socket_ptr<span class="token punctuation">;</span>
+ 
+<span class="token keyword">public</span><span class="token operator">:</span>
+ 
+	<span class="token function">Server</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service<span class="token operator">&amp;</span> _ios<span class="token punctuation">)</span> <span class="token operator">:</span> <span class="token function">ios_</span><span class="token punctuation">(</span>_ios<span class="token punctuation">)</span><span class="token punctuation">,</span>
+		<span class="token function">acceptor_</span><span class="token punctuation">(</span>_ios<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">endpoint</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">13695</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 默认执行</span>
+		<span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+	<span class="token comment">// 启动网络侦听的操作入口</span>
+	<span class="token keyword">void</span> <span class="token function">start</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 自定义的智能指针</span>
+		socket_ptr <span class="token function">socket</span><span class="token punctuation">(</span><span class="token keyword">new</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">socket</span><span class="token punctuation">(</span>ios_<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 异步侦听，若有服务连接，则自动调用Server::handler_accept函数，并将error, socket传入作为参数</span>
+		acceptor_<span class="token punctuation">.</span><span class="token function">async_accept</span><span class="token punctuation">(</span><span class="token operator">*</span>socket<span class="token punctuation">,</span>
+			boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Server<span class="token double-colon punctuation">::</span>accept_handler<span class="token punctuation">,</span> <span class="token keyword">this</span><span class="token punctuation">,</span>
+			boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token comment">/* 此处作为占位符 */</span><span class="token punctuation">,</span> socket<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+	<span class="token comment">// 请求者响应后触发的处理器</span>
+	<span class="token keyword">void</span> <span class="token function">accept_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _ec<span class="token punctuation">,</span> socket_ptr _socket<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 错误码检测</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_ec<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">// 打印当前连接进来的客户端</span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"client: "</span> <span class="token operator">&lt;&lt;</span> _socket<span class="token operator">-&gt;</span><span class="token function">remote_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// 异步发送 "hello CSND_Ayo" 消息到客户端，发送成功后，自动调用Server::write_handler函数</span>
+		_socket<span class="token operator">-&gt;</span><span class="token function">async_write_some</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span><span class="token string">"hello CSND_Ayo"</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+			boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Server<span class="token double-colon punctuation">::</span>write_handler<span class="token punctuation">,</span> <span class="token keyword">this</span><span class="token punctuation">,</span>
+			boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token comment">/* 此处作为占位符 */</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 启动新的异步监听</span>
+		<span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+	<span class="token comment">// 完成异步写操作后的处理器</span>
+	<span class="token keyword">void</span> <span class="token function">write_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _ec<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server: send message complete."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+ 
+ 
+ 
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server start."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// 建造服务对象</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service ios<span class="token punctuation">;</span>
+		<span class="token comment">// 构建Server实例</span>
+		Server <span class="token function">server</span><span class="token punctuation">(</span>ios<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 启动异步调用事件处理循环</span>
+		ios<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>exception<span class="token operator">&amp;</span> _e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> _e<span class="token punctuation">.</span><span class="token function">what</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server end."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h2><a id="_455"></a>八、简易并发服务器类</h2> 
+<p>两个类来撰写了一个并发的服务器类：Server（服务器监听类）、Session（会话类）。</p> 
+<p>具备功能：</p> 
+<ol><li>异步监听客户端连接。</li><li>客户连接时，首包要求具有特定格式（协议包）。</li><li>并发处理客户端交互。</li></ol> 
+<p><img src="https://images2.imgbox.com/82/eb/8Tk3Wzr1_o.png" alt="在这里插入图片描述"><br> <code>Server.h</code></p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">ifndef</span> <span class="token expression">__CLY_SERVER_H__</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">__CLY_SERVER_H__</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;string.h&gt;</span>  </span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/shared_ptr.hpp&gt;</span></span>
+<span class="token keyword">class</span> <span class="token class-name">Session</span><span class="token punctuation">;</span>
+<span class="token keyword">class</span> <span class="token class-name">Server</span> <span class="token punctuation">{<!-- --></span>
+<span class="token keyword">private</span><span class="token operator">:</span>
+	<span class="token comment">// 会话 - 智能指针</span>
+	<span class="token keyword">typedef</span>	boost<span class="token double-colon punctuation">::</span>shared_ptr<span class="token operator">&lt;</span>Session<span class="token operator">&gt;</span>	session_ptr<span class="token punctuation">;</span>
+<span class="token keyword">public</span><span class="token operator">:</span>
+	<span class="token function">Server</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service <span class="token operator">&amp;</span>_ioService<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>endpoint <span class="token operator">&amp;</span>_endpoint<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">virtual</span> <span class="token operator">~</span><span class="token function">Server</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 监听</span>
+	<span class="token keyword">void</span> <span class="token function">start</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 异步</span>
+	<span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span><span class="token operator">:</span>
+	<span class="token comment">// 数据导出接口</span>
+	<span class="token keyword">void</span> <span class="token function">callback_session</span><span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>string _fromIp<span class="token punctuation">,</span> std<span class="token double-colon punctuation">::</span>string _info<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 会话启动</span>
+	<span class="token keyword">void</span> <span class="token function">accept_handler</span><span class="token punctuation">(</span>session_ptr _chatSession<span class="token punctuation">,</span> <span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span><span class="token operator">:</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service <span class="token operator">&amp;</span>ioService_<span class="token punctuation">;</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>acceptor acceptor_<span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">// __CLY_SERVER_H__</span></span>
+</code></pre> 
+<p><code>Server.cpp</code></p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/bind.hpp&gt;</span></span>
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"Server.h"</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"Session.h"</span></span>
+ 
+ 
+<span class="token class-name">Server</span><span class="token double-colon punctuation">::</span><span class="token function">Server</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service <span class="token operator">&amp;</span>_ioService<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>endpoint <span class="token operator">&amp;</span>_endpoint<span class="token punctuation">)</span>
+<span class="token operator">:</span> <span class="token function">ioService_</span><span class="token punctuation">(</span>_ioService<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">acceptor_</span><span class="token punctuation">(</span>_ioService<span class="token punctuation">,</span> _endpoint<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+ 
+<span class="token class-name">Server</span><span class="token double-colon punctuation">::</span><span class="token operator">~</span><span class="token function">Server</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">void</span> <span class="token class-name">Server</span><span class="token double-colon punctuation">::</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	session_ptr	<span class="token function">new_chat_session</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token function">Session</span><span class="token punctuation">(</span>ioService_<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	acceptor_<span class="token punctuation">.</span><span class="token function">async_accept</span><span class="token punctuation">(</span>new_chat_session<span class="token operator">-&gt;</span><span class="token function">socket</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Server<span class="token double-colon punctuation">::</span>accept_handler<span class="token punctuation">,</span> <span class="token keyword">this</span><span class="token punctuation">,</span> new_chat_session<span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">void</span> <span class="token class-name">Server</span><span class="token double-colon punctuation">::</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	ioService_<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">void</span> <span class="token class-name">Server</span><span class="token double-colon punctuation">::</span><span class="token function">callback_session</span><span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>string <span class="token comment">/*_fromIp*/</span><span class="token punctuation">,</span> std<span class="token double-colon punctuation">::</span>string <span class="token comment">/*_info*/</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">void</span> <span class="token class-name">Server</span><span class="token double-colon punctuation">::</span><span class="token function">accept_handler</span><span class="token punctuation">(</span>session_ptr _chatSession<span class="token punctuation">,</span> <span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>_error <span class="token operator">&amp;&amp;</span> _chatSession<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+			_chatSession<span class="token operator">-&gt;</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><code>Session.h</code></p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">ifndef</span> <span class="token expression">__CLY_SESSION_H__</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">__CLY_SESSION_H__</span></span>
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;iostream&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;string&gt;</span></span>
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/enable_shared_from_this.hpp&gt;</span></span>
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">REPLY_SIZE</span> <span class="token expression"><span class="token punctuation">(</span><span class="token number">32</span><span class="token punctuation">)</span></span></span>
+ 
+<span class="token comment">// 会话类</span>
+<span class="token keyword">class</span> <span class="token class-name">Session</span> <span class="token operator">:</span> <span class="token base-clause"><span class="token keyword">public</span> boost<span class="token double-colon punctuation">::</span><span class="token class-name">enable_shared_from_this</span><span class="token operator">&lt;</span><span class="token class-name">Session</span><span class="token operator">&gt;</span></span>
+<span class="token punctuation">{<!-- --></span>
+ 
+<span class="token keyword">public</span><span class="token operator">:</span>
+ 
+	<span class="token keyword">typedef</span> <span class="token keyword">void</span> <span class="token function">pSessionCallback</span><span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>string<span class="token punctuation">,</span> std<span class="token double-colon punctuation">::</span>string<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token keyword">public</span><span class="token operator">:</span>
+ 
+	<span class="token function">Session</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service<span class="token operator">&amp;</span> _ioService<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">virtual</span> <span class="token operator">~</span><span class="token function">Session</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token keyword">void</span> <span class="token function">start</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token keyword">void</span> <span class="token function">setCallback</span><span class="token punctuation">(</span>pSessionCallback<span class="token operator">*</span> _callback<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> callback_ <span class="token operator">=</span> _callback<span class="token punctuation">;</span> <span class="token punctuation">}</span>
+ 
+	<span class="token comment">// socket 实例</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket<span class="token operator">&amp;</span> <span class="token function">socket</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token keyword">private</span><span class="token operator">:</span>
+	
+	<span class="token comment">// 第一个协议包</span>
+	<span class="token keyword">void</span> <span class="token function">init_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 解析协议包</span>
+	<span class="token keyword">void</span> <span class="token function">analyse_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 完成数据传输后触发的收尾工作</span>
+	<span class="token keyword">void</span> <span class="token function">done_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 读取成功后触发的函数</span>
+	<span class="token keyword">void</span> <span class="token function">read_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">,</span> size_t _readSize<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 写入完成后触发的函数</span>
+	<span class="token keyword">void</span> <span class="token function">write_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token keyword">private</span><span class="token operator">:</span>
+	<span class="token comment">// 临时信息缓冲区</span>
+	<span class="token keyword">char</span> msg_<span class="token punctuation">[</span><span class="token number">1024</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+	std<span class="token double-colon punctuation">::</span>string currentMsg_<span class="token punctuation">;</span>
+	<span class="token comment">// 数据总数量</span>
+	<span class="token keyword">int</span> sumSize_<span class="token punctuation">;</span>
+	<span class="token comment">// 单个数据包大小</span>
+	<span class="token keyword">unsigned</span> <span class="token keyword">int</span> maxSize_<span class="token punctuation">;</span>
+	<span class="token comment">// socket句柄</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket socket_<span class="token punctuation">;</span>
+	<span class="token comment">// 回调</span>
+	pSessionCallback<span class="token operator">*</span> callback_<span class="token punctuation">;</span>
+ 
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+ 
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">// __CLY_SESSION_H__</span></span>
+</code></pre> 
+<p><code>Session.cpp</code></p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/bind.hpp&gt;</span></span>
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"Session.h"</span></span>
+ 
+ 
+<span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">Session</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service<span class="token operator">&amp;</span> _ioService<span class="token punctuation">)</span>
+<span class="token operator">:</span><span class="token function">socket_</span><span class="token punctuation">(</span>_ioService<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token function">memset</span><span class="token punctuation">(</span>msg_<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>msg_<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+ 
+<span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token operator">~</span><span class="token function">Session</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+<span class="token punctuation">}</span>
+ 
+ 
+<span class="token keyword">void</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 告诉链接成功的客户端，你想要的信息。</span>
+	<span class="token keyword">char</span> msg<span class="token punctuation">[</span><span class="token number">256</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">"001:Connect Succeed! Please tell me with 10 bytes, the total data and the size of each package, example:128 1024"</span><span class="token punctuation">;</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">async_write</span><span class="token punctuation">(</span>socket_<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> <span class="token function">strlen</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Session<span class="token double-colon punctuation">::</span>init_handler<span class="token punctuation">,</span> <span class="token function">shared_from_this</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>socket<span class="token operator">&amp;</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">socket</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span> socket_<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+ 
+<span class="token comment">// 第一个协议包</span>
+<span class="token keyword">void</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">init_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 读取客户端发来的 10 bytes，确定单个包的大小以及数据总大小</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">async_read</span><span class="token punctuation">(</span>socket_<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg_<span class="token punctuation">,</span> <span class="token number">10</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Session<span class="token double-colon punctuation">::</span>analyse_handler<span class="token punctuation">,</span> <span class="token function">shared_from_this</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">void</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">analyse_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 分析协议包格式</span>
+	<span class="token keyword">bool</span> bflag <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+	<span class="token comment">// 正则分析格式</span>
+ 
+	<span class="token comment">// do something.</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bflag<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+	<span class="token comment">// 格式化保存协议包数据</span>
+	std<span class="token double-colon punctuation">::</span>stringstream <span class="token function">io</span><span class="token punctuation">(</span>msg_<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	io <span class="token operator">&gt;&gt;</span> maxSize_<span class="token punctuation">;</span>
+	io <span class="token operator">&gt;&gt;</span> sumSize_<span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 发送接收请求信息</span>
+	<span class="token keyword">char</span> msg<span class="token punctuation">[</span>REPLY_SIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>
+	<span class="token function">sprintf_s</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> <span class="token string">"001:is ok, data remaining %d."</span><span class="token punctuation">,</span> sumSize_<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">async_write</span><span class="token punctuation">(</span>socket_<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> REPLY_SIZE<span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Session<span class="token double-colon punctuation">::</span>write_handler<span class="token punctuation">,</span> <span class="token function">shared_from_this</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+ 
+<span class="token comment">// 完成数据传输</span>
+<span class="token keyword">void</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">done_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	currentMsg_ <span class="token operator">+=</span> msg_<span class="token punctuation">;</span>
+	<span class="token comment">// 发送信息到回调</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>currentMsg_<span class="token punctuation">.</span><span class="token function">empty</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> callback_ <span class="token operator">!=</span> <span class="token keyword">nullptr</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">callback_</span><span class="token punctuation">(</span>socket_<span class="token punctuation">.</span><span class="token function">remote_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">to_string</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> currentMsg_<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		currentMsg_<span class="token punctuation">.</span><span class="token function">clear</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token function">memset</span><span class="token punctuation">(</span>msg_<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>msg_<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token keyword">char</span> msg<span class="token punctuation">[</span><span class="token number">32</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">"001:will done."</span><span class="token punctuation">;</span>
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">async_write</span><span class="token punctuation">(</span>socket_<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> REPLY_SIZE<span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Session<span class="token double-colon punctuation">::</span>init_handler<span class="token punctuation">,</span> <span class="token function">shared_from_this</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">void</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">read_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">,</span> size_t _readSize<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 数据处理</span>
+	currentMsg_ <span class="token operator">+=</span> msg_<span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>currentMsg_<span class="token punctuation">.</span><span class="token function">size</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">1024</span> <span class="token operator">*</span> <span class="token number">512</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 发送信息到回调</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>callback_ <span class="token operator">!=</span> <span class="token keyword">nullptr</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token function">callback_</span><span class="token punctuation">(</span>socket_<span class="token punctuation">.</span><span class="token function">remote_endpoint</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">address</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">to_string</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> currentMsg_<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			currentMsg_<span class="token punctuation">.</span><span class="token function">clear</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+	<span class="token function">memset</span><span class="token punctuation">(</span>msg_<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>msg_<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 计算当前剩余数据数量</span>
+	sumSize_ <span class="token operator">-=</span> _readSize<span class="token punctuation">;</span>
+ 
+	<span class="token comment">// 接收完成</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token number">0</span> <span class="token operator">&gt;</span> sumSize_<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">done_handler</span><span class="token punctuation">(</span>_error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 继续接收</span>
+	<span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">char</span> msg<span class="token punctuation">[</span>REPLY_SIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>
+		<span class="token function">sprintf_s</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> <span class="token string">"001:%d."</span><span class="token punctuation">,</span> sumSize_<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">async_write</span><span class="token punctuation">(</span>socket_<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> REPLY_SIZE<span class="token punctuation">)</span><span class="token punctuation">,</span>
+			boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Session<span class="token double-colon punctuation">::</span>write_handler<span class="token punctuation">,</span> <span class="token function">shared_from_this</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+			boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"send client recv succeed: "</span> <span class="token operator">&lt;&lt;</span> msg <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+ 
+	
+<span class="token punctuation">}</span>
+<span class="token keyword">void</span> <span class="token class-name">Session</span><span class="token double-colon punctuation">::</span><span class="token function">write_handler</span><span class="token punctuation">(</span><span class="token keyword">const</span> boost<span class="token double-colon punctuation">::</span>system<span class="token double-colon punctuation">::</span>error_code<span class="token operator">&amp;</span> _error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+ 
+	boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">async_read</span><span class="token punctuation">(</span>socket_<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span><span class="token function">buffer</span><span class="token punctuation">(</span>msg_<span class="token punctuation">,</span> maxSize_<span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span><span class="token function">bind</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>Session<span class="token double-colon punctuation">::</span>read_handler<span class="token punctuation">,</span> <span class="token function">shared_from_this</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>error<span class="token punctuation">,</span> boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>placeholders<span class="token double-colon punctuation">::</span>bytes_transferred<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><code>main.cpp</code></p> 
+<pre><code class="prism language-cpp"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;iostream&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/asio.hpp&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;boost/bind.hpp&gt;</span></span>
+ 
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"Server.h"</span></span>
+ 
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server start."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+		<span class="token comment">// 建造服务对象</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>io_service ios<span class="token punctuation">;</span>
+		<span class="token comment">// 具体的服务器地址与端口</span>
+		boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span>endpoint <span class="token function">endpotion</span><span class="token punctuation">(</span>boost<span class="token double-colon punctuation">::</span>asio<span class="token double-colon punctuation">::</span>ip<span class="token double-colon punctuation">::</span>tcp<span class="token double-colon punctuation">::</span><span class="token function">v4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">13695</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 构建Server实例</span>
+		Server <span class="token function">server</span><span class="token punctuation">(</span>ios<span class="token punctuation">,</span> endpotion<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 启动异步调用事件处理循环</span>
+		server<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span>std<span class="token double-colon punctuation">::</span>exception<span class="token operator">&amp;</span> _e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> _e<span class="token punctuation">.</span><span class="token function">what</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"server end."</span> <span class="token operator">&lt;&lt;</span> std<span class="token double-colon punctuation">::</span>endl<span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h2><a id="_776"></a>总诉</h2> 
+<p>这是Asio运作方式的简单介绍。 如果你的需求更高级，比如扩展Asio来执行其他类型的异步操作，你会想要更深入地研究文档。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/f9d9e2c7a51890963a7a83a73cabc99e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">[R]_使用filter_all()，filter_at()，filter_if()筛选数据框的行</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b72e4aa7f16a5a74bc6ff91d4afd7042/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">敏捷软件开发原则、模式与实践</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

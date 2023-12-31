@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>数字IC设计入门（三）—— 同步FIFO - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="数字IC设计入门（三）—— 同步FIFO" />
+<meta property="og:description" content="FIFO介绍 FIFO即First In First out，顾名思义就是先进先出，他是用来存储数据的，先存入的数据会被先读出，数据读出的顺序和数据写入的顺序相同，所以一般用作数据缓冲。例如FIFO前级模块的数据处理速率为100Mbps，后级模块的处理速率为50Mbps，这时候显然不能直接将前级数据直连到后级模块，此时就可以利用FIFO将数据暂存起来，后级模块处理时便从中读出并且不影响数据写入，也不用担心后级模块处理数据过程中数据终端的情况，因为写入速率是快于读出的速率。
+而FIFO又分为同步FIFO和异步FIFO。同步FIFO指的是读写使用同一个人时钟，异步FIFO指的就是读写时钟不同。显然同步FIFO先对于异步FIFO实现起来更加简单一些，不需要考虑跨时钟域的亚稳态问题。
+同步FIFO设计思路 FIFO其实就是一个存储器，那么如何实现先进先出呢？首先我们需要明确读写是独立的， 而数据的存储一般需要进行寻址，因此我们可以将地址分为读地址和写地址，每次写入数据时写地址自增，读地址不变；每次读数据时读地址自增，写地址不变，以此来完成对读写数据当前顺序的确定。
+既然是存储器那必然有一个存储容量，达到存储容量后就不能写入数据了，都则会造成数据丢失。那如何确定何时达到了存储容量呢？假设FIFO的深度为100，那当写地址为99时（地址从0开始增加）就已经达到存储容量吗？显然不是，因为在这个过程中可能数据也会被读出，就好比泳池注水和排水的过程。如果写数据的过程中有数据读出，那么当写地址增加到99后，下一个写地址又会变为0（因为读数据顺序和写地址顺序一样，先从哪写的就先从哪出，既然数据被读出那一定是地址0的数据先被读出，然后是地址1的数据以此类推），之后又开始自增。那何时才是真的写满FIFO了呢，，可以将读写比作两个人围着操场跑步，两人从同一起点出发，他们之间差的距离就是目前已经存储的数据个数，每次跑完一圈回到起点的过程就是上面读写地址从99变为0，只有当前面的那个人快看到慢的那个人的背影，即将超过跑的慢的人时，这时候就已经比他快了一圈，而操场的一圈就代表FIFO的深度（存储容量），这时候就已经存满了。
+如何标志FIFO满的状态 根据上面的描述，当写地址要追上读地址的时候就是写满FIFO了，那可以用已经写的地址数量（注意不是写地址，而是已经写的数量，写地址只有0-99）减去已经读的地址数量就好了。这样比较简单，但是有一个问题，因为读写数据可能一直在进行，我们得给多大的位宽才行呢？这个问题是没有办法的，如果读写速率相同并且一直在进行，那么已经写的地址数量/读的地址数量的位宽是没有边界的。但是我们需要明确，写地址只会比读地址最多快一圈，因为FIFO写满后我们就不能让数据继续写入了。因此只需要对地址位宽扩展一位，就能够得到FIFO中现存数据的数量了。下面举个例子说明：
+比如读写地址数量从0-31，即FIFO的深度为32，那么读写地址的范围为5’b0-5’b11111(十进制为0-31)，那么对其进行扩展一位，地址就变为6’b0-6’b011111，当写地址写满一圈后继续增加时就变为6’b100000,而读地址还处在第一圈，假设其地址为6’b0xxxxx,其实扩展的这一位就代表目前读写地址处在哪一圈，当写地址继续增加到6’b111111时，再增加就变为6’b000000，假设读地址也读完了第一圈，那读地址为6’b1xxxxx，这时候最高位又不一样，就说明最高位代表了读写地址有没有在同一轮次（也就是跑步的两人是不是都在跑第x圈），因此这时候就可以通过扩展的这一位和写地址、读地址来得到FIFO中现存数据的个数。如果最高位不同，那写地址比读地址快一圈，原本的5位写地址&#43;FIFO深度减去原本的5位读地址，就是现存数据的数量，当现存数据等于FIFO深度时，就拉高写满信号，停止数据写入。（也可以直接利用扩展后的写地址减去读地址得到FIFO现存数据量，即使写地址小于读地址，差值是负数，但是用补码表示依然可以得到正确的数量如写地址为6’b0 00011,读地址为6’b1 00011，写地址减去读地址得到6’b100000,此时读写指针处于同一位置，也就是说写入的数量为FIFO的深度，此时FIFO写满了）
+代码实现 FIFO设计代码如下：
+module FIFO_sync #( parameter DEPTH = 32, parameter DEPTH_WIDTH = 5, parameter WIDTH = 32 ) ( input clk, input rst_n, input wr_en, input [WIDTH-1:0]wr_data, input rd_en, output reg [WIDTH-1:0]rd_data, output reg rd_data_valid, output full, output almost_full, output empty, output almost_empty, output [DEPTH_WIDTH:0]data_count ); wire [DEPTH_WIDTH-1:0] wr_addr; reg [DEPTH_WIDTH:0] wr_addr_bit; wire [DEPTH_WIDTH-1:0] rd_addr; reg [DEPTH_WIDTH:0] rd_addr_bit; reg [DEPTH-1:0]memory[WIDTH-1:0]; integer i; //写数据 //写地址 always @(posedge clk or negedge rst_n) begin if(~rst_n) begin wr_addr_bit &lt;= {(DEPTH_WIDTH&#43;1){1&#39;b0}}; end else if(wr_en) begin wr_addr_bit &lt;= wr_addr_bit&#43;1&#39;b1; end else begin wr_addr_bit &lt;= wr_addr_bit; end end assign wr_addr=wr_addr_bit[DEPTH_WIDTH-1:0]; //将数据写入存储单元 always @(posedge clk or negedge rst_n) begin if(!" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/7b323ef6f5fa366195c5412179280509/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-10-31T17:35:11+08:00" />
+<meta property="article:modified_time" content="2023-10-31T17:35:11+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">数字IC设计入门（三）—— 同步FIFO</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h5><a id="FIFO_0"></a><strong>FIFO介绍</strong></h5> 
+<p>FIFO即First In First out，顾名思义就是先进先出，他是用来存储数据的，先存入的数据会被先读出，数据读出的顺序和数据写入的顺序相同，所以一般用作数据缓冲。例如FIFO前级模块的数据处理速率为100Mbps，后级模块的处理速率为50Mbps，这时候显然不能直接将前级数据直连到后级模块，此时就可以利用FIFO将数据暂存起来，后级模块处理时便从中读出并且不影响数据写入，也不用担心后级模块处理数据过程中数据终端的情况，因为写入速率是快于读出的速率。</p> 
+<p>而FIFO又分为同步FIFO和异步FIFO。同步FIFO指的是读写使用同一个人时钟，异步FIFO指的就是读写时钟不同。显然同步FIFO先对于异步FIFO实现起来更加简单一些，不需要考虑跨时钟域的亚稳态问题。</p> 
+<h5><a id="FIFO_6"></a>同步FIFO设计思路</h5> 
+<p>FIFO其实就是一个存储器，那么如何实现先进先出呢？首先我们需要明确读写是独立的， 而数据的存储一般需要进行寻址，因此我们可以将地址分为读地址和写地址，每次写入数据时写地址自增，读地址不变；每次读数据时读地址自增，写地址不变，以此来完成对读写数据当前顺序的确定。</p> 
+<p>既然是存储器那必然有一个存储容量，达到存储容量后就不能写入数据了，都则会造成数据丢失。那如何确定何时达到了存储容量呢？假设FIFO的深度为100，那当写地址为99时（地址从0开始增加）就已经达到存储容量吗？显然不是，因为在这个过程中可能数据也会被读出，就好比泳池注水和排水的过程。如果写数据的过程中有数据读出，那么当写地址增加到99后，下一个写地址又会变为0（因为读数据顺序和写地址顺序一样，先从哪写的就先从哪出，既然数据被读出那一定是地址0的数据先被读出，然后是地址1的数据以此类推），之后又开始自增。那何时才是真的写满FIFO了呢，，可以将读写比作两个人围着操场跑步，两人从同一起点出发，他们之间差的距离就是目前已经存储的数据个数，每次跑完一圈回到起点的过程就是上面读写地址从99变为0，只有当前面的那个人快看到慢的那个人的背影，即将超过跑的慢的人时，这时候就已经比他快了一圈，而操场的一圈就代表FIFO的深度（存储容量），这时候就已经存满了。<br> <img src="https://images2.imgbox.com/c3/a5/aul4gEXr_o.png" alt="在这里插入图片描述"></p> 
+<h5><a id="FIFO_14"></a>如何标志FIFO满的状态</h5> 
+<p>根据上面的描述，当写地址要追上读地址的时候就是写满FIFO了，那可以用已经写的地址数量（注意不是写地址，而是已经写的数量，写地址只有0-99）减去已经读的地址数量就好了。这样比较简单，但是有一个问题，因为读写数据可能一直在进行，我们得给多大的位宽才行呢？这个问题是没有办法的，如果读写速率相同并且一直在进行，那么已经写的地址数量/读的地址数量的位宽是没有边界的。但是我们需要明确，写地址只会比读地址最多快一圈，因为FIFO写满后我们就不能让数据继续写入了。因此只需要对地址位宽<strong>扩展一位</strong>，就能够得到FIFO中现存数据的数量了。下面举个例子说明：</p> 
+<p>比如读写地址数量从0-31，即FIFO的深度为32，那么读写地址的范围为5’b0-5’b11111(十进制为0-31)，那么对其进行扩展一位，地址就变为6’b0-6’b011111，当写地址写满一圈后继续增加时就变为6’b100000,而读地址还处在第一圈，假设其地址为6’b0xxxxx,其实扩展的这一位就代表目前读写地址处在哪一圈，当写地址继续增加到6’b111111时，再增加就变为6’b000000，假设读地址也读完了第一圈，那读地址为6’b1xxxxx，这时候最高位又不一样，就说明最高位代表了读写地址有没有在同一轮次（也就是跑步的两人是不是都在跑第x圈），因此这时候就可以通过扩展的这一位和写地址、读地址来得到FIFO中现存数据的个数。如果最高位不同，那写地址比读地址快一圈，原本的5位写地址+FIFO深度减去原本的5位读地址，就是现存数据的数量，当现存数据等于FIFO深度时，就拉高写满信号，停止数据写入。（也可以直接利用扩展后的写地址减去读地址得到FIFO现存数据量，即使写地址小于读地址，差值是负数，但是用补码表示依然可以得到正确的数量如写地址为6’b0 00011,读地址为6’b1 00011，写地址减去读地址得到6’b100000,此时读写指针处于同一位置，也就是说写入的数量为FIFO的深度，此时FIFO写满了）</p> 
+<h5><a id="_20"></a><strong>代码实现</strong></h5> 
+<p>FIFO设计代码如下：</p> 
+<pre><code class="prism language-Verilog">module FIFO_sync
+    #(
+        parameter DEPTH = 32,
+        parameter DEPTH_WIDTH = 5,
+        parameter WIDTH = 32
+
+        )
+    (
+    input clk,
+    input rst_n,
+
+    input wr_en,
+    input [WIDTH-1:0]wr_data,
+
+    input rd_en,
+    output reg [WIDTH-1:0]rd_data,
+    output reg rd_data_valid,
+
+    output full,
+    output almost_full,
+    output empty,
+    output almost_empty,
+    output [DEPTH_WIDTH:0]data_count
+
+    );
+
+wire [DEPTH_WIDTH-1:0] wr_addr;
+reg  [DEPTH_WIDTH:0]   wr_addr_bit;
+
+wire [DEPTH_WIDTH-1:0] rd_addr;
+reg  [DEPTH_WIDTH:0]   rd_addr_bit;
+
+reg [DEPTH-1:0]memory[WIDTH-1:0];
+integer i;
+
+//写数据
+//写地址
+always @(posedge clk or negedge rst_n) 
+begin
+    if(~rst_n) 
+        begin
+            wr_addr_bit &lt;= {(DEPTH_WIDTH+1){1'b0}};
+        end 
+    else if(wr_en)
+        begin
+            wr_addr_bit &lt;= wr_addr_bit+1'b1;
+        end
+    else
+        begin
+            wr_addr_bit &lt;= wr_addr_bit;
+        end
+end
+
+assign wr_addr=wr_addr_bit[DEPTH_WIDTH-1:0];
+//将数据写入存储单元
+always @(posedge clk or negedge rst_n)
+begin 
+    if(!rst_n) 
+    begin
+        for(i=0;i&lt;DEPTH;i=i+1)
+            memory[i]&lt;= 0;
+    end 
+    else if(wr_en) 
+    begin
+        for(i=0;i&lt;DEPTH;i=i+1)
+        begin
+            if(i==wr_addr)
+                memory[i]&lt;= wr_data;
+            else
+                memory[i]&lt;=memory[i];
+         end
+    end
+    else
+        for(i=0;i&lt;DEPTH;i=i+1)
+            memory[i]&lt;= memory[i];
+end
+
+
+//读数据
+//读地址
+always @(posedge clk or negedge rst_n) 
+begin
+    if(~rst_n) 
+        begin
+            rd_addr_bit &lt;= {(DEPTH_WIDTH+1){1'b0}};
+        end 
+    else if(rd_en)
+        begin
+            rd_addr_bit &lt;= rd_addr_bit+1'b1;
+        end
+    else
+        begin
+            rd_addr_bit &lt;= rd_addr_bit;
+        end
+end
+
+assign rd_addr=rd_addr_bit[DEPTH_WIDTH-1:0];
+always @(posedge clk or negedge rst_n)
+begin 
+    if(!rst_n) 
+    begin
+        rd_data&lt;={WIDTH{1'b0}};
+        rd_data_valid&lt;=1'b0;
+    end 
+    else if(rd_en) 
+    begin
+        for(i=0;i&lt;DEPTH;i=i+1)
+        begin
+            if(i==rd_addr)
+                rd_data&lt;= memory[i];
+         end
+         rd_data_valid&lt;=1'b1;
+    end
+    else
+    begin
+         rd_data &lt;={WIDTH{1'b0}};
+         rd_data_valid&lt;=1'b0;
+     end
+end
+
+//FIFO中已存数据量
+assign data_count=wr_addr_bit-rd_addr_bit;
+//assign data_count=(wr_addr_bit[DEPTH_WIDTH]==rd_addr_bit[DEPTH_WIDTH])?(wr_addr_bit-rd_addr_bit):(wr_addr_bit+DEPTH-rd_addr_bit);
+//满标志/将满标志判断
+assign full= (data_count==DEPTH)|(data_count==DEPTH-1 &amp;&amp; wr_en &amp;&amp; (!rd_en));
+assign almost_full= (data_count==DEPTH-1)|(data_count==DEPTH-2 &amp;&amp; wr_en &amp;&amp; (!rd_en));
+//空标志/将空标志判断
+assign empty=(data_count==0)|(data_count==1 &amp;&amp; (!wr_en) &amp;&amp; rd_en);
+assign almost_empty=(data_count==1)|(data_count==2 &amp;&amp; (!wr_en) &amp;&amp; rd_en);
+
+
+endmodule
+</code></pre> 
+<p>仿真激励如下：</p> 
+<pre><code class="prism language-Verilog">module tb_fifo_sync();
+
+reg clk;
+reg rst_n;
+reg wr_en;
+reg [31:0] wr_data;
+
+reg rd_en;
+wire [31:0] rd_data;
+wire rd_data_valid;
+
+wire full;
+wire almost_full;
+wire empty;
+wire almost_empty;
+wire [5:0]data_count;
+
+integer seed = 100;
+
+
+always #5 clk=!clk;
+initial
+begin
+    clk=0;
+    rst_n=0;
+    wr_en=0;
+    wr_data=32'b0;
+    rd_en=0;
+    #100
+    rst_n=1;
+    #55
+    repeat(40)
+    @(posedge clk)
+    begin
+        if(!full)
+        begin
+            wr_en&lt;=1;
+            wr_data&lt;=$random(seed);
+        end
+        else  
+        begin
+            wr_en&lt;=0;
+            wr_data&lt;=0; 
+        end
+    end
+    #105
+    repeat(40)
+    @(posedge clk)
+    begin
+        if(!empty)
+        begin
+            rd_en&lt;=1;
+        end
+        else  
+        begin
+            rd_en&lt;=0;
+        end
+    end
+
+    #1000
+    $stop;
+
+end
+
+
+        FIFO_sync #(
+            .DEPTH(32),
+            .DEPTH_WIDTH(5),
+            .WIDTH(32)
+        ) inst_FIFO_sync (
+            .clk           (clk),
+            .rst_n         (rst_n),
+            .wr_en         (wr_en),
+            .wr_data       (wr_data),
+            .rd_en         (rd_en),
+            .rd_data       (rd_data),
+            .rd_data_valid (rd_data_valid),
+            .full          (full),
+            .almost_full   (almost_full),
+            .empty         (empty),
+            .almost_empty  (almost_empty),
+            .data_count    (data_count)
+        );
+
+endmodule
+</code></pre> 
+<h5><a id="_255"></a><strong>仿真结果</strong></h5> 
+<p><strong>1.数据写入仿真</strong><br> <img src="https://images2.imgbox.com/2d/28/7xbGLjSY_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/0a/02/b6Ui2Q6Z_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>2.数据读出仿真</strong><br> <img src="https://images2.imgbox.com/d2/a9/iYWrU8O7_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/f6/1a/K8IoTcr5_o.png" alt="在这里插入图片描述"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/f50aa48d0dee49e1ce24cf03f0918576/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Verilog实现呼吸流水灯</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b3e29e80cef79872d36865a28c96a2fe/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">数字IC设计入门（四）—— 异步FIFO</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

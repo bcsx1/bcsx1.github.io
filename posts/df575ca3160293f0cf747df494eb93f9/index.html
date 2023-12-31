@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>GhostNet(CVPR2020) - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="GhostNet(CVPR2020)" />
+<meta property="og:description" content="参考：https://www.wanglichun.tech/2020/03/08/ghostnet/
+论文链接：https://arxiv.org/abs/1911.11907
+作者解读：https://zhuanlan.zhihu.com/p/109325275
+开源代码：pytorch :https://github.com/iamhankai/ghostnet.pytorch/blob/master/ghost_net.py
+本篇论文是发表于CVPR2020的一篇轻量级网络的论文，作者是华为诺亚方舟实验室，文章的总体思路比较清晰，为了减少网络计算量，作者将传统的卷积分成两步进行，首先利用较少的计算量通过传统的卷积生成channel较小的特征图，然后在此特征图的基础上，通过cheap operation(depthwise conv)再进一步利用较少的计算量，生成新的特征图，最后将两组特征图拼接到一起，得到最终的output，最终实验效果还不错，相同计算量的情况下比MobileNet- V3的效果还要更好一些。
+虽然说mobileNet或者是shuffleNet提出了使用depthwise或者是shuffle等操作，但是引入的1x1卷积依然会产生一定的计算量
+为什么1x1依然会产生较大的计算量?看卷积计算量的计算公式n∗h∗w∗c∗k∗k,可以发现，由于c和n都是比较大的，所以会导致这个计算量也是比较大的，但是作者在分析输出的特征图的时候发现，其实有些特征图是比较相似的，如下所示，作者认为可以通过简单的变换得到。
+基于此，作者得到启发，是不是每张图都需要用这么大的计算量去得到？是否可以通过cheap transformation得到这些相似的特征图？
+于是乎，就诞生了GhostNet。Ghost就是说相似的特征图，犹如另一个的幽灵，可以通过简单的线性变换得到。
+1.Ghost模块
+对于某个特征层，只用卷积操作生成部分真实的特征层(真实特征层)，剩余的特征层(幻象特征层)通过对真实特征层进行线性操作获得，然后将真实特征层与幻象特征层拼接到一起组成完整的特征层。
+2. 复杂度分析
+假设我们输入特征图的尺寸是h*w*c,输出特征图的尺寸是h&#39;*w&#39;*n,卷积核大小为k*k
+在cheap operation变换中，我们假设特征图的channel是m，变换的数量是s，最终得到的新的特征图的数量是n,那么我们可以得到等式：
+n=m∗s
+由于Ghost的变换过程中最后存在一个恒等变换（Identity），所以实际有效的变换数量是s-1,所以上式可以得到如下公式：
+m∗(s−1)=n/s∗(s−1)
+所以我们便可以计算得到如下结果：
+Ghost模块具有两个超参数
+① s:用于生成 m=n/s 个内在特征图，
+② 以及用于计算幻影特征图的线性运算的 d*d（即深度卷积核的大小）。
+实验得s=2；d=3
+深度可分卷积vs幻象模块
+深度可分卷积用深度卷积处理每个特征通道上的空间信息，然后用点卷积进行通道间的特征融合。而幻象模块用正常卷积生成部分真实特征层，然后由真实特征层线性变换得到幻象特征层，最终由真实特征层和幻象特征层组成完整特征层
+3.GhostNet bottleneck
+下图是Ghost bottleneck结构图，很类似resnet结构，不同的是channel是先升维再降维。
+Ghost Bottleneck：利用Ghost模块的优势，作者介绍了专门为小型CNN设计的Ghost bottleneck（G-bneck）。如图3所示，Ghost bottleneck似乎类似于ResNet中的基本残差块（Basic Residual Block），其中集成了多个卷积层和shortcut。Ghost bottleneck主要由两个堆叠的Ghost模块组成。第一个Ghost模块用作扩展层，增加了通道数。这里将输出通道数与输入通道数之比称为expansion ratio。第二个Ghost模块减少通道数，以与shortcut路径匹配。然后，使用shortcut连接这两个Ghost模块的输入和输出。这里借鉴了MobileNetV2，第二个Ghost模块之后不使用ReLU，其他层在每层之后都应用了批量归一化（BN）和ReLU非线性激活。上述Ghost bottleneck适用于stride= 1，对于stride = 2的情况，shortcut路径由下采样层和stride = 2的深度卷积（Depthwise Convolution）来实现。出于效率考虑，Ghost模块中的初始卷积是点卷积（Pointwise Convolution）。
+Difference from existing methods
+在MobileNet等网络中，基本都会使用1x1的卷积，而在GhostNet中，可以使用任何尺寸的卷积。在MobileNet中，使用了pointwise&#43;depthwise,但是在GhostNet中，可以使用正常的卷积。Ghost使用了更多的线性变换。 4.GhostNet：
+GhostNet：基于Ghost bottleneck，作者提出GhostNet，如表1所属。作者遵循MobileNetV3的基本体系结构的优势，然后使用Ghost bottleneck替换MobileNetV3中的bottleneck。GhostNet主要由一堆Ghost bottleneck组成，其中Ghost bottleneck以Ghost模块为构建基础。第一层是具有16个卷积核的标准卷积层，然后是一系列Ghost bottleneck，通道逐渐增加。这些Ghost bottleneck根据其输入特征图的大小分为不同的阶段。除了每个阶段的最后一个Ghost bottleneck是stride = 2，其他所有Ghost bottleneck都以stride = 1进行应用。最后，利用全局平均池和卷积层将特征图转换为1280维特征向量以进行最终分类。SE模块也用在了某些Ghost bottleneck中的残留层，如表1中所示。与MobileNetV3相比，这里用ReLU换掉了Hard-swish激活函数。尽管进一步的超参数调整或基于自动架构搜索的Ghost模块将进一步提高性能，但表1所提供的架构提供了一个基本设计参考。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/df575ca3160293f0cf747df494eb93f9/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-04-12T21:15:07+08:00" />
+<meta property="article:modified_time" content="2022-04-12T21:15:07+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">GhostNet(CVPR2020)</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>参考：<a class="link-info" href="https://www.wanglichun.tech/2020/03/08/ghostnet/" rel="nofollow" title="https://www.wanglichun.tech/2020/03/08/ghostnet/">https://www.wanglichun.tech/2020/03/08/ghostnet/</a></p> 
+<p>论文链接：<a class="link-info" href="https://arxiv.org/abs/1911.11907" rel="nofollow" title="https://arxiv.org/abs/1911.11907">https://arxiv.org/abs/1911.11907</a></p> 
+<p>作者解读：<a class="link-info" href="https://zhuanlan.zhihu.com/p/109325275" rel="nofollow" title="https://zhuanlan.zhihu.com/p/109325275">https://zhuanlan.zhihu.com/p/109325275</a></p> 
+<p>开源代码：pytorch :<a class="link-info" href="https://github.com/iamhankai/ghostnet.pytorch/blob/master/ghost_net.py" title="https://github.com/iamhankai/ghostnet.pytorch/blob/master/ghost_net.py">https://github.com/iamhankai/ghostnet.pytorch/blob/master/ghost_net.py</a></p> 
+<hr> 
+<p>       本篇论文是发表于CVPR2020的一篇轻量级网络的论文，作者是华为诺亚方舟实验室，文章的总体思路比较清晰，为了减少网络计算量，作者将传统的卷积分成两步进行，首先利用较少的计算量通过传统的卷积生成channel较小的特征图，然后在此特征图的基础上，通过cheap operation(depthwise conv)再进一步利用较少的计算量，生成新的特征图，最后将两组特征图拼接到一起，得到最终的output，最终实验效果还不错，相同计算量的情况下比MobileNet- V3的效果还要更好一些。</p> 
+<hr> 
+<p>虽然说mobileNet或者是shuffleNet提出了使用depthwise或者是shuffle等操作，但是引入的1x1卷积依然会产生一定的计算量</p> 
+<p>为什么1x1依然会产生较大的计算量?看卷积计算量的计算公式n∗h∗w∗c∗k∗k,可以发现，由于c和n都是比较大的，所以会导致这个计算量也是比较大的，但是作者在分析输出的特征图的时候发现，其实有些特征图是比较相似的，如下所示，作者认为可以通过简单的变换得到。</p> 
+<p><img alt="" height="331" src="https://images2.imgbox.com/64/b8/nP1jqPKH_o.png" width="519"></p> 
+<p>基于此，作者得到启发，是不是每张图都需要用这么大的计算量去得到？是否可以通过cheap transformation得到这些相似的特征图？</p> 
+<p>于是乎，就诞生了GhostNet。Ghost就是说相似的特征图，犹如另一个的幽灵，可以通过简单的线性变换得到。</p> 
+<p><span style="color:#fe2c24;"><strong>1.Ghost模块</strong></span></p> 
+<p><img alt="" height="475" src="https://images2.imgbox.com/78/ed/SUhzCTcN_o.png" width="547"></p> 
+<p><strong>对于某个特征层，只用卷积操作生成部分真实的特征层(真实特征层)，剩余的特征层(幻象特征层)通过对真实特征层进行线性操作获得，然后将真实特征层与幻象特征层拼接到一起组成完整的特征层。</strong></p> 
+<p><span style="color:#fe2c24;"><strong>2.</strong> <strong>复杂度分析</strong></span></p> 
+<p>假设我们输入特征图的尺寸是<strong>h*w*c</strong>,输出特征图的尺寸是<strong>h'*w'*n</strong>,卷积核大小为<strong>k*k</strong></p> 
+<p>在cheap operation变换中，我们假设特征图的channel是m，变换的数量是s，最终得到的新的特征图的数量是n,那么我们可以得到等式：</p> 
+<p style="text-align:center;"><strong>n=m∗s</strong></p> 
+<p>由于Ghost的变换过程中最后存在一个恒等变换（Identity），所以实际有效的变换数量是s-1,所以上式可以得到如下公式：</p> 
+<p style="text-align:center;"><strong>m∗(s−1)=n/s∗(s−1)</strong></p> 
+<p>所以我们便可以计算得到如下结果：</p> 
+<p><img alt="" height="284" src="https://images2.imgbox.com/6f/35/iRSX7NXP_o.png" width="934"></p> 
+<p> Ghost模块具有两个超参数</p> 
+<p><strong>① s:</strong>用于生成 m=n/s 个内在特征图，</p> 
+<p>② 以及用于计算幻影特征图的线性运算的  d*d（即深度卷积核的大小）。</p> 
+<p> 实验得s=2；d=3<img alt="" height="508" src="https://images2.imgbox.com/56/a6/eiDJw8dS_o.png" width="858"></p> 
+<blockquote> 
+ <p> 深度可分卷积vs幻象模块<br> 深度可分卷积用深度卷积处理每个特征通道上的空间信息，然后用点卷积进行通道间的特征融合。而幻象模块用正常卷积生成部分真实特征层，然后由真实特征层线性变换得到幻象特征层，最终由真实特征层和幻象特征层组成完整特征层</p> 
+</blockquote> 
+<p><strong><span style="color:#fe2c24;">3.GhostNet</span> <span style="color:#fe2c24;">bottleneck</span></strong></p> 
+<p>下图是Ghost bottleneck结构图，很类似resnet结构，不同的是channel是先升维再降维。</p> 
+<p> <img alt="" height="380" src="https://images2.imgbox.com/05/7d/TOsMIB1O_o.png" width="535"></p> 
+<p><strong>Ghost Bottleneck：</strong>利用Ghost模块的优势，作者介绍了专门为小型CNN设计的Ghost bottleneck（G-bneck）。如图3所示，Ghost bottleneck似乎类似于ResNet中的基本残差块（Basic Residual Block），其中集成了多个卷积层和shortcut。Ghost bottleneck主要由两个堆叠的Ghost模块组成。第一个Ghost模块用作扩展层，增加了通道数。这里将输出通道数与输入通道数之比称为expansion ratio。第二个Ghost模块减少通道数，以与shortcut路径匹配。然后，使用shortcut连接这两个Ghost模块的输入和输出。这里借鉴了MobileNetV2，第二个Ghost模块之后不使用ReLU，其他层在每层之后都应用了批量归一化（BN）和ReLU非线性激活。上述Ghost bottleneck适用于stride= 1，对于stride = 2的情况，shortcut路径由下采样层和stride = 2的深度卷积（Depthwise Convolution）来实现。出于效率考虑，Ghost模块中的初始卷积是点卷积（Pointwise Convolution）。</p> 
+<blockquote> 
+ <p>Difference from existing methods</p> 
+ <ul><li>在MobileNet等网络中，基本都会使用1x1的卷积，而在GhostNet中，可以使用任何尺寸的卷积。</li><li>在MobileNet中，使用了pointwise+depthwise,但是在GhostNet中，可以使用正常的卷积。</li><li>Ghost使用了更多的线性变换。</li></ul> 
+</blockquote> 
+<p><strong><span style="color:#fe2c24;">4.GhostNet：</span></strong></p> 
+<p><strong>GhostNet</strong>：基于Ghost bottleneck，作者提出GhostNet，如表1所属。作者遵循MobileNetV3的基本体系结构的优势，然后使用Ghost bottleneck替换MobileNetV3中的bottleneck。GhostNet主要由一堆Ghost bottleneck组成，其中Ghost bottleneck以Ghost模块为构建基础。第一层是具有16个卷积核的标准卷积层，然后是一系列Ghost bottleneck，通道逐渐增加。这些Ghost bottleneck根据其输入特征图的大小分为不同的阶段。除了每个阶段的最后一个Ghost bottleneck是stride = 2，其他所有Ghost bottleneck都以stride = 1进行应用。最后，利用全局平均池和卷积层将特征图转换为1280维特征向量以进行最终分类。SE模块也用在了某些Ghost bottleneck中的残留层，如表1中所示。与MobileNetV3相比，这里用ReLU换掉了Hard-swish激活函数。尽管进一步的超参数调整或基于自动架构搜索的Ghost模块将进一步提高性能，但表1所提供的架构提供了一个基本设计参考。</p> 
+<p><img alt="" height="724" src="https://images2.imgbox.com/be/29/uuYfchwo_o.png" width="611"></p> 
+<p></p> 
+<p> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/86093fbebb434059aabc8d631a536f29/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">数组以及冒泡排序算法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f0784bbf52d5a4f7395fc827f77e831f/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">刘二大人《Pytorch深度学习》第七讲作业</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

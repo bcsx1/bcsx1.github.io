@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>JDK21最终版协程实现之虚拟线程 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="JDK21最终版协程实现之虚拟线程" />
+<meta property="og:description" content="1 全新并发编程模式 JDK9 后的版本你觉得没必要折腾，我也认可，但是JDK21有必要关注。因为 JDK21 引入全新的并发编程模式。
+一直沽名钓誉的GoLang吹得最厉害的就是协程了。JDK21 中就在这方面做了很大的改进，让Java并发编程变得更简单一点，更丝滑一点。
+之前写过JDK21 Feature。Virtual Threads、Scoped Values、Structured Concurrency就是针对多线程并发编程的几个功能。。
+2 发展历史 虚拟线程是轻量级线程，极大地减少了编写、维护和观察高吞吐量并发应用的工作量。
+虚拟线程是由JEP 425提出的预览功能，并在JDK 19中发布，JDK 21中最终确定虚拟线程，以下是根据开发者反馈从JDK 20中的变化：
+现在，虚拟线程始终支持线程本地变量。与在预览版本中允许的不同，现在不再可能创建不能具有线程本地变量的虚拟线程。对线程本地变量的有保障支持确保了许多现有库可以不经修改地与虚拟线程一起使用，并有助于将以任务为导向的代码迁移到使用虚拟线程直接使用Thread.Builder API创建的虚拟线程（而不是通过Executors.newVirtualThreadPerTaskExecutor()创建的虚拟线程）现在默认情况下也会在其生命周期内进行监控，并且可以通过描述在&#34;观察虚拟线程&#34;部分中的新线程转储来观察。 基于协程的线程，与其他语言中的协程有相似之处，也有不同。虚拟线程是依附于主线程的，如果主线程销毁了，虚拟线程也不复存在。
+3 目标 使采用简单的 thread-per-request 模式编写的服务器应用程序，能以接近最佳的硬件利用率扩展使利用java.lang.Thread API的现有代码能在最小更改下采用虚拟线程通过现有的JDK工具轻松进行虚拟线程的故障排除、调试和分析 4 非目标 不是删除传统的线程实现，也不是悄悄将现有应用程序迁移到使用虚拟线程不是改变Java的基本并发模型不是在Java语言或Java库中提供新的数据并行构造。Stream API仍是处理大型数据集的首选方式。 5 动机 Java开发人员在近30年来一直依赖线程作为并发服务端应用程序的构建块。每个方法中的每个语句都在一个线程内执行，并且由于Java是多线程，多个线程同时执行。
+线程是Java的并发单元：它是一段顺序代码，与其他这样的单元并发运行，很大程度上是独立的。每个线程提供一个堆栈来存储局部变量和协调方法调用及在出现问题时的上下文：异常由同一线程中的方法抛出和捕获，因此开发可使用线程的堆栈跟踪来查找发生了啥。
+线程也是工具的核心概念：调试器逐步执行线程方法中的语句，分析工具可视化多个线程的行为，以帮助理解它们的性能。
+6 thread-per-request模式 服务器应用程序通常处理彼此独立的并发用户请求，因此将一个线程专用于处理整个请求在逻辑上是合理的。这种模式易理解、易编程，且易调试和分析，因为它使用平台的并发单元来表示应用程序的并发单元。
+服务器应用程序的可扩展性受到Little定律约束，该定律关联延迟、并发性和吞吐量：对给定的请求处理持续时间（即延迟），应用程序同时处理的请求数量（并发性）必须与到达速率（吞吐量）成比例增长。如一个具有平均延迟为50ms的应用程序，通过同时处理10个请求实现每秒处理200个请求的吞吐量。为使该应用程序扩展到每秒处理2000个请求吞吐量，它要同时处理100个请求。如每个请求在其持续时间内都使用一个线程（因此使用一个os线程），那在其他资源（如CPU或网络连接）耗尽前，线程数量通常成为限制因素。JDK对线程的当前实现将应用程序的吞吐量限制在远低于硬件支持水平的水平。即使线程进行池化，仍然发生，因为池化可避免启动新线程的高成本，但并不会增加总线程数。
+7 使用异步模式提高可扩展性 一些开发人员为了充分利用硬件资源，已经放弃了采用&#34;thread-per-request&#34;的编程风格，转而采用&#34;共享线程&#34;。这种方式，请求处理的代码在等待I/O操作完成时会将其线程返回给一个线程池，以便该线程可以为其他请求提供服务。这种对线程的精细共享，即只有在执行计算时才保持线程，而在等待I/O时释放线程，允许高并发操作而不消耗大量线程资源。虽然它消除了由于os线程有限而导致的吞吐量限制，但代价高：它需要一种异步编程风格，使用一组专门的I/O方法，这些方法不会等待I/O操作完成，而是稍后通过回调通知其完成。
+在没有专用线程情况下，开发须将请求处理逻辑分解为小阶段，通常编写为lambda表达式，然后使用API（如CompletableFuture或响应式框架）将它们组合成顺序管道。因此，他们放弃语言的基本顺序组合运算符，如循环和try/catch块。
+异步风格中，请求的每个阶段可能在不同线程执行，每个线程交错方式运行属于不同请求的阶段。这对于理解程序行为产生了深刻的影响：堆栈跟踪提供不了可用的上下文，调试器无法逐步执行请求处理逻辑，分析器无法将操作的成本与其调用者关联起来。使用Java的流API在短管道中处理数据时，组合lambda表达式是可管理的，但当应用程序中的所有请求处理代码都必须以这种方式编写时，会带来问题。这种编程风格与Java平台不符，因为应用程序的并发单位——异步管道——不再是平台的并发单位。
+8 通过虚拟线程保持 thread-per-request 编程风格 为了在保持与平台和谐的情况下使应用程序能扩展，应努力通过更高效方式实现线程，以便它们可更丰富存在。os无法更高效实现操作系统线程，因为不同编程语言和运行时以不同方式使用线程堆栈。然而，JRE可通过将大量虚拟线程映射到少量操作系统线程来实现线程的伪装丰富性，就像os通过将大型虚拟地址空间映射到有限的物理内存一样，JRE可通过将大量虚拟线程映射到少量操作系统线程来实现线程的伪装丰富性。
+虚拟线程是java.lang.Thread一个实例，不与特定os线程绑定。相反，平台线程是java.lang.Thread的一个实例，以传统方式实现，作为包装在操作系统线程周围的薄包装。
+采用 thread-per-request 编程风格的应用程序，可在整个请求的持续时间内在虚拟线程中运行，但虚拟线程仅在它在CPU上执行计算时才会消耗os线程。结果与异步风格相同，只是它是透明实现：当在虚拟线程中运行的代码调用java.* API中的阻塞I/O操作时，运行时会执行非阻塞的os调用，并自动暂停虚拟线程，直到可稍后恢复。对Java开发，虚拟线程只是便宜且几乎无限丰富的线程。硬件利用率接近最佳，允许高并发，因此实现高吞吐量，同时应用程序与Java平台及其工具的多线程设计保持和谐一致。
+9 虚拟线程的含义 虚拟线程成本低且丰富，因此永远都不应被池化：每个应用程序任务应该创建一个新的虚拟线程。因此，大多数虚拟线程将是短暂的，且具有浅层次的调用栈，执行的操作可能只有一个HTTP客户端调用或一个JDBC查询。相比之下，平台线程是重量级且代价昂贵，因此通常必须池化。它们倾向于具有较长的生命周期，具有深层次调用栈，并在许多任务间共享。
+总之，虚拟线程保留了与Java平台设计和谐一致的可靠的 thread-per-request 编程风格，同时最大限度地利用硬件资源。使用虚拟线程无需学习新概念，尽管可能需要放弃为应对当前线程成本高昂而养成的习惯。虚拟线程不仅将帮助应用程序开发人员，还将帮助框架设计人员提供与平台设计兼容且不会牺牲可伸缩性的易于使用的API。
+10 描述 如今，JDK 中的每个 java.lang.Thread 实例都是平台线程。平台线程在底层os线程上运行 Java 代码，并在代码的整个生命周期内捕获os线程。平台线程的数量受限于os线程的数量。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8530c7c1214b6aae14f343b1b3fb24c9/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-09-25T10:41:37+08:00" />
+<meta property="article:modified_time" content="2023-09-25T10:41:37+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">JDK21最终版协程实现之虚拟线程</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-tomorrow-night">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h3><a id="1__2"></a>1 全新并发编程模式</h3> 
+<p>JDK9 后的版本你觉得没必要折腾，我也认可，但是JDK21有必要关注。因为 JDK21 引入全新的并发编程模式。</p> 
+<p>一直沽名钓誉的GoLang吹得最厉害的就是协程了。JDK21 中就在这方面做了很大的改进，让Java并发编程变得更简单一点，更丝滑一点。</p> 
+<p>之前写过<a href="https://javaedge.blog.csdn.net/article/details/132427641" rel="nofollow">JDK21 Feature</a>。<code>Virtual Threads</code>、<code>Scoped Values</code>、<code>Structured Concurrency</code>就是针对多线程并发编程的几个功能。。</p> 
+<h3><a id="2__10"></a>2 发展历史</h3> 
+<p>虚拟线程是轻量级线程，极大地减少了编写、维护和观察高吞吐量并发应用的工作量。</p> 
+<p>虚拟线程是由JEP 425提出的预览功能，并在JDK 19中发布，JDK 21中最终确定虚拟线程，以下是根据开发者反馈从JDK 20中的变化：</p> 
+<ul><li>现在，虚拟线程始终支持线程本地变量。与在预览版本中允许的不同，现在不再可能创建不能具有线程本地变量的虚拟线程。对线程本地变量的有保障支持确保了许多现有库可以不经修改地与虚拟线程一起使用，并有助于将以任务为导向的代码迁移到使用虚拟线程</li><li>直接使用Thread.Builder API创建的虚拟线程（而不是通过Executors.newVirtualThreadPerTaskExecutor()创建的虚拟线程）现在默认情况下也会在其生命周期内进行监控，并且可以通过描述在"观察虚拟线程"部分中的新线程转储来观察。</li></ul> 
+<p><img src="https://images2.imgbox.com/ce/80/NU4yb5nk_o.png" alt=""></p> 
+<p>基于协程的线程，与其他语言中的协程有相似之处，也有不同。虚拟线程是依附于主线程的，如果主线程销毁了，虚拟线程也不复存在。</p> 
+<h3><a id="3__23"></a>3 目标</h3> 
+<ul><li>使采用简单的 thread-per-request 模式编写的服务器应用程序，能以接近最佳的硬件利用率扩展</li><li>使利用java.lang.Thread API的现有代码能在最小更改下采用虚拟线程</li><li>通过现有的JDK工具轻松进行虚拟线程的故障排除、调试和分析</li></ul> 
+<h3><a id="4__29"></a>4 非目标</h3> 
+<ul><li>不是删除传统的线程实现，也不是悄悄将现有应用程序迁移到使用虚拟线程</li><li>不是改变Java的基本并发模型</li><li>不是在Java语言或Java库中提供新的数据并行构造。Stream API仍是处理大型数据集的首选方式。</li></ul> 
+<h3><a id="5__35"></a>5 动机</h3> 
+<p>Java开发人员在近30年来一直依赖线程作为并发服务端应用程序的构建块。每个方法中的每个语句都在一个线程内执行，并且由于Java是多线程，多个线程同时执行。</p> 
+<p>线程是Java的并发单元：它是一段顺序代码，与其他这样的单元并发运行，很大程度上是独立的。每个线程提供一个堆栈来存储局部变量和协调方法调用及在出现问题时的上下文：异常由同一线程中的方法抛出和捕获，因此开发可使用线程的堆栈跟踪来查找发生了啥。</p> 
+<p>线程也是工具的核心概念：调试器逐步执行线程方法中的语句，分析工具可视化多个线程的行为，以帮助理解它们的性能。</p> 
+<h3><a id="6_threadperrequest_43"></a>6 thread-per-request模式</h3> 
+<p>服务器应用程序通常处理彼此独立的并发用户请求，因此将一个线程专用于处理整个请求在逻辑上是合理的。这种模式易理解、易编程，且易调试和分析，因为它使用平台的并发单元来表示应用程序的并发单元。</p> 
+<p>服务器应用程序的可扩展性受到Little定律约束，该定律关联延迟、并发性和吞吐量：对给定的请求处理持续时间（即延迟），应用程序同时处理的请求数量（并发性）必须与到达速率（吞吐量）成比例增长。如一个具有平均延迟为50ms的应用程序，通过同时处理10个请求实现每秒处理200个请求的吞吐量。为使该应用程序扩展到每秒处理2000个请求吞吐量，它要同时处理100个请求。如每个请求在其持续时间内都使用一个线程（因此使用一个os线程），那在其他资源（如CPU或网络连接）耗尽前，线程数量通常成为限制因素。JDK对线程的当前实现将应用程序的吞吐量限制在远低于硬件支持水平的水平。即使线程进行池化，仍然发生，因为池化可避免启动新线程的高成本，但并不会增加总线程数。</p> 
+<h3><a id="7__49"></a>7 使用异步模式提高可扩展性</h3> 
+<p>一些开发人员为了充分利用硬件资源，已经放弃了采用"thread-per-request"的编程风格，转而采用"共享线程"。这种方式，请求处理的代码在等待I/O操作完成时会将其线程返回给一个线程池，以便该线程可以为其他请求提供服务。这种对线程的精细共享，即只有在执行计算时才保持线程，而在等待I/O时释放线程，允许高并发操作而不消耗大量线程资源。虽然它消除了由于os线程有限而导致的吞吐量限制，但代价高：它需要一种异步编程风格，使用一组专门的I/O方法，这些方法不会等待I/O操作完成，而是稍后通过回调通知其完成。</p> 
+<p>在没有专用线程情况下，开发须将请求处理逻辑分解为小阶段，通常编写为lambda表达式，然后使用API（如CompletableFuture或响应式框架）将它们组合成顺序管道。因此，他们放弃语言的基本顺序组合运算符，如循环和try/catch块。</p> 
+<p>异步风格中，请求的每个阶段可能在不同线程执行，每个线程交错方式运行属于不同请求的阶段。这对于理解程序行为产生了深刻的影响：堆栈跟踪提供不了可用的上下文，调试器无法逐步执行请求处理逻辑，分析器无法将操作的成本与其调用者关联起来。使用Java的流API在短管道中处理数据时，组合lambda表达式是可管理的，但当应用程序中的所有请求处理代码都必须以这种方式编写时，会带来问题。这种编程风格与Java平台不符，因为应用程序的并发单位——异步管道——不再是平台的并发单位。</p> 
+<h3><a id="8__threadperrequest__57"></a>8 通过虚拟线程保持 thread-per-request 编程风格</h3> 
+<p>为了在保持与平台和谐的情况下使应用程序能扩展，应努力通过更高效方式实现线程，以便它们可更丰富存在。os无法更高效实现操作系统线程，因为不同编程语言和运行时以不同方式使用线程堆栈。然而，JRE可通过将大量虚拟线程映射到少量操作系统线程来实现线程的伪装丰富性，就像os通过将大型虚拟地址空间映射到有限的物理内存一样，JRE可通过将大量虚拟线程映射到少量操作系统线程来实现线程的伪装丰富性。</p> 
+<p>虚拟线程是java.lang.Thread一个实例，不与特定os线程绑定。相反，平台线程是java.lang.Thread的一个实例，以传统方式实现，作为包装在操作系统线程周围的薄包装。</p> 
+<p>采用 thread-per-request 编程风格的应用程序，可在整个请求的持续时间内在虚拟线程中运行，但虚拟线程仅在它在CPU上执行计算时才会消耗os线程。结果与异步风格相同，只是它是透明实现：当在虚拟线程中运行的代码调用java.* API中的阻塞I/O操作时，运行时会执行非阻塞的os调用，并自动暂停虚拟线程，直到可稍后恢复。对Java开发，虚拟线程只是便宜且几乎无限丰富的线程。硬件利用率接近最佳，允许高并发，因此实现高吞吐量，同时应用程序与Java平台及其工具的多线程设计保持和谐一致。</p> 
+<h3><a id="9__65"></a>9 虚拟线程的含义</h3> 
+<p>虚拟线程成本低且丰富，因此永远都不应被池化：每个应用程序任务应该创建一个新的虚拟线程。因此，大多数虚拟线程将是短暂的，且具有浅层次的调用栈，执行的操作可能只有一个HTTP客户端调用或一个JDBC查询。相比之下，平台线程是重量级且代价昂贵，因此通常必须池化。它们倾向于具有较长的生命周期，具有深层次调用栈，并在许多任务间共享。</p> 
+<p>总之，虚拟线程保留了与Java平台设计和谐一致的可靠的 thread-per-request 编程风格，同时最大限度地利用硬件资源。使用虚拟线程无需学习新概念，尽管可能需要放弃为应对当前线程成本高昂而养成的习惯。虚拟线程不仅将帮助应用程序开发人员，还将帮助框架设计人员提供与平台设计兼容且不会牺牲可伸缩性的易于使用的API。</p> 
+<h3><a id="10__71"></a>10 描述</h3> 
+<p>如今，JDK 中的每个 java.lang.Thread 实例都是平台线程。平台线程在底层os线程上运行 Java 代码，并在代码的整个生命周期内捕获os线程。平台线程的数量受限于os线程的数量。</p> 
+<p>虚拟线程是 java.lang.Thread 的一个实例，它在底层os线程上运行 Java 代码，但并不在代码的整个生命周期内捕获操作系统线程。这意味着许多虚拟线程可在同一个os线程上运行其 Java 代码，有效地共享它。而平台线程会独占一个宝贵的os线程，虚拟线程则不会。虚拟线程的数量可 &gt;&gt; os线程的数量。</p> 
+<p>虚拟线程是 JDK 提供的轻量级线程实现，不是由os提供。它们是用户态线程的一种形式，在其他多线程语言（如 Go 的 goroutine 和 Erlang 的进程）中取得成功。</p> 
+<p>早期版本 Java，当os线程尚未成熟和广泛使用时，Java 的绿色线程都共享一个os线程（M:1 调度），最终被作为os线程的包装器（1:1 调度）超越。虚拟线程采用 M:N 调度，其中大量（M）虚拟线程被调度在较少（N）的os线程上运行。</p> 
+<h3><a id="11__81"></a>11 使用虚拟线程与平台线程</h3> 
+<p>开发人员可选择使用虚拟线程或平台线程。</p> 
+<h4><a id="111_demo_85"></a>11.1 创建大量虚拟线程demo</h4> 
+<p>先获取一个 ExecutorService，用于为每个提交的任务创建一个新的虚拟线程。然后，它提交 10,000 个任务并等待它们全部完成：</p> 
+<pre><code class="prism language-java"><span class="token keyword">try</span> <span class="token punctuation">(</span><span class="token keyword">var</span> executor <span class="token operator">=</span> <span class="token class-name">Executors</span><span class="token punctuation">.</span><span class="token function">newVirtualThreadPerTaskExecutor</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token class-name">IntStream</span><span class="token punctuation">.</span><span class="token function">range</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">10_000</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">forEach</span><span class="token punctuation">(</span>i <span class="token operator">-&gt;</span> <span class="token punctuation">{<!-- --></span>
+        executor<span class="token punctuation">.</span><span class="token function">submit</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-&gt;</span> <span class="token punctuation">{<!-- --></span>
+          	<span class="token comment">// 任务即休眠1s</span>
+            <span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">sleep</span><span class="token punctuation">(</span><span class="token class-name">Duration</span><span class="token punctuation">.</span><span class="token function">ofSeconds</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> i<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>  <span class="token comment">// executor.close() is called implicitly, and waits</span>
+</code></pre> 
+<p>现代硬件可轻松支持同时运行 10,000 个虚拟线程来执行这样代码。幕后，JDK 在较少的os线程上运行代码，可能只有一个：</p> 
+<ul><li>若此程序使用一个为每个任务创建一个新的平台线程的 ExecutorService，如 <code>Executors.newCachedThreadPool()</code>，情况将完全不同。ExecutorService 将尝试创建 10,000 个平台线程，因此会创建 10,000 个操作系统线程，根据计算机和os的不同，程序可能会崩溃</li><li>若程序改用从池中获取平台线程的 ExecutorService，如 <code>Executors.newFixedThreadPool(200)</code>，情况也不好多少。ExecutorService 将创建 200 个平台线程供所有 10,000 个任务共享，因此许多任务将顺序而非并发运行，程序将要很久才能完成</li></ul> 
+<p>该程序，具有 200 个平台线程的池只能实现每秒 200 个任务的吞吐量，而虚拟线程在足够热身后，可实现每秒约 10,000 个任务的吞吐量。</p> 
+<p>若将demo中的 <code>10_000</code> 更改为 <code>1_000_000</code>，则程序将提交 1,000,000 个任务，创建 1,000,000 个同时运行的虚拟线程，并在足够热身后实现每秒约 1,000,000 个任务的吞吐量。</p> 
+<p>若此程序任务执行一个需要1s计算（如对大型数组排序），而不仅是休眠，那增加线程数量超过CPU核数量将无法提高吞吐量，无论是虚拟线程、平台线程。虚拟线程不是更快的线程 —— 它们不会比平台线程运行代码更快。它们存在目的是提供规模（更高吞吐量），而非速度（更低的延迟）。虚拟线程的数量可以远远多于平台线程的数量，因此它们可以实现更高的并发，从而实现更高的吞吐量，根据 Little 定律。</p> 
+<p>换句话说，虚拟线程可在以下情况显著提高应用吞吐量：</p> 
+<ol><li>并发任务的数量很高（超过几千）</li><li>工作负载不是 CPU 限制的，因为此时，比CPU核数量更多的线程无法提高吞吐量</li></ol> 
+<p>虚拟线程有助提高典型服务器应用程序的吞吐量，因为这种应用程序由大量并发任务组成，这些任务在大部分时间内都在等待。</p> 
+<p>虚拟线程可运行任何平台线程可运行的代码。特别是，虚拟线程支持线程本地变量和线程中断，就像平台线程一样。这意味着已存在的用于处理请求的 Java 代码可轻松在虚拟线程中运行。许多服务端框架可能会自动选择这样做，为每个传入的请求启动一个新的虚拟线程，并在其中运行应用程序的业务逻辑。</p> 
+<h4><a id="112_demo_121"></a>11.2 聚合服务demo</h4> 
+<p>聚合了另外两个服务的结果。一个假设的服务器框架（未显示）为每个请求创建一个新的虚拟线程，并在该虚拟线程中运行应用程序的处理代码。</p> 
+<p>又创建两个新虚拟线程并发通过与第一个示例相同的 ExecutorService 获取资源：</p> 
+<pre><code class="prism language-java"><span class="token keyword">void</span> <span class="token function">handle</span><span class="token punctuation">(</span><span class="token class-name">Request</span> request<span class="token punctuation">,</span> <span class="token class-name">Response</span> response<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">var</span> url1 <span class="token operator">=</span> <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+    <span class="token keyword">var</span> url2 <span class="token operator">=</span> <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+ 
+    <span class="token keyword">try</span> <span class="token punctuation">(</span><span class="token keyword">var</span> executor <span class="token operator">=</span> <span class="token class-name">Executors</span><span class="token punctuation">.</span><span class="token function">newVirtualThreadPerTaskExecutor</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">var</span> future1 <span class="token operator">=</span> executor<span class="token punctuation">.</span><span class="token function">submit</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-&gt;</span> <span class="token function">fetchURL</span><span class="token punctuation">(</span>url1<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">var</span> future2 <span class="token operator">=</span> executor<span class="token punctuation">.</span><span class="token function">submit</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-&gt;</span> <span class="token function">fetchURL</span><span class="token punctuation">(</span>url2<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        response<span class="token punctuation">.</span><span class="token function">send</span><span class="token punctuation">(</span>future1<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">+</span> future2<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">ExecutionException</span> <span class="token operator">|</span> <span class="token class-name">InterruptedException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        response<span class="token punctuation">.</span><span class="token function">fail</span><span class="token punctuation">(</span>e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token class-name">String</span> <span class="token function">fetchURL</span><span class="token punctuation">(</span><span class="token class-name">URL</span> url<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">IOException</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">try</span> <span class="token punctuation">(</span><span class="token keyword">var</span> in <span class="token operator">=</span> url<span class="token punctuation">.</span><span class="token function">openStream</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> <span class="token keyword">new</span> <span class="token class-name">String</span><span class="token punctuation">(</span>in<span class="token punctuation">.</span><span class="token function">readAllBytes</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token class-name">StandardCharsets</span><span class="token punctuation">.</span><span class="token constant">UTF_8</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>这程序具有直接的阻塞代码，因为它可以使用大量虚拟线程，所以能很好扩展。</p> 
+<p><code>Executor.newVirtualThreadPerTaskExecutor()</code> 不是创建虚拟线程的唯一方式。下面讨论新的 <code>java.lang.Thread.Builder</code> API 可创建和启动虚拟线程。</p> 
+<p>结构化并发提供更强大 API，用于创建和管理虚拟线程，特别是在类似这服务器示例的代码，其中线程之间的关系对于平台和其工具是已知的。</p> 
+<h3><a id="12__154"></a>12 解除默认禁用限制</h3> 
+<p>虚拟线程是一项预览 API，默认禁用。上面程序使用 <code>Executors.newVirtualThreadPerTaskExecutor()</code> 方法，所以要在 JDK 19 上运行它们，须启用预览 API：</p> 
+<ul><li>使用 <code>javac --release 19 --enable-preview Main.java</code> 编译程序，然后使用 <code>java --enable-preview Main</code> 运行它；</li><li>当使用源代码启动器时，使用 <code>java --source 19 --enable-preview Main.java</code> 运行程序</li><li>当使用 jshell 时，启动它时加上 <code>jshell --enable-preview</code></li></ul> 
+<h3><a id="13__162"></a>13 不要池化虚拟线程</h3> 
+<p>开发通常会将应用程序代码从基于线程池的传统 ExecutorService 迁移到基于虚拟线程的virtual-thread-per-task的 ExecutorService。线程池就像所有资源池一样，旨在共享昂贵资源，但虚拟线程并不昂贵，永远不要对它们池化。</p> 
+<p>开发人员有时使用线程池限制对有限资源的并发访问。如一个服务不能处理超过 20 个并发请求，通过提交到大小为 20 的线程池的任务来执行对该服务的所有访问将确保这点。由于平台线程高成本已使线程池无处不在，这种习惯也无处不在，但开发不应诱惑自己在虚拟线程中进行池化以限制并发。应该使用专门设计用于此目的的构造，如信号量来保护对有限资源的访问。这比线程池更有效方便，也安全，因为不存在线程本地的数据意外泄漏给另一个任务的风险。</p> 
+<h3><a id="13__168"></a>13 观察虚拟线程</h3> 
+<p>编写清晰的代码还不够，运行中程序状态的清晰呈现对故障排除、维护和优化也重要，而 JDK 一直提供调试、分析和监视线程的机制。这些工具应对虚拟线程执行相同操作，尽管可能需要适应它们的大量存在，因为它们毕竟是 java.lang.Thread 的实例。</p> 
+<h4><a id="131_Java__172"></a>13.1 Java 调试器</h4> 
+<p>可逐步执行虚拟线程，显示调用栈，并检查栈帧变量。JDK Flight Recorder（JFR）是 JDK 的低开销分析和监视机制，可将来自应用程序代码（如对象分配和 I/O 操作）的事件与正确的虚拟线程关联起来。这些工具无法为采用异步编程风格编写的应用程序执行这些操作。在该风格中，任务与线程无关，因此调试器无法显示或操作任务的状态，分析器无法判断任务等待 I/O 所花费的时间。</p> 
+<h4><a id="132_dump_176"></a>13.2 线程dump</h4> 
+<p>故障排除线程-每请求编程风格应用程序的常用工具。但 JDK 的传统线程转储（使用 jstack 或 jcmd 获取）呈现为线程的扁平列表。适用于几十或数百平台线程，但不适用于数千或数百万虚拟线程。因此，官方不会扩展传统线程转储以包括虚拟线程，而是会引入一种新的线程转储类型，在 jcmd 中以有意义的方式将虚拟线程与平台线程一起显示。当程序使用结构化并发时，可显示线程之间更丰富的关系。</p> 
+<p>由于可视化和分析大量线程可受益于工具支持，jcmd 还可以 JSON 格式输出新的线程转储，而不仅是纯文本：</p> 
+<pre><code class="prism language-shell">$ jcmd <span class="token operator">&lt;</span>pid<span class="token operator">&gt;</span> Thread.dump_to_file <span class="token parameter variable">-format</span><span class="token operator">=</span>json <span class="token operator">&lt;</span>file<span class="token operator">&gt;</span>
+</code></pre> 
+<p>新的线程转储格式列出了在网络 I/O 操作中被阻塞的虚拟线程以及由上面示例中的 new-thread-per-task ExecutorService 创建的虚拟线程。它不包括对象地址、锁、JNI 统计信息、堆统计信息和传统线程转储中显示的其他信息。此外，由于可能需要列出大量线程，生成新的线程转储不会暂停应用程序。</p> 
+<p>类似第二个demo程序的线程转储示例，以 JSON 呈现：</p> 
+<p><img src="https://images2.imgbox.com/9b/b7/r6kYeFv3_o.png" alt="外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传"></p> 
+<pre><code class="prism language-json"><span class="token punctuation">{<!-- --></span>
+  <span class="token string-property property">"virtual_threads"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+    <span class="token punctuation">{<!-- --></span>
+      <span class="token string-property property">"id"</span><span class="token operator">:</span> <span class="token number">1</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"name"</span><span class="token operator">:</span> <span class="token string">"VirtualThread-1"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"state"</span><span class="token operator">:</span> <span class="token string">"RUNNABLE"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"stack_trace"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+        <span class="token punctuation">{<!-- --></span>
+          <span class="token string-property property">"class"</span><span class="token operator">:</span> <span class="token string">"java.base/java.lang.Thread"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"method"</span><span class="token operator">:</span> <span class="token string">"lambda$main$0"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"file"</span><span class="token operator">:</span> <span class="token string">"Main.java"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"line"</span><span class="token operator">:</span> <span class="token number">10</span>
+        <span class="token punctuation">}</span>
+      <span class="token punctuation">]</span>
+    <span class="token punctuation">}</span><span class="token punctuation">,</span>
+    <span class="token punctuation">{<!-- --></span>
+      <span class="token string-property property">"id"</span><span class="token operator">:</span> <span class="token number">2</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"name"</span><span class="token operator">:</span> <span class="token string">"VirtualThread-2"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"state"</span><span class="token operator">:</span> <span class="token string">"BLOCKED"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"stack_trace"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+        <span class="token punctuation">{<!-- --></span>
+          <span class="token string-property property">"class"</span><span class="token operator">:</span> <span class="token string">"java.base/java.net.SocketInputStream"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"method"</span><span class="token operator">:</span> <span class="token string">"socketRead0"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"file"</span><span class="token operator">:</span> <span class="token string">"SocketInputStream.java"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"line"</span><span class="token operator">:</span> <span class="token number">61</span>
+        <span class="token punctuation">}</span>
+      <span class="token punctuation">]</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">]</span><span class="token punctuation">,</span>
+  <span class="token string-property property">"platform_threads"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+    <span class="token punctuation">{<!-- --></span>
+      <span class="token string-property property">"id"</span><span class="token operator">:</span> <span class="token number">11</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"name"</span><span class="token operator">:</span> <span class="token string">"Thread-11"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"state"</span><span class="token operator">:</span> <span class="token string">"RUNNABLE"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"stack_trace"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+        <span class="token punctuation">{<!-- --></span>
+          <span class="token string-property property">"class"</span><span class="token operator">:</span> <span class="token string">"java.base/java.lang.Thread"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"method"</span><span class="token operator">:</span> <span class="token string">"run"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"file"</span><span class="token operator">:</span> <span class="token string">"Thread.java"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"line"</span><span class="token operator">:</span> <span class="token number">834</span>
+        <span class="token punctuation">}</span>
+      <span class="token punctuation">]</span>
+    <span class="token punctuation">}</span><span class="token punctuation">,</span>
+    <span class="token punctuation">{<!-- --></span>
+      <span class="token string-property property">"id"</span><span class="token operator">:</span> <span class="token number">12</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"name"</span><span class="token operator">:</span> <span class="token string">"Thread-12"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"state"</span><span class="token operator">:</span> <span class="token string">"WAITING"</span><span class="token punctuation">,</span>
+      <span class="token string-property property">"stack_trace"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+        <span class="token punctuation">{<!-- --></span>
+          <span class="token string-property property">"class"</span><span class="token operator">:</span> <span class="token string">"java.base/java.lang.Object"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"method"</span><span class="token operator">:</span> <span class="token string">"wait"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"file"</span><span class="token operator">:</span> <span class="token string">"Object.java"</span><span class="token punctuation">,</span>
+          <span class="token string-property property">"line"</span><span class="token operator">:</span> <span class="token number">328</span>
+        <span class="token punctuation">}</span>
+      <span class="token punctuation">]</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">]</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>由于虚拟线程是在 JDK 实现的，不与任何特定 OS 线程绑定，因此它们对os不可见的，os 也不知道它们、存在。操作系统级别的监控将观察到 JDK 进程使用的 OS 线程少于虚拟线程的数量。</p> 
+<h3><a id="14__255"></a>14 虚拟线程调度</h3> 
+<p>要执行有用的工作，线程需要被调度，即分配给一个处理器核心来执行。对于作为 OS 线程实现的平台线程，JDK 依赖os中的调度程序。对虚拟线程，JDK 有自己调度程序。JDK 调度程序不是直接将虚拟线程分配给处理器，而是将虚拟线程分配给平台线程（虚拟线程 M:N 调度）。然后，os会像往常一样对这些平台线程调度。</p> 
+<p>JDK 虚拟线程调度程序是以 FIFO 运行的 work-stealing ForkJoinPool。调度程序的并行度是用于调度虚拟线程的可用平台线程数量。默认为可用处理器数量，但可使用系统属性 <code>jdk.virtualThreadScheduler.parallelism</code> 调整。这 ForkJoinPool 与通常用于并行流实现等的公共池不同，后者 LIFO 运行。</p> 
+<p>调度程序分配虚拟线程给平台线程就是虚拟线程的载体。虚拟线程可在其生命周期内被分配给不同载体，即调度程序不会在虚拟线程和任何特定的平台线程之间保持关联。从 Java 代码角度看，正在运行的虚拟线程逻辑上与其当前载体无关：</p> 
+<ul><li>虚拟线程无法获取载体标识。<code>Thread.currentThread()</code> 返回值始终是虚拟线程本身</li><li>载体和虚拟线程的栈轨迹是分开的。在虚拟线程中抛出的异常不会包含载体栈帧。线程转储不会在虚拟线程的栈中显示载体的栈帧，反之亦然</li><li>载体的线程本地变量对虚拟线程不可见，反之亦然</li></ul> 
+<p>Java代码角度，虚拟线程及其载体暂时共享一个 OS 线程的事实是不可见的。本地代码角度，与虚拟线程多次调用相同本地代码可能会在每次调用时观察到不同的 OS 线程标识。</p> 
+<h4><a id="_271"></a>时间共享</h4> 
+<p>目前，调度程序不实现虚拟线程的时间共享。时间共享是对已消耗的 CPU 时间进行强制抢占的机制。虽然时间共享在某些任务的延迟降低方面可能有效，但在平台线程相对较少且 CPU 利用率达 100% 时，不清楚时间共享是否同样有效，尤其拥有百万虚拟线程时。</p> 
+<h3><a id="15__275"></a>15 执行虚拟线程</h3> 
+<p>要利用虚拟线程，无需重写程序。虚拟线程不需要或不期望应用程序代码明确将控制权交还给调度程序，即虚拟线程不是协作式的。用户代码不应假设虚拟线程是如何或何时分配给平台线程的，就像它不应假设平台线程是如何或何时分配给处理器核。</p> 
+<p>要在虚拟线程中运行代码，JDK虚拟线程调度程序通过将虚拟线程挂载到平台线程，为其分配平台线程来执行。这使平台线程成为虚拟线程的载体。稍后，在运行一些代码后，虚拟线程可以从其载体卸载。在这点上，平台线程是空闲的，因此调度程序可以再次将不同的虚拟线程挂载到上面，从而使其成为载体。</p> 
+<p>通常，当虚拟线程在 JDK 中的某些阻塞操作（如 BlockingQueue.take()）阻塞时，它会卸载。当阻塞操作准备完成（如在套接字上接收到字节）时，它会将虚拟线程提交回调度程序，后者将挂载虚拟线程到载体上以恢复执行。</p> 
+<p>虚拟线程的挂载和卸载频繁而透明地发生，不会阻塞任何 OS 线程。如前面示例中的服务器应用程序包含以下一行代码，包含对阻塞操作的调用：</p> 
+<pre><code class="prism language-java">response<span class="token punctuation">.</span><span class="token function">send</span><span class="token punctuation">(</span>future1<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">+</span> future2<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>这些操作将导致虚拟线程多次挂载和卸载，通常对每次调用 <code>get()</code> 进行一次，可能在执行 <code>send(...)</code> 中的 I/O 操作期间多次进行。</p> 
+<p>JDK大多数阻塞操作都会卸载虚拟线程，释放其载体和底层 OS 线程以承担新工作。然而，JDK一些阻塞操作不会卸载虚拟线程，因此会阻塞其载体和底层 OS 线程。这是因为在 OS 级别（如许多文件系统操作）或 JDK 级别（如Object.wait()）存在一些限制。这些阻塞操作实现将通过临时扩展调度程序的并行性来弥补 OS 线程的占用，因此调度程序的 ForkJoinPool 中的平台线程数量可能会在短时间内超过可用处理器的数量。可通过系统属性 <code>jdk.virtualThreadScheduler.maxPoolSize</code> 调整调度程序可用于的最大平台线程数量。</p> 
+<p>如下情况下，虚拟线程在阻塞操作期间无法卸载，因为它被固定在其载体：</p> 
+<ul><li>当它执行同步块或方法内部的代码时</li><li>当它执行本机方法或外部函数时</li></ul> 
+<p>固定不会使应用程序不正确，但可能会阻碍其可扩展性。若虚拟线程在固定状态下执行阻塞操作，如 I/O 或 BlockingQueue.take()，则其载体和底层 OS 线程将在操作的持续时间内被阻塞。频繁而长时间的固定可能会损害应用程序的可扩展性，因为它会占用载体。</p> 
+<p>调度程序不会通过扩展其并行性来补偿固定。相反，避免频繁和长时间的固定，通过修改频繁运行并保护潜在的长时间 I/O 操作的同步块或方法，以使用 <code>java.util.concurrent.locks.ReentrantLock</code>，而不是 synchronized。无需替换仅在启动时执行的同步块和方法（如仅在启动时执行的同步块和方法，或者保护内存中操作的同步块和方法）。一如既往，努力保持锁策略简单明了。</p> 
+<p>新的诊断工具有助于将代码迁移到虚拟线程并评估是否应该用 <code>java.util.concurrent</code> 锁替换特定的 synchronized 使用：</p> 
+<ul><li> <p>当线程在固定状态下阻塞时，会发出 JDK Flight Recorder (JFR) 事件（参阅 JDK Flight Recorder）。</p> </li><li> <p>系统属性 <code>jdk.tracePinnedThreads</code> 触发线程在固定状态下阻塞时的堆栈跟踪。使用 <code>-Djdk.tracePinnedThreads=full</code> 运行时会打印完整的堆栈跟踪，突出显示了持有监视器的本机帧和帧。使用 <code>-Djdk.tracePinnedThreads=short</code> 会将输出限制为仅包含有问题的帧。</p> </li></ul> 
+<p>将来版本可能能够解决上述的第一个限制（在同步块内部固定）。第二个限制是为了与本机代码进行正确交互而需要的。</p> 
+<h3><a id="16__310"></a>16 内存使用和与垃圾回收的交互</h3> 
+<p>虚拟线程的堆栈存储在 Java 的垃圾回收堆中，作为堆栈块对象。随应用运行，堆栈会动态增长和收缩，既能高效使用内存，又能够容纳任意深度的堆栈（最多达到 JVM 配置的平台线程堆栈大小）。这种效率是支持大量虚拟线程的关键，因此线程每请求的风格在服务器应用程序中仍然具有持续的可行性。</p> 
+<p>第二个示例中，一个假设的框架通过创建一个新的虚拟线程并调用 <code>handle</code> 方法来处理每个请求；即使它在深层次的调栈末尾（经过身份验证、事务等）调用 <code>handle</code>，<code>handle</code> 本身也会生成多个仅执行短暂任务的虚拟线程。因此，对有深度调用栈的每个虚拟线程，都将有多个具有浅调用栈的虚拟线程，占用内存很少。</p> 
+<p>虚拟线程与异步代码的堆空间使用和垃圾回收活动难以比较：</p> 
+<ul><li>一百万个虚拟线程需至少一百万个对象</li><li>但共享平台线程池的一百万个任务也需要一百万个对象</li><li>处理请求的应用程序代码通常会在 I/O 操作之间保留数据</li></ul> 
+<p>Thread-per-request的代码可将这些数据保留在本地变量，这些变量存储在堆中的虚拟线程栈，而异步代码须将相同的数据保留在从管道的一个阶段传递到下一个阶段的堆对象。一方面，虚拟线程所需的栈更浪费空间，而异步管道总是需要分配新对象，因此虚拟线程可能需要较少的分配。总体而言，线程每请求代码与异步代码的堆消耗和垃圾回收活动应该大致相似。随时间推移，希望将虚拟线程栈的内部表示大大压缩。</p> 
+<p>与平台线程栈不同，虚拟线程栈不是 GC root，因此不会在垃圾收集器（如 G1）进行并发堆扫描时遍历其中的引用。这还意味着，如虚拟线程被阻塞在如 <code>BlockingQueue.take()</code>，并且没有其他线程可获取到虚拟线程或队列的引用，那该线程可进行垃圾回收 — 这没问题，因为虚拟线程永远不会被中断或解除阻塞。当然，如虚拟线程正在运行或正在阻塞且可能会被解除阻塞，那么它将不会被垃圾回收。</p> 
+<h4><a id="161__326"></a>16.1 当前限制</h4> 
+<p>G1不支持庞大的（humongous）堆栈块对象。如虚拟线程的堆栈达到region大小一半，这可能只有 512KB，那可能会抛 <code>StackOverflowError</code>。</p> 
+<h3><a id="17__330"></a>17 详情变化</h3> 
+<p>在Java平台及其实现中的更改：</p> 
+<h4><a id="javalangThread_334"></a>java.lang.Thread</h4> 
+<p>API更新：</p> 
+<ul><li>Thread.Builder、Thread.ofVirtual()和Thread.ofPlatform()，创建虚拟线程和平台线程的新API。如</li></ul> 
+<pre><code class="prism language-java"><span class="token comment">// 创建一个名为"duke"的新的未启动的虚拟线程</span>
+<span class="token class-name">Thread</span> thread <span class="token operator">=</span> <span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">ofVirtual</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">name</span><span class="token punctuation">(</span><span class="token string">"duke"</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">unstarted</span><span class="token punctuation">(</span>runnable<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<ul><li> <p>Thread.startVirtualThread(Runnable)，创建并启动虚拟线程的便捷方式</p> </li><li> <p>Thread.Builder可创建线程或ThreadFactory可创建具有相同属性的多个线程</p> </li><li> <p>Thread.isVirtual()：测试线程是否为虚拟线程</p> </li><li> <p>Thread.join和Thread.sleep的新重载接受java.time.Duration的等待和休眠参数</p> </li><li> <p>新的final方法Thread.threadId()返回线程的标识符。现有的非final方法Thread.getId()已弃用。</p> </li><li> <p>Thread.getAllStackTraces()现在返回所有平台线程的映射，而不是所有线程。</p> </li></ul> 
+<p>java.lang.Thread API在其他方面不变。Thread类定义的构造函数仍创建平台线程，与以前一样。没有新构造函数。</p> 
+<h5><a id="API_355"></a>虚拟线程和平台线程API区别</h5> 
+<ul><li>public Thread构造函数无法创建虚拟线程</li><li>虚拟线程始终是守护线程。Thread.setDaemon(boolean)方法无法将虚拟线程更改为非守护线程</li><li>虚拟线程具有Thread.NORM_PRIORITY的固定优先级。Thread.setPriority(int)方法对虚拟线程没有影响。这个限制可能会在将来版本重审</li><li>虚拟线程不是线程组的活跃成员。在虚拟线程上调用时，Thread.getThreadGroup()返回一个带有名称"VirtualThreads"的占位符线程组。Thread.Builder API不定义设置虚拟线程线程组的方法</li><li>设置SecurityManager时，虚拟线程在运行时没有权限</li><li>虚拟线程不支持stop()、suspend()或resume()方法。在虚拟线程上调用这些方法会抛异常</li></ul> 
+<h4><a id="_364"></a>线程本地变量</h4> 
+<p>虚拟线程支持：</p> 
+<ul><li>线程本地变量（ThreadLocal）</li><li>可继承线程本地变量（InheritableThreadLocal）</li></ul> 
+<p>就像平台线程，因此它们可运行使用线程本地变量的现有代码。然而，由于虚拟线程可能非常多，使用线程本地变量时需谨慎考虑。</p> 
+<p>不要使用线程本地变量在线程池中共享昂贵资源，多个任务共享同一个线程。</p> 
+<p>虚拟线程不应被池化，因为每个虚拟线程的生命周期只用于运行单个任务。为在运行时具有数百万个线程时减少内存占用，已从java.base模块删除了许多线程本地变量的用法。</p> 
+<h4><a id="_377"></a>更多的</h4> 
+<p>Thread.Builder API定义了一个方法，用于在创建线程时选择不使用线程本地变量。它还定义了一个方法，用于选择不继承inheritable thread-locals的初始值。在不支持线程本地变量的线程上调用ThreadLocal.get()将返回初始值，ThreadLocal.set(T)会抛异常。</p> 
+<p>传统的上下文类加载器现在被指定为像inheritable thread local一样工作。如在不支持thread locals的线程上调用Thread.setContextClassLoader(ClassLoader)，则抛异常。</p> 
+<p>范围本地变量可能对某些用例来说是线程本地变量的更好选择。</p> 
+<h4><a id="JUC_385"></a>JUC</h4> 
+<p>支持锁的基本API，java.util.concurrent.LockSupport，现支持虚拟线程：</p> 
+<ul><li>挂起虚拟线程会释放底层的平台线程以执行其他工作</li><li>而唤醒虚拟线程会安排它继续执行</li></ul> 
+<p>这对LockSupport的更改使得所有使用它的API（锁、信号量、阻塞队列等）在虚拟线程中调用时能够优雅地挂起。</p> 
+<h5><a id="_394"></a>此外</h5> 
+<p>Executors.newThreadPerTaskExecutor(ThreadFactory)和Executors.newVirtualThreadPerTaskExecutor()创建一个ExecutorService，它为每个任务创建一个新线程。这些方法允许迁移和与使用线程池和ExecutorService的现有代码进行互操作。</p> 
+<p>ExecutorService现扩展AutoCloseable，可使用try-with-resource构造来使用此API，如上面demo。</p> 
+<p>Future现定义了获取已完成任务的结果或异常及获取任务状态的方法。它们组合可将Future对象用作流的元素，过滤包含已完成任务的流，然后map以获取结果的流。这些方法也将对结构化并发的API添加非常有用。</p> 
+<h3><a id="18__402"></a>18 <strong>网络</strong></h3> 
+<p>java.net和java.nio.channels包中的网络API的实现现在与虚拟线程一起工作：在虚拟线程上执行的操作，如建立网络连接或从套接字读取时，将释放底层平台线程以执行其他工作。</p> 
+<p>为允许中断和取消操作，java.net.Socket、ServerSocket和DatagramSocket定义的阻塞I/O方法现在在虚拟线程中调用时被规定为可中断：中断在套接字上阻塞的虚拟线程将唤醒线程并关闭套接字。从InterruptibleChannel获取的这些类型套接字上的阻塞I/O操作一直是可中断，因此这个更改使得这些API在使用它们的构造函数创建时的行为与从通道获取时的行为保持一致。</p> 
+<h4><a id="javaio_408"></a><strong>java.io</strong></h4> 
+<p>提供了字节和字符流的API。这些API的实现在被虚拟线程使用时需要进行更改以避免固定（pinning）。</p> 
+<p>作为背景，面向字节的输入/输出流没有规定是线程安全的，也没有规定在线程在读取或写入方法中被阻塞时调用close()的预期行为。大多情况下，不应在多个并发线程中使用特定的输入或输出流。面向字符的读取/写入器也没规定是线程安全的，但它们为子类公开了一个锁对象。除了固定，这些类中的同步存在问题且不一致；例如，InputStreamReader和OutputStreamWriter使用的流解码器和编码器在流对象上同步，而不是在锁对象上同步。</p> 
+<p>为了防止固定，现在实现的工作方式如下：</p> 
+<ul><li>BufferedInputStream、BufferedOutputStream、BufferedReader、BufferedWriter、PrintStream和PrintWriter现在在直接使用时使用显式锁，而不是监视器。当它们被子类化时，这些类会像以前一样同步</li><li>InputStreamReader和OutputStreamWriter使用的流解码器和编码器现在使用与包含它们的InputStreamReader或OutputStreamWriter相同的锁</li><li>BufferedOutputStream、BufferedWriter和OutputStreamWriter使用的流编码器的初始缓冲区大小现在更小，以减少在堆中存在许多流或编写器时的内存使用——如果有百万个虚拟线程，每个线程都有一个套接字连接上的缓冲流，这种情况可能会发生。</li></ul> 
+<h4><a id="JNI_420"></a>JNI</h4> 
+<p>JNI定义了一个新的函数IsVirtualThread，用于测试一个对象是否是虚拟线程。</p> 
+<h4><a id="_424"></a><strong>调试</strong></h4> 
+<p>调试架构包括三个接口：JVM工具接口（JVM TI）、Java调试线协议（JDWP）和Java调试接口（JDI）。这三个接口现在都支持虚拟线程。</p> 
+<p>JVM TI的更新包括：</p> 
+<ul><li>大多数使用jthread（即对Thread对象的JNI引用）调用的函数现在可以使用对虚拟线程的引用来调用。一小部分函数，即PopFrame、ForceEarlyReturn、StopThread、AgentStartFunction和GetThreadCpuTime，不支持虚拟线程。SetLocal*函数仅限于在中断或单步事件时挂起的虚拟线程的最顶层帧中设置本地变量</li><li>GetAllThreads和GetAllStackTraces函数现在规定返回所有平台线程，而不是所有线程</li><li>所有事件，除了在早期VM启动或堆迭代期间发布的事件外，都可以在虚拟线程的上下文中调用事件回调</li><li>挂起/恢复实现允许调试器挂起和恢复虚拟线程，以及在挂载虚拟线程时挂起平台线程</li><li>一个新的能力can_support_virtual_threads允许代理程序对虚拟线程的线程启动和结束事件有更精细的控制</li></ul> 
+<p>现有的JVM TI代理程序大多将像以前一样工作，但如果调用不支持虚拟线程的函数，可能会遇到错误。这些错误将在使用不了解虚拟线程的代理程序与使用虚拟线程的应用程序时发生。将GetAllThreads更改为返回仅包含平台线程的数组可能对某些代理程序构成问题。已启用ThreadStart和ThreadEnd事件的现有代理程序可能会遇到性能问题，因为它们无法将这些事件限制为平台线程。</p> 
+<p>JDWP的更新包括：</p> 
+<ul><li>一个新的命令允许调试器测试一个线程是否是虚拟线程</li><li>EventRequest命令上的新修饰符允许调试器将线程启动和结束事件限制为平台线程。</li></ul> 
+<p>JDI的更新包括：</p> 
+<ul><li>com.sun.jdi.ThreadReference中的一个新方法测试一个线程是否是虚拟线程</li><li>com.sun.jdi.request.ThreadStartRequest和com.sun.jdi.request.ThreadDeathRequest中的新方法限制了为请求生成的事件的线程到平台线程</li></ul> 
+<p>如上所述，虚拟线程不被认为是线程组中的活动线程。因此，JVM TI函数GetThreadGroupChildren、JDWP命令ThreadGroupReference/Children和JDI方法com.sun.jdi.ThreadGroupReference.threads()返回的线程列表仅包含平台线程。</p> 
+<h4><a id="JDK_Flight_RecorderJFR_450"></a><strong>JDK Flight Recorder（JFR）</strong></h4> 
+<p>JFR支持虚拟线程，并引入了几个新的事件：</p> 
+<p>jdk.VirtualThreadStart和jdk.VirtualThreadEnd表示虚拟线程的启动和结束。这些事件默认情况下是禁用的。</p> 
+<p>jdk.VirtualThreadPinned表示虚拟线程被固定（pinned）时的情况，即在不释放其平台线程的情况下被挂起。此事件默认情况下启用，阈值为20毫秒。</p> 
+<p>jdk.VirtualThreadSubmitFailed表示启动或唤醒虚拟线程失败，可能是由于资源问题。此事件默认情况下启用。</p> 
+<p><strong>Java管理扩展（JMX）</strong><br> java.lang.management.ThreadMXBean仅支持监视和管理平台线程。findDeadlockedThreads()方法查找处于死锁状态的平台线程的循环；它不会查找处于死锁状态的虚拟线程的循环。</p> 
+<p>com.sun.management.HotSpotDiagnosticsMXBean中的一个新方法生成了上面描述的新式线程转储。可以通过平台MBeanServer从本地或远程JMX工具间接调用此方法。</p> 
+<p><strong>java.lang.ThreadGroup</strong><br> java.lang.ThreadGroup是一个用于分组线程的遗留API，在现代应用程序中很少使用，不适合分组虚拟线程。我们现在将其标记为已过时并降级，预计将来将在结构化并发的一部分中引入新的线程组织构造。</p> 
+<p>作为背景，ThreadGroup API来自Java 1.0。最初，它的目的是提供作业控制操作，如停止组中的所有线程。现代代码更有可能使用自Java 5引入的java.util.concurrent包的线程池API。ThreadGroup支持早期Java版本中小程序的隔离，但Java 1.2中Java安全性架构的演进显著，线程组不再扮演重要角色。ThreadGroup还旨在用于诊断目的，但这个角色在Java 5引入的监视和管理功能，包括java.lang.management API，中已被取代。</p> 
+<p>除了现在基本无关紧要外，ThreadGroup API和其实现存在一些重要问题：</p> 
+<p>销毁线程组的能力存在缺陷。</p> 
+<p>API要求实现具有对组中的所有活动线程的引用。这会增加线程创建、线程启动和线程终止的同步和争用开销。</p> 
+<p>API定义了enumerate()方法，这些方法本质上是竞态条件的。</p> 
+<p>API定义了suspend()、resume()和stop()方法，这些方法本质上容易产生死锁且不安全。</p> 
+<p>ThreadGroup现在被规定为已过时和降级如下：</p> 
+<p>明确删除了显式销毁线程组的能力：已终止过时的destroy()方法不再执行任何操作。</p> 
+<p>删除了守护线程组的概念：已终止过时的setDaemon(boolean)和isDaemon()方法设置和检索的守护状态被忽略。</p> 
+<p>现在，实现不再保持对子组的强引用。ThreadGroup现在在组中没有活动线程且没有其他东西保持线程组存活时可以被垃圾回收。</p> 
+<p>已终止的suspend()、resume()和stop()方法总是抛出异常。</p> 
+<h4><a id="_490"></a>替代方案</h4> 
+<p>继续依赖异步API。异步API难与同步API集成，创建了两种表示相同I/O操作的不同表示，不提供用于上下文的操作序列的统一概念，无法用于故障排除、监视、调试和性能分析。</p> 
+<p>向Java添加语法无堆栈协程（即async/await）。与用户模式线程相比，这些更易实现，并且将提供一种表示操作序列上下文的统一构造。然而，这个构造是新的，与线程分开，与线程在许多方面相似但在一些微妙的方式中不同。它将在线程设计的API和工具层面引入新的类似线程的构造。这需要更长时间来被生态系统接受，并且不像用户模式线程与平台一体的设计那样优雅和和谐。</p> 
+<p>大多采用协程的语言之所以采用这种方法，是因为无法实现用户模式线程（如Kotlin）、遗留的语义保证（如天生单线程的JavaScript）或特定于语言的技术约束（如C++）。这些限制不适用于Java。</p> 
+<p>引入一个新的用于表示用户模式线程的公共类，与java.lang.Thread无关。这将是一个机会，可以摆脱Thread类在25年来积累的不必要负担。探讨和原型化了这种方法的几个变体，但在每种情况下都遇到了如何运行现有代码问题。</p> 
+<p>主要问题是Thread.currentThread()广泛用于现有代码，直接或间接。现有代码中，这个方法必须返回一个表示当前执行线程的对象。如果我们引入一个新的类来表示用户模式线程，那currentThread()将不得不返回某种看起来像Thread但代理到用户模式线程对象的包装对象。</p> 
+<p>有两个对象表示当前执行线程将会令人困惑，最终决定保留旧的Thread API不是一个重大障碍。除了一些方法（例如currentThread()）外，开发人员很少直接使用Thread API；他们主要与高级API（例如ExecutorService）交互。随时间推移，将通过弃用和删除Thread类和ThreadGroup等类中的过时方法来摆脱不需要负担。</p> 
+<h4><a id="_504"></a><strong>测试</strong></h4> 
+<p>现有的测试将确保我们在运行它们的多种配置和执行模式下的更改不会导致意外的回退。</p> 
+<p>我们将扩展jtreg测试工具，以允许在虚拟线程的上下文中运行现有测试。这将避免需要有许多测试的两个版本。</p> 
+<p>新测试将测试所有新的和修订的API，以及支持虚拟线程的所有更改区域。</p> 
+<p>新的压力测试将针对可靠性和性能关键区域。</p> 
+<p>新的微基准测试将针对性能关键区域。</p> 
+<p>我们将使用多个现有服务器，包括Helidon和Jetty，进行大规模测试。</p> 
+<h4><a id="_518"></a><strong>风险和假设</strong></h4> 
+<p>此提案的主要风险是由于现有API和其实现的更改而产生的兼容性问题：</p> 
+<p>对java.io.BufferedInputStream、BufferedOutputStream、BufferedReader、BufferedWriter、PrintStream和PrintWriter类中的内部（和未记录的）锁定协议的修订可能会影响那些假设I/O方法在调用时会在其上同步的代码。这些更改不会影响通过扩展这些类并假定由超类同步的代码，也不会影响扩展java.io.Reader或java.io.Writer并使用这些API公开的锁对象的代码。</p> 
+<p>java.lang.ThreadGroup不再允许销毁线程组，不再支持守护线程组的概念，并且其suspend()、resume()和stop()方法始终引发异常。</p> 
+<p>有一些源不兼容的API更改和一个二进制不兼容的更改，可能会影响那些扩展java.lang.Thread的代码：</p> 
+<p>如果现有源文件中的代码扩展了Thread并且子类中的方法与任何新的Thread方法冲突，则该文件将无法在不进行更改的情况下编译。</p> 
+<p>Thread.Builder被添加为嵌套接口。如果现有源文件中的代码扩展了Thread，导入了名为Builder的类，并且子类中引用“Builder”作为简单名称的代码，则该文件将无法在不进行更改的情况下编译。</p> 
+<p>Thread.threadId()被添加为一个返回线程标识符的final方法。如果现有源文件中的代码扩展了Thread，并且子类声明了一个名为threadId的无参数方法，则它将无法编译。如果存在已编译的扩展Thread的代码，并且子类定义了一个返回类型为long且没有参数的threadId方法，则在加载子类时将抛出IncompatibleClassChangeError。</p> 
+<p>在混合现有代码与利用虚拟线程或新API的较新代码时，可能会观察到平台线程和虚拟线程之间的一些行为差异：</p> 
+<p>Thread.setPriority(int)方法不会对虚拟线程产生影响，虚拟线程始终具有Thread.NORM_PRIORITY优先级。</p> 
+<p>Thread.setDaemon(boolean)方法对虚拟线程没有影响，虚拟线程始终是守护线程。</p> 
+<p>Thread.stop()、suspend()和resume()方法在虚拟线程上调用时会引发UnsupportedOperationException异常。</p> 
+<p>Thread API支持创建不支持线程本地变量的线程。在不支持线程本地变量的线程上调用ThreadLocal.set(T)和Thread.setContextClassLoader(ClassLoader)时会引发UnsupportedOperationException异常。</p> 
+<p>Thread.getAllStackTraces()现在返回所有平台线程的映射，而不是所有线程的映射。</p> 
+<p>java.net.Socket、ServerSocket和DatagramSocket定义的阻塞I/O方法现在在虚拟线程的上下文中被中断时可中断。当线程在套接字操作上被中断时，现有代码可能会中断，这将唤醒线程并关闭套接字。</p> 
+<p>虚拟线程不是ThreadGroup的活动成员。在虚拟线程上调用Thread.getThreadGroup()将返回一个名为"VirtualThreads"的虚拟线程组，该组为空。</p> 
+<p>虚拟线程在设置了SecurityManager的情况下没有权限。</p> 
+<p>在JVM TI中，GetAllThreads和GetAllStackTraces函数不返回虚拟线程。已启用ThreadStart和ThreadEnd事件的现有代理程序可能会遇到性能问题，因为它们无法将这些事件限制为平台线程。</p> 
+<p>java.lang.management.ThreadMXBean API支持监视和管理平台线程，但不支持虚拟线程。</p> 
+<p>-XX:+PreserveFramePointer标志对虚拟线程性能产生严重的负面影响。</p> 
+<h4><a id="_558"></a><strong>依赖关系</strong></h4> 
+<p>JEP 416（使用Method Handles重新实现核心反射）在JDK 18中移除VM本机反射实现。这允许虚拟线程在通过反射调用方法时正常挂起。</p> 
+<p>JEP 353（使用新实现替换传统Socket API）在JDK 13中，以及JEP 373（使用新实现替换传统DatagramSocket API）在JDK 15中，替换了java.net.Socket、ServerSocket和DatagramSocket的实现，以适应虚拟线程的使用。</p> 
+<p>JEP 418（Internet地址解析SPI）在JDK 18中定义了一种主机名和地址查找的服务提供程序接口。这将允许第三方库实现不会在主机查找期间钉住线程的替代java.net.InetAddress解析器。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/930522f44cff64ac451d20bf0550ce96/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">github 网页显示不全？</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/fac1983f21cc162683254eb34cbf3bf9/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">H5端Video无法自动播放</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

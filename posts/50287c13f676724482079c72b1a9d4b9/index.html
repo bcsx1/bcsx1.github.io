@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>陀螺仪与加速度计的姿态融合——互补滤波 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="陀螺仪与加速度计的姿态融合——互补滤波" />
+<meta property="og:description" content="本篇文章我们来讲讲如何将陀螺仪和加速度计的数据结合起来，获取更准确的姿态数据，使用的是互补滤波的方法。
+阅读本文需有一定的知识基础，可以参见作者以前MPU6050的两篇文章：《MPU6050陀螺仪和加速度计数据的获取和校准》、《MPU6050官方DMP的移植和使用》，以及了解四元数的一些基本概念。
+1）为什么要进行姿态融合 在之前的文章里，我们讲过一些陀螺仪和加速度计的知识，我们知道，陀螺仪可以获取载体的角速度，由角速度积分，就能得到角度，也就得到了载体的姿态。但是，陀螺仪给出的角速度存在测量误差、噪声和漂移，经过积分运算之后，会形成累积误差，这个误差会随着时间延长越来越大，最终导致偏差太大而无法使用。
+另一方面，加速度计可以测量到地球的重力，当载体静止或者匀速运动时，重力的方向就是竖直向下的，通过测量重力加速度的方向，可以获取当前载体的俯仰角、滚转角。但是加速度计容易受到高频噪声的干扰，动态响应慢，只在长时间内数据比较有效。
+因此，一般我们使用加速度计的数据来修正陀螺仪，以加速度计获取的实时姿态角来修正陀螺仪的累积误差，就能在短时间和长时间内都能获取比较满意的姿态信息。
+我们以下图为例，Z轴向上，约定绕X轴旋转的角度为滚转角；绕Y轴旋转的角度为俯仰角，绕Z轴旋转的角度为偏航角。
+那么，滚转角（绕X轴转）和俯仰角（绕Y轴转）发生变化时，MPU6050测出来的重力加速度g的方向相对于载体也会发生变化。而加速度计测出来的重力加速度g的方向是实时的，不会受长时间计算累加的影响。所以，我们可以用加速度计测到的g的方向，来修正陀螺仪积分得到的滚转角和俯仰角。
+而偏航角（绕Z轴转）变化时，MPU6050测到的重力加速度g方向是不会变化的，所以g的方向不能用来修正偏航角。要想修正偏航角，需要测量地磁偏角的传感器信息。
+这个用加速度计或磁力计来修正姿态角的过程，一般称为数据融合，有多种方法实现。在之前的文章中，我们使用MPU6050芯片官方提供的DMP库直接获取了融合后的数据；但是这只适用于特定厂家的芯片，而更通用的方法是使用互补滤波或者卡尔曼滤波来实现，本节要讲的就是使用互补滤波的方法，来进行数据融合。
+(注意，由于没有引入磁力计的数据，本文使用互补滤波的方法只是修正了俯仰角和滚转角的信息，无法修正偏航角，后续有机会再讲解如何用磁力计修正偏航角)
+2)互补滤波的原理 假如我们有两种途径测量某个信号，测得的结果一个带有高频噪声，一个带有低频噪声。我们为了获取更准确的信号，可以把它们的噪声分别滤掉，再合并，就得到了没有噪声的原始信号。具体操作如下图所示：
+这就是互补滤波最基础的理论。
+为了使得最后相加的重构信号与我们想要的信号尽量相等，一般要求F1(s)&#43;F2(s) = 1。
+具体到我们的实际问题，姿态信息可以通过陀螺仪角速度积分得到，也可以通过加速度计实时测量得到；而且，陀螺仪积分得到的姿态主要包含低频噪声（零偏、累积误差），加速度计得到的姿态主要包含高频噪声。使用互补滤波正好可以融合二者的姿态信息。
+依据上面这个框图，我们可以想到以下的姿态融合方法：
+图中ω是角速度，n1和n2为噪声，θ’为融合后的角度。
+当我们把滤波器简化为最简单的一个比例系数时，有如下形式：
+姿态角 = k*陀螺仪姿态角 &#43; (1-k)*加速度计姿态角
+(其中0&lt;k&lt;1，k的选择，取决于我们更相信陀螺仪的数据，还是更相信加速度计的数据)
+你可能会很惊讶，这不就是个加权平均吗？就这也能滤波？
+别急，它确实没有滤波，但我们先理解一下，再慢慢深入。
+我们看看等式右边的两项，由于k小于1，所以陀螺仪姿态角的低频噪声被缩小了k倍；同样，1-k也小于1，所以加速度计姿态角的高频噪声被缩小了1-k倍；二者相加，姿态角的倍数仍为1，而高频和低频的噪声都被缩小了。虽然这个“滤波”效果有点弱，但是这样我们至少得到了一个高频、低频都比原始信号稍好一些的姿态信息，这就实现了高频和低频信号的互补。
+实际上，当使用了有效的高通和低通滤波器时，噪声的影响会被进一步减弱。
+前人的研究已经帮我们总结出了通用的公式，就是低通滤波器为LPF=C(s)/(C(s)&#43;s)，高通滤波器HPF=s/(C(s)&#43;s)。选用不同的C(s)可以形成不同滤波效果。
+把算法化成框图的形式，如下图所示：
+上面这个框图对于理解互补滤波的原理比较直观，但是等效为下图这种形式时，更接近于编程实现的思想：（有兴趣的可以推导一下，两种框图是等效的）
+当选择不同的C(s)时，可以获得不同的滤波效果，C(s)为常数时，就是一阶滤波器；C(s)为a&#43;b/s时就是二阶滤波器。
+3）互补滤波用于姿态融合的编程实现 当求解姿态角时，必须要有一些四元数的知识，可以认为四元数等价于滚转角、俯仰角、偏航角。之所以要使用四元数，是因为它可以简化姿态更新的计算过程。基本上现在网上的开源代码都是以四元数来表征姿态角的。本文不去深究四元数的理论，只是拿来使用。
+我们来看一下最经典互补滤波算法是如何实现的，这段代码被广泛应用在开源四轴飞行器上，它的核心部分如下：
+ax、ay、az是加速度计测得的三个方向的加速度，gx、gy、gz是陀螺仪测得的三个方向的角速度。
+首先，将ax、ay、az进行单位化，因为我们只需要使用它们求角度，不关心它们的大小，单位化的操作就是第65~68行，其中sqrt函数是求平方根：
+norm = sqrt(ax*ax &#43; ay*ay &#43; az*az);
+ax = ax / norm;
+ay = ay / norm;
+az = az / norm;
+然后，第72~74行，是依据当前的姿态来计算重力加速度；静止或匀速直线运动时，重力产生的加速度在地面东北天坐标系的xyz三个方向上分量是[0,0,g]，再乘以姿态转换矩阵，就得到了机体坐标系下的加速度：
+用四元数表示的姿态转移矩阵是：
+所以，转换矩阵的最后一列，就是在载体坐标系下的加速度（忽略了倍数g）：
+vx = 2*(q1q3 - q0q2);" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/50287c13f676724482079c72b1a9d4b9/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-11-26T00:07:02+08:00" />
+<meta property="article:modified_time" content="2022-11-26T00:07:02+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">陀螺仪与加速度计的姿态融合——互补滤波</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p style="margin-left:0;text-align:justify;">本篇文章我们来讲讲如何将陀螺仪和加速度计的数据结合起来，获取更准确的姿态数据，使用的是互补滤波的方法。</p> 
+<p style="margin-left:0;text-align:justify;">阅读本文需有一定的知识基础，可以参见作者以前MPU6050的两篇文章：《MPU6050陀螺仪和加速度计数据的获取和校准》、《MPU6050官方DMP的移植和使用》，以及了解四元数的一些基本概念。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<h2 style="margin-left:0px;text-align:justify;"><strong>1）为什么要进行姿态融合</strong></h2> 
+<p style="margin-left:0;text-align:justify;">在之前的文章里，我们讲过一些陀螺仪和加速度计的知识，我们知道，陀螺仪可以获取载体的角速度，由角速度积分，就能得到角度，也就得到了载体的姿态。但是，陀螺仪给出的角速度存在测量误差、噪声和漂移，经过积分运算之后，会形成累积误差，这个<span style="color:#ff0000;">误差会随着时间延长越来越大</span>，最终导致偏差太大而无法使用。</p> 
+<p style="margin-left:0;text-align:justify;">另一方面，加速度计可以测量到地球的重力，当载体静止或者匀速运动时，重力的方向就是竖直向下的，通过测量重力加速度的方向，可以获取当前载体的俯仰角、滚转角。但是加速度计容易受到高频噪声的干扰，<span style="color:#ff0000;">动态响应慢</span>，只在长时间内数据比较有效。</p> 
+<p style="margin-left:0;text-align:justify;">因此，一般我们使用加速度计的数据来修正陀螺仪，以加速度计获取的实时姿态角来修正陀螺仪的累积误差，就能在短时间和长时间内都能获取比较满意的姿态信息。</p> 
+<p style="margin-left:0;text-align:justify;">我们以下图为例，Z轴向上，约定绕X轴旋转的角度为滚转角；绕Y轴旋转的角度为俯仰角，绕Z轴旋转的角度为偏航角。</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="457" src="https://images2.imgbox.com/c5/ac/j87lVYEu_o.png" width="536"></p> 
+<p style="margin-left:0;text-align:justify;">那么，滚转角（绕X轴转）和俯仰角（绕Y轴转）发生变化时，MPU6050测出来的重力加速度g的方向相对于载体也会发生变化。而加速度计测出来的重力加速度g的方向是实时的，不会受长时间计算累加的影响。所以，<span style="color:#ff0000;">我们可以用加速度计测到的g的方向，来修正陀螺仪积分得到的滚转角和俯仰角</span>。</p> 
+<p style="margin-left:0;text-align:justify;">而偏航角（绕Z轴转）变化时，MPU6050测到的重力加速度g方向是不会变化的，所以<span style="color:#ff0000;">g</span><span style="color:#ff0000;">的方向不能用来修正偏航角</span>。要想修正偏航角，需要测量地磁偏角的传感器信息。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">这个用加速度计或磁力计来修正姿态角的过程，一般称为数据融合，有多种方法实现。在之前的文章中，我们使用MPU6050芯片官方提供的DMP库直接获取了融合后的数据；但是这只适用于特定厂家的芯片，而更通用的方法是使用互补滤波或者卡尔曼滤波来实现，本节要讲的就是使用互补滤波的方法，来进行数据融合。</p> 
+<p style="margin-left:0;text-align:justify;">(注意，由于没有引入磁力计的数据，本文使用互补滤波的方法只是修正了俯仰角和滚转角的信息，无法修正偏航角，后续有机会再讲解如何用磁力计修正偏航角)</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<h2 style="margin-left:0px;text-align:justify;"><strong>2)互补滤波的原理</strong></h2> 
+<p style="margin-left:0;text-align:justify;">假如我们有两种途径测量某个信号，测得的结果一个带有高频噪声，一个带有低频噪声。我们为了获取更准确的信号，可以把它们的噪声分别滤掉，再合并，就得到了没有噪声的原始信号。具体操作如下图所示：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="230" src="https://images2.imgbox.com/aa/3b/tG6hRIxr_o.png" width="612"></p> 
+<p style="margin-left:0;text-align:justify;">这就是互补滤波最基础的理论。</p> 
+<p style="margin-left:0;text-align:justify;">为了使得最后相加的重构信号与我们想要的信号尽量相等，一般要求F1(s)+F2(s) = 1。</p> 
+<p style="margin-left:0;text-align:justify;">具体到我们的实际问题，姿态信息可以通过陀螺仪角速度积分得到，也可以通过加速度计实时测量得到；而且，陀螺仪积分得到的姿态主要包含低频噪声（零偏、累积误差），加速度计得到的姿态主要包含高频噪声。使用互补滤波正好可以融合二者的姿态信息。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">依据上面这个框图，我们可以想到以下的姿态融合方法：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="170" src="https://images2.imgbox.com/4a/c8/nI5LP5a0_o.png" width="549"></p> 
+<p style="margin-left:0;text-align:justify;">图中<span style="color:#000000;">ω是角速度，</span>n1和n2为噪声，<span style="color:#000000;">θ’为融合后的角度。</span></p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">当我们把滤波器简化为最简单的一个比例系数时，有如下形式：</p> 
+<p style="margin-left:0;text-align:justify;">姿态角 = k*陀螺仪姿态角 + (1-k)*加速度计姿态角</p> 
+<p style="margin-left:0;text-align:justify;">(其中0&lt;k&lt;1，k的选择，取决于我们更相信陀螺仪的数据，还是更相信加速度计的数据)</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">你可能会很惊讶，这不就是个加权平均吗？就这也能滤波？</p> 
+<p style="margin-left:0;text-align:justify;">别急，它确实没有滤波，但我们先理解一下，再慢慢深入。</p> 
+<p style="margin-left:0;text-align:justify;">我们看看等式右边的两项，由于k小于1，所以陀螺仪姿态角的低频噪声被缩小了k倍；同样，1-k也小于1，所以加速度计姿态角的高频噪声被缩小了1-k倍；二者相加，姿态角的倍数仍为1，而高频和低频的噪声都被缩小了。虽然这个“滤波”效果有点弱，但是这样我们至少得到了一个高频、低频都比原始信号稍好一些的姿态信息，这就实现了高频和低频信号的互补。</p> 
+<p style="margin-left:0;text-align:justify;">实际上，当使用了有效的高通和低通滤波器时，噪声的影响会被进一步减弱。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">前人的研究已经帮我们总结出了通用的公式，就是低通滤波器为LPF=C(s)/(C(s)+s)，高通滤波器HPF=s/(C(s)+s)。选用不同的C(s)可以形成不同滤波效果。</p> 
+<p style="margin-left:0;text-align:justify;">把算法化成框图的形式，如下图所示：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="191" src="https://images2.imgbox.com/cb/b8/IebnPRLr_o.png" width="525"></p> 
+<p style="margin-left:0;text-align:justify;">上面这个框图对于理解互补滤波的原理比较直观，但是等效为下图这种形式时，更接近于编程实现的思想：（有兴趣的可以推导一下，两种框图是等效的）</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="186" src="https://images2.imgbox.com/bf/c1/WrtgHvYE_o.png" width="497"></p> 
+<p style="margin-left:0;text-align:justify;">当选择不同的C(s)时，可以获得不同的滤波效果，C(s)为常数时，就是一阶滤波器；C(s)为a+b/s时就是二阶滤波器。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<h2 style="margin-left:0px;text-align:justify;"><strong>3）互补滤波用于姿态融合的编程实现</strong></h2> 
+<p style="margin-left:0;text-align:justify;">当求解姿态角时，必须要有一些<span style="color:#ff0000;">四元数</span>的知识，可以认为四元数等价于滚转角、俯仰角、偏航角。之所以要使用四元数，是因为它可以简化姿态更新的计算过程。基本上现在网上的开源代码都是以四元数来表征姿态角的。本文不去深究四元数的理论，只是拿来使用。</p> 
+<p style="margin-left:0;text-align:justify;">我们来看一下最经典互补滤波算法是如何实现的，这段代码被广泛应用在开源四轴飞行器上，它的核心部分如下：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="433" src="https://images2.imgbox.com/86/9a/ZlNZJHbI_o.png" width="751"></p> 
+<p style="margin-left:0;text-align:justify;">ax、ay、az是加速度计测得的三个方向的加速度，gx、gy、gz是陀螺仪测得的三个方向的角速度。</p> 
+<p style="margin-left:0;text-align:justify;">首先，将ax、ay、az进行单位化，因为我们只需要使用它们求角度，不关心它们的大小，单位化的操作就是第65~68行，其中sqrt函数是求平方根：</p> 
+<p style="margin-left:0;text-align:justify;">       norm = sqrt(ax*ax + ay*ay + az*az);</p> 
+<p style="margin-left:0;text-align:justify;">       ax = ax / norm;</p> 
+<p style="margin-left:0;text-align:justify;">       ay = ay / norm;</p> 
+<p style="margin-left:0;text-align:justify;">       az = az / norm;</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">然后，第72~74行，是依据当前的姿态来计算重力加速度；静止或匀速直线运动时，重力产生的加速度在地面东北天坐标系的xyz三个方向上分量是[0,0,g]，再乘以姿态转换矩阵，就得到了机体坐标系下的加速度：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="185" src="https://images2.imgbox.com/c4/29/HwsKNthG_o.png" width="786"></p> 
+<p style="margin-left:0;text-align:justify;">用四元数表示的姿态转移矩阵是：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="127" src="https://images2.imgbox.com/d9/16/fcuDjuWB_o.png" width="587"></p> 
+<p style="margin-left:0;text-align:justify;">所以，转换矩阵的最后一列，就是在载体坐标系下的加速度（忽略了倍数g）：</p> 
+<p style="margin-left:0;text-align:justify;">       vx = 2*(q1q3 - q0q2);</p> 
+<p style="margin-left:0;text-align:justify;">       vy = 2*(q0q1 + q2q3);</p> 
+<p style="margin-left:0;text-align:justify;">       vz = q0q0 - q1q1 - q2q2 + q3q3 ;</p> 
+<p style="margin-left:0;text-align:justify;">由于这个计算过程是通过已有的姿态转移矩阵算出来的，所以，它是包含了陀螺仪的角度信息的，那么它与加速度计的测量原始量ax、ay、az之间会比较接近但会有偏差。我们知道了这个偏差后，就可以用加速度计的测量值来修正已有的姿态了。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">计算偏差的过程就是第77~79行，这里是用向量的外积作为向量之间的偏差：</p> 
+<p style="margin-left:0;text-align:justify;">       ex = (ay*vz - az*vy) ;</p> 
+<p style="margin-left:0;text-align:justify;">       ey = (az*vx - ax*vz) ;</p> 
+<p style="margin-left:0;text-align:justify;">       ez = (ax*vy - ay*vx) ;</p> 
+<p style="margin-left:0;text-align:justify;">注意，上一节的框图中，是通过角度θ1(s)-θ’(s)来计算偏差的，而这里的代码实现，是将θ’(s)反算到了三个轴的加速度vx、vy、vz之后，再计算三个轴的加速度误差，效果也是一样的，这样也是为了简化计算。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">现在我们已经得到了框图中的θ1(s)-θ’(s)等效量ex、ey、ez，接下来就要选择合适的C(s)来确定滤波函数了。这部分代码中实现的，是使用的二阶滤波，取的<span style="color:#fe2c24;">C(s)=Kp+Ki/s，也就是用“误差”和“误差的积分”共同去修正角速度</span>，Kp和Ki是两个由用户确定的常数，代码如下：</p> 
+<p style="margin-left:0;text-align:justify;">       exInt = exInt + ex * Ki;  //对误差进行积分，也就是每周期累加</p> 
+<p style="margin-left:0;text-align:justify;">       eyInt = eyInt + ey * Ki;</p> 
+<p style="margin-left:0;text-align:justify;">       ezInt = ezInt + ez * Ki; </p> 
+<p style="margin-left:0;text-align:justify;">       gx = gx + Kp*ex + exInt;  //将误差PI（比例和积分项）补偿到陀螺仪角速度</p> 
+<p style="margin-left:0;text-align:justify;">       gy = gy + Kp*ey + eyInt;</p> 
+<p style="margin-left:0;text-align:justify;">       gz = gz + Kp*ez + ezInt;  </p> 
+<p style="margin-left:0;text-align:justify;">细心的朋友可能发现了，这与PID控制中只使用了PI环节是一样的，有比例项和积分项。所以，代码里也用Kp和Ki两个参数来表示。</p> 
+<p style="margin-left:0;text-align:justify;">执行完这里，就已经完成了加速度计对陀螺仪的修正。上一节的框图就只剩下最后一步，积分一次就能得到新的姿态角了。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">我们使用四元数更新姿态时，不是使用积分累加的方法，而有另一种方法：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="326" src="https://images2.imgbox.com/2f/4e/jsWhNf90_o.png" width="699"></p> 
+<p style="margin-left:0;text-align:justify;">具体为什么如上面计算，用角速度和周期可以更新四元数，这里不深入探讨了，有兴趣可以找资料深入了解。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">最后，有需要的话，可以用更新后的四元数，通过反三角函数来求取当前的姿态角：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="137" src="https://images2.imgbox.com/a6/63/jNtMOSZy_o.png" width="807"></p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">这段代码在使用时，只要周期性地获取陀螺仪和加速度计的数据、调用互补滤波函数、</p> 
+<p style="margin-left:0;text-align:justify;">更新四元数、计算姿态角即可。</p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">测试一下互补滤波的效果，取Kp=10，Ki=0.008，初始时z轴向上保持5s进行MPU6050传感器自校正，然后每100ms获取一次MPU6050的测量数据，进行互补滤波，计算姿态角，送到上位机显示。</p> 
+<p style="margin-left:0;text-align:justify;">可以看到，经过较长时间后，俯仰和滚转角都可以保持正确，不会产生误差累积和漂移，说明陀螺仪的数据得到了加速计的修正；而偏航角是不能实时修正的，会慢慢越偏越大：</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="506" src="https://images2.imgbox.com/ba/dc/7hXVbzNq_o.png" width="981"></p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;"></p> 
+<p style="margin-left:0;text-align:justify;">好了，关于互补滤波姿态融合的知识，就讲到这里了。由于篇幅所限，文中的代码只是截取了核心片段进行讲解，完整的工程代码可以免费提供下载交流。</p> 
+<p style="margin-left:0;text-align:justify;">如果觉得有用可以关注作者微信公众号“小白白学电子”，有更多内容分享，在公众号可以找到所有代码和资料下载地址。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/47544d1c7d9c65e3afe20a35b00817ca/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">【Java 设计模式】创建者模式 之抽象工厂模式</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f520bc37ca3c72092dfbfadff1c395c1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">idea导入项目时无法识别出maven项目</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【数据存储】【Redis】第三章： Redis五大数据类型实现原理 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【数据存储】【Redis】第三章： Redis五大数据类型实现原理" />
+<meta property="og:description" content="Redis五大数据类型实现原理 对于五大数据类型（String,list,Hash,Set,Zset）实现原理，Redis在底层用到了多种数据结构，通过数据结构来实现键值对，将数据结构创建了一个对象redisObject，根据对象的类型type，为对象设置多种不同的数据结构，对象可以执行特定的命令。
+本章主要涉及到的知识点有：
+redisObject的属性五大数据类型编码 注意：本章内容每一小节可单独学习，无论先后。
+redisObject属性 学完本章中，读者需要回答：
+1．Redis底层数据结构如何实现？
+2．Redis是如何回收内存？
+Redis的一个键值对，有两个对象，一个是键对象，一个是值对象，键总是一个字符串对象，而值可以是字符串、列表、集合等对象，Redis中的值对象都是由 redisObject 结构来表示：
+typedef struct redisObject{ //表示类型：string,list,hash,set,zset unsigned type:4; //编码：比如字符串的编码有int编码，embstr编码，raw编码 unsigned encoding:4; //指向底层数据结构的指针，prt是个指针变量，存放地址，指向数据存储的位置 void *ptr; //引用计数，类似java里的引用计数 int refcount; //记录最后一次被程序访问的时间 unsigned lru:22; }robj type属性 redisObject 对象的type属性记录了对象的类型（string,list,hash,set,zset），可以通过type key命令来判断对象类型，从而区分redis中key-value的类型
+127.0.0.1:6379&gt; set testString testValue OK 127.0.0.1:6379&gt; lpush testList testValue1 testValue2 testValue3 (integer) 3 127.0.0.1:6379&gt; hmset testhash 1:testvalue 2:testvalue2 OK 127.0.0.1:6379&gt; sadd testset testvalue (integer) 1 127.0.0.1:6379&gt; zadd testzset 1 testvalue (integer) 1 127.0.0.1:6379&gt; type testString string 127." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/0d48395d2e33fb0f0ad07e62ff12c411/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-07-31T12:01:48+08:00" />
+<meta property="article:modified_time" content="2021-07-31T12:01:48+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【数据存储】【Redis】第三章： Redis五大数据类型实现原理</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-dracula">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="Redis_0"></a>Redis五大数据类型实现原理</h2> 
+<blockquote> 
+ <p>对于五大数据类型（String,list,Hash,Set,Zset）实现原理，Redis在底层用到了多种数据结构，通过数据结构来实现键值对，将数据结构创建了一个对象redisObject，根据对象的类型type，为对象设置多种不同的数据结构，对象可以执行特定的命令。</p> 
+</blockquote> 
+<p>本章主要涉及到的知识点有：</p> 
+<ul><li>redisObject的属性</li><li>五大数据类型编码</li></ul> 
+<p>注意：本章内容每一小节可单独学习，无论先后。</p> 
+<h3><a id="redisObject_10"></a>redisObject属性</h3> 
+<p>学完本章中，读者需要回答：<br> <strong>1．Redis底层数据结构如何实现？<br> 2．Redis是如何回收内存？</strong><br> Redis的一个键值对，有两个对象，一个是键对象，一个是值对象，键总是一个字符串对象，而值可以是字符串、列表、集合等对象，Redis中的值对象都是由 redisObject 结构来表示：</p> 
+<pre><code class="prism language-java">typedef struct redisObject<span class="token punctuation">{<!-- --></span>
+     <span class="token comment">//表示类型：string,list,hash,set,zset</span>
+     unsigned type<span class="token operator">:</span><span class="token number">4</span><span class="token punctuation">;</span>
+     <span class="token comment">//编码：比如字符串的编码有int编码，embstr编码，raw编码</span>
+     unsigned encoding<span class="token operator">:</span><span class="token number">4</span><span class="token punctuation">;</span>
+     <span class="token comment">//指向底层数据结构的指针，prt是个指针变量，存放地址，指向数据存储的位置</span>
+     <span class="token keyword">void</span> <span class="token operator">*</span>ptr<span class="token punctuation">;</span>
+     <span class="token comment">//引用计数，类似java里的引用计数</span>
+     <span class="token keyword">int</span> refcount<span class="token punctuation">;</span>
+     <span class="token comment">//记录最后一次被程序访问的时间</span>
+     unsigned lru<span class="token operator">:</span><span class="token number">22</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>robj
+</code></pre> 
+<h4><a id="type_31"></a>type属性</h4> 
+<p>redisObject 对象的type属性记录了对象的类型（string,list,hash,set,zset），可以通过type key命令来判断对象类型，从而区分redis中key-value的类型</p> 
+<pre><code class="prism language-java"><span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> set testString testValue
+OK
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> lpush testList testValue1 testValue2 testValue3
+<span class="token punctuation">(</span>integer<span class="token punctuation">)</span> <span class="token number">3</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> hmset testhash <span class="token number">1</span><span class="token operator">:</span>testvalue <span class="token number">2</span><span class="token operator">:</span>testvalue2
+OK
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> sadd testset testvalue
+<span class="token punctuation">(</span>integer<span class="token punctuation">)</span> <span class="token number">1</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> zadd testzset <span class="token number">1</span> testvalue
+<span class="token punctuation">(</span>integer<span class="token punctuation">)</span> <span class="token number">1</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> type testString
+string
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> type testList
+list
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> type testhash
+hash
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> type testset
+set
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> type testzset
+zset
+</code></pre> 
+<h4><a id="prtencoding_57"></a>prt和encoding属性</h4> 
+<p>redisObject 对象的 prt 指针，存放数据的地址，指向对象底层的数据结构，通过它可以找到数据的位置，而数据结构由 encoding 属性，也就是编码，由它来决定,可以通过object encoding key命令查看一个值对象的编码。</p> 
+<pre><code class="prism language-java"><span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> object encoding testString
+<span class="token string">"embstr"</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> object encoding testList
+<span class="token string">"quicklist"</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> object encoding testhash
+<span class="token string">"ziplist"</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> object encoding testset
+<span class="token string">"hashtable"</span>
+<span class="token number">127.0</span><span class="token number">.0</span><span class="token number">.1</span><span class="token operator">:</span><span class="token number">6379</span><span class="token operator">&gt;</span> object encoding testzset
+<span class="token string">"ziplist"</span>
+</code></pre> 
+<h4><a id="refcount__73"></a>refcount 属性</h4> 
+<p>由于C语言跟贴近操作系统，直接跟操作系统交互，命令执行响应比较快，所以Redis选择C语言进行编写可以提高性能，但是C 语言不具备自动回收内存功能，于是乎Redis自己构建了一个内存回收机制。<br> 创建一个新对象，redisObject 对象中的refcount属性就会加1，对象被一个新程序使用，调用incrRefCount函数进行加 1，如果有对象不再被应用程序使用了，那么它就会调用decrRefCount函数进行减 1，当对象的引用计数值为 0 的时候，那么这个对象所占用的内存就会被释放。<br> 从这里可以看出来，这其实就是Java虚拟机中引用计数的内存回收机制，在Java中这种回收机制不被使用，因为它不能解决循环引用的问题。<br> <strong>循环引用举例：A引用B，B引用C，C引用A。</strong></p> 
+<p>Redis通过在配置文件中修改相关的配置，来达到解决循环引用的问题，在Redis的配置文件里，Windows的配置文件是redis.windows.conf,Linux系统的配置文件是redis.conf。<br> 在配置文件中有一个配置：maxmemory-policy，当内存使用达到最大值时，redis使用的清楚策略，默认配置是noeviction</p> 
+<blockquote> 
+ <p>1）volatile-lru 删除已有的过期时间的key<br> 2）allkeys-lru 删除所有的key<br> 3）volatile-random 已有过期时间的key 随机删除<br> 4）allkeys-random 随机删除key<br> 5）volatile-ttl 删除即将过期的key<br> 6）noeviction 不删除任何key，只是返回一个写错误，这个是默认选项 对于整数值的字符串对象（例如：1,2,3这种的）可实现内存共享。</p> 
+</blockquote> 
+<p><strong>问题：什么是内存共享？</strong><br> <strong>定义</strong>：键不同，值相同。<br> <strong>举例</strong>：输入命令set key1 1024,键为 key1，值为1024的字符串对象，接着输入命令 set key2 1024 ，键为 key2，值为1024 的字符串对象。这个时候，有二个不同的键，一个相同的值。<br> <strong>实现原理</strong>：键的值，指针指向一个有值的对象，被共享的值对象引用refcount 加 1。<br> <strong>局限性</strong>：判断两个对象是否相等需要消耗运算的额外的时间。整数值，判断操作复杂度低；普通字符串，判断复杂度相比较而已是高的；哈希、列表、集合和有序集合，判断的复杂度更高，所以内存共享只适用于整数值的字符串。</p> 
+<h4><a id="lru__94"></a>lru 属性</h4> 
+<p>Lru属性是redisObject 记录对象最后一次被命令程序访问的时间，用来辅助lru算法删除过期内存的。<br> 在Redis 配置文件中有三个配置，最大内存配置 maxmemory，触发数据淘汰后的淘汰策略 maxmemory_policy，随机采样的精度maxmemory_samples。</p> 
+<p>当有条件符合配置文件中三个配置的时候，继续往Redis中加key时，会触发执行 lru 策略，进行内存清除。最近最少使用，lru算法根据数据的历史访问记录进行数据淘汰。</p> 
+<blockquote> 
+ <p>Lru策略的运行原理是数据插入到链表头部，当缓存数据被访问之后，数据会移到链表头，链表满的时候，链表尾部的数据会被丢弃。</p> 
+</blockquote> 
+<p>redis配置中的淘汰策略（maxmemory_policy）对应的值：</p> 
+<blockquote> 
+ <ul><li>Noeviction：缓存里的数据超过maxmemory值，这个时候如果客户端正在执行命令，会让内存分配，给客户端返回错误响应</li><li>allkeys-lru： 所有的key都用LRU进行淘汰。</li><li>volatile-lru： LRU策略淘汰已经设置过过期时间的键。</li><li>allkeys-random：随机淘汰使用的。</li><li>key volatile-random：随机淘汰已设置过过期时间的key</li><li>volatile-ttl：只回收设置了过期时间的key</li></ul> 
+</blockquote> 
+<p>从redis缓存中淘汰数据，我们的需求是淘汰一些不可能被使用的数据，保留有些以后可能会频繁访问的数据，频繁访问的数据，将来被访问的可能性大很多，所以redis它记录每个数据的最后一次访问时间（lru记录的时间），通过当前时间减去键值对象lru记录的时间，最后可以计算出最少空闲时间，最少空闲时间的数据是最有可能被访问到，这就是LRU淘汰策略的设计思想，是不是很棒。<br> <strong>举例说明：</strong><br> A数据每10s访问一次，B数据每5s访问一次，C数据每50s访问一次，|代表计算空闲时间的截止点。<br> <img src="https://images2.imgbox.com/bf/85/OOlfsyzL_o.png" alt="在这里插入图片描述"></p> 
+<p>预测被访问的概率是B &gt; A &gt; C。</p> 
+<p>过期key的删除策略有两种：<br> <strong>惰性删除</strong>：每次获取键时，都检查键是否过期，过期的话，就删除该键；未过期，就返回该键。<br> <strong>定期删除</strong>：每隔一段时间，进行一次检查，删除里面的过期键。</p> 
+<h4><a id="String__123"></a>String 编码</h4> 
+<p>我们最常使用的redis的一个数据类型就是String类型，实现单值缓存，分布式锁，计数器，分布式系统全局序列号等等功能。</p> 
+<p>它的底层编码分为三种，<strong>int，raw或者embstr。</strong></p> 
+<p><strong>int编码</strong>：存储整数值(例如：1,2,3)，当 int 编码保存的值不再是整数值，又或者值的大小超过了long的范围，会自动转化成raw。例如：(1,2,3)-&gt;(a,b,c)<br> <strong>embstr编码</strong>：存储短字符串。<br> 它只分配一次内存空间，redisObject和sds是连续的内存，查询效率会快很多，也正是因为redisObject和sds是连续在一起，伴随了一些缺点：当字符串增加的时候，它长度会增加，这个时候又需要重新分配内存，导致的结果就是整个redisObject和sds都需要重新分配空间，这样是会影响性能的，所以redis用embstr实现一次分配而后,只允许读，如果修改数据，那么它就会转成raw编码，不再用embstr编码了。<br> <strong>raw编码</strong>：用来存储长字符串。<br> 它可以分配两次内存空间，一个是redisObject，一个是sds，二个内存空间不是连续的内存空间。和embstr编码相比，它创建的时候会多分配一次空间，删除时多释放一次空间。<br> <strong>版本区别：</strong><br> embstr编码版本之间的区别：在redis3.2版本之前，用来存储39字节以内的数据，在这之后用来存储44字节以内的数据。<br> raw编码版本之间的区别：和embstr相反，redis3.2版本之前，可用来存储超过39字节的数据，3.2版本之后，它可以存储超过44字节的数据。<br> <strong>问题一：为什么是39字节？</strong><br> 从上面可以得知，embstr是一块连续的内存区域，由redisObject和sdshdr组成。<br> embstr最多占64字节场景：<br> redisObject占16个字节</p> 
+<pre><code class="prism language-java">struct <span class="token class-name">RedisObject</span> <span class="token punctuation">{<!-- --></span>
+    int4 type<span class="token punctuation">;</span> <span class="token comment">// 4bits,不同的redis对象会有不同的数据类型(string、list、hash等)，type记录类型，会用到4bits。</span>
+    int4 encoding<span class="token punctuation">;</span> <span class="token comment">// 4bits,存储编码形式，用4bits。</span>
+    int24 lru<span class="token punctuation">;</span> <span class="token comment">// 24bits,用24bits记录对象的LRU信息</span>
+    int32 refcount<span class="token punctuation">;</span> <span class="token comment">// 4bytes = 32bits,引用计数器，用到32bits</span>
+    <span class="token keyword">void</span> <span class="token operator">*</span>ptr<span class="token punctuation">;</span> <span class="token comment">// 8bytes，64-bit system,指针指向对象的具体内容，需要64bits</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>计算： 4 + 4 + 24 + 32 + 64 = 128bits = 16bytes<br> sdshdr占48字节</p> 
+<pre><code class="prism language-java">struct sdshdr <span class="token punctuation">{<!-- --></span>
+    unsigned <span class="token keyword">int</span> len<span class="token punctuation">;</span><span class="token comment">//4个字节</span>
+    unsigned <span class="token keyword">int</span> free<span class="token punctuation">;</span><span class="token comment">//4个字节</span>
+    <span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span><span class="token comment">//假设buf里面是39个字节</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+<span class="token keyword">if</span> <span class="token punctuation">(</span>ptr<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">memcpy</span><span class="token punctuation">(</span>sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">,</span>ptr<span class="token punctuation">,</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">[</span>len<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">'\0'</span><span class="token punctuation">;</span><span class="token comment">//一个字节</span>
+</code></pre> 
+<p>sdshdr的大小为8+39+1=48<br> 那么一个embstr最多占64字节：16+48（4+4+1+39）=64</p> 
+<p>从2.4版本开始，redis用jemalloc内存分配器，比glibc的malloc要好一些，省内存，jemalloc会分配8，16，32，64等类型字节的内存。<br> embstr最小为33字节场景：<br> 从上面我们可以得知redisObject占16个字节，现在buf中取8字节。</p> 
+<pre><code class="prism language-java">struct sdshdr <span class="token punctuation">{<!-- --></span>
+    unsigned <span class="token keyword">int</span> len<span class="token punctuation">;</span><span class="token comment">//4个字节</span>
+    unsigned <span class="token keyword">int</span> free<span class="token punctuation">;</span><span class="token comment">//4个字节</span>
+    <span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span><span class="token comment">//假设buf里面是8个字节</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+<span class="token keyword">if</span> <span class="token punctuation">(</span>ptr<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">memcpy</span><span class="token punctuation">(</span>sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">,</span>ptr<span class="token punctuation">,</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">[</span>len<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">'\0'</span><span class="token punctuation">;</span><span class="token comment">//一个字节</span>
+</code></pre> 
+<p>sdshdr的大小为4+4+8+1=17<br> 计算得出：16+17(4+4+1+8)=33<br> 8,16,32都比33字节小，所以最小分配64字节。<br> 通过对比：<br> 16+17(4+4+1+8)=33<br> 16+48（4+4+1+39）=64<br> 当字符数大于8时，会分配64字节。当字符数小于39时，会分配64字节。这个默认39就是这样来的。</p> 
+<p><strong>问题二：为什么分界值由39字节会变成44字节？</strong><br> 被暴打的回答是：REDIS_ENCODING_EMBSTR_SIZE_LIMIT值被换成了44了。</p> 
+<pre><code class="prism language-java">#define REDIS_ENCODING_EMBSTR_SIZE_LIMIT <span class="token number">39</span>
+#define REDIS_ENCODING_EMBSTR_SIZE_LIMIT <span class="token number">44</span>
+</code></pre> 
+<p>正经的回答是：<br> 每个sds都有一个sdshdr，里面的len和free记录了这个sds的长度和空闲空间。</p> 
+<pre><code class="prism language-java">struct sdshdr <span class="token punctuation">{<!-- --></span>
+    unsigned <span class="token keyword">int</span> len<span class="token punctuation">;</span>
+    unsigned <span class="token keyword">int</span> free<span class="token punctuation">;</span>
+</code></pre> 
+<p>用的unsigned int可以表示很大的范围，短的sds空间被浪费了(unsigned int len和unsigned int free 8个字节)<br> commit之后，unsigned int 变成了uint8_t,uint16_t,uint32_t</p> 
+<pre><code class="prism language-java">struct __attribute__ <span class="token punctuation">(</span><span class="token punctuation">(</span>__packed__<span class="token punctuation">)</span><span class="token punctuation">)</span> sdshdr8 <span class="token punctuation">{<!-- --></span>
+    uint8_t len<span class="token punctuation">;</span> <span class="token comment">/* used */</span>
+    uint8_t alloc<span class="token punctuation">;</span> <span class="token comment">/* excluding the header and null terminator */</span>
+    <span class="token keyword">char</span> flags<span class="token punctuation">;</span> <span class="token comment">/* 2 lsb of type, and 6 msb of refcount */</span>
+    <span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+struct __attribute__ <span class="token punctuation">(</span><span class="token punctuation">(</span>__packed__<span class="token punctuation">)</span><span class="token punctuation">)</span> sdshdr16 <span class="token punctuation">{<!-- --></span>
+    uint16_t len<span class="token punctuation">;</span> <span class="token comment">/* used */</span>
+    uint16_t alloc<span class="token punctuation">;</span> <span class="token comment">/* excluding the header and null terminator */</span>
+    <span class="token keyword">char</span> flags<span class="token punctuation">;</span> <span class="token comment">/* 2 lsb of type, and 6 msb of refcount */</span>
+    <span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+struct __attribute__ <span class="token punctuation">(</span><span class="token punctuation">(</span>__packed__<span class="token punctuation">)</span><span class="token punctuation">)</span> sdshdr32 <span class="token punctuation">{<!-- --></span>
+    uint32_t len<span class="token punctuation">;</span> <span class="token comment">/* used */</span>
+    uint32_t alloc<span class="token punctuation">;</span> <span class="token comment">/* excluding the header and null terminator */</span>
+    <span class="token keyword">char</span> flags<span class="token punctuation">;</span> <span class="token comment">/* 2 lsb of type, and 6 msb of refcount */</span>
+    <span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+struct __attribute__ <span class="token punctuation">(</span><span class="token punctuation">(</span>__packed__<span class="token punctuation">)</span><span class="token punctuation">)</span> sdshdr64 <span class="token punctuation">{<!-- --></span>
+    uint64_t len<span class="token punctuation">;</span> <span class="token comment">/* used */</span>
+    uint64_t alloc<span class="token punctuation">;</span> <span class="token comment">/* excluding the header and null terminator */</span>
+    <span class="token keyword">char</span> flags<span class="token punctuation">;</span> <span class="token comment">/* 2 lsb of type, and 6 msb of refcount */</span>
+</code></pre> 
+<p>除此之外还将原来的sdshdr改成了sdshdr16，sdshdr32，sdshdr64</p> 
+<pre><code class="prism language-java">sizes <span class="token operator">=</span> <span class="token function">sdscatprintf</span><span class="token punctuation">(</span>sizes<span class="token punctuation">,</span><span class="token string">"sdshdr:%d"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span><span class="token function">sizeof</span><span class="token punctuation">(</span>struct sdshdr<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+改成了
+sizes <span class="token operator">=</span> <span class="token function">sdscatprintf</span><span class="token punctuation">(</span>sizes<span class="token punctuation">,</span><span class="token string">"sdshdr8:%d"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span><span class="token function">sizeof</span><span class="token punctuation">(</span>struct sdshdr8<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+sizes <span class="token operator">=</span> <span class="token function">sdscatprintf</span><span class="token punctuation">(</span>sizes<span class="token punctuation">,</span><span class="token string">"sdshdr16:%d"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span><span class="token function">sizeof</span><span class="token punctuation">(</span>struct sdshdr16<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+sizes <span class="token operator">=</span> <span class="token function">sdscatprintf</span><span class="token punctuation">(</span>sizes<span class="token punctuation">,</span><span class="token string">"sdshdr32:%d"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span><span class="token function">sizeof</span><span class="token punctuation">(</span>struct sdshdr32<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+sizes <span class="token operator">=</span> <span class="token function">sdscatprintf</span><span class="token punctuation">(</span>sizes<span class="token punctuation">,</span><span class="token string">"sdshdr64:%d"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span><span class="token function">sizeof</span><span class="token punctuation">(</span>struct sdshdr64<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>unsigned int占四个字节<br> uint8_t 占1个字节<br> Char 占一个字节<br> 我们通过计算可以得出为什么优化之后会多出5个字节了，短字符串的embstr用最小的sdshdr8。<br> sdsdr8 = uint8_t * 2 + char = 1*2+1 = 3<br> sdshdr = unsigned int * 2 = 4 * 2 = 8<br> 这么一算是不是少了五个字节了，所以3.2版本更新之后，由于优化小sds的内存使用，使得原本39个字节可以多使用5个字节，这就变成了44字节了。<br> <strong>问题三：Redis字符串最大长度是多少？</strong><br> 512M，查看源码可知。</p> 
+<pre><code class="prism language-java"><span class="token keyword">static</span> <span class="token keyword">int</span> <span class="token function">checkStringLength</span><span class="token punctuation">(</span>redisClient <span class="token operator">*</span>c<span class="token punctuation">,</span> <span class="token keyword">long</span> <span class="token keyword">long</span> size<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>size <span class="token operator">&gt;</span> <span class="token number">512</span><span class="token operator">*</span><span class="token number">1024</span><span class="token operator">*</span><span class="token number">1024</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReplyError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span><span class="token string">"string exceeds maximum allowed size (512MB)"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> REDIS_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> REDIS_OK<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h4><a id="List_269"></a>List编码</h4> 
+<p><strong>List类型可以实现栈，队列，阻塞队列等数据结构，底层是个链表结构，它的底层编码分二种：ziplist(压缩列表) 和 linkedlist(双端链表)。</strong><br> 超过配置的数量或者最大的元素超过临界值时，符合配置的值，触发机制会选择不同的编码。<br> 列表保存元素个数小于512个，每个元素长度小于64字节的时候触发机制会使用ziplist（压缩列表）编码，否则使用linkedlist（双端链表）。<br> 在redis.conf(linux系统)或者redis.windows.conf(windows系统)对应的配置：</p> 
+<pre><code class="prism language-java">list<span class="token operator">-</span>max<span class="token operator">-</span>ziplist<span class="token operator">-</span>entries <span class="token number">512</span>
+list<span class="token operator">-</span>max<span class="token operator">-</span>ziplist<span class="token operator">-</span>value <span class="token number">64</span>
+</code></pre> 
+<p>通过修改配置这二个配置，设置触发条件选择编码。比如我修改列表保存元素个数小于1024个并且每个元素长度小于128字节时使用ziplist（压缩列表）编码，否则使用linkedlist（双端链表）。修改配置如下：</p> 
+<pre><code class="prism language-java">list<span class="token operator">-</span>max<span class="token operator">-</span>ziplist<span class="token operator">-</span>entries <span class="token number">1024</span>
+list<span class="token operator">-</span>max<span class="token operator">-</span>ziplist<span class="token operator">-</span>value <span class="token number">128</span>
+</code></pre> 
+<h4><a id="Hash__287"></a>Hash 编码</h4> 
+<p><strong>Hash类型比string类型消耗内存和cpu更小。Hash的编码有二种 ziplist编码 或者 hashtable。</strong><br> 超过指定的值，最大的元素超过临界值时，符合配置的值，触发机制选择不同的编码。列表保存元素个数小于512个，每个元素长度小于64字节的时候，使用ziplist（压缩列表）编码，否则使用hashtable 。<br> 配置文件中可以通过修改set-max-intset-entries 1024达到改变列表保存元素个数小于1024个，原理类似。<br> hashtable 编码是字典作为底层实现，字典的键是字符串对象，值则全部设置为 null。在上面的字典也有详细介绍。</p> 
+<h4><a id="Set_292"></a>Set集合对象</h4> 
+<p><strong>Set类型可以实现抽奖小程序，点赞，收藏，加标签，关注模型等功能。Set的编码有二种intset 或者 hashtable。</strong><br> 超过指定的值，最大的元素超过临界值时，符合配置条件，触发机制选择不同的编码。集合对象中所有元素都是整数，对象元素数量不超过512时，使用intset编码，否则使用hashtable。原理大致和上面的类型相同。<br> 列表保存元素个数的配置也是通过set-max-intset-entries进行修改的。<br> intset 编码用整数集合作为底层实现，hashtable编码可以类比HashMap的实现，HashTable类中存储的实际数据是Entry对象，数据结构与HashMap是相同的。</p> 
+<h4><a id="Zset_297"></a>Zset有序集合对象</h4> 
+<p><strong>Zset适合做排序以及范围查询等功能，比如实现实现排行榜等。有序集合的编码有二种 ziplist 或者 skiplist。</strong><br> 保存的元素数量小于128，存储的所有元素长度小于64字节的时候，使用ziplist编码，否则用skiplist编码。修改配置如下：</p> 
+<pre><code class="prism language-java">zset<span class="token operator">-</span>max<span class="token operator">-</span>ziplist<span class="token operator">-</span>entries <span class="token number">128</span>
+zset<span class="token operator">-</span>max<span class="token operator">-</span>ziplist<span class="token operator">-</span>value <span class="token number">64</span>
+</code></pre> 
+<p>ziplist 编码底层是用压缩列表实现的，集合元素是两个紧挨在一起的压缩列表节点来保存，第一个节点保存元素的成员，第二个节点保存元素的分值。 压缩列表的集合元素按照设置的分值从小到大的顺序进行排列，小的放置在靠近表头的位置，大的放置在靠近表尾的位置。<br> skiplist 编码的有序集合对象使用 zet 结构作为底层实现，一个 zset 结构同时包含一个字典和一个跳跃表。<br> 字典的键保存元素的值，字典的值则保存元素的分值；跳跃表节点的 object 属性保存元素的成员，跳跃表节点的 score 属性保存元素的分值。这两种数据结构会通过指针来共享相同元素的成员和分值，所以不会产生重复成员和分值，造成内存的浪费。<br> <strong>问题：为什么需要二种数据结构？</strong><br> 有序集合单独使用字典或跳跃表，其中一种数据结构都可以实现，但是这里用两种数据结构组合起来。<br> 原因是我们单独用字典，时间复杂度虽然低一些，查找成员的分值也快，但是字典以无序的方式来保存集合元素的，所以每次进行范围操作的时候都要重新进行排序，对性能有影响。<br> 单独用跳跃表，虽然可以进行范围操作，但是查询复杂度变高了。因此Redis使用了两种数据结构来共同实现有序集合，可以保证排序的效率。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/81a2a5514b53a1c91e074cc8ec061bac/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">钉钉机器人-scheduler</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/21505a589b46ec15e43deb992f2776b0/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">集成学习之提升树(DB、GBDT)</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

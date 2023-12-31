@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>VFIO概述 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="VFIO概述" />
+<meta property="og:description" content="文章目录 1.IOMMU1.1 IOMMU功能简介1.2 IOMMU作用1.3 IOMMU工作原理1.4 Source Identifier 2.VFIO2.1 概念介绍2.2 使用示例 3.设备透传分析3.1 虚机地址映射3.2 设备透传实现 1.IOMMU 1.1 IOMMU功能简介 IOMMU主要功能包括DMA Remapping和Interrupt Remapping，这里主要讲解DMA Remapping，Interrupt Remapping会独立讲解。对于DMA Remapping，IOMMU与MMU类似。IOMMU可以将一个设备访问地址转换为存储器地址，下图针对有无IOMMU情况说明IOMMU作用。
+在没有IOMMU的情况下，网卡接收数据时地址转换流程，RC会将网卡请求写入地址addr1直接发送到DDR控制器，然后访问DRAM上的addr1地址，这里的RC对网卡请求地址不做任何转换，网卡访问的地址必须是物理地址。
+对于有IOMMU的情况，网卡请求写入地址addr1会被IOMMU转换为addr2，然后发送到DDR控制器，最终访问的是DRAM上addr2地址，网卡访问的地址addr1会被IOMMU转换成真正的物理地址addr2，这里可以将addr1理解为虚机地址。
+左图是没有IOMMU的情况，对于虚机无法实现设备的透传，原因主要有两个：一是因为在没有IOMMU的情况下，设备必须访问真实的物理地址HPA，而虚机可见的是GPA；二是如果让虚机填入真正的HPA，那样的话相当于虚机可以直接访问物理地址，会有安全隐患。所以针对没有IOMMU的情况，不能用透传的方式，对于设备的直接访问都会有VMM接管，这样就不会对虚机暴露HPA。
+右图是有IOMMU的情况，虚机可以将GPA直接写入到设备，当设备进行DMA传输时，设备请求地址GPA由IOMMU转换为HPA（硬件自动完成），进而DMA操作真实的物理空间。IOMMU的映射关系是由VMM维护的，HPA对虚机不可见，保障了安全问题，利用IOMMU可实现设备的透传。这里先留一个问题，既然IOMMU可以将设备访问地址映射成真实的物理地址，那么对于右图中的Device A和Device B，IOMMU必须保证两个设备映射后的物理空间不能存在交集，否则两个虚机可以相互干扰，这和IOMMU的映射原理有关，后面会详细介绍。
+1.2 IOMMU作用 根据上一节内容，总结IOMMU主要作用如下：
+屏蔽物理地址，起到保护作用。典型应用包括两个：一是实现用户态驱动，由于IOMMU的映射功能，使HPA对用户空间不可见，在vfio部分还会举例。二是将设备透传给虚机，使HPA对虚机不可见，并将GPA映射为HPAIOMMU可以将连续的虚拟地址映射到不连续的多个物理内存片段，这部分功能于MMU类似，对于没有IOMMU的情况，设备访问的物理空间必须是连续的，IOMMU可有效的解决这个问题 1.3 IOMMU工作原理 前面简单介绍了IOMMU的映射功能，下面讲述IOMMU到底如何实现映射的，为便于分析，这里先不考虑虚拟化的场景，以下图为例，阐述工作原理。
+IOMMU的主要功能就是完成映射，类比MMU利用页表实现VA-&gt;PA的映射，IOMMU也需要用到页表，那么下一个问题就是如何找到页表。在设备发起DMA请求时，会将自己的Source Identifier(包含Bus、Device、Func)包含在请求中，IOMMU根据这个标识，以RTADDR_REG指向空间为基地址，然后利用Bus、Device、Func在Context Table中找到对应的Context Entry，即页表首地址，然后利用页表即可将设备请求的虚拟地址翻译成物理地址。这里做以下说明：
+图中红线的部门，是两个Context Entry指向了同一个页表。这种情况在虚拟化场景中的典型用法就是这两个Context Entry对应的不同PCIe设备属于同一个虚机，那样IOMMU在将GPA-&gt;HPA过程中要遵循同一规则由图中可知，每个具有Source Identifier(包含Bus、Device、Func)的设备都会具有一个Context Entry。如果不这样做，所有设备共用同一个页表，隶属于不同虚机的不同GPA就会翻译成相同HPA，会产生问题， 有了页表之后，就可以按照MMU那样进行地址映射工作了，这里也支持不同页大小的映射，包括4KB、2MB、1GB，不同页大小对应的级数也不同，下图以4KB页大小为例说明，映射过程和MMU类似，不再详细阐述。
+1.4 Source Identifier 在讲述IOMMU的工作原理时，讲到了设备利用自己的Source Identifier(包含Bus、Device、Func)来找到页表项来完成地址映射，不过存在下面几个特殊情况需要考虑。
+对于由PCIe switch扩展出的PCI桥及桥下设备，在发送DMA请求时，Source Identifier是PCIe switch的，这样的话该PCI桥及桥下所有设备都会使用PCIe switch的Source Identifier去定位Context Entry，找到的页表也是同一个，如果将这个PCI桥下的不同设备分给不同虚机，由于会使用同一份页表，这样会产生问题，针对这种情况，当前PCI桥及桥下的所有设备必须分配给同一个虚机，这就是VFIO中组的概念，下面会再讲到。对于SRIO-V，之前介绍过VF的Bus及devfn的计算方法，所以不同VF会有不同的Source Identifier，映射到不同虚机也是没有问题的 2.VFIO VFIO就是内核针对IOMMU提供的软件框架，支持DMA Remapping和Interrupt Remapping，这里只讲DMA Remapping。VFIO利用IOMMU这个特性，可以屏蔽物理地址对上层的可见性，可以用来开发用户态驱动，也可以实现设备透传。
+2.1 概念介绍 先介绍VFIO中的几个重要概念，主要包括Group和Container。
+Group：group 是IOMMU能够进行DMA隔离的最小硬件单元，一个group内可能只有一个device，也可能有多个device，这取决于物理平台上硬件的IOMMU拓扑结构。 设备直通的时候一个group里面的设备必须都直通给一个虚拟机。 不能够让一个group里的多个device分别从属于2个不同的VM，也不允许部分device在host上而另一部分被分配到guest里， 因为就这样一个guest中的device可以利用DMA攻击获取另外一个guest里的数据，就无法做到物理上的DMA隔离。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/9c2d0ac41300f087a64a5c5f4adc61df/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-01-18T13:48:32+08:00" />
+<meta property="article:modified_time" content="2020-01-18T13:48:32+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">VFIO概述</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><ul><li><a href="#1IOMMU_1" rel="nofollow">1.IOMMU</a></li><li><ul><li><a href="#11_IOMMU_3" rel="nofollow">1.1 IOMMU功能简介</a></li><li><a href="#12_IOMMU_17" rel="nofollow">1.2 IOMMU作用</a></li><li><a href="#13_IOMMU_24" rel="nofollow">1.3 IOMMU工作原理</a></li><li><a href="#14_Source_Identifier_39" rel="nofollow">1.4 Source Identifier</a></li></ul> 
+   </li><li><a href="#2VFIO_48" rel="nofollow">2.VFIO</a></li><li><ul><li><a href="#21__52" rel="nofollow">2.1 概念介绍</a></li><li><a href="#22__64" rel="nofollow">2.2 使用示例</a></li></ul> 
+   </li><li><a href="#3_125" rel="nofollow">3.设备透传分析</a></li><li><ul><li><a href="#31__129" rel="nofollow">3.1 虚机地址映射</a></li><li><a href="#32__146" rel="nofollow">3.2 设备透传实现</a></li></ul> 
+  </li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<h3><a id="1IOMMU_1"></a>1.IOMMU</h3> 
+<h4><a id="11_IOMMU_3"></a>1.1 IOMMU功能简介</h4> 
+<p>IOMMU主要功能包括DMA Remapping和Interrupt Remapping，这里主要讲解DMA Remapping，Interrupt Remapping会独立讲解。对于DMA Remapping，IOMMU与MMU类似。IOMMU可以将一个设备访问地址转换为存储器地址，下图针对有无IOMMU情况说明IOMMU作用。<br> <img src="https://images2.imgbox.com/fb/ef/Tm1pqsZL_o.png" alt="在这里插入图片描述"><br> 在没有IOMMU的情况下，网卡接收数据时地址转换流程，RC会将网卡请求写入地址addr1直接发送到DDR控制器，然后访问DRAM上的addr1地址，这里的RC对网卡请求地址不做任何转换，网卡访问的地址必须是物理地址。<br> <img src="https://images2.imgbox.com/e1/49/PVuoUZGN_o.png" alt="在这里插入图片描述"></p> 
+<p>对于有IOMMU的情况，网卡请求写入地址addr1会被IOMMU转换为addr2，然后发送到DDR控制器，最终访问的是DRAM上addr2地址，网卡访问的地址addr1会被IOMMU转换成真正的物理地址addr2，这里可以将addr1理解为虚机地址。<br> <img src="https://images2.imgbox.com/50/be/8Ueq4ZQi_o.png" alt="在这里插入图片描述"></p> 
+<p>左图是没有IOMMU的情况，对于虚机无法实现设备的透传，原因主要有两个：一是因为在没有IOMMU的情况下，设备必须访问真实的物理地址HPA，而虚机可见的是GPA；二是如果让虚机填入真正的HPA，那样的话相当于虚机可以直接访问物理地址，会有安全隐患。所以针对没有IOMMU的情况，不能用透传的方式，对于设备的直接访问都会有VMM接管，这样就不会对虚机暴露HPA。</p> 
+<p>右图是有IOMMU的情况，虚机可以将GPA直接写入到设备，当设备进行DMA传输时，设备请求地址GPA由IOMMU转换为HPA（硬件自动完成），进而DMA操作真实的物理空间。IOMMU的映射关系是由VMM维护的，HPA对虚机不可见，保障了安全问题，利用IOMMU可实现设备的透传。这里先留一个问题，既然IOMMU可以将设备访问地址映射成真实的物理地址，那么对于右图中的Device A和Device B，IOMMU必须保证两个设备映射后的物理空间不能存在交集，否则两个虚机可以相互干扰，这和IOMMU的映射原理有关，后面会详细介绍。</p> 
+<h4><a id="12_IOMMU_17"></a>1.2 IOMMU作用</h4> 
+<p>根据上一节内容，总结IOMMU主要作用如下：</p> 
+<ul><li>屏蔽物理地址，起到保护作用。典型应用包括两个：一是实现用户态驱动，由于IOMMU的映射功能，使HPA对用户空间不可见，在vfio部分还会举例。二是将设备透传给虚机，使HPA对虚机不可见，并将GPA映射为HPA</li><li>IOMMU可以将连续的虚拟地址映射到不连续的多个物理内存片段，这部分功能于MMU类似，对于没有IOMMU的情况，设备访问的物理空间必须是连续的，IOMMU可有效的解决这个问题</li></ul> 
+<h4><a id="13_IOMMU_24"></a>1.3 IOMMU工作原理</h4> 
+<p>前面简单介绍了IOMMU的映射功能，下面讲述IOMMU到底如何实现映射的，为便于分析，这里先不考虑虚拟化的场景，以下图为例，阐述工作原理。</p> 
+<p><img src="https://images2.imgbox.com/6a/9e/AXixOadI_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-n9bf2ngC-1579326156465)(/Users/hexin15/work/blog/IOMMU/assets/image-20190716102554600.png)]"></p> 
+<p>IOMMU的主要功能就是完成映射，类比MMU利用页表实现VA-&gt;PA的映射，IOMMU也需要用到页表，那么下一个问题就是如何找到页表。在设备发起DMA请求时，会将自己的Source Identifier(包含Bus、Device、Func)包含在请求中，IOMMU根据这个标识，以RTADDR_REG指向空间为基地址，然后利用Bus、Device、Func在Context Table中找到对应的Context Entry，即页表首地址，然后利用页表即可将设备请求的虚拟地址翻译成物理地址。这里做以下说明：</p> 
+<ul><li>图中红线的部门，是两个Context Entry指向了同一个页表。这种情况在虚拟化场景中的典型用法就是这两个Context Entry对应的不同PCIe设备属于同一个虚机，那样IOMMU在将GPA-&gt;HPA过程中要遵循同一规则</li><li>由图中可知，每个具有Source Identifier(包含Bus、Device、Func)的设备都会具有一个Context Entry。如果不这样做，所有设备共用同一个页表，隶属于不同虚机的不同GPA就会翻译成相同HPA，会产生问题，</li></ul> 
+<p>有了页表之后，就可以按照MMU那样进行地址映射工作了，这里也支持不同页大小的映射，包括4KB、2MB、1GB，不同页大小对应的级数也不同，下图以4KB页大小为例说明，映射过程和MMU类似，不再详细阐述。</p> 
+<p><img src="https://images2.imgbox.com/bd/62/CrEhAu7s_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-veSuU6Da-1579326156466)(/Users/hexin15/work/blog/IOMMU/assets/image-20190716101922099.png)]"></p> 
+<h4><a id="14_Source_Identifier_39"></a>1.4 Source Identifier</h4> 
+<p>在讲述IOMMU的工作原理时，讲到了设备利用自己的Source Identifier(包含Bus、Device、Func)来找到页表项来完成地址映射，不过存在下面几个特殊情况需要考虑。</p> 
+<ul><li>对于由PCIe switch扩展出的PCI桥及桥下设备，在发送DMA请求时，Source Identifier是PCIe switch的，这样的话该PCI桥及桥下所有设备都会使用PCIe switch的Source Identifier去定位Context Entry，找到的页表也是同一个，如果将这个PCI桥下的不同设备分给不同虚机，由于会使用同一份页表，这样会产生问题，针对这种情况，当前PCI桥及桥下的所有设备必须分配给同一个虚机，这就是VFIO中组的概念，下面会再讲到。</li><li><s>对于SRIO-V，之前介绍过VF的Bus及devfn的计算方法，所以不同VF会有不同的Source Identifier，映射到不同虚机也是没有问题的</s></li></ul> 
+<h3><a id="2VFIO_48"></a>2.VFIO</h3> 
+<p>VFIO就是内核针对IOMMU提供的软件框架，支持DMA Remapping和Interrupt Remapping，这里只讲DMA Remapping。VFIO利用IOMMU这个特性，可以屏蔽物理地址对上层的可见性，可以用来开发用户态驱动，也可以实现设备透传。</p> 
+<h4><a id="21__52"></a>2.1 概念介绍</h4> 
+<p>先介绍VFIO中的几个重要概念，主要包括Group和Container。</p> 
+<p>Group：group 是IOMMU能够进行DMA隔离的最小硬件单元，一个group内可能只有一个device，也可能有多个device，这取决于物理平台上硬件的IOMMU拓扑结构。 设备直通的时候一个group里面的设备必须都直通给一个虚拟机。 不能够让一个group里的多个device分别从属于2个不同的VM，也不允许部分device在host上而另一部分被分配到guest里， 因为就这样一个guest中的device可以利用DMA攻击获取另外一个guest里的数据，就无法做到物理上的DMA隔离。</p> 
+<p>Container：对于虚机，Container 这里可以简单理解为一个VM Domain的物理内存空间。对于用户态驱动，Container可以是多个Group的集合。</p> 
+<p><img src="https://images2.imgbox.com/18/16/95F9uPuZ_o.png" alt="在这里插入图片描述"></p> 
+<p>上图中PCIe-PCI桥下的两个设备，在发送DMA请求时，PCIe-PCI桥会为下面两个设备生成Source Identifier，其中Bus域为红色总线号bus，device和func域为0。这样的话，PCIe-PCI桥下的两个设备会找到同一个Context Entry和同一份页表，所以这两个设备不能分别给两个虚机使用，这两个设备就属于一个Group。</p> 
+<h4><a id="22__64"></a>2.2 使用示例</h4> 
+<p>这里先以简单的用户态驱动为例，在设备透传小节中，在分析如何利用vfio实现透传。</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> container<span class="token punctuation">,</span> group<span class="token punctuation">,</span> device<span class="token punctuation">,</span> i<span class="token punctuation">;</span>
+	<span class="token keyword">struct</span> vfio_group_status group_status <span class="token operator">=</span>
+					<span class="token punctuation">{<!-- --></span> <span class="token punctuation">.</span>argsz <span class="token operator">=</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>group_status<span class="token punctuation">)</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+	<span class="token keyword">struct</span> vfio_iommu_type1_info iommu_info <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span> <span class="token punctuation">.</span>argsz <span class="token operator">=</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>iommu_info<span class="token punctuation">)</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+	<span class="token keyword">struct</span> vfio_iommu_type1_dma_map dma_map <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span> <span class="token punctuation">.</span>argsz <span class="token operator">=</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>dma_map<span class="token punctuation">)</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+	<span class="token keyword">struct</span> vfio_device_info device_info <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span> <span class="token punctuation">.</span>argsz <span class="token operator">=</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>device_info<span class="token punctuation">)</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Create a new container */</span>
+	container <span class="token operator">=</span> <span class="token function">open</span><span class="token punctuation">(</span><span class="token string">"/dev/vfio/vfio"</span><span class="token punctuation">,</span> O_RDWR<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">ioctl</span><span class="token punctuation">(</span>container<span class="token punctuation">,</span> VFIO_GET_API_VERSION<span class="token punctuation">)</span> <span class="token operator">!=</span> VFIO_API_VERSION<span class="token punctuation">)</span>
+		<span class="token comment">/* Unknown API version */</span>
+
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">ioctl</span><span class="token punctuation">(</span>container<span class="token punctuation">,</span> VFIO_CHECK_EXTENSION<span class="token punctuation">,</span> VFIO_TYPE1_IOMMU<span class="token punctuation">)</span><span class="token punctuation">)</span>
+		<span class="token comment">/* Doesn't support the IOMMU driver we want. */</span>
+
+	<span class="token comment">/* Open the group */</span>
+	group <span class="token operator">=</span> <span class="token function">open</span><span class="token punctuation">(</span><span class="token string">"/dev/vfio/26"</span><span class="token punctuation">,</span> O_RDWR<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Test the group is viable and available */</span>
+	<span class="token function">ioctl</span><span class="token punctuation">(</span>group<span class="token punctuation">,</span> VFIO_GROUP_GET_STATUS<span class="token punctuation">,</span> <span class="token operator">&amp;</span>group_status<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token punctuation">(</span>group_status<span class="token punctuation">.</span>flags <span class="token operator">&amp;</span> VFIO_GROUP_FLAGS_VIABLE<span class="token punctuation">)</span><span class="token punctuation">)</span>
+		<span class="token comment">/* Group is not viable (ie, not all devices bound for vfio) */</span>
+
+	<span class="token comment">/* Add the group to the container */</span>
+	<span class="token function">ioctl</span><span class="token punctuation">(</span>group<span class="token punctuation">,</span> VFIO_GROUP_SET_CONTAINER<span class="token punctuation">,</span> <span class="token operator">&amp;</span>container<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Enable the IOMMU model we want */</span>   <span class="token comment">// type 1 open | attatch</span>
+	<span class="token function">ioctl</span><span class="token punctuation">(</span>container<span class="token punctuation">,</span> VFIO_SET_IOMMU<span class="token punctuation">,</span> VFIO_TYPE1_IOMMU<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Get addition IOMMU info */</span>
+	<span class="token function">ioctl</span><span class="token punctuation">(</span>container<span class="token punctuation">,</span> VFIO_IOMMU_GET_INFO<span class="token punctuation">,</span> <span class="token operator">&amp;</span>iommu_info<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Allocate some space and setup a DMA mapping */</span>
+	dma_map<span class="token punctuation">.</span>vaddr <span class="token operator">=</span> <span class="token function">mmap</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1024</span> <span class="token operator">*</span> <span class="token number">1024</span><span class="token punctuation">,</span> PROT_READ <span class="token operator">|</span> PROT_WRITE<span class="token punctuation">,</span>
+			     MAP_PRIVATE <span class="token operator">|</span> MAP_ANONYMOUS<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	dma_map<span class="token punctuation">.</span>size <span class="token operator">=</span> <span class="token number">1024</span> <span class="token operator">*</span> <span class="token number">1024</span><span class="token punctuation">;</span>
+	dma_map<span class="token punctuation">.</span>iova <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> <span class="token comment">/* 1MB starting at 0x0 from device view */</span>
+	dma_map<span class="token punctuation">.</span>flags <span class="token operator">=</span> VFIO_DMA_MAP_FLAG_READ <span class="token operator">|</span> VFIO_DMA_MAP_FLAG_WRITE<span class="token punctuation">;</span>
+
+	<span class="token function">ioctl</span><span class="token punctuation">(</span>container<span class="token punctuation">,</span> VFIO_IOMMU_MAP_DMA<span class="token punctuation">,</span> <span class="token operator">&amp;</span>dma_map<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Get a file descriptor for the device */</span>
+	device <span class="token operator">=</span> <span class="token function">ioctl</span><span class="token punctuation">(</span>group<span class="token punctuation">,</span> VFIO_GROUP_GET_DEVICE_FD<span class="token punctuation">,</span> <span class="token string">"0000:06:0d.0"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">/* Test and setup the device */</span>
+	<span class="token function">ioctl</span><span class="token punctuation">(</span>device<span class="token punctuation">,</span> VFIO_DEVICE_GET_INFO<span class="token punctuation">,</span> <span class="token operator">&amp;</span>device_info<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>对于dev下Group就是按照上一节介绍的Group划分规则产生的，上述代码描述了如何使用VFIO实现映射，对于Group和Container的相关操作这里不做过多解释，主要关注如何完成映射，下图解释具体工作流程。</p> 
+<p><img src="https://images2.imgbox.com/d3/67/RAk9iuZd_o.png" alt="在这里插入图片描述"></p> 
+<p>首先，利用mmap映射出1MB字节的虚拟空间，因为物理地址对于用户态不可见，只能通过虚拟地址访问物理空间。然后执行ioctl的VFIO_IOMMU_MAP_DMA命令，传入参数主要包含vaddr及iova，其中iova代表的是设备发起DMA请求时要访问的地址，也就是IOMMU映射前的地址，vaddr就是mmap的地址。VFIO_IOMMU_MAP_DMA命令会为虚拟地址vaddr找到物理页并pin住（因为设备DMA是异步的，随时可能发生，物理页面不能交换出去），然后找到Group对应的Contex Entry，建立页表项，页表项能够将iova地址映射成上面pin住的物理页对应的物理地址上去，这样对用户态程序完全屏蔽了物理地址，实现了用户空间驱动。IOVA地址的0<sub>0x100000对应DRAM地址0x10000000</sub>0x10100000，size为1024 * 1024。一句话概述，VFIO_IOMMU_MAP_DMA这个命令就是将iova通过IOMMU映射到vaddr对应的物理地址上去。</p> 
+<h3><a id="3_125"></a>3.设备透传分析</h3> 
+<p>设备透传就是由虚机直接接管设备，虚机可以直接访问MMIO空间，VMM配置好IOMMU之后，设备DMA读写请求也无需VMM借入，需要注意的是设备的配置空间没有透传，因为VMM已经配置好了BAR空间，如果将这部分空间也透传给虚机，虚机会对BAR空间再次配置，会导致设备无法正常工作。</p> 
+<h4><a id="31__129"></a>3.1 虚机地址映射</h4> 
+<p>在介绍透传之前，先看下虚机的GPA与HVA和HPA的关系，以及虚机是如何访问到真实的物理地址的，过程如下图。</p> 
+<p><img src="https://images2.imgbox.com/41/1f/r4R4Qghi_o.png" alt="在这里插入图片描述"></p> 
+<p>一旦页表建立好后，整个映射过程都是硬件自动完成的，对于上图有如下几点说明：</p> 
+<ul><li> <p>对于虚机内的页表，完成GVA到GPA的映射，虽然整个过程都是硬件自动完成，但有一点要注意下，在虚机的中各级页表也是存储在HPA中的，而CR3及各级页表中装的地址都是GPA，所以在访问页表时也需要借助EPT，上图中以虚线表示这个过程</p> </li><li> <p>利用虚机页表完成GVA到GPA的映射后，此时借助EPT实现GPA到HPA的映射，这里没有什么特殊的，就是一层层页表映射</p> </li><li> <p>看完上图，有没有发现少了点啥，是不是没有HVA。单从上图整个虚机寻址的映射过程来看，是不需要HVA借助的，硬件会自动完成GVA-&gt;GPA-&gt;HPA映射，那么HVA有什么用呢？这里从下面两方面来分析：1）Qemu利用iotcl控制KVM实现EPT的映射，映射的过程中必然要申请物理页面。Qemu是应用程序，唯一可见的只是HVA，这时候又需要借助mmap了，Qemu会根据虚机的ram大小，即GPA大小范围，然后mmap出与之对应的大小，即HVA。通过KVM_SET_USER_MEMORY_REGION命令控制KVM，与这个命令一起传入的参数主要包括两个值，guest_phys_addr代表虚机GPA地址起始，userspace_addr代表上面mmap得到的首地址（HVA）。传入进去后，KVM就会为当前虚机GPA建立EPT映射表实现GPA-&gt;HPA，同时会为VMM建立HVA-&gt;HPA映射。2）当vm_exit发生时，VMM需要对异常进行处理，异常发生时VMM能够获取到GPA，有时VMM需要访问虚机GPA对应的HPA，VMM的映射和虚机的映射方式不同，是通过VMM完成HVA-&gt;HPA，且只能通过HVA才能访问HPA，这就需要VMM将GPA及HVA的对应关系维护起来，这个关系是Qemu维护的，这里先不管Qemu的具体实现（后面会有专门文档介绍），当前只需要知道给定一个虚机的GPA，虚机就能获取到GPA对应的HVA。下图描述VMM与VM的地址映射关系。</p> </li></ul> 
+<p><img src="https://images2.imgbox.com/8f/8d/Rl21KEWy_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="32__146"></a>3.2 设备透传实现</h4> 
+<p>在前面介绍VFIO的使用实例时，核心思想就是IOVA经过IOMMU映射出的物理地址与HVA经过MMU映射出的物理地址是同一个。对于设备透传的情况，先上图，然后看图说话。</p> 
+<p><img src="https://images2.imgbox.com/46/2e/MPZ940Ku_o.png" alt="在这里插入图片描述"></p> 
+<p>先来分析一下设备的DMA透传的工作流程，一旦设备透传给了虚机，虚机在配置设备DMA时直接使用GPA。此时GPA经由EPT会映射成HPA1，GPA经由IOMMU映射的地址为HPA2，此时的HPA1和HPA2必须相等，设备的透传才有意义。下面介绍在配置IOMMU时如何保证HPA1和HPA2相等，在VFIO章节讲到了VFIO_IOMMU_MAP_DMA这个命令就是将iova通过IOMMU映射到vaddr对应的物理地址上去。对于IOMMU来讲，此时的GPA就是iova，我们知道GPA经由EPT会映射为HPA1，对于VMM来讲，这个HPA1对应的虚机地址为HVA，那样的话在传入VFIO_IOMMU_MAP_DMA命令时讲hva作为vaddr，IOMMU就会将GPA映射为HVA对应的物理地址及HPA1，即HPA1和HPA2相等。上述流程帮助理清整个映射关系，实际映射IOMMU的操作很简单，前面提到了qemu维护了GPA和HVA的关系，在映射IOMMU的时候也可以派上用场。注：IOMMU的映射在虚机启动时就已经建立好了，映射要涵盖整个GPA地址范围，同时虚机的HPA对应的物理页都不会交换出去（设备DMA交换是异步的）。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/6dd79d2d6e272597edc7ce92e856afe7/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Markdown 小技巧之图片左对齐</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/beffefc1440e59d2b09edbdb45244a45/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">转圈打印矩阵</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

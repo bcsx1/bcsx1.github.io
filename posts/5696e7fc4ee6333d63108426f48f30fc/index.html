@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>源码解析springbatch的job是如何运行的？ - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="源码解析springbatch的job是如何运行的？" />
+<meta property="og:description" content="202208-源码解析springbatch的job是如何运行的？ 注，本文中的demo代码节选于图书《Spring Batch批处理框架》的配套源代码，并做并适配springboot升级版本，完全开源。
+SpringBatch的背景和用法，就不再赘述了，默认本文受众都使用过batch框架。
+本文仅讨论普通的ChunkStep，分片/异步处理等功能暂不讨论。
+1. 表结构 Spring系列的框架代码，大多又臭又长，让人头晕。先列出整体流程，再去看源码。顺带也可以了解存储表结构。
+每一个jobname，加运行参数的MD5值，被定义为一个job_instance，存储在batch_job_instance表中；job_instance每次运行时，会创建一个新的job_execution，存储在batch_job_execution / batch_job_execution_context 表中； 扩展：任务重启时，如何续作？ 答，判定为任务续作，创建新的job_execution时，会使用旧job_execution的运行态ExecutionContext（通俗讲，火车出故障只换了车头，车厢货物不变。） job_execution会根据job排程中的step顺序，逐个执行，逐个转化为step_execution，并存储在batch_step_execution / batch_step_execution_context表中每个step在执行时，会维护step运行状态，当出现异常或者整个step清单执行完成，会更新job_execution的状态在每个step执行前后、job_execution前后，都会通知Listener做回调。 框架使用的表
+batch_job_instance batch_job_execution batch_job_execution_context batch_job_execution_params batch_step_execution batch_step_execution_context batch_job_seq batch_step_execution_seq batch_job_execution_seq 2. API入口 先看看怎么调用启动Job的API，看起来非常简单，传入job信息和参数即可
+@Autowired @Qualifier(&#34;billJob&#34;) private Job job; @Test public void billJob() throws Exception { JobParameters jobParameters = new JobParametersBuilder() .addLong(&#34;currentTimeMillis&#34;, System.currentTimeMillis()) .addString(&#34;batchNo&#34;,&#34;2022080402&#34;) .toJobParameters(); JobExecution result = jobLauncher.run(job, jobParameters); System.out.println(result.toString()); Thread.sleep(6000); } &lt;!-- 账单作业 --&gt; &lt;batch:job id=&#34;billJob&#34;&gt; &lt;batch:step id=&#34;billStep&#34;&gt; &lt;batch:tasklet transaction-manager=&#34;transactionManager&#34;&gt; &lt;batch:chunk reader=&#34;" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5696e7fc4ee6333d63108426f48f30fc/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-08-12T09:22:17+08:00" />
+<meta property="article:modified_time" content="2022-08-12T09:22:17+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">源码解析springbatch的job是如何运行的？</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="202208springbatchjob_0"></a>202208-源码解析springbatch的job是如何运行的？</h2> 
+<blockquote> 
+ <p>注，本文中的demo代码节选于图书《Spring Batch批处理框架》的配套源代码，并做并适配springboot升级版本，完全开源。</p> 
+</blockquote> 
+<blockquote> 
+ <p>SpringBatch的背景和用法，就不再赘述了，默认本文受众都使用过batch框架。<br> 本文仅讨论普通的ChunkStep，分片/异步处理等功能暂不讨论。</p> 
+</blockquote> 
+<h3><a id="1__6"></a>1. 表结构</h3> 
+<p>Spring系列的框架代码，大多又臭又长，让人头晕。先列出整体流程，再去看源码。顺带也可以了解存储表结构。</p> 
+<ol><li>每一个jobname，加运行参数的MD5值，被定义为一个job_instance，存储在batch_job_instance表中；</li><li>job_instance每次运行时，会创建一个新的job_execution，存储在batch_job_execution / batch_job_execution_context 表中； 
+  <ol><li>扩展：任务重启时，如何续作？ 答，判定为任务续作，创建新的job_execution时，会使用旧job_execution的运行态ExecutionContext（通俗讲，火车出故障只换了车头，车厢货物不变。）</li></ol> </li><li>job_execution会根据job排程中的step顺序，逐个执行，逐个转化为step_execution，并存储在batch_step_execution / batch_step_execution_context表中</li><li>每个step在执行时，会维护step运行状态，当出现异常或者整个step清单执行完成，会更新job_execution的状态</li><li>在每个step执行前后、job_execution前后，都会通知Listener做回调。</li></ol> 
+<p>框架使用的表</p> 
+<pre><code class="prism language-sql">batch_job_instance
+batch_job_execution
+batch_job_execution_context
+batch_job_execution_params
+batch_step_execution
+batch_step_execution_context
+batch_job_seq
+batch_step_execution_seq
+batch_job_execution_seq
+</code></pre> 
+<h3><a id="2_API_30"></a>2. API入口</h3> 
+<p>先看看怎么调用启动Job的API，看起来非常简单，传入job信息和参数即可</p> 
+<pre><code class="prism language-java">    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token annotation punctuation">@Qualifier</span><span class="token punctuation">(</span><span class="token string">"billJob"</span><span class="token punctuation">)</span>
+    <span class="token keyword">private</span> <span class="token class-name">Job</span> job<span class="token punctuation">;</span>
+    
+    <span class="token annotation punctuation">@Test</span>
+    <span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">billJob</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">JobParameters</span> jobParameters <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">JobParametersBuilder</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+                <span class="token punctuation">.</span><span class="token function">addLong</span><span class="token punctuation">(</span><span class="token string">"currentTimeMillis"</span><span class="token punctuation">,</span> <span class="token class-name">System</span><span class="token punctuation">.</span><span class="token function">currentTimeMillis</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+                <span class="token punctuation">.</span><span class="token function">addString</span><span class="token punctuation">(</span><span class="token string">"batchNo"</span><span class="token punctuation">,</span><span class="token string">"2022080402"</span><span class="token punctuation">)</span>
+                <span class="token punctuation">.</span><span class="token function">toJobParameters</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">JobExecution</span> result <span class="token operator">=</span> jobLauncher<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span>job<span class="token punctuation">,</span> jobParameters<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span>result<span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">sleep</span><span class="token punctuation">(</span><span class="token number">6000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre> 
+<pre><code class="prism language-xml">    <span class="token comment">&lt;!-- 账单作业 --&gt;</span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span><span class="token namespace">batch:</span>job</span> <span class="token attr-name">id</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>billJob<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span><span class="token namespace">batch:</span>step</span> <span class="token attr-name">id</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>billStep<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span><span class="token namespace">batch:</span>tasklet</span> <span class="token attr-name">transaction-manager</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>transactionManager<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>
+                <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span><span class="token namespace">batch:</span>chunk</span> <span class="token attr-name">reader</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>csvItemReader<span class="token punctuation">"</span></span> <span class="token attr-name">writer</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>csvItemWriter<span class="token punctuation">"</span></span> <span class="token attr-name">processor</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>creditBillProcessor<span class="token punctuation">"</span></span> <span class="token attr-name">commit-interval</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>3<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>
+                <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span><span class="token namespace">batch:</span>chunk</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span><span class="token namespace">batch:</span>tasklet</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span><span class="token namespace">batch:</span>step</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span><span class="token namespace">batch:</span>job</span><span class="token punctuation">&gt;</span></span>
+</code></pre> 
+<p>org.springframework.batch.core.launch.support.SimpleJobLauncher#run</p> 
+<pre><code class="prism language-java"><span class="token comment">// 简化部分代码（参数检查、log日志）</span>
+<span class="token annotation punctuation">@Override</span>
+<span class="token keyword">public</span> <span class="token class-name">JobExecution</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token keyword">final</span> <span class="token class-name">Job</span> job<span class="token punctuation">,</span> <span class="token keyword">final</span> <span class="token class-name">JobParameters</span> jobParameters<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">final</span> <span class="token class-name">JobExecution</span> jobExecution<span class="token punctuation">;</span>
+	<span class="token class-name">JobExecution</span> lastExecution <span class="token operator">=</span> jobRepository<span class="token punctuation">.</span><span class="token function">getLastJobExecution</span><span class="token punctuation">(</span>job<span class="token punctuation">.</span><span class="token function">getName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> jobParameters<span class="token punctuation">)</span><span class="token punctuation">;</span>
+       <span class="token comment">// 上次执行存在，说明本次请求是重启job，先做检查</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>lastExecution <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>job<span class="token punctuation">.</span><span class="token function">isRestartable</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">JobRestartException</span><span class="token punctuation">(</span><span class="token string">"JobInstance already exists and is not restartable"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">/* 检查stepExecutions的状态
+		 * validate here if it has stepExecutions that are UNKNOWN, STARTING, STARTED and STOPPING
+		 * retrieve the previous execution and check
+		 */</span>
+		<span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token class-name">StepExecution</span> execution <span class="token operator">:</span> lastExecution<span class="token punctuation">.</span><span class="token function">getStepExecutions</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token class-name">BatchStatus</span> status <span class="token operator">=</span> execution<span class="token punctuation">.</span><span class="token function">getStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>status<span class="token punctuation">.</span><span class="token function">isRunning</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">||</span> status <span class="token operator">==</span> <span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STOPPING<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">JobExecutionAlreadyRunningException</span><span class="token punctuation">(</span><span class="token string">"A job execution for this job is already running: "</span>
+						<span class="token operator">+</span> lastExecution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>status <span class="token operator">==</span> <span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>UNKNOWN<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">JobRestartException</span><span class="token punctuation">(</span>
+						<span class="token string">"Cannot restart step ["</span> <span class="token operator">+</span> execution<span class="token punctuation">.</span><span class="token function">getStepName</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token string">"] from UNKNOWN status. "</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// Check jobParameters</span>
+	job<span class="token punctuation">.</span><span class="token function">getJobParametersValidator</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">validate</span><span class="token punctuation">(</span>jobParameters<span class="token punctuation">)</span><span class="token punctuation">;</span>
+       <span class="token comment">// 创建JobExecution 同一个job+参数，只能有一个Execution执行器</span>
+	jobExecution <span class="token operator">=</span> jobRepository<span class="token punctuation">.</span><span class="token function">createJobExecution</span><span class="token punctuation">(</span>job<span class="token punctuation">.</span><span class="token function">getName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> jobParameters<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+           <span class="token comment">// SyncTaskExecutor 看似是异步，实际是同步执行（可扩展）</span>
+		taskExecutor<span class="token punctuation">.</span><span class="token function">execute</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">Runnable</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token annotation punctuation">@Override</span>
+			<span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                       <span class="token comment">// 关键入口，请看[org.springframework.batch.core.job.AbstractJob#execute]</span>
+					job<span class="token punctuation">.</span><span class="token function">execute</span><span class="token punctuation">(</span>jobExecution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token keyword">if</span> <span class="token punctuation">(</span>logger<span class="token punctuation">.</span><span class="token function">isInfoEnabled</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+						<span class="token class-name">Duration</span> jobExecutionDuration <span class="token operator">=</span> <span class="token class-name">BatchMetrics</span><span class="token punctuation">.</span><span class="token function">calculateDuration</span><span class="token punctuation">(</span>jobExecution<span class="token punctuation">.</span><span class="token function">getStartTime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> jobExecution<span class="token punctuation">.</span><span class="token function">getEndTime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+				<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Throwable</span> t<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token function">rethrow</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">rethrow</span><span class="token punctuation">(</span><span class="token class-name">Throwable</span> t<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                   <span class="token comment">// 省略各类抛异常</span>
+				<span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">IllegalStateException</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">TaskRejectedException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 更新job_execution的运行状态</span>
+		jobExecution<span class="token punctuation">.</span><span class="token function">upgradeStatus</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>FAILED<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>jobExecution<span class="token punctuation">.</span><span class="token function">getExitStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">equals</span><span class="token punctuation">(</span><span class="token class-name">ExitStatus</span><span class="token punctuation">.</span>UNKNOWN<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			jobExecution<span class="token punctuation">.</span><span class="token function">setExitStatus</span><span class="token punctuation">(</span><span class="token class-name">ExitStatus</span><span class="token punctuation">.</span>FAILED<span class="token punctuation">.</span><span class="token function">addExitDescription</span><span class="token punctuation">(</span>e<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		jobRepository<span class="token punctuation">.</span><span class="token function">update</span><span class="token punctuation">(</span>jobExecution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> jobExecution<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<h3><a id="3__128"></a>3. 深入代码流程</h3> 
+<blockquote> 
+ <p>简单看看API入口，子类划分较多，继续往后看</p> 
+</blockquote> 
+<p>总体代码流程</p> 
+<ol><li>org.springframework.batch.core.launch.support.SimpleJobLauncher#run 入口api，构建jobExecution</li><li>org.springframework.batch.core.job.AbstractJob#execute 对jobExecution进行执行、listener的前置处理</li><li>FlowJob#doExecute -&gt; SimpleFlow#start 按顺序逐个处理Step、构建stepExecution</li><li>JobFlowExecutor#executeStep -&gt; SimpleStepHandler#handleStep -&gt; AbstractStep#execute 执行stepExecution</li><li>TaskletStep#doExecute 通过RepeatTemplate，调用TransactionTemplate方法，在事务中执行 
+  <ol><li>内部类TaskletStep.ChunkTransactionCallback#doInTransaction</li></ol> </li><li>反复调起ChunkOrientedTasklet#execute 去执行read-process-writer方法， 
+  <ol><li>通过自定义的Reader得到inputs，例如本文实现的是flatReader读取csv文件</li><li>遍历inputs，将item逐个传入，调用processor处理</li><li>调用writer，将outputs一次性写入</li><li>不同reader的实现内容不同，通过缓存读取的行数等信息，可做到分片、按数量处理chunk</li></ol> </li></ol> 
+<p>JobExecution的处理过程</p> 
+<p>org.springframework.batch.core.job.AbstractJob#execute</p> 
+<pre><code class="prism language-java">
+<span class="token comment">/** 运行给定的job，处理全部listener和DB存储的调用
+* Run the specified job, handling all listener and repository calls, and
+* delegating the actual processing to {@link #doExecute(JobExecution)}.
+*
+* @see Job#execute(JobExecution)
+* @throws StartLimitExceededException
+*             if start limit of one of the steps was exceeded
+*/</span>
+<span class="token annotation punctuation">@Ovrride</span>
+<span class="token keyword">public</span> <span class="token keyword">final</span> <span class="token keyword">void</span> <span class="token function">execute</span><span class="token punctuation">(</span><span class="token class-name">JobExecution</span> execution<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token comment">// 同步控制器，防并发执行</span>
+    <span class="token class-name">JobSynchronizationManager</span><span class="token punctuation">.</span><span class="token function">register</span><span class="token punctuation">(</span>execution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 计时器，记录耗时</span>
+    <span class="token class-name">LongTaskTimer</span> longTaskTimer <span class="token operator">=</span> <span class="token class-name">BatchMetrics</span><span class="token punctuation">.</span><span class="token function">createLongTaskTimer</span><span class="token punctuation">(</span><span class="token string">"job.active"</span><span class="token punctuation">,</span> <span class="token string">"Active jobs"</span><span class="token punctuation">,</span>
+            <span class="token class-name">Tag</span><span class="token punctuation">.</span><span class="token function">of</span><span class="token punctuation">(</span><span class="token string">"name"</span><span class="token punctuation">,</span> execution<span class="token punctuation">.</span><span class="token function">getJobInstance</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getJobName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token class-name">LongTaskTimer<span class="token punctuation">.</span>Sample</span> longTaskTimerSample <span class="token operator">=</span> longTaskTimer<span class="token punctuation">.</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token class-name">Timer<span class="token punctuation">.</span>Sample</span> timerSample <span class="token operator">=</span> <span class="token class-name">BatchMetrics</span><span class="token punctuation">.</span><span class="token function">createTimerSample</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 参数再次进行校验</span>
+        jobParametersValidator<span class="token punctuation">.</span><span class="token function">validate</span><span class="token punctuation">(</span>execution<span class="token punctuation">.</span><span class="token function">getJobParameters</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>execution<span class="token punctuation">.</span><span class="token function">getStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STOPPING<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+            <span class="token comment">// 更新db中任务状态</span>
+            execution<span class="token punctuation">.</span><span class="token function">setStartTime</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">Date</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token function">updateStatus</span><span class="token punctuation">(</span>execution<span class="token punctuation">,</span> <span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STARTED<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// 回调所有listener的beforeJob方法</span>
+            listener<span class="token punctuation">.</span><span class="token function">beforeJob</span><span class="token punctuation">(</span>execution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token function">doExecute</span><span class="token punctuation">(</span>execution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">RepeatException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">throw</span> e<span class="token punctuation">.</span><span class="token function">getCause</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 搞不懂这里包一个RepeatException 有啥用</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// 任务状态时BatchStatus.STOPPING，说明任务已经停止，直接改成STOPPED</span>
+            <span class="token comment">// The job was already stopped before we even got this far. Deal</span>
+            <span class="token comment">// with it in the same way as any other interruption.</span>
+            execution<span class="token punctuation">.</span><span class="token function">setStatus</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STOPPED<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            execution<span class="token punctuation">.</span><span class="token function">setExitStatus</span><span class="token punctuation">(</span><span class="token class-name">ExitStatus</span><span class="token punctuation">.</span>COMPLETED<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+
+    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">JobInterruptedException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 任务被打断 STOPPED</span>
+        execution<span class="token punctuation">.</span><span class="token function">setExitStatus</span><span class="token punctuation">(</span><span class="token function">getDefaultExitStatusForFailure</span><span class="token punctuation">(</span>e<span class="token punctuation">,</span> execution<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        execution<span class="token punctuation">.</span><span class="token function">setStatus</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span><span class="token function">max</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STOPPED<span class="token punctuation">,</span> e<span class="token punctuation">.</span><span class="token function">getStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        execution<span class="token punctuation">.</span><span class="token function">addFailureException</span><span class="token punctuation">(</span>e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Throwable</span> t<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 其他原因失败 FAILED</span>
+        logger<span class="token punctuation">.</span><span class="token function">error</span><span class="token punctuation">(</span><span class="token string">"Encountered fatal error executing job"</span><span class="token punctuation">,</span> t<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        execution<span class="token punctuation">.</span><span class="token function">setExitStatus</span><span class="token punctuation">(</span><span class="token function">getDefaultExitStatusForFailure</span><span class="token punctuation">(</span>t<span class="token punctuation">,</span> execution<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        execution<span class="token punctuation">.</span><span class="token function">setStatus</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>FAILED<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        execution<span class="token punctuation">.</span><span class="token function">addFailureException</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>execution<span class="token punctuation">.</span><span class="token function">getStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">isLessThanOrEqualTo</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STOPPED<span class="token punctuation">)</span>
+                    <span class="token operator">&amp;&amp;</span> execution<span class="token punctuation">.</span><span class="token function">getStepExecutions</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">isEmpty</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token class-name">ExitStatus</span> exitStatus <span class="token operator">=</span> execution<span class="token punctuation">.</span><span class="token function">getExitStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token class-name">ExitStatus</span> newExitStatus <span class="token operator">=</span>
+                        <span class="token class-name">ExitStatus</span><span class="token punctuation">.</span>NOOP<span class="token punctuation">.</span><span class="token function">addExitDescription</span><span class="token punctuation">(</span><span class="token string">"All steps already completed or no steps configured for this job."</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                execution<span class="token punctuation">.</span><span class="token function">setExitStatus</span><span class="token punctuation">(</span>exitStatus<span class="token punctuation">.</span><span class="token function">and</span><span class="token punctuation">(</span>newExitStatus<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+
+            <span class="token comment">// 计时器 计算总耗时</span>
+            timerSample<span class="token punctuation">.</span><span class="token function">stop</span><span class="token punctuation">(</span><span class="token class-name">BatchMetrics</span><span class="token punctuation">.</span><span class="token function">createTimer</span><span class="token punctuation">(</span><span class="token string">"job"</span><span class="token punctuation">,</span> <span class="token string">"Job duration"</span><span class="token punctuation">,</span>
+                    <span class="token class-name">Tag</span><span class="token punctuation">.</span><span class="token function">of</span><span class="token punctuation">(</span><span class="token string">"name"</span><span class="token punctuation">,</span> execution<span class="token punctuation">.</span><span class="token function">getJobInstance</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getJobName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+                    <span class="token class-name">Tag</span><span class="token punctuation">.</span><span class="token function">of</span><span class="token punctuation">(</span><span class="token string">"status"</span><span class="token punctuation">,</span> execution<span class="token punctuation">.</span><span class="token function">getExitStatus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getExitCode</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+            <span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            longTaskTimerSample<span class="token punctuation">.</span><span class="token function">stop</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            execution<span class="token punctuation">.</span><span class="token function">setEndTime</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">Date</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 回调所有listener的afterJob方法  调用失败也不影响任务完成</span>
+                listener<span class="token punctuation">.</span><span class="token function">afterJob</span><span class="token punctuation">(</span>execution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                logger<span class="token punctuation">.</span><span class="token function">error</span><span class="token punctuation">(</span><span class="token string">"Exception encountered in afterJob callback"</span><span class="token punctuation">,</span> e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token comment">// 写入db</span>
+            jobRepository<span class="token punctuation">.</span><span class="token function">update</span><span class="token punctuation">(</span>execution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// 释放控制</span>
+            <span class="token class-name">JobSynchronizationManager</span><span class="token punctuation">.</span><span class="token function">release</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+
+    <span class="token punctuation">}</span>
+
+<span class="token punctuation">}</span>
+</code></pre> 
+<h4><a id="32Reader_242"></a>3.2何时调用Reader？</h4> 
+<p>在SimpleChunkProvider#provide中会分次调用reader，并将结果包装为Chunk<i>返回。</i></p> 
+<p>其中有几个细节，此处不再赘述。</p> 
+<ol><li>如何控制一次读取几个item？</li><li>如何控制最后一行读完就不读了？</li><li>如果需要跳过文件头的前N行，怎么处理？</li><li>在StepContribution中记录读取数量</li></ol> 
+<pre><code class="prism language-java"><span class="token class-name"><span class="token namespace">org<span class="token punctuation">.</span>springframework<span class="token punctuation">.</span>batch<span class="token punctuation">.</span>core<span class="token punctuation">.</span>step<span class="token punctuation">.</span>item<span class="token punctuation">.</span></span>SimpleChunkProcessor</span>#process
+
+	<span class="token annotation punctuation">@Nullable</span>
+	<span class="token annotation punctuation">@Override</span>
+	<span class="token keyword">public</span> <span class="token class-name">RepeatStatus</span> <span class="token function">execute</span><span class="token punctuation">(</span><span class="token class-name">StepContribution</span> contribution<span class="token punctuation">,</span> <span class="token class-name">ChunkContext</span> chunkContext<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+
+		<span class="token annotation punctuation">@SuppressWarnings</span><span class="token punctuation">(</span><span class="token string">"unchecked"</span><span class="token punctuation">)</span>
+		<span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">I</span><span class="token punctuation">&gt;</span></span> inputs <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">I</span><span class="token punctuation">&gt;</span></span><span class="token punctuation">)</span> chunkContext<span class="token punctuation">.</span><span class="token function">getAttribute</span><span class="token punctuation">(</span>INPUTS_KEY<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>inputs <span class="token operator">==</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			inputs <span class="token operator">=</span> chunkProvider<span class="token punctuation">.</span><span class="token function">provide</span><span class="token punctuation">(</span>contribution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>buffering<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				chunkContext<span class="token punctuation">.</span><span class="token function">setAttribute</span><span class="token punctuation">(</span>INPUTS_KEY<span class="token punctuation">,</span> inputs<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+
+		chunkProcessor<span class="token punctuation">.</span><span class="token function">process</span><span class="token punctuation">(</span>contribution<span class="token punctuation">,</span> inputs<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		chunkProvider<span class="token punctuation">.</span><span class="token function">postProcess</span><span class="token punctuation">(</span>contribution<span class="token punctuation">,</span> inputs<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token comment">// Allow a message coming back from the processor to say that we</span>
+		<span class="token comment">// are not done yet</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>inputs<span class="token punctuation">.</span><span class="token function">isBusy</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			logger<span class="token punctuation">.</span><span class="token function">debug</span><span class="token punctuation">(</span><span class="token string">"Inputs still busy"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token keyword">return</span> <span class="token class-name">RepeatStatus</span><span class="token punctuation">.</span>CONTINUABLE<span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+
+		chunkContext<span class="token punctuation">.</span><span class="token function">removeAttribute</span><span class="token punctuation">(</span>INPUTS_KEY<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		chunkContext<span class="token punctuation">.</span><span class="token function">setComplete</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>logger<span class="token punctuation">.</span><span class="token function">isDebugEnabled</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			logger<span class="token punctuation">.</span><span class="token function">debug</span><span class="token punctuation">(</span><span class="token string">"Inputs not busy, ended: "</span> <span class="token operator">+</span> inputs<span class="token punctuation">.</span><span class="token function">isEnd</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token keyword">return</span> <span class="token class-name">RepeatStatus</span><span class="token punctuation">.</span><span class="token function">continueIf</span><span class="token punctuation">(</span><span class="token operator">!</span>inputs<span class="token punctuation">.</span><span class="token function">isEnd</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token punctuation">}</span>
+</code></pre> 
+<h4><a id="33ProcessorWriter_289"></a>3.3何时调用Processor/Writer？</h4> 
+<p>在RepeatTemplate和外围事务模板的包装下，通过SimpleChunkProcessor进行处理：</p> 
+<ol><li>查出若干条数的items，打包为Chunk</li><li>遍历items，逐个item调用processor 
+  <ol><li>通知StepListener，环绕处理调用before/after方法</li></ol> </li></ol> 
+<pre><code class="prism language-java">    <span class="token comment">// 忽略无关代码...</span>
+	<span class="token annotation punctuation">@Override</span>
+	<span class="token keyword">public</span> <span class="token keyword">final</span> <span class="token keyword">void</span> <span class="token function">process</span><span class="token punctuation">(</span><span class="token class-name">StepContribution</span> contribution<span class="token punctuation">,</span> <span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">I</span><span class="token punctuation">&gt;</span></span> inputs<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+
+		<span class="token comment">// 输入为空，直接返回If there is no input we don't have to do anything more</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">isComplete</span><span class="token punctuation">(</span>inputs<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+
+		<span class="token comment">// Make the transformation, calling remove() on the inputs iterator if</span>
+		<span class="token comment">// any items are filtered. Might throw exception and cause rollback.</span>
+		<span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">O</span><span class="token punctuation">&gt;</span></span> outputs <span class="token operator">=</span> <span class="token function">transform</span><span class="token punctuation">(</span>contribution<span class="token punctuation">,</span> inputs<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token comment">// Adjust the filter count based on available data</span>
+		contribution<span class="token punctuation">.</span><span class="token function">incrementFilterCount</span><span class="token punctuation">(</span><span class="token function">getFilterCount</span><span class="token punctuation">(</span>inputs<span class="token punctuation">,</span> outputs<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token comment">// Adjust the outputs if necessary for housekeeping purposes, and then</span>
+		<span class="token comment">// write them out...</span>
+		<span class="token function">write</span><span class="token punctuation">(</span>contribution<span class="token punctuation">,</span> inputs<span class="token punctuation">,</span> <span class="token function">getAdjustedOutputs</span><span class="token punctuation">(</span>inputs<span class="token punctuation">,</span> outputs<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token punctuation">}</span>
+
+    <span class="token comment">// 遍历items，逐个item调用processor</span>
+	<span class="token keyword">protected</span> <span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">O</span><span class="token punctuation">&gt;</span></span> <span class="token function">transform</span><span class="token punctuation">(</span><span class="token class-name">StepContribution</span> contribution<span class="token punctuation">,</span> <span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">I</span><span class="token punctuation">&gt;</span></span> inputs<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">O</span><span class="token punctuation">&gt;</span></span> outputs <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token punctuation">&gt;</span></span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token class-name">Chunk</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">I</span><span class="token punctuation">&gt;</span></span><span class="token punctuation">.</span>ChunkIterator iterator <span class="token operator">=</span> inputs<span class="token punctuation">.</span><span class="token function">iterator</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> iterator<span class="token punctuation">.</span><span class="token function">hasNext</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">final</span> <span class="token class-name">I</span> item <span class="token operator">=</span> iterator<span class="token punctuation">.</span><span class="token function">next</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token class-name">O</span> output<span class="token punctuation">;</span>
+			<span class="token class-name">String</span> status <span class="token operator">=</span> <span class="token class-name">BatchMetrics</span><span class="token punctuation">.</span>STATUS_SUCCESS<span class="token punctuation">;</span>
+			<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+				output <span class="token operator">=</span> <span class="token function">doProcess</span><span class="token punctuation">(</span>item<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">/*
+				 * For a simple chunk processor (no fault tolerance) we are done here, so prevent any more processing of these inputs.
+				 */</span>
+				inputs<span class="token punctuation">.</span><span class="token function">clear</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+				status <span class="token operator">=</span> <span class="token class-name">BatchMetrics</span><span class="token punctuation">.</span>STATUS_FAILURE<span class="token punctuation">;</span>
+				<span class="token keyword">throw</span> e<span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>output <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				outputs<span class="token punctuation">.</span><span class="token function">add</span><span class="token punctuation">(</span>output<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+				iterator<span class="token punctuation">.</span><span class="token function">remove</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+		<span class="token keyword">return</span> outputs<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+</code></pre> 
+<h3><a id="4_step_350"></a>4. 每个step是如何与事务处理挂钩？</h3> 
+<p>在TaskletStep#doExecute中会使用TransactionTemplate，包装事务操作</p> 
+<p>标准的事务操作，通过函数式编程风格，从action的CallBack调用实际处理方法</p> 
+<ol><li>通过transactionManager获取事务</li><li>执行操作</li><li>无异常，则提交事务</li><li>若异常，则回滚</li></ol> 
+<pre><code class="prism language-java">    <span class="token comment">// org.springframework.batch.core.step.tasklet.TaskletStep#doExecute</span>
+    result <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">TransactionTemplate</span><span class="token punctuation">(</span>transactionManager<span class="token punctuation">,</span> transactionAttribute<span class="token punctuation">)</span>
+				    <span class="token punctuation">.</span><span class="token function">execute</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">ChunkTransactionCallback</span><span class="token punctuation">(</span>chunkContext<span class="token punctuation">,</span> semaphore<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 事务启用过程</span>
+    <span class="token comment">// org.springframework.transaction.support.TransactionTemplate#execute</span>
+	<span class="token annotation punctuation">@Override</span>
+	<span class="token annotation punctuation">@Nullable</span>
+	<span class="token keyword">public</span> <span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">T</span><span class="token punctuation">&gt;</span></span> <span class="token class-name">T</span> <span class="token function">execute</span><span class="token punctuation">(</span><span class="token class-name">TransactionCallback</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">T</span><span class="token punctuation">&gt;</span></span> action<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">TransactionException</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token class-name">Assert</span><span class="token punctuation">.</span><span class="token function">state</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">.</span>transactionManager <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">,</span> <span class="token string">"No PlatformTransactionManager set"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">.</span>transactionManager <span class="token keyword">instanceof</span> <span class="token class-name">CallbackPreferringPlatformTransactionManager</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span> <span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token class-name">CallbackPreferringPlatformTransactionManager</span><span class="token punctuation">)</span> <span class="token keyword">this</span><span class="token punctuation">.</span>transactionManager<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">execute</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">,</span> action<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token class-name">TransactionStatus</span> status <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>transactionManager<span class="token punctuation">.</span><span class="token function">getTransaction</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token class-name">T</span> result<span class="token punctuation">;</span>
+			<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+				result <span class="token operator">=</span> action<span class="token punctuation">.</span><span class="token function">doInTransaction</span><span class="token punctuation">(</span>status<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">RuntimeException</span> <span class="token operator">|</span> <span class="token class-name">Error</span> ex<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">// Transactional code threw application exception -&gt; rollback</span>
+				<span class="token function">rollbackOnException</span><span class="token punctuation">(</span>status<span class="token punctuation">,</span> ex<span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token keyword">throw</span> ex<span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Throwable</span> ex<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">// Transactional code threw unexpected exception -&gt; rollback</span>
+				<span class="token function">rollbackOnException</span><span class="token punctuation">(</span>status<span class="token punctuation">,</span> ex<span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">UndeclaredThrowableException</span><span class="token punctuation">(</span>ex<span class="token punctuation">,</span> <span class="token string">"TransactionCallback threw undeclared checked exception"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">this</span><span class="token punctuation">.</span>transactionManager<span class="token punctuation">.</span><span class="token function">commit</span><span class="token punctuation">(</span>status<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token keyword">return</span> result<span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="5_chunk_item_399"></a>5. 怎么控制每个chunk几条记录提交一次事务？ 控制每个事务窗口处理的item数量</h3> 
+<p>在配置任务时，有个step级别的参数，[commit-interval]，用于每个事务窗口提交的控制被处理的item数量。</p> 
+<p>RepeatTemplate#executeInternal 在处理单条item后，会查看已处理完的item数量，与配置的chunk数量做比较，如果满足chunk数，则不再继续，准备提交事务。</p> 
+<p>StepBean在初始化时，会新建SimpleCompletionPolicy(chunkSize会优先使用配置值，默认是5)</p> 
+<p>在每个chunk处理开始时，都会调用SimpleCompletionPolicy#start新建RepeatContextSupport#count用于计数。</p> 
+<p>源码（简化） org.springframework.batch.repeat.support.RepeatTemplate#executeInternal</p> 
+<pre><code class="prism language-java">
+<span class="token comment">/**
+ * Internal convenience method to loop over interceptors and batch
+ * callbacks.
+ * @param callback the callback to process each element of the loop.
+ */</span>
+<span class="token keyword">private</span> <span class="token class-name">RepeatStatus</span> <span class="token function">executeInternal</span><span class="token punctuation">(</span><span class="token keyword">final</span> <span class="token class-name">RepeatCallback</span> callback<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// Reset the termination policy if there is one...</span>
+       <span class="token comment">// 此处会调用completionPolicy.start方法，更新chunk的计数器</span>
+	<span class="token class-name">RepeatContext</span> context <span class="token operator">=</span> <span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// Make sure if we are already marked complete before we start then no processing takes place.</span>
+       <span class="token comment">// 通过running字段来判断是否继续处理next</span>
+	<span class="token keyword">boolean</span> running <span class="token operator">=</span> <span class="token operator">!</span><span class="token function">isMarkedComplete</span><span class="token punctuation">(</span>context<span class="token punctuation">)</span><span class="token punctuation">;</span>
+       <span class="token comment">// 省略listeners处理....</span>
+	<span class="token comment">// Return value, default is to allow continued processing.</span>
+	<span class="token class-name">RepeatStatus</span> result <span class="token operator">=</span> <span class="token class-name">RepeatStatus</span><span class="token punctuation">.</span>CONTINUABLE<span class="token punctuation">;</span>
+	<span class="token class-name">RepeatInternalState</span> state <span class="token operator">=</span> <span class="token function">createInternalState</span><span class="token punctuation">(</span>context<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">while</span> <span class="token punctuation">(</span>running<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">/*
+			 * Run the before interceptors here, not in the task executor so
+			 * that they all happen in the same thread - it's easier for
+			 * tracking batch status, amongst other things.
+			 */</span>
+               <span class="token comment">// 省略listeners处理....</span>
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>running<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                       <span class="token comment">// callback是实际处理方法，类似函数式编程</span>
+					result <span class="token operator">=</span> <span class="token function">getNextResult</span><span class="token punctuation">(</span>context<span class="token punctuation">,</span> callback<span class="token punctuation">,</span> state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token function">executeAfterInterceptors</span><span class="token punctuation">(</span>context<span class="token punctuation">,</span> result<span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+				<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Throwable</span> throwable<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token function">doHandle</span><span class="token punctuation">(</span>throwable<span class="token punctuation">,</span> context<span class="token punctuation">,</span> deferred<span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+                   <span class="token comment">// 检查当前chunk是否处理完，决策出是否继续处理下一条item</span>
+				<span class="token comment">// N.B. the order may be important here:</span>
+				<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">isComplete</span><span class="token punctuation">(</span>context<span class="token punctuation">,</span> result<span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token function">isMarkedComplete</span><span class="token punctuation">(</span>context<span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token operator">!</span>deferred<span class="token punctuation">.</span><span class="token function">isEmpty</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					running <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+		result <span class="token operator">=</span> result<span class="token punctuation">.</span><span class="token function">and</span><span class="token punctuation">(</span><span class="token function">waitForResults</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+           <span class="token comment">// 省略throwables处理....</span>
+		<span class="token comment">// Explicitly drop any references to internal state...</span>
+		state <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+           <span class="token comment">// 省略代码...</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> result<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="_467"></a>总结</h3> 
+<p>JSR-352标准定义了Java批处理的基本模型，包含批处理的元数据像 JobExecutions，JobInstances，StepExecutions 等等。通过此类模型，提供了许多基础组件与扩展点：</p> 
+<ol><li>完善的基础组件 
+  <ol><li>Spring Batch 有很多的这类组件 例如 ItemReaders，ItemWriters，PartitionHandlers 等等对应各类数据和环境。</li></ol> </li><li>丰富的配置 
+  <ol><li>JSR－352 定义了基于XML的任务设置模型。Spring Batch 提供了基于Java （类型安全的）的配置方式</li></ol> </li><li>可伸缩性 
+  <ol><li>伸缩性选项－Local Partitioning 已经包含在JSR －352 里面了。但是还应该有更多的选择 ，例如Spring Batch 提供的 Multi－threaded Step，Remote Partitioning ，Parallel Step，Remote Chunking 等等选项</li></ol> </li><li>扩展点 
+  <ol><li>良好的listener模式，提供step/job运行前后的锚点，以供开发人员个性化处理批处理流程。</li></ol> </li></ol> 
+<p>2013年， JSR-352标准包含在 JavaEE7中发布，到2022年已近10年，Spring也在探索新的批处理模式， 如Spring Attic /Spring Cloud Data Flow。 https://docs.spring.io/spring-batch/docs/current/reference/html/jsr-352.html</p> 
+<h3><a id="_483"></a>扩展</h3> 
+<h4><a id="1_JobStep_485"></a>1. Job/Step运行时的上下文，是如何保存？如何控制？</h4> 
+<p>整个Job在运行时，会将运行信息保存在JobContext中。 类似的，Step运行时也有StepContext。可以在Context中保存一些参数，在任务或者步骤中传递使用。</p> 
+<p>查看JobContext/StepContext源码，发现仅用了普通变量保存Execution，这个类肯定有线程安全问题。 生产环境中常常出现多个任务并处处理的情况。</p> 
+<p>SpringBatch用了几种方式来包装并发安全：</p> 
+<ol><li>每个job初始化时，通过JobExecution新建了JobContext，每个任务线程都用自己的对象。</li><li>使用JobSynchronizationManager，内含一个ConcurrentHashMap，KEY是JobExecution，VALUE是JobContext</li><li>在任务解释时，会移除当前JobExecution对应的k-v</li></ol> 
+<blockquote> 
+ <p>此处能看到，如果在JobExecution存储大量的业务数据，会导致无法GC回收，导致OOM。所以在上下文中，只应保存精简的数据。</p> 
+</blockquote> 
+<h4><a id="2_step_497"></a>2. step执行时，如果出现异常，如何保护运行状态？</h4> 
+<p>在源码中，使用了各类同步控制和加锁、oldVersion版本拷贝，整体比较复杂(org.springframework.batch.core.step.tasklet.TaskletStep.ChunkTransactionCallback#doInTransaction)</p> 
+<ol><li>oldVersion版本拷贝：上一次运行出现异常时，本次执行时沿用上次的断点内容</li></ol> 
+<pre><code class="prism language-java"><span class="token comment">// 节选部分代码</span>
+oldVersion <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">StepExecution</span><span class="token punctuation">(</span>stepExecution<span class="token punctuation">.</span><span class="token function">getStepName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> stepExecution<span class="token punctuation">.</span><span class="token function">getJobExecution</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token function">copy</span><span class="token punctuation">(</span>stepExecution<span class="token punctuation">,</span> oldVersion<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">copy</span><span class="token punctuation">(</span><span class="token keyword">final</span> <span class="token class-name">StepExecution</span> source<span class="token punctuation">,</span> <span class="token keyword">final</span> <span class="token class-name">StepExecution</span> target<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	target<span class="token punctuation">.</span><span class="token function">setVersion</span><span class="token punctuation">(</span>source<span class="token punctuation">.</span><span class="token function">getVersion</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	target<span class="token punctuation">.</span><span class="token function">setWriteCount</span><span class="token punctuation">(</span>source<span class="token punctuation">.</span><span class="token function">getWriteCount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	target<span class="token punctuation">.</span><span class="token function">setFilterCount</span><span class="token punctuation">(</span>source<span class="token punctuation">.</span><span class="token function">getFilterCount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	target<span class="token punctuation">.</span><span class="token function">setCommitCount</span><span class="token punctuation">(</span>source<span class="token punctuation">.</span><span class="token function">getCommitCount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	target<span class="token punctuation">.</span><span class="token function">setExecutionContext</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">ExecutionContext</span><span class="token punctuation">(</span>source<span class="token punctuation">.</span><span class="token function">getExecutionContext</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol start="2"><li>信号量控制，在每个chunk运行完成后，需先获取锁，再更新stepExecution前 
+  <ol><li>Shared semaphore per step execution, so other step executions can run in parallel without needing the lockSemaphore (org.springframework.batch.core.step.tasklet.TaskletStep#doExecute)</li></ol> </li></ol> 
+<pre><code class="prism language-java"><span class="token comment">// 省略无关代码</span>
+<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 执行w-p-r模型方法</span>
+		result <span class="token operator">=</span> tasklet<span class="token punctuation">.</span><span class="token function">execute</span><span class="token punctuation">(</span>contribution<span class="token punctuation">,</span> chunkContext<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>result <span class="token operator">==</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			result <span class="token operator">=</span> <span class="token class-name">RepeatStatus</span><span class="token punctuation">.</span>FINISHED<span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 省略...</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// If the step operations are asynchronous then we need to synchronize changes to the step execution (at a</span>
+	<span class="token comment">// minimum). Take the lock *before* changing the step execution.</span>
+	<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 获取锁</span>
+		semaphore<span class="token punctuation">.</span><span class="token function">acquire</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		locked <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">InterruptedException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		logger<span class="token punctuation">.</span><span class="token function">error</span><span class="token punctuation">(</span><span class="token string">"Thread interrupted while locking for repository update"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		stepExecution<span class="token punctuation">.</span><span class="token function">setStatus</span><span class="token punctuation">(</span><span class="token class-name">BatchStatus</span><span class="token punctuation">.</span>STOPPED<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		stepExecution<span class="token punctuation">.</span><span class="token function">setTerminateOnly</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">currentThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">interrupt</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	stepExecution<span class="token punctuation">.</span><span class="token function">apply</span><span class="token punctuation">(</span>contribution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+stepExecutionUpdated <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+stream<span class="token punctuation">.</span><span class="token function">update</span><span class="token punctuation">(</span>stepExecution<span class="token punctuation">.</span><span class="token function">getExecutionContext</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// 更新上下文、DB中的状态</span>
+	<span class="token comment">// Going to attempt a commit. If it fails this flag will stay false and we can use that later.</span>
+	<span class="token function">getJobRepository</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">updateExecutionContext</span><span class="token punctuation">(</span>stepExecution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	stepExecution<span class="token punctuation">.</span><span class="token function">incrementCommitCount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">getJobRepository</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">update</span><span class="token punctuation">(</span>stepExecution<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+<span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// If we get to here there was a problem saving the step execution and we have to fail.</span>
+	<span class="token class-name">String</span> msg <span class="token operator">=</span> <span class="token string">"JobRepository failure forcing rollback"</span><span class="token punctuation">;</span>
+	logger<span class="token punctuation">.</span><span class="token function">error</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">FatalStepExecutionException</span><span class="token punctuation">(</span>msg<span class="token punctuation">,</span> e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3c35f1dacd7bb7bfb24fe1819d67a8ba/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">开源MyBatisGenerator组件源码分析</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/038134c0a52aee94dc6fba89865a89a2/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">常见限流算法（固定or滑动窗口、漏桶、令牌桶）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

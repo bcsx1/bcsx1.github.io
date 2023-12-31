@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ffplay播放器原理剖析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ffplay播放器原理剖析" />
+<meta property="og:description" content="*****************************************************************************
+* ffplay系列博客： *
+* ffplay播放器原理剖析 *
+* ffplay播放器音视频同步原理 *
+* ffplay播放控制代码分析 *
+* 视频主观质量对比工具(Visual comparision tool based on ffplay) *
+*****************************************************************************
+ffplay是使用ffmpeg api开发的功能完善的开源播放器，弄懂ffplay原理可以帮助我们很好的理解播放器的工作机制，但是目前很少看到关于ffplay的系统介绍的文章，所以下面基于ffmpeg-3.1.1的源代码来剖析ffplay的工作机制。
+播放器框架 首先，一个简单的通用播放器的基本框架图如下：
+ffplay的总体框架解读 在ffplay中，各个线程角色如下：
+read_thread()线程扮演着图中Demuxer的角色。
+video_thread()线程扮演着图中Video Decoder的角色。
+audio_thread()线程扮演着图中Audio Decoder的角色。
+主线程中的event_loop()函数循环调用refresh_loop_wait_event()则扮演着图中 视频渲染的角色。
+回调函数sdl_audio_callback扮演图中音频播放的角色。VideoState结构体变量则扮演者各个线程之间的信使。
+因此ffplay的基本框架图如下：
+1、read_thread线程负责读取文件内容，将video和audio内容分离出来生成packet，将packet输出到packet队列中，包括Video Packet Queue和Audio Packet Queue（不考虑subtitle）。
+2、video_thread线程负责读取Video Packets Queue队列，将video packet解码得到Video Frame，将Video Frame输出到Video Frame Queue队列中。
+3、audio_thread线程负责读取Audio Packets Queue队列，将audio packet解码得到Audio Frame，将Audio Frame输出到Audio Frame Queue队列中。
+4、主函数(主线程)-&gt;event_loop()-&gt;refresh_loop_wait_event()负责读取Video Frame Queue中的video frame，调用SDL进行显示（其中包括了音视频同步控制的相关操作）。
+5、SDL的回调函数sdl_audio_callback()负责读取Audio Frame Queue中的audio frame，对其进行处理后，将数据返回给SDL，然后SDL进行音频播放。
+ffplay数据的流通 研究数据的流通可以帮助理解播放器的工作机制。ffplay中有两个关键队列packet queue和frame queue，把往队列中添加成员的操作称之为生产，从队列中取走成员的操作称之为消耗。通过分析各个队列的生产和消耗可以帮助我们弄明白数据是如何流通的。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/e32aac174fd9b07231cf4e5fb73e655f/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2017-12-07T21:24:26+08:00" />
+<meta property="article:modified_time" content="2017-12-07T21:24:26+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ffplay播放器原理剖析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p style="text-align:justify"></p> 
+<p style="text-align:justify">*****************************************************************************</p> 
+<p style="text-align:justify">*<strong> ffplay系列博客：                                                                                      </strong>*</p> 
+<p style="text-align:justify">* <a target="_blank" href="http://blog.csdn.net/lrzkd/article/details/78709186" rel="noopener noreferrer">ffplay播放器原理剖析</a>                                                                                 *<br> </p> 
+<p style="text-align:justify">* <a target="_blank" href="http://blog.csdn.net/lrzkd/article/details/78661841" rel="noopener noreferrer">ffplay播放器音视频同步原理</a>                                                                       *</p> 
+<p style="text-align:justify">* <a target="_blank" href="http://blog.csdn.net/lrzkd/article/details/78841677" rel="noopener noreferrer">ffplay播放控制代码分析</a>                                                                             *<br> </p> 
+<p style="text-align:justify">* <a target="_blank" href="http://blog.csdn.net/lrzkd/article/details/78809659" rel="noopener noreferrer">视频主观质量对比工具(Visual comparision tool based on ffplay) </a>             *<br> </p> 
+<p style="text-align:justify">*****************************************************************************</p> 
+<p style="text-align:justify"><br> </p> 
+<p style="text-align:justify">    ffplay是使用ffmpeg api开发的功能完善的开源播放器，弄懂ffplay原理可以帮助我们很好的理解播放器的工作机制，但是目前很少看到关于ffplay的系统介绍的文章，所以下面基于ffmpeg-3.1.1的源代码来剖析ffplay的工作机制。</p> 
+<h2 style="text-align:justify"><span style="font-size:18px">播放器框架</span></h2> 
+<p style="text-align:justify"><strong>首先，一个简单的通用播放器的基本框架图如下</strong>：</p> 
+<p style="text-align:center">  <img src="https://images2.imgbox.com/54/20/CHTH1MQe_o.png" alt=""></p> 
+<p style="text-align:justify"></p> 
+<h2 style="text-align:justify"><span style="font-size:18px">ffplay的总体框架解读</span></h2> 
+<p></p> 
+<p style="text-align:justify">在ffplay中，各个线程角色如下：</p> 
+<p style="text-align:justify">read_thread()线程扮演着图中Demuxer的角色。</p> 
+<p style="text-align:justify">video_thread()线程扮演着图中Video Decoder的角色。</p> 
+<p style="text-align:justify">audio_thread()线程扮演着图中Audio Decoder的角色。</p> 
+<p style="text-align:justify">主线程中的event_loop()函数循环调用refresh_loop_wait_event()则扮演着图中 视频渲染的角色。</p> 
+<p style="text-align:justify">回调函数sdl_audio_callback扮演图中音频播放的角色。VideoState结构体变量则扮演者各个线程之间的信使。</p> 
+<p style="text-align:justify"><strong>因此ffplay的基本框架图如下：</strong></p> 
+<p style="text-align:justify"><img src="https://images2.imgbox.com/59/e1/8LBQIYKX_o.png" alt=""><br> </p> 
+<p style="text-align:justify">    1、<span style="color:rgb(255,0,0)">read_thread线程</span>负责读取文件内容，将video和audio内容分离出来生成packet，将packet输出到packet队列中，包括Video Packet Queue和Audio Packet Queue（不考虑subtitle）。</p> 
+<p style="text-align:justify">    2、<span style="color:#ff0000">video_thread线程</span>负责读取Video Packets Queue队列，将video packet解码得到Video Frame，将Video Frame输出到Video Frame Queue队列中。</p> 
+<p style="text-align:justify">    3、<span style="color:#ff0000">audio_thread线程</span>负责读取Audio Packets Queue队列，将audio packet解码得到Audio Frame，将Audio Frame输出到Audio Frame Queue队列中。</p> 
+<p style="text-align:justify">    4、<span style="color:#ff0000">主函数(主线程)-&gt;event_loop()-&gt;refresh_loop_wait_event()</span>负责读取Video Frame Queue中的video frame，调用SDL进行显示（其中包括了音视频同步控制的相关操作）。</p> 
+<p style="text-align:justify">    5、<span style="color:#ff0000">SDL的回调函数sdl_audio_callback()</span>负责读取Audio Frame Queue中的audio frame，对其进行处理后，将数据返回给SDL，然后SDL进行音频播放。</p> 
+<h2 style="text-align:justify"><span style="font-size:18px">ffplay数据的流通</span></h2> 
+<p style="text-align:justify">研究数据的流通可以帮助理解播放器的工作机制。ffplay中有两个关键队列packet queue和frame queue，把往队列中添加成员的操作称之为<strong>生产</strong>，从队列中取走成员的操作称之为<strong>消耗</strong>。通过<strong>分析各个队列的生产和消耗</strong>可以帮助我们弄明白数据是如何流通的。</p> 
+<h3 style="text-align:justify"><strong><span style="font-size:18px">Packet Queue，Video(Audio) Frame Queue的生产和消耗</span></strong></h3> 
+<h4><strong><span style="font-size:18px">read_thread()解析</span></strong></h4> 
+<p style="text-align:justify"><strong>read_thread()</strong>负责packet queue的生产，包括Video Packet Queue(is-&gt;videoq)和Audio Packet Queue(is-&gt;audioq)的生产。</p> 
+<p style="text-align:justify">调用关系：read_thread() -&gt; packet_queue_put() -&gt; packet_queue_put_private()</p> 
+<p style="text-align:justify">read_thread()的主干代码及相关函数代码如下：</p> 
+<p style="text-align:justify"></p> 
+<pre><code class="language-cpp">static int read_thread(void *arg)
+{
+    VideoState *is = arg;
+    ......
+    for (;;) {
+        ret = av_read_frame(ic, pkt);  // 从源文件中读取内容到pkt结构中
+        /* check if packet is in play range specified by user, then queue, otherwise discard */
+        stream_start_time = ic-&gt;streams[pkt-&gt;stream_index]-&gt;start_time;
+        // 下面的duration是通过命令传递给ffplay的指定播放时长的参数，所以判断pkt的时间戳是否在duration内
+        pkt_ts = pkt-&gt;pts == AV_NOPTS_VALUE ? pkt-&gt;dts : pkt-&gt;pts;
+        pkt_in_play_range = duration == AV_NOPTS_VALUE ||
+                (pkt_ts - (stream_start_time != AV_NOPTS_VALUE ? stream_start_time : 0)) *
+                av_q2d(ic-&gt;streams[pkt-&gt;stream_index]-&gt;time_base) -
+                (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000
+                &lt;= ((double)duration / 1000000);
+        if (pkt-&gt;stream_index == is-&gt;audio_stream &amp;&amp; pkt_in_play_range) {
+            packet_queue_put(&amp;is-&gt;audioq, pkt);      // 读到的pkt为audio，放入audio queue(is-&gt;audioq)
+        } else if (pkt-&gt;stream_index == is-&gt;video_stream &amp;&amp; pkt_in_play_range
+                   &amp;&amp; !(is-&gt;video_st-&gt;disposition &amp; AV_DISPOSITION_ATTACHED_PIC)) {
+            packet_queue_put(&amp;is-&gt;videoq, pkt);      // 读到的pkt为video，放入video queue(is-&gt;videoq)
+        } else if (pkt-&gt;stream_index == is-&gt;subtitle_stream &amp;&amp; pkt_in_play_range) {
+            packet_queue_put(&amp;is-&gt;subtitleq, pkt);   // 读到的pkt为subtitle，放到subtitile queue中
+        } else {
+            av_packet_unref(pkt);
+        }
+    }
+    ......
+}
+
+static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
+{
+    int ret;
+
+    SDL_LockMutex(q-&gt;mutex);  // packet queue的写和读操作是在不同线程中，需要加锁互斥访问
+    ret = packet_queue_put_private(q, pkt);
+    SDL_UnlockMutex(q-&gt;mutex);
+
+    if (pkt != &amp;flush_pkt &amp;&amp; ret &lt; 0)
+        av_packet_unref(pkt);
+
+    return ret;
+}
+
+static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
+{
+	// PacketQueue为链表，往链表末尾追加成员
+    MyAVPacketList *pkt1;
+
+    if (q-&gt;abort_request)
+       return -1;
+
+    pkt1 = av_malloc(sizeof(MyAVPacketList)); //创建packet
+    if (!pkt1)
+        return -1;
+    pkt1-&gt;pkt = *pkt;
+    pkt1-&gt;next = NULL;
+    if (pkt == &amp;flush_pkt)
+        q-&gt;serial++;
+    pkt1-&gt;serial = q-&gt;serial;
+
+    if (!q-&gt;last_pkt)
+        q-&gt;first_pkt = pkt1;
+    else
+        q-&gt;last_pkt-&gt;next = pkt1; //将新pkt放到PacketQueue链表的末尾
+    q-&gt;last_pkt = pkt1; // 更新链表尾巴
+    q-&gt;nb_packets++;    // 链表packet个数加1
+    q-&gt;size += pkt1-&gt;pkt.size + sizeof(*pkt1); //更新链表size
+    q-&gt;duration += pkt1-&gt;pkt.duration;  //更新链表所有packets的总duration
+    /* XXX: should duplicate packet data in DV case */
+    SDL_CondSignal(q-&gt;cond); //通知packet_queue_get()函数，链表中有新packet了。
+    return 0;
+}</code></pre> 
+<p><br> </p> 
+<h4><strong><span style="font-size:18px">video_thread()解析：</span></strong></h4> 
+<p><strong>video_thread()</strong>负责Video Packet Queue(is-&gt;videoq)的消耗和Video Frame Queue(is-&gt;pictq)的生产。</p> 
+<p>Video Packet Queue消耗的函数调用关系：video_thread() -&gt; get_video_frame() -&gt; packet_queue_get(&amp;is-&gt;videoq) </p> 
+<p>Video Frame Queue生产的函数调用关系：video_thread() -&gt; queue_picture()      -&gt; frame_queue_push(&amp;is-&gt;pictq)<br> video_thread()的主干代码及相关代码如下：</p> 
+<p></p> 
+<pre><code class="language-cpp">static int video_thread(void *arg)
+{
+    ......
+    for (;;) {
+        ret = get_video_frame(is, frame, &amp;pkt, &amp;serial); // 获取解码图像frame
+        ......
+        ret = queue_picture(is, frame, pts, duration, av_frame_get_pkt_pos(frame), serial); //将解码图像放到队列Video Frame Queue中
+    }
+    .......
+}
+
+// 获取解码图像frame
+static int get_video_frame(VideoState *is, AVFrame *frame, AVPacket *pkt, int *serial)
+{
+    int got_picture;
+
+    if (packet_queue_get(&amp;is-&gt;videoq, pkt, 1, serial) &lt; 0) //从队列中取packet
+        return -1;
+    ......
+    if(avcodec_decode_video2(is-&gt;video_st-&gt;codec, frame, &amp;got_picture, pkt) &lt; 0) //解码packet，获取解码图像frame
+        return 0;
+    ......
+}
+
+// packet_queue_get用来获取链表packet queue的第一个packet，与packet_queue_put_private对应，一个读一个写
+static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
+{
+    MyAVPacketList *pkt1;
+    int ret;
+
+    SDL_LockMutex(q-&gt;mutex); // packet queue的写和读操作是在不同线程中，需要加锁互斥访问
+
+    for (;;) {
+        if (q-&gt;abort_request) {
+            ret = -1;
+            break;
+        }
+
+        pkt1 = q-&gt;first_pkt; //获取链表的第一个packet（链表头）
+        if (pkt1) {
+            q-&gt;first_pkt = pkt1-&gt;next; //packet queue链表头更新，指向第二个元素
+            if (!q-&gt;first_pkt)
+                q-&gt;last_pkt = NULL;
+            q-&gt;nb_packets--;
+            q-&gt;size -= pkt1-&gt;pkt.size + sizeof(*pkt1);
+            *pkt = pkt1-&gt;pkt; //返回链表第一个packet的内容
+            if (serial)
+                *serial = pkt1-&gt;serial;
+            av_free(pkt1);
+            ret = 1;
+            break;
+        } else if (!block) { // packet queue链表是空的，非阻塞条件下，直接返回ret=0
+            ret = 0;
+            break;
+        } else {
+            SDL_CondWait(q-&gt;cond, q-&gt;mutex); // packet queue链表是空的(阻塞条件下)，则等待read_thread读取packet
+        }
+    }
+    SDL_UnlockMutex(q-&gt;mutex);
+    return ret;
+}
+
+// queue_picture函数将解码出来的Video Frame(src_frame)追加到队列Video Frame Queue的末尾。
+static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double duration, int64_t pos, int serial)
+{
+    Frame *vp;
+    // 探测video frame queue是否有空的Frame，如果有则返回空的Frame(vp)，接下来将src_frame中的视频内容拷贝到其中
+    if (!(vp = frame_queue_peek_writable(&amp;is-&gt;pictq)))
+        return -1;
+
+    vp-&gt;sar = src_frame-&gt;sample_aspect_ratio;
+
+    /* alloc or resize hardware picture buffer */
+    // 是否需要给vp-&gt;bmp分配？ vp-&gt;bmp是一个SDL_Overlay，存放yuv数据，然后在SDL_surface上进行显示
+    if (!vp-&gt;bmp || vp-&gt;reallocate || !vp-&gt;allocated ||
+        vp-&gt;width  != src_frame-&gt;width ||
+        vp-&gt;height != src_frame-&gt;height) {
+        SDL_Event event;
+
+        vp-&gt;allocated  = 0;
+        vp-&gt;reallocate = 0;
+        vp-&gt;width = src_frame-&gt;width;
+        vp-&gt;height = src_frame-&gt;height;
+
+        /* the allocation must be done in the main thread to avoid
+           locking problems. */
+        event.type = FF_ALLOC_EVENT;
+        event.user.data1 = is;
+        SDL_PushEvent(&amp;event); // 在主线程的event_loop函数中，收到FF_ALLOC_EVENT事件后，会调用alloc_picture创建vp-&gt;bmp
+
+        /* wait until the picture is allocated */
+        SDL_LockMutex(is-&gt;pictq.mutex);
+        while (!vp-&gt;allocated &amp;&amp; !is-&gt;videoq.abort_request) {
+            SDL_CondWait(is-&gt;pictq.cond, is-&gt;pictq.mutex);
+        }
+        /* if the queue is aborted, we have to pop the pending ALLOC event or wait for the allocation to complete */
+        if (is-&gt;videoq.abort_request &amp;&amp; SDL_PeepEvents(&amp;event, 1, SDL_GETEVENT, SDL_EVENTMASK(FF_ALLOC_EVENT)) != 1) {
+            while (!vp-&gt;allocated &amp;&amp; !is-&gt;abort_request) {
+                SDL_CondWait(is-&gt;pictq.cond, is-&gt;pictq.mutex);
+            }
+        }
+        SDL_UnlockMutex(is-&gt;pictq.mutex);
+
+        if (is-&gt;videoq.abort_request)
+            return -1;
+    }
+
+    /* if the frame is not skipped, then display it */
+    // 将解码出来的yuv数据拷贝到vp-&gt;bmp中，供后续显示线程显示
+    if (vp-&gt;bmp) {
+        uint8_t *data[4];
+        int linesize[4];
+
+        /* get a pointer on the bitmap */
+        SDL_LockYUVOverlay (vp-&gt;bmp); //对SDL_Overlay操作前，先Lock
+
+        data[0] = vp-&gt;bmp-&gt;pixels[0];
+        data[1] = vp-&gt;bmp-&gt;pixels[2];
+        data[2] = vp-&gt;bmp-&gt;pixels[1];
+
+        linesize[0] = vp-&gt;bmp-&gt;pitches[0];
+        linesize[1] = vp-&gt;bmp-&gt;pitches[2];
+        linesize[2] = vp-&gt;bmp-&gt;pitches[1];
+
+#if CONFIG_AVFILTER
+        // FIXME use direct rendering
+        // 将解码出来的yuv数据拷贝到vp-&gt;bmp中，供后续显示线程显示
+        av_image_copy(data, linesize, (const uint8_t **)src_frame-&gt;data, src_frame-&gt;linesize,
+                        src_frame-&gt;format, vp-&gt;width, vp-&gt;height);
+#else
+        {
+            AVDictionaryEntry *e = av_dict_get(sws_dict, "sws_flags", NULL, 0);
+            if (e) {
+                const AVClass *class = sws_get_class();
+                const AVOption    *o = av_opt_find(&amp;class, "sws_flags", NULL, 0,
+                        AV_OPT_SEARCH_FAKE_OBJ);
+                int ret = av_opt_eval_flags(&amp;class, o, e-&gt;value, &amp;sws_flags);
+                if (ret &lt; 0)
+                    exit(1);
+            }
+        }
+
+        is-&gt;img_convert_ctx = sws_getCachedContext(is-&gt;img_convert_ctx,
+                                                   vp-&gt;width, vp-&gt;height, src_frame-&gt;format, vp-&gt;width, vp-&gt;height,
+                                                   AV_PIX_FMT_YUV420P, sws_flags, NULL, NULL, NULL);
+        if (!is-&gt;img_convert_ctx) {
+            av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
+            exit(1);
+        }
+        sws_scale(is-&gt;img_convert_ctx, src_frame-&gt;data, src_frame-&gt;linesize,
+                  0, vp-&gt;height, data, linesize);
+#endif
+        /* workaround SDL PITCH_WORKAROUND */
+        duplicate_right_border_pixels(vp-&gt;bmp);
+        /* update the bitmap content */
+        SDL_UnlockYUVOverlay(vp-&gt;bmp);  //对SDL_Overlay操作完成，UnLock
+
+        vp-&gt;pts = pts;
+        vp-&gt;duration = duration;
+        vp-&gt;pos = pos;
+        vp-&gt;serial = serial;
+
+        /* now we can update the picture count */
+        frame_queue_push(&amp;is-&gt;pictq); //更新frame queue队列，增加了新的一帧Frame用于显示
+    }
+    return 0;
+}</code></pre> 
+<p></p> 
+<p><br> </p> 
+<h4><span style="font-size:18px">audio_thread()解析</span></h4> 
+<p><strong>audio_thread()</strong>负责Audio Packet Queue(is-&gt;audioq)的消耗和Audio Sample Queue(is-&gt;sampq)的生产。</p> 
+<p>Audio Packet Queue消耗的函数调用关系：audio_thread() -&gt; decoder_decode_frame() -&gt; packet_queue_get(is-&gt;audioq)</p> 
+<p>Audio Sample Queue生产的函数调用关系：audio_thread() -&gt; frame_queue_push(&amp;is-&gt;sampq)。</p> 
+<p>audio_thread()的主干代码及相关代码如下：<br> </p> 
+<p></p> 
+<pre><code class="language-cpp">static int audio_thread(void *arg)
+{
+    VideoState *is = arg;
+    AVFrame *frame = av_frame_alloc();
+    Frame *af;
+    ......
+    do {
+		// 解码音频packet，解码后的音频数据放在frame中
+        if ((got_frame = decoder_decode_frame(&amp;is-&gt;auddec, frame, NULL)) &lt; 0)
+            goto the_end;
+
+        if (got_frame) {
+            ......
+
+#if CONFIG_AVFILTER
+            ......
+            while ((ret = av_buffersink_get_frame_flags(is-&gt;out_audio_filter, frame, 0)) &gt;= 0) {
+                tb = is-&gt;out_audio_filter-&gt;inputs[0]-&gt;time_base;
+#endif
+                //探测audio sample queue是否有空的Frame，如果有则返回空的Frame(af)，接下来将解码的音频sample内容拷贝到其中
+                if (!(af = frame_queue_peek_writable(&amp;is-&gt;sampq))) 
+                    goto the_end;
+
+                af-&gt;pts = (frame-&gt;pts == AV_NOPTS_VALUE) ? NAN : frame-&gt;pts * av_q2d(tb);
+                af-&gt;pos = av_frame_get_pkt_pos(frame);
+                af-&gt;serial = is-&gt;auddec.pkt_serial;
+                af-&gt;duration = av_q2d((AVRational){frame-&gt;nb_samples, frame-&gt;sample_rate});
+
+                av_frame_move_ref(af-&gt;frame, frame); //将解码后的音频数据放到audio sample queue(af)中，后续提供给音频播放设备播放
+                frame_queue_push(&amp;is-&gt;sampq);  //更新frame queue队列，增加了新的audio sample用于后续播放
+
+#if CONFIG_AVFILTER
+                if (is-&gt;audioq.serial != is-&gt;auddec.pkt_serial)
+                    break;
+            }
+            if (ret == AVERROR_EOF)
+                is-&gt;auddec.finished = is-&gt;auddec.pkt_serial;
+#endif
+        }
+    } while (ret &gt;= 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF);
+ the_end:
+#if CONFIG_AVFILTER
+    avfilter_graph_free(&amp;is-&gt;agraph);
+#endif
+    av_frame_free(&amp;frame);
+    return ret;
+}</code></pre> 
+<br> 
+<p></p> 
+<h4><span style="font-size:18px">音频回调函数sdl_audio_callback()解析</span></h4> 
+<div>
+  ffplay中，音频的播放采用回调函数的方式，具体来说在打开音频设备时指定回调函数，之后SDL将根据需要不断调用该函数来获取音频数据进行播放。 
+</div> 
+<div> 
+ <strong>sdl_audio_callback()</strong>负责Audio Sample Queue(is-&gt;audioq)的消耗，函数调用：sdl_audio_callback() -&gt; audio_decode_frame() -&gt; frame_queue_peek_readable() 
+</div> 
+<div>
+  sdl_audio_callback()相关代码如下： 
+</div> 
+<div> 
+ <pre><code class="language-cpp">static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
+{
+    VideoState *is = opaque;
+    int audio_size, len1;
+
+    audio_callback_time = av_gettime_relative();
+
+    while (len &gt; 0) {
+        if (is-&gt;audio_buf_index &gt;= is-&gt;audio_buf_size) {
+           // audio_decode_frame将Audio Sample Queue中的解码后音频数据进行转换，然后存储到is-&gt;audio_buf中。
+           audio_size = audio_decode_frame(is);
+           if (audio_size &lt; 0) {
+                /* if error, just output silence */
+               is-&gt;audio_buf = NULL;
+               is-&gt;audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is-&gt;audio_tgt.frame_size * is-&gt;audio_tgt.frame_size;
+           } else {
+               if (is-&gt;show_mode != SHOW_MODE_VIDEO)
+                   update_sample_display(is, (int16_t *)is-&gt;audio_buf, audio_size);
+               is-&gt;audio_buf_size = audio_size;
+           }
+           is-&gt;audio_buf_index = 0;
+        }
+        len1 = is-&gt;audio_buf_size - is-&gt;audio_buf_index;
+        if (len1 &gt; len)
+            len1 = len;
+		// 将音频数据拷贝到stream中，供SDL进行播放使用
+        if (!is-&gt;muted &amp;&amp; is-&gt;audio_buf &amp;&amp; is-&gt;audio_volume == SDL_MIX_MAXVOLUME)
+            memcpy(stream, (uint8_t *)is-&gt;audio_buf + is-&gt;audio_buf_index, len1);
+        else {
+            memset(stream, 0, len1);
+            if (!is-&gt;muted &amp;&amp; is-&gt;audio_buf)
+                SDL_MixAudio(stream, (uint8_t *)is-&gt;audio_buf + is-&gt;audio_buf_index, len1, is-&gt;audio_volume);
+        }
+        len -= len1;
+        stream += len1;
+        is-&gt;audio_buf_index += len1;
+    }
+    is-&gt;audio_write_buf_size = is-&gt;audio_buf_size - is-&gt;audio_buf_index;
+    /* Let's assume the audio driver that is used by SDL has two periods. */
+    if (!isnan(is-&gt;audio_clock)) { // 更新audio clock，用于音视频同步
+        set_clock_at(&amp;is-&gt;audclk, is-&gt;audio_clock - (double)(2 * is-&gt;audio_hw_buf_size + is-&gt;audio_write_buf_size) / is-&gt;audio_tgt.bytes_per_sec, is-&gt;audio_clock_serial, audio_callback_time / 1000000.0);
+        sync_clock_to_slave(&amp;is-&gt;extclk, &amp;is-&gt;audclk);
+    }
+}
+
+static int audio_decode_frame(VideoState *is)
+{
+    int data_size, resampled_data_size;
+    int64_t dec_channel_layout;
+    av_unused double audio_clock0;
+    int wanted_nb_samples;
+    Frame *af;
+
+    if (is-&gt;paused)
+        return -1;
+
+    do {
+        ... ...
+		//探测audio sample queue是否有可读的Frame，如果有则返回该Frame(af)，
+        if (!(af = frame_queue_peek_readable(&amp;is-&gt;sampq)))
+            return -1;
+        frame_queue_next(&amp;is-&gt;sampq);
+    } while (af-&gt;serial != is-&gt;audioq.serial);
+
+    data_size = av_samples_get_buffer_size(NULL, av_frame_get_channels(af-&gt;frame),
+                                           af-&gt;frame-&gt;nb_samples,
+                                           af-&gt;frame-&gt;format, 1);
+
+    dec_channel_layout =
+        (af-&gt;frame-&gt;channel_layout &amp;&amp; av_frame_get_channels(af-&gt;frame) == av_get_channel_layout_nb_channels(af-&gt;frame-&gt;channel_layout)) ?
+        af-&gt;frame-&gt;channel_layout : av_get_default_channel_layout(av_frame_get_channels(af-&gt;frame));
+    wanted_nb_samples = synchronize_audio(is, af-&gt;frame-&gt;nb_samples);
+
+    if (af-&gt;frame-&gt;format        != is-&gt;audio_src.fmt            ||
+        dec_channel_layout       != is-&gt;audio_src.channel_layout ||
+        af-&gt;frame-&gt;sample_rate   != is-&gt;audio_src.freq           ||
+        (wanted_nb_samples       != af-&gt;frame-&gt;nb_samples &amp;&amp; !is-&gt;swr_ctx)) {
+        swr_free(&amp;is-&gt;swr_ctx);
+        is-&gt;swr_ctx = swr_alloc_set_opts(NULL,
+                                         is-&gt;audio_tgt.channel_layout, is-&gt;audio_tgt.fmt, is-&gt;audio_tgt.freq,
+                                         dec_channel_layout,           af-&gt;frame-&gt;format, af-&gt;frame-&gt;sample_rate,
+                                         0, NULL);
+        if (!is-&gt;swr_ctx || swr_init(is-&gt;swr_ctx) &lt; 0) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "Cannot create sample rate converter for conversion of %d Hz %s %d channels to %d Hz %s %d channels!\n",
+                    af-&gt;frame-&gt;sample_rate, av_get_sample_fmt_name(af-&gt;frame-&gt;format), av_frame_get_channels(af-&gt;frame),
+                    is-&gt;audio_tgt.freq, av_get_sample_fmt_name(is-&gt;audio_tgt.fmt), is-&gt;audio_tgt.channels);
+            swr_free(&amp;is-&gt;swr_ctx);
+            return -1;
+        }
+        is-&gt;audio_src.channel_layout = dec_channel_layout;
+        is-&gt;audio_src.channels       = av_frame_get_channels(af-&gt;frame);
+        is-&gt;audio_src.freq = af-&gt;frame-&gt;sample_rate;
+        is-&gt;audio_src.fmt = af-&gt;frame-&gt;format;
+    }
+
+    if (is-&gt;swr_ctx) { //对解码后音频数据转换，符合目标输出格式
+        const uint8_t **in = (const uint8_t **)af-&gt;frame-&gt;extended_data;
+        uint8_t **out = &amp;is-&gt;audio_buf1;
+        int out_count = (int64_t)wanted_nb_samples * is-&gt;audio_tgt.freq / af-&gt;frame-&gt;sample_rate + 256;
+        int out_size  = av_samples_get_buffer_size(NULL, is-&gt;audio_tgt.channels, out_count, is-&gt;audio_tgt.fmt, 0);
+        int len2;
+        if (out_size &lt; 0) {
+            av_log(NULL, AV_LOG_ERROR, "av_samples_get_buffer_size() failed\n");
+            return -1;
+        }
+        if (wanted_nb_samples != af-&gt;frame-&gt;nb_samples) {
+            if (swr_set_compensation(is-&gt;swr_ctx, (wanted_nb_samples - af-&gt;frame-&gt;nb_samples) * is-&gt;audio_tgt.freq / af-&gt;frame-&gt;sample_rate,
+                                        wanted_nb_samples * is-&gt;audio_tgt.freq / af-&gt;frame-&gt;sample_rate) &lt; 0) {
+                av_log(NULL, AV_LOG_ERROR, "swr_set_compensation() failed\n");
+                return -1;
+            }
+        }
+        av_fast_malloc(&amp;is-&gt;audio_buf1, &amp;is-&gt;audio_buf1_size, out_size);
+        if (!is-&gt;audio_buf1)
+            return AVERROR(ENOMEM);
+        len2 = swr_convert(is-&gt;swr_ctx, out, out_count, in, af-&gt;frame-&gt;nb_samples);
+        if (len2 &lt; 0) {
+            av_log(NULL, AV_LOG_ERROR, "swr_convert() failed\n");
+            return -1;
+        }
+        if (len2 == out_count) {
+            av_log(NULL, AV_LOG_WARNING, "audio buffer is probably too small\n");
+            if (swr_init(is-&gt;swr_ctx) &lt; 0)
+                swr_free(&amp;is-&gt;swr_ctx);
+        }
+        is-&gt;audio_buf = is-&gt;audio_buf1;
+        resampled_data_size = len2 * is-&gt;audio_tgt.channels * av_get_bytes_per_sample(is-&gt;audio_tgt.fmt);
+    } else {
+        is-&gt;audio_buf = af-&gt;frame-&gt;data[0]; //audio_buf指向解码后音频数据
+        resampled_data_size = data_size;
+    }
+
+    audio_clock0 = is-&gt;audio_clock;
+    /* update the audio clock with the pts */
+    if (!isnan(af-&gt;pts))
+        is-&gt;audio_clock = af-&gt;pts + (double) af-&gt;frame-&gt;nb_samples / af-&gt;frame-&gt;sample_rate;
+    else
+        is-&gt;audio_clock = NAN;
+    is-&gt;audio_clock_serial = af-&gt;serial;
+
+    return resampled_data_size;
+}</code></pre> 
+ <br> 
+ <h4 style="text-align:justify">主线程视频渲染解析</h4> 
+</div> 
+<div style="text-align:justify">
+  event_loop()-&gt;refresh_loop_wait_event() 负责Video Frame Queue的消耗，将Video Frame渲染显示。 
+</div> 
+<div style="text-align:justify">
+  调用关系：main() -&gt; event_loop() -&gt; refresh_loop_wait_event() 
+</div> 
+<div style="text-align:justify">
+  相关代码如下： 
+</div> 
+<div style="text-align:justify"> 
+ <pre><code class="language-cpp">static void event_loop(VideoState *cur_stream)
+{
+    SDL_Event event;
+    double incr, pos, frac;
+
+    for (;;) {
+        ......
+        refresh_loop_wait_event(cur_stream, &amp;event);
+        switch (event.type) {
+        case SDL_KEYDOWN:
+        ......
+	    }
+    }
+}
+
+static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
+    double remaining_time = 0.0;
+    // 调用SDL_PeepEvents前先调用SDL_PumpEvents，将输入设备的事件抽到事件队列中
+    SDL_PumpEvents();
+    while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_ALLEVENTS)) {
+        // 从事件队列中拿一个事件，放到event中，如果没有事件，则进入循环中
+        if (!cursor_hidden &amp;&amp; av_gettime_relative() - cursor_last_shown &gt; CURSOR_HIDE_DELAY) {
+            SDL_ShowCursor(0); //隐藏鼠标
+            cursor_hidden = 1;
+        }
+        if (remaining_time &gt; 0.0) // 在video_refresh函数中，根据当前帧显示时刻和实际时刻计算需要sleep的时间，保证帧按时显示
+            av_usleep((int64_t)(remaining_time * 1000000.0));
+        remaining_time = REFRESH_RATE;
+        if (is-&gt;show_mode != SHOW_MODE_NONE &amp;&amp; (!is-&gt;paused || is-&gt;force_refresh))
+            video_refresh(is, &amp;remaining_time);
+        SDL_PumpEvents();
+    }
+}
+
+/* called to display each frame */
+static void video_refresh(void *opaque, double *remaining_time)
+{
+    VideoState *is = opaque;
+    double time;
+
+    Frame *sp, *sp2;
+
+    if (!is-&gt;paused &amp;&amp; get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK &amp;&amp; is-&gt;realtime)
+        check_external_clock_speed(is);
+
+    ......
+
+    if (is-&gt;video_st) {
+retry:
+        if (frame_queue_nb_remaining(&amp;is-&gt;pictq) == 0) {
+            // nothing to do, no picture to display in the queue
+        } else {
+            double last_duration, duration, delay;
+            Frame *vp, *lastvp;
+
+            /* dequeue the picture */
+            lastvp = frame_queue_peek_last(&amp;is-&gt;pictq);   //取Video Frame Queue上一帧图像
+            vp = frame_queue_peek(&amp;is-&gt;pictq);            //取Video Frame Queue当前帧图像
+
+            ......
+
+            if (is-&gt;paused)
+                goto display;
+
+            /* compute nominal last_duration */
+            last_duration = vp_duration(is, lastvp, vp);     //计算两帧之间的时间间隔
+            delay = compute_target_delay(last_duration, is); //计算当前帧与上一帧渲染的时间差
+
+            time= av_gettime_relative()/1000000.0;
+            //is-&gt;frame_timer + delay是当前帧渲染的时刻，如果当前时间还没到帧渲染的时刻，那就要sleep了
+            if (time &lt; is-&gt;frame_timer + delay) { // remaining_time为需要sleep的时间
+                *remaining_time = FFMIN(is-&gt;frame_timer + delay - time, *remaining_time); 
+                goto display;
+            }
+
+            is-&gt;frame_timer += delay;
+            if (delay &gt; 0 &amp;&amp; time - is-&gt;frame_timer &gt; AV_SYNC_THRESHOLD_MAX)
+                is-&gt;frame_timer = time;
+
+            SDL_LockMutex(is-&gt;pictq.mutex);
+            if (!isnan(vp-&gt;pts))
+                update_video_pts(is, vp-&gt;pts, vp-&gt;pos, vp-&gt;serial);
+            SDL_UnlockMutex(is-&gt;pictq.mutex);
+
+            if (frame_queue_nb_remaining(&amp;is-&gt;pictq) &gt; 1) {
+                Frame *nextvp = frame_queue_peek_next(&amp;is-&gt;pictq);
+                duration = vp_duration(is, vp, nextvp);
+				// 如果当前帧显示时刻早于实际时刻，说明解码慢了，帧到的晚了，需要丢弃不能用于显示了，不然音视频不同步了。
+                if(!is-&gt;step &amp;&amp; (framedrop&gt;0 || (framedrop &amp;&amp; get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) &amp;&amp; time &gt; is-&gt;frame_timer + duration){
+                    is-&gt;frame_drops_late++;
+                    frame_queue_next(&amp;is-&gt;pictq);
+                    goto retry;
+                }
+            }
+
+            ......
+            frame_queue_next(&amp;is-&gt;pictq); 
+            is-&gt;force_refresh = 1;        //显示当前帧
+
+            if (is-&gt;step &amp;&amp; !is-&gt;paused)
+                stream_toggle_pause(is);
+        }
+display:
+        /* display picture */
+        if (!display_disable &amp;&amp; is-&gt;force_refresh &amp;&amp; is-&gt;show_mode == SHOW_MODE_VIDEO &amp;&amp; is-&gt;pictq.rindex_shown)
+            video_display(is);
+    }
+    is-&gt;force_refresh = 0;
+    ......
+}
+
+static void video_display(VideoState *is)
+{
+    if (!screen)
+        video_open(is, 0, NULL);
+    if (is-&gt;audio_st &amp;&amp; is-&gt;show_mode != SHOW_MODE_VIDEO)
+        video_audio_display(is);
+    else if (is-&gt;video_st)
+        video_image_display(is);
+}
+
+static void video_image_display(VideoState *is)
+{
+    Frame *vp;
+    Frame *sp;
+    SDL_Rect rect;
+    int i;
+
+    vp = frame_queue_peek_last(&amp;is-&gt;pictq);
+    if (vp-&gt;bmp) {
+        ......
+        calculate_display_rect(&amp;rect, is-&gt;xleft, is-&gt;ytop, is-&gt;width, is-&gt;height, vp-&gt;width, vp-&gt;height, vp-&gt;sar);
+        SDL_DisplayYUVOverlay(vp-&gt;bmp, &amp;rect); //显示当前帧
+        ......
+    }
+}</code></pre> 
+ <br> 至此，ffplay正常播放流程基本解析完成了。后面有空，会继续分析ffplay的音视频同步机制、事件响应机制等等。 
+</div> 
+<p style="text-align:justify"><br> </p> 
+<p style="text-align:justify"><span style='color:rgb(120,128,135); font-family:"PingFang SC","Microsoft YaHei",SimHei,Arial,SimSun; font-size:14px'>版权声明：本文为博主原创文章，转载请注明出处。</span><br> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/77091c95ad035cc283524ccb61343169/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Uboot中start.S源码解析</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5472f3b42edcaa4140d0ca6d1c41e673/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">批量添加 或修改文件后缀名</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

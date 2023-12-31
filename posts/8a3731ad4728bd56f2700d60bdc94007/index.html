@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>PX4代码解析(6) - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="PX4代码解析(6)" />
+<meta property="og:description" content="一、前言 上一节介绍了PX4姿态估计调用函数的流程，这一节分享一下我对PX4姿态解算的解读.首先，要理解PX4姿态解算的程序，要先从传感器的特性入手，这里主要介绍的传感器有加速度计，磁力计，陀螺仪.
+二、传感器特性 1.加速度计 pixhawk上使用的为三轴加速度计，主要用于测量x,y,z三轴的加速度值，常用的传感器例如mpu6000与mpu9250，在进行PX4二次开发时，我们并不需要编写加速度计相关驱动程序，其代码已经在PX4_Firmware/src/drivers/imu下进行了实现，感兴趣可以自己查阅.这里我们只需了解加速度计的原理与特性.
+如图所示，该图为加速度计简易模型，由弹簧与质量块构成，当外界有加速度时，质量块位置会发生变化，从而使得电容两端距离改变，流经电容的电流也会发生变化，通过测量电流大小，就可以得到质量块移动距离，从而得到加速度大小。理想状态下，当没有外界作用时，质量块会处于零点位置，但由于工艺，使用时间长短等各种因素，质量块可能会处于非零点位置，即所谓零偏，因此，在飞无人机之前往往需要进行校准。
+此外，加速度计校准还涉及到另一个参数，这个参数是标度因数，在这里可以理解为一个比例系数，测量值乘以这个比例系数后得到实际值。
+从加速度原理可以看出，在测量加速度时质量块需要不断移动，移动需要时间，因此，在高频情况下加速度计值不一定准确，低频率特性比较好.
+2.陀螺仪 pixhawk上另一个比较重要的传感器就是陀螺仪，陀螺仪用于测量x,y,z三轴角速度，其基本的原理是动量守恒。当外部系统发生旋转时，内部转动装置会保持恒定的速度与方向旋转，测量这两个系统的差就可以得到当前系统角速度。为了测量x,y,z三轴角速度，通常采用万向节构成转动装置
+以其中一个方向为例，当陀螺仪测量装置随着转动轴转动时，在半径方向上会存在力，使得质量块在半径方向进行周期往复运动，从而得到旋转角速度.但由于存在零点漂移，陀螺仪在低频特性较差，高频特性较好.
+3.磁力计 磁力计主要用于测量当前磁场强度。为了能够测量地磁方向，通常将地磁分为水平与垂直方向，水平方向可以近似表示地磁方向。但地球的磁轴与地轴有着夹角，一般称为磁偏角，磁偏角在不同地理位置不同，因此在无人机航向计算时，需要gps获得当前经纬度，然后查表得到当前位置磁偏角，对航向进行修正（后续代码中会看到）.同样的磁力计校正也涉及到偏移与标度因数.
+三、姿态解算算法 1.为什么采用四元数计算 在介绍姿态解算算法前，先来谈谈姿态的表示方式，常用的姿态表示方法有：四元数，欧拉角，方向余弦这几种方式，并且这几种方式是可以 互相转换，欧拉角虽然计算简单，但是存在退化现象；方向余弦有9个参数，导致其计算量过大，实时性不好；因此，PX4源码中采用四元数来表示姿态。
+2.姿态解算的坐标系 在无人机的坐标变换过程中，一般会涉及到以下四个坐标系
+1.传感器坐标系
+传感器本身具有自己的测量坐标系，在安装过程中会存在安装误差，而传感器读数是在传感器坐标系下测得，为了能让无人机使用，需要将其转换到机体坐标系。但加速度计，磁力计，陀螺仪这些传感器安装时一般与无人机机体中心位置与方向都重合，所以可以粗略认为传感器坐标系与无人机坐标系重合
+2.机体坐标系
+一般以无人机几何中心为中心，以右手定则建立的三维直角坐标系，x轴位于无人机机体平面，以无人机前进方向为正方向；y轴在机体平面且垂直x轴，z轴垂直机体平面，以向下为正.
+3.本地坐标系（local）
+为了确定无人机相对于地面的速度与位置，需要引入本地坐标系（仿真中常用的地面坐标系）。一般情况下，本地坐标系是以无人机起点为坐标中心，在水平面上正北方向为x轴，正东为y轴方向，z轴垂直地面向下，这也是所谓的北东地（NED）坐标系
+4.全局坐标系（global）
+前面提到，在不同经纬度下，地轴与磁轴之间的磁偏角是不一样的，为了修正无人机航向，还需要引入GPS测得的地球经纬度.
+3.Mahony滤波算法 下面来讲解算法，如图为mahony滤波的流程图，取自文献[1]
+先来解释一下上图：
+1. a , m a,m a,m与 ω \omega ω分别是加速度计测得的加速度，磁力计测得的磁场强度以及陀螺仪测得的角速度。其实这里就引出了一个问题，为什么需要加速度计与磁力计，光靠陀螺仪不就可以得到无人机姿态吗？
+确实，光靠陀螺仪是可以得到无人机姿态的，通过对得到的角速度积分就得到了姿态，但靠积分得到的姿态会存在积分误差，这个光靠陀螺仪是无法解决的，因此引入了加速度计与磁力计来解决陀螺仪积分误差。
+2.四元数微分方程为 Q ˙ = 1 2 ⊗ ω n b b \dot{Q} =\frac{1}{2} \otimes \omega _{nb}^{b} Q˙​=21​⊗ωnbb​,式中 Q Q Q为姿态四元数， ω n b b \omega _{nb}^{b} ωnbb​为无人机机体坐标系b相对于北东地（NED）坐标系n的角速度，这个式子是姿态解算的核心
+3.由加速度计与磁力计得来的姿态同样存在误差，因此需要PI控制器来对误差进行修正，PI控制器的输入是由加速度计与磁力计算出的姿态与最终通过四元数微分方程计算出的实际姿态的差值，输出角速度修正值，补偿到陀螺仪，抵消陀螺仪误差
+4.这个过程在无人机运行过程中循环计算，不断进行姿态解算" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8a3731ad4728bd56f2700d60bdc94007/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-12-01T20:16:31+08:00" />
+<meta property="article:modified_time" content="2022-12-01T20:16:31+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">PX4代码解析(6)</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="_0"></a>一、前言</h2> 
+<p>上一节介绍了PX4姿态估计调用函数的流程，这一节分享一下我对PX4姿态解算的解读.首先，要理解PX4姿态解算的程序，要先从传感器的特性入手，这里主要介绍的传感器有加速度计，磁力计，陀螺仪.</p> 
+<h2><a id="_2"></a>二、传感器特性</h2> 
+<h3><a id="1_3"></a>1.加速度计</h3> 
+<p>pixhawk上使用的为三轴加速度计，主要用于测量x,y,z三轴的加速度值，常用的传感器例如mpu6000与mpu9250，在进行PX4二次开发时，我们并不需要编写加速度计相关驱动程序，其代码已经在PX4_Firmware/src/drivers/imu下进行了实现，感兴趣可以自己查阅.这里我们只需了解加速度计的原理与特性.<br> <img src="https://images2.imgbox.com/f1/03/ffmzdJNZ_o.png" alt="在这里插入图片描述"></p> 
+<p>如图所示，该图为加速度计简易模型，由弹簧与质量块构成，当外界有加速度时，质量块位置会发生变化，从而使得电容两端距离改变，流经电容的电流也会发生变化，通过测量电流大小，就可以得到质量块移动距离，从而得到加速度大小。理想状态下，当没有外界作用时，质量块会处于零点位置，但由于工艺，使用时间长短等各种因素，质量块可能会处于非零点位置，即所谓零偏，因此，在飞无人机之前往往需要进行校准。<br> 此外，加速度计校准还涉及到另一个参数，这个参数是<strong>标度因数</strong>，在这里可以理解为一个比例系数，测量值乘以这个比例系数后得到实际值。<br> 从加速度原理可以看出，在测量加速度时质量块需要不断移动，移动需要时间，因此，<strong>在高频情况下加速度计值不一定准确，低频率特性比较好.</strong></p> 
+<h3><a id="2_11"></a>2.陀螺仪</h3> 
+<p>pixhawk上另一个比较重要的传感器就是陀螺仪，陀螺仪用于测量x,y,z三轴角速度，其基本的原理是动量守恒。当外部系统发生旋转时，内部转动装置会保持恒定的速度与方向旋转，测量这两个系统的差就可以得到当前系统角速度。为了测量x,y,z三轴角速度，通常采用万向节构成转动装置<br> <img src="https://images2.imgbox.com/30/02/7kiuCgf3_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/9f/cc/JunMViGh_o.png" alt="在这里插入图片描述"></p> 
+<p>以其中一个方向为例，当陀螺仪测量装置随着转动轴转动时，在半径方向上会存在力，使得质量块在半径方向进行周期往复运动，从而得到旋转角速度.<strong>但由于存在零点漂移，陀螺仪在低频特性较差，高频特性较好.</strong></p> 
+<h3><a id="3_17"></a>3.磁力计</h3> 
+<p>磁力计主要用于测量当前磁场强度。为了能够测量地磁方向，通常将地磁分为水平与垂直方向，水平方向可以近似表示地磁方向。但地球的磁轴与地轴有着夹角，一般称为磁偏角，磁偏角在不同地理位置不同，因此在无人机航向计算时，需要gps获得当前经纬度，然后查表得到当前位置磁偏角，对航向进行修正（后续代码中会看到）.同样的磁力计校正也涉及到偏移与标度因数.</p> 
+<h2><a id="_23"></a>三、姿态解算算法</h2> 
+<h3><a id="1_24"></a>1.为什么采用四元数计算</h3> 
+<p>在介绍姿态解算算法前，先来谈谈姿态的表示方式，常用的姿态表示方法有：四元数，欧拉角，方向余弦这几种方式，并且这几种方式是可以 <a href="https://blog.csdn.net/weixin_43821888/article/details/109991746">互相转换</a>，欧拉角虽然计算简单，但是存在退化现象；方向余弦有9个参数，导致其计算量过大，实时性不好；因此，PX4源码中采用四元数来表示姿态。</p> 
+<h3><a id="2_26"></a>2.姿态解算的坐标系</h3> 
+<p>在无人机的坐标变换过程中，一般会涉及到以下四个坐标系<br> <strong>1.传感器坐标系</strong><br> 传感器本身具有自己的测量坐标系，在安装过程中会存在安装误差，而传感器读数是在传感器坐标系下测得，为了能让无人机使用，需要将其转换到机体坐标系。但加速度计，磁力计，陀螺仪这些传感器安装时一般与无人机机体中心位置与方向都重合，所以可以粗略认为传感器坐标系与无人机坐标系重合<br> <strong>2.机体坐标系</strong><br> 一般以无人机几何中心为中心，以右手定则建立的三维直角坐标系，x轴位于无人机机体平面，以无人机前进方向为正方向；y轴在机体平面且垂直x轴，z轴垂直机体平面，以向下为正.<br> <strong>3.本地坐标系（local）</strong><br> 为了确定无人机相对于地面的速度与位置，需要引入本地坐标系（仿真中常用的地面坐标系）。一般情况下，本地坐标系是以无人机起点为坐标中心，在水平面上正北方向为x轴，正东为y轴方向，z轴垂直地面向下，这也是所谓的北东地（NED）坐标系<br> <strong>4.全局坐标系（global）</strong><br> 前面提到，在不同经纬度下，地轴与磁轴之间的磁偏角是不一样的，为了修正无人机航向，还需要引入GPS测得的地球经纬度.</p> 
+<h3><a id="3Mahony_37"></a>3.Mahony滤波算法</h3> 
+<p>下面来讲解算法，如图为mahony滤波的流程图，取自文献[1]<br> <img src="https://images2.imgbox.com/29/7e/4C6vtqOB_o.png" alt="在这里插入图片描述"><br> 先来解释一下上图：<br> 1.<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         a 
+        
+       
+         , 
+        
+       
+         m 
+        
+       
+      
+        a,m 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.625em; vertical-align: -0.19444em;"></span><span class="mord mathdefault">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right: 0.166667em;"></span><span class="mord mathdefault">m</span></span></span></span></span>与<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         ω 
+        
+       
+      
+        \omega 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.43056em; vertical-align: 0em;"></span><span style="margin-right: 0.03588em;" class="mord mathdefault">ω</span></span></span></span></span>分别是加速度计测得的加速度，磁力计测得的磁场强度以及陀螺仪测得的角速度。其实这里就引出了一个问题，<strong>为什么需要加速度计与磁力计，光靠陀螺仪不就可以得到无人机姿态吗？</strong><br> 确实，光靠陀螺仪是可以得到无人机姿态的，通过对得到的角速度积分就得到了姿态，但靠积分得到的姿态会存在积分误差，这个光靠陀螺仪是无法解决的，因此引入了加速度计与磁力计来解决陀螺仪积分误差。<br> 2.四元数微分方程为<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          Q 
+         
+        
+          ˙ 
+         
+        
+       
+         = 
+        
+        
+        
+          1 
+         
+        
+          2 
+         
+        
+       
+         ⊗ 
+        
+        
+        
+          ω 
+         
+         
+         
+           n 
+          
+         
+           b 
+          
+         
+        
+          b 
+         
+        
+       
+      
+        \dot{Q} =\frac{1}{2} \otimes \omega _{nb}^{b} 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.11463em; vertical-align: -0.19444em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.92019em;"><span class="" style="top: -3em;"><span class="pstrut" style="height: 3em;"></span><span class="mord"><span class="mord mathdefault">Q</span></span></span><span class="" style="top: -3.25233em;"><span class="pstrut" style="height: 3em;"></span><span class="accent-body" style="left: -0.05555em;">˙</span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.19444em;"><span class=""></span></span></span></span></span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1.19011em; vertical-align: -0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.845108em;"><span class="" style="top: -2.655em;"><span class="pstrut" style="height: 3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span class="" style="top: -3.23em;"><span class="pstrut" style="height: 3em;"></span><span class="frac-line" style="border-bottom-width: 0.04em;"></span></span><span class="" style="top: -3.394em;"><span class="pstrut" style="height: 3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.345em;"><span class=""></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">⊗</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.13222em; vertical-align: -0.283108em;"></span><span class="mord"><span style="margin-right: 0.03588em;" class="mord mathdefault">ω</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.849108em;"><span class="" style="top: -2.41689em; margin-left: -0.03588em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">b</span></span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">b</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.283108em;"><span class=""></span></span></span></span></span></span></span></span></span></span>,式中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         Q 
+        
+       
+      
+        Q 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.87777em; vertical-align: -0.19444em;"></span><span class="mord mathdefault">Q</span></span></span></span></span>为姿态四元数，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          ω 
+         
+         
+         
+           n 
+          
+         
+           b 
+          
+         
+        
+          b 
+         
+        
+       
+      
+        \omega _{nb}^{b} 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.13222em; vertical-align: -0.283108em;"></span><span class="mord"><span style="margin-right: 0.03588em;" class="mord mathdefault">ω</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.849108em;"><span class="" style="top: -2.41689em; margin-left: -0.03588em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">b</span></span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">b</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.283108em;"><span class=""></span></span></span></span></span></span></span></span></span></span>为无人机机体坐标系b相对于北东地（NED）坐标系n的角速度，这个式子是姿态解算的核心<br> 3.由加速度计与磁力计得来的姿态同样存在误差，因此需要PI控制器来对误差进行修正，PI控制器的输入是由加速度计与磁力计算出的姿态与最终通过四元数微分方程计算出的实际姿态的差值，输出角速度修正值，补偿到陀螺仪，抵消陀螺仪误差<br> 4.这个过程在无人机运行过程中循环计算，不断进行姿态解算</p> 
+<h2><a id="_48"></a>四、姿态解算算法代码讲解</h2> 
+<p>在PX4代码解析(5)中我已经介绍了代码运行流程，本节只针对姿态解算算法重点部分进行讲解，我将这部分代码分为以下几个部分：<br> 1.AttitudeEstimatorQ对象建立以及相关数据获取<br> 2.四元数q的初始化<br> 3.姿态解算</p> 
+<h3><a id="1AttitudeEstimatorQ_53"></a>1.AttitudeEstimatorQ对象的构造函数</h3> 
+<p>先来看看.AttitudeEstimatorQ对象的构造函数</p> 
+<pre><code class="prism language-javascript"><span class="token comment">//在对象的构造函数中，主要是对对象成员变量清0</span>
+<span class="token literal-property property">AttitudeEstimatorQ</span><span class="token operator">:</span><span class="token operator">:</span><span class="token function">AttitudeEstimatorQ</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">:</span>
+	<span class="token function">ModuleParams</span><span class="token punctuation">(</span>nullptr<span class="token punctuation">)</span><span class="token punctuation">,</span>
+	<span class="token function">WorkItem</span><span class="token punctuation">(</span><span class="token parameter"><span class="token constant">MODULE_NAME</span><span class="token punctuation">,</span> <span class="token literal-property property">px4</span><span class="token operator">:</span><span class="token operator">:</span>wq_configurations<span class="token operator">:</span><span class="token operator">:</span>att_pos_ctrl</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	_vel_prev<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	_pos_acc<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//gyro是陀螺仪数据，是一个1*3或者3*1向量</span>
+	_gyro<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//accel表示的是加速度计数据</span>
+	_accel<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//mag是磁力计数据</span>
+	_mag<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//vision是视觉数据，mocap是动作捕捉的数据，暂时用不到</span>
+	_vision_hdg<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	_mocap_hdg<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//四元数q清0</span>
+	_q<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	_rates<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	_gyro_bias<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">//将参数文件中参数拷贝到当前进程使用，这些参数就是你在地面站里可以修改的那些，比如加速度计的偏移等数据</span>
+    <span class="token function">update_parameters</span><span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="2Run_80"></a>2.Run函数</h3> 
+<p>在执行完构造函数后，该进程会执行run函数</p> 
+<pre><code class="prism language-javascript"><span class="token comment">//该函数主要是读取各传感器数据，并分配给相应变量，为后续姿态解算做前置工作</span>
+<span class="token keyword">void</span>
+<span class="token literal-property property">AttitudeEstimatorQ</span><span class="token operator">:</span><span class="token operator">:</span><span class="token function">Run</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+<span class="token comment">//第一个if主要用于判断传感器那边数据准备好没有</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">should_exit</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		_sensors_sub<span class="token punctuation">.</span><span class="token function">unregisterCallback</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">exit_and_cleanup</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+<span class="token comment">//定义了一个sensor_combine的结构体，用于接收数据</span>
+	sensor_combined_s sensors<span class="token punctuation">;</span>
+<span class="token comment">//将数据拷贝到sensors</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_sensors_sub<span class="token punctuation">.</span><span class="token function">update</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>sensors<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+        <span class="token function">update_parameters</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">//默认参数为force</span>
+    <span class="token comment">//检查数据是否为最新陀螺仪</span>
+		<span class="token comment">// Feed validator with recent sensor data</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>sensors<span class="token punctuation">.</span>timestamp <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token function">_gyro</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">=</span> sensors<span class="token punctuation">.</span>gyro_rad<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+			<span class="token function">_gyro</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">=</span> sensors<span class="token punctuation">.</span>gyro_rad<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+			<span class="token function">_gyro</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">=</span> sensors<span class="token punctuation">.</span>gyro_rad<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+<span class="token comment">//更新加速度计数据</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>sensors<span class="token punctuation">.</span>accelerometer_timestamp_relative <span class="token operator">!=</span> sensor_combined_s<span class="token operator">:</span><span class="token operator">:</span><span class="token constant">RELATIVE_TIMESTAMP_INVALID</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token function">_accel</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">=</span> sensors<span class="token punctuation">.</span>accelerometer_m_s2<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+			<span class="token function">_accel</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">=</span> sensors<span class="token punctuation">.</span>accelerometer_m_s2<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+			<span class="token function">_accel</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">=</span> sensors<span class="token punctuation">.</span>accelerometer_m_s2<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_accel<span class="token punctuation">.</span><span class="token function">length</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">.</span>01f<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token constant">PX4_ERR</span><span class="token punctuation">(</span><span class="token string">"degenerate accel!"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token keyword">return</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+
+        <span class="token comment">// U更新磁力计数据</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_magnetometer_sub<span class="token punctuation">.</span><span class="token function">updated</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			vehicle_magnetometer_s magnetometer<span class="token punctuation">;</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_magnetometer_sub<span class="token punctuation">.</span><span class="token function">copy</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>magnetometer<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token function">_mag</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">=</span> magnetometer<span class="token punctuation">.</span>magnetometer_ga<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+				<span class="token function">_mag</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">=</span> magnetometer<span class="token punctuation">.</span>magnetometer_ga<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+				<span class="token function">_mag</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">=</span> magnetometer<span class="token punctuation">.</span>magnetometer_ga<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token comment">//如果磁力计数据太小，则返回报错</span>
+				<span class="token keyword">if</span> <span class="token punctuation">(</span>_mag<span class="token punctuation">.</span><span class="token function">length</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">.</span>01f<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token constant">PX4_ERR</span><span class="token punctuation">(</span><span class="token string">"degenerate mag!"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token keyword">return</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+
+		<span class="token punctuation">}</span>
+<span class="token comment">//数据更新完成标志位</span>
+		_data_good <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+
+		<span class="token comment">// Update vision and motion capture heading</span>
+        <span class="token comment">//是否有视觉或者动作捕捉，false不使用</span>
+		_ext_hdg_good <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_vision_odom_sub<span class="token punctuation">.</span><span class="token function">updated</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			vehicle_odometry_s vision<span class="token punctuation">;</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_vision_odom_sub<span class="token punctuation">.</span><span class="token function">copy</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>vision<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">// validation check for vision attitude data</span>
+				bool vision_att_valid <span class="token operator">=</span> <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span>vision<span class="token punctuation">.</span>q<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+							<span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span><span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span>vision<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>vision<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_ROLL_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">?</span> <span class="token function">sqrtf</span><span class="token punctuation">(</span><span class="token function">fmaxf</span><span class="token punctuation">(</span>
+									vision<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>vision<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_ROLL_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+									<span class="token function">fmaxf</span><span class="token punctuation">(</span>vision<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>vision<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_PITCH_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+											vision<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>vision<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_YAW_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&lt;=</span> _eo_max_std_dev <span class="token operator">:</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+				<span class="token keyword">if</span> <span class="token punctuation">(</span>vision_att_valid<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					Dcmf Rvis <span class="token operator">=</span> <span class="token function">Quatf</span><span class="token punctuation">(</span>vision<span class="token punctuation">.</span>q<span class="token punctuation">)</span><span class="token punctuation">;</span>
+					Vector3f <span class="token function">v</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>4f<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+					<span class="token comment">// Rvis is Rwr (robot respect to world) while v is respect to world.</span>
+					<span class="token comment">// Hence Rvis must be transposed having (Rwr)' * Vw</span>
+					<span class="token comment">// Rrw * Vw = vn. This way we have consistency</span>
+					_vision_hdg <span class="token operator">=</span> Rvis<span class="token punctuation">.</span><span class="token function">transpose</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> v<span class="token punctuation">;</span>
+
+					<span class="token comment">// vision external heading usage (ATT_EXT_HDG_M 1)</span>
+					<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_ext_hdg_m<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+						<span class="token comment">// Check for timeouts on data</span>
+						_ext_hdg_good <span class="token operator">=</span> vision<span class="token punctuation">.</span>timestamp <span class="token operator">&gt;</span> <span class="token number">0</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span><span class="token function">hrt_elapsed_time</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>vision<span class="token punctuation">.</span>timestamp<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">500000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+        <span class="token comment">//动捕</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_mocap_odom_sub<span class="token punctuation">.</span><span class="token function">updated</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			vehicle_odometry_s mocap<span class="token punctuation">;</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_mocap_odom_sub<span class="token punctuation">.</span><span class="token function">copy</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>mocap<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">// validation check for mocap attitude data</span>
+				bool mocap_att_valid <span class="token operator">=</span> <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span>mocap<span class="token punctuation">.</span>q<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+						       <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span><span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span>mocap<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>mocap<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_ROLL_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">?</span> <span class="token function">sqrtf</span><span class="token punctuation">(</span><span class="token function">fmaxf</span><span class="token punctuation">(</span>
+								       mocap<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>mocap<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_ROLL_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+								       <span class="token function">fmaxf</span><span class="token punctuation">(</span>mocap<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>mocap<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_PITCH_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+										       mocap<span class="token punctuation">.</span>pose_covariance<span class="token punctuation">[</span>mocap<span class="token punctuation">.</span><span class="token constant">COVARIANCE_MATRIX_YAW_VARIANCE</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&lt;=</span> _eo_max_std_dev <span class="token operator">:</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+				<span class="token keyword">if</span> <span class="token punctuation">(</span>mocap_att_valid<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					Dcmf Rmoc <span class="token operator">=</span> <span class="token function">Quatf</span><span class="token punctuation">(</span>mocap<span class="token punctuation">.</span>q<span class="token punctuation">)</span><span class="token punctuation">;</span>
+					Vector3f <span class="token function">v</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>4f<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+					<span class="token comment">// Rmoc is Rwr (robot respect to world) while v is respect to world.</span>
+					<span class="token comment">// Hence Rmoc must be transposed having (Rwr)' * Vw</span>
+					<span class="token comment">// Rrw * Vw = vn. This way we have consistency</span>
+					_mocap_hdg <span class="token operator">=</span> Rmoc<span class="token punctuation">.</span><span class="token function">transpose</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> v<span class="token punctuation">;</span>
+
+					<span class="token comment">// Motion Capture external heading usage (ATT_EXT_HDG_M 2)</span>
+					<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_ext_hdg_m<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">2</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+						<span class="token comment">// Check for timeouts on data</span>
+						_ext_hdg_good <span class="token operator">=</span> mocap<span class="token punctuation">.</span>timestamp <span class="token operator">&gt;</span> <span class="token number">0</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span><span class="token function">hrt_elapsed_time</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>mocap<span class="token punctuation">.</span>timestamp<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">500000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+<span class="token comment">//上面的代码是读取视觉与动捕数据，没有这些传感器的用不到</span>
+        <span class="token comment">//如果gps数据更新</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_gps_sub<span class="token punctuation">.</span><span class="token function">updated</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            vehicle_gps_position_s gps<span class="token punctuation">;</span><span class="token comment">//定义结构体，该结构体在msg文件夹中</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_gps_sub<span class="token punctuation">.</span><span class="token function">copy</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>gps<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">//如果gps数据获取成功并且精度不错，则使用gps数据查阅磁偏角</span>
+				<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_mag_decl_a<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>gps<span class="token punctuation">.</span>eph <span class="token operator">&lt;</span> <span class="token number">20</span><span class="token punctuation">.</span>0f<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token comment">//通过gps得到的经纬度查表，得到磁偏角，去修正磁力计数据</span>
+					<span class="token function">update_mag_declination</span><span class="token punctuation">(</span>math<span class="token operator">:</span><span class="token operator">:</span><span class="token function">radians</span><span class="token punctuation">(</span><span class="token function">get_mag_declination</span><span class="token punctuation">(</span>gps<span class="token punctuation">.</span>lat<span class="token punctuation">,</span> gps<span class="token punctuation">.</span>lon<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+<span class="token comment">//更新在NED坐标系的位置</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_local_position_sub<span class="token punctuation">.</span><span class="token function">updated</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			vehicle_local_position_s lpos<span class="token punctuation">;</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_local_position_sub<span class="token punctuation">.</span><span class="token function">copy</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>lpos<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token comment">//是否进行运动加速度计算，加速度计数据比较好</span>
+				<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_acc_comp<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span><span class="token function">hrt_elapsed_time</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>lpos<span class="token punctuation">.</span>timestamp<span class="token punctuation">)</span> <span class="token operator">&lt;</span> 20_ms<span class="token punctuation">)</span>
+				    <span class="token operator">&amp;&amp;</span> lpos<span class="token punctuation">.</span>v_xy_valid <span class="token operator">&amp;&amp;</span> lpos<span class="token punctuation">.</span>v_z_valid <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>lpos<span class="token punctuation">.</span>eph <span class="token operator">&lt;</span> <span class="token number">5</span><span class="token punctuation">.</span>0f<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> _inited<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+					<span class="token comment">/* position data is actual */</span>
+					<span class="token keyword">const</span> Vector3f <span class="token function">vel</span><span class="token punctuation">(</span>lpos<span class="token punctuation">.</span>vx<span class="token punctuation">,</span> lpos<span class="token punctuation">.</span>vy<span class="token punctuation">,</span> lpos<span class="token punctuation">.</span>vz<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//更新速度</span>
+					<span class="token comment">/* velocity updated */</span>
+					<span class="token keyword">if</span> <span class="token punctuation">(</span>_vel_prev_t <span class="token operator">!=</span> <span class="token number">0</span> <span class="token operator">&amp;&amp;</span> lpos<span class="token punctuation">.</span>timestamp <span class="token operator">!=</span> _vel_prev_t<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token comment">//将时间由us转为s</span>
+						float vel_dt <span class="token operator">=</span> <span class="token punctuation">(</span>lpos<span class="token punctuation">.</span>timestamp <span class="token operator">-</span> _vel_prev_t<span class="token punctuation">)</span> <span class="token operator">/</span> 1e6f<span class="token punctuation">;</span>
+                        <span class="token comment">/* calculate acceleration in body frame */</span><span class="token operator">/</span><span class="token operator">/</span>补偿加速度计
+						_pos_acc <span class="token operator">=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate_inversed</span><span class="token punctuation">(</span><span class="token punctuation">(</span>vel <span class="token operator">-</span> _vel_prev<span class="token punctuation">)</span> <span class="token operator">/</span> vel_dt<span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token punctuation">}</span>
+
+					_vel_prev_t <span class="token operator">=</span> lpos<span class="token punctuation">.</span>timestamp<span class="token punctuation">;</span>
+					_vel_prev <span class="token operator">=</span> vel<span class="token punctuation">;</span>
+
+                <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span><span class="token comment">//数据过期，重置加速度</span>
+					<span class="token comment">/* position data is outdated, reset acceleration */</span>
+					_pos_acc<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+					_vel_prev<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+					_vel_prev_t <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+<span class="token comment">//以上是获取数据，对数据简单处理</span>
+<span class="token comment">//上一次迭代时间</span>
+		<span class="token comment">/* time from previous iteration */</span>
+     hrt_abstime now <span class="token operator">=</span> <span class="token function">hrt_absolute_time</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">//高精度定时器，得到当前时间</span>
+     <span class="token comment">//得到用于计算积分的步长时间</span>
+		<span class="token keyword">const</span> float dt <span class="token operator">=</span> math<span class="token operator">:</span><span class="token operator">:</span><span class="token function">constrain</span><span class="token punctuation">(</span><span class="token punctuation">(</span>now <span class="token operator">-</span> _last_time<span class="token punctuation">)</span> <span class="token operator">/</span> 1e6f<span class="token punctuation">,</span> _dt_min<span class="token punctuation">,</span> _dt_max<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//更新last_time</span>
+		_last_time <span class="token operator">=</span> now<span class="token punctuation">;</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">update</span><span class="token punctuation">(</span>dt<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span><span class="token comment">//姿态解算</span>
+            vehicle_attitude_s att <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span><span class="token punctuation">;</span><span class="token comment">//</span>
+			att<span class="token punctuation">.</span>timestamp <span class="token operator">=</span> sensors<span class="token punctuation">.</span>timestamp<span class="token punctuation">;</span>
+			_q<span class="token punctuation">.</span><span class="token function">copyTo</span><span class="token punctuation">(</span>att<span class="token punctuation">.</span>q<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+			<span class="token comment">/* the instance count is not used here */</span>
+            _att_pub<span class="token punctuation">.</span><span class="token function">publish</span><span class="token punctuation">(</span>att<span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">//姿态发布</span>
+
+#<span class="token keyword">if</span> <span class="token function">defined</span><span class="token punctuation">(</span><span class="token constant">ENABLE_LOCKSTEP_SCHEDULER</span><span class="token punctuation">)</span>
+
+			<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_est_group<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">3</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">// In this case the estimator_q is running without LPE and needs</span>
+				<span class="token comment">// to publish ekf2_timestamps because SITL lockstep requires it.</span>
+				ekf2_timestamps_s ekf2_timestamps<span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>timestamp <span class="token operator">=</span> now<span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>airspeed_timestamp_rel <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>distance_sensor_timestamp_rel <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>optical_flow_timestamp_rel <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>vehicle_air_data_timestamp_rel <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>vehicle_magnetometer_timestamp_rel <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				ekf2_timestamps<span class="token punctuation">.</span>visual_odometry_timestamp_rel <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+				_ekf2_timestamps_pub<span class="token punctuation">.</span><span class="token function">publish</span><span class="token punctuation">(</span>ekf2_timestamps<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token punctuation">}</span>
+
+#endif
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>代码中，我对其进行了注释，下面有几个需要强调的点</p> 
+<p><strong>1.sensor_combined_s是什么？</strong><br> 他是一个结构体，这个结构体是通过定义的消息自动生成，可以在msg文件中查看，在msg文件中找到sensor_combine，文件内容如下：</p> 
+<pre><code class="prism language-javascript"># Sensor readings <span class="token keyword">in</span> <span class="token constant">SI</span><span class="token operator">-</span>unit form<span class="token punctuation">.</span>
+# These fields are scaled and offset<span class="token operator">-</span>compensated where possible and <span class="token keyword">do</span> not
+# change <span class="token keyword">with</span> board revisions and sensor updates<span class="token punctuation">.</span>
+
+uint64 timestamp				# time since system <span class="token function">start</span> <span class="token punctuation">(</span>microseconds<span class="token punctuation">)</span>
+
+int32 <span class="token constant">RELATIVE_TIMESTAMP_INVALID</span> <span class="token operator">=</span> <span class="token number">2147483647</span>	# <span class="token punctuation">(</span><span class="token number">0x7fffffff</span><span class="token punctuation">)</span> If one <span class="token keyword">of</span> the relative timestamps is <span class="token keyword">set</span> to <span class="token keyword">this</span> value<span class="token punctuation">,</span> it means the associated sensor values are invalid
+<span class="token comment">//陀螺仪数据</span>
+# gyro timstamp is equal to the timestamp <span class="token keyword">of</span> the message
+float32<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span> gyro_rad			# average angular rate measured <span class="token keyword">in</span> the <span class="token constant">XYZ</span> body frame <span class="token keyword">in</span> rad<span class="token operator">/</span>s over the last gyro sampling period
+uint32 gyro_integral_dt		# gyro measurement sampling period <span class="token keyword">in</span> us
+<span class="token comment">//加速度计数据</span>
+int32 accelerometer_timestamp_relative	# timestamp <span class="token operator">+</span> accelerometer_timestamp_relative <span class="token operator">=</span> Accelerometer timestamp
+float32<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span> accelerometer_m_s2		# average value acceleration measured <span class="token keyword">in</span> the <span class="token constant">XYZ</span> body frame <span class="token keyword">in</span> m<span class="token operator">/</span>s<span class="token operator">/</span>s over the last accelerometer sampling period
+uint32 accelerometer_integral_dt	# accelerometer measurement sampling period <span class="token keyword">in</span> us
+
+uint8 <span class="token constant">CLIPPING_X</span> <span class="token operator">=</span> <span class="token number">1</span>
+uint8 <span class="token constant">CLIPPING_Y</span> <span class="token operator">=</span> <span class="token number">2</span>
+uint8 <span class="token constant">CLIPPING_Z</span> <span class="token operator">=</span> <span class="token number">4</span>
+uint8 accelerometer_clipping            # bitfield indicating <span class="token keyword">if</span> there was any accelerometer <span class="token function">clipping</span> <span class="token punctuation">(</span>per axis<span class="token punctuation">)</span> during the sampling period
+</code></pre> 
+<p>可以看到，在结构体sensor_combine_s中，存放了陀螺仪与加速度计的数据，所以run函数一直到_data_good = true;代码之前的工作就是更新陀螺仪，加速度计，磁力计.当_data_good=true，说明数据准备完成</p> 
+<p><strong>2._pos_acc是运动加速度</strong>，运动加速度与加速度计测量的值不同，加速度计的值=运动加速度+重力加速度；在这里，代码利用两次速度之差除以时间得到运动加速度，这个运动加速度在后续姿态解算有用</p> 
+<p>3.update(dt)函数就是姿态解算的核心代码，下面对这部分代码进行解读</p> 
+<h3><a id="3update_312"></a>3.update姿态解算函数</h3> 
+<p>我先把姿态解算的代码贴上来</p> 
+<pre><code class="prism language-javascript">bool
+<span class="token literal-property property">AttitudeEstimatorQ</span><span class="token operator">:</span><span class="token operator">:</span><span class="token function">update</span><span class="token punctuation">(</span><span class="token parameter">float dt</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+  <span class="token comment">//判断是否存在四元数初值</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>_inited<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token comment">//如果数据没有准备好，就是加速度计，磁力计这些数据没有更新，则不进行下面操作</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>_data_good<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">//执行四元数初始化函数</span>
+        <span class="token keyword">return</span> <span class="token function">init_attq</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">//进行初始姿态获取</span>
+	<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>1.从前面的原理可知，姿态解算的核心公式是四元数的微分方程，而为了实现微分方程的计算，我们需要一个四元数初值，四元数初值是通过init_attq（）函数产生，代码如下：</p> 
+<pre><code class="prism language-javascript">bool
+<span class="token literal-property property">AttitudeEstimatorQ</span><span class="token operator">:</span><span class="token operator">:</span><span class="token function">init_attq</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// Rotation matrix can be easily constructed from acceleration and mag field vectors</span>
+	<span class="token comment">//初始方向余弦矩阵可以由加速度计与磁力计获得</span>
+	<span class="token comment">// 'k' is Earth Z axis (Down) unit vector in body frame</span>
+	<span class="token comment">//以加速度计测得向量反方向作为z轴，因为加速度计测量坐标系z轴向上，与NED坐标系的z轴方向相反</span>
+  Vector3f k <span class="token operator">=</span> <span class="token operator">-</span>_accel<span class="token punctuation">;</span>
+  <span class="token comment">//进行归一化，k向量除以它的二范数，目的是为了构成余弦矩阵</span>
+	k<span class="token punctuation">.</span><span class="token function">normalize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 'i' is Earth X axis (North) unit vector in body frame, orthogonal with 'k'</span>
+	<span class="token comment">//_mag*k可以看做</span>
+   Vector3f i <span class="token operator">=</span> <span class="token punctuation">(</span>_mag <span class="token operator">-</span> k <span class="token operator">*</span> <span class="token punctuation">(</span>_mag <span class="token operator">*</span> k<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">//以磁力计作为x轴，保证x与z轴正交</span>
+	i<span class="token punctuation">.</span><span class="token function">normalize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 'j' is Earth Y axis (East) unit vector in body frame, orthogonal with 'k' and 'i'</span>
+	<span class="token comment">向量叉乘得到y轴</span>
+    Vector3f j <span class="token operator">=</span> k <span class="token operator">%</span> i<span class="token punctuation">;</span><span class="token comment">//向量叉乘得到y轴</span>
+
+	<span class="token comment">// Fill rotation matrix</span>
+	<span class="token comment">//填充旋转矩阵</span>
+    Dcmf <span class="token constant">R</span><span class="token punctuation">;</span><span class="token comment">//旋转矩阵</span>
+	<span class="token constant">R</span><span class="token punctuation">.</span><span class="token function">row</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">=</span> i<span class="token punctuation">;</span>
+	<span class="token constant">R</span><span class="token punctuation">.</span><span class="token function">row</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">=</span> j<span class="token punctuation">;</span>
+	<span class="token constant">R</span><span class="token punctuation">.</span><span class="token function">row</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">=</span> k<span class="token punctuation">;</span>
+
+	<span class="token comment">// Convert to quaternion</span>
+	<span class="token comment">//转换为四元数，PX4中重载了赋值号</span>
+	_q <span class="token operator">=</span> <span class="token constant">R</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// Compensate for magnetic declination</span>
+	<span class="token comment">//补偿磁力计偏移</span>
+	Quatf decl_rotation <span class="token operator">=</span> <span class="token function">Eulerf</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> _mag_decl<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//四元数更新并重新初始化</span>
+	_q <span class="token operator">=</span> _q <span class="token operator">*</span> decl_rotation<span class="token punctuation">;</span>
+	_q<span class="token punctuation">.</span><span class="token function">normalize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//判断更新是否成功</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span>
+	    <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span>
+	    _q<span class="token punctuation">.</span><span class="token function">length</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">.</span>95f <span class="token operator">&amp;&amp;</span> _q<span class="token punctuation">.</span><span class="token function">length</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">1</span><span class="token punctuation">.</span>05f<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		_inited <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+
+	<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+		_inited <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> _inited<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>这里面需要提醒的是这句代码<br> Vector3f i = (_mag - k * (_mag * k))<br> 代码中_mag与k都为向量，且向量k在经历归一化后为单位向量，因此_mag*k可以看做_mag在k向量上的投影长度，然后乘以单位向量k就变成了与k同向，长度为|_mag|*cos<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         θ 
+        
+       
+      
+        \theta 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.69444em; vertical-align: 0em;"></span><span style="margin-right: 0.02778em;" class="mord mathdefault">θ</span></span></span></span></span>的向量，再使用_mag减去该向量就得到垂直于k的向量i，具体可见下图<br> <img src="https://images2.imgbox.com/f5/73/egJvOyqL_o.jpg" alt="在这里插入图片描述">这里就完成了第一段讲解，接着向下看</p> 
+<pre><code class="prism language-javascript"><span class="token comment">//还是update函数</span>
+<span class="token comment">//记录上一次四元数值</span>
+	Quatf q_last <span class="token operator">=</span> _q<span class="token punctuation">;</span>
+
+	<span class="token comment">// Angular rate of correction</span>
+	Vector3f corr<span class="token punctuation">;</span><span class="token comment">//</span>
+	float spinRate <span class="token operator">=</span> _gyro<span class="token punctuation">.</span><span class="token function">length</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//_ext_hdg_good==false，不使用动作捕捉与视觉</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_ext_hdg_m<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">0</span> <span class="token operator">&amp;&amp;</span> _ext_hdg_good<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_ext_hdg_m<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// Vision heading correction</span>
+			<span class="token comment">// Project heading to global frame and extract XY component</span>
+			Vector3f vision_hdg_earth <span class="token operator">=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate</span><span class="token punctuation">(</span>_vision_hdg<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			float vision_hdg_err <span class="token operator">=</span> <span class="token function">wrap_pi</span><span class="token punctuation">(</span><span class="token function">atan2f</span><span class="token punctuation">(</span><span class="token function">vision_hdg_earth</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">vision_hdg_earth</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// Project correction to body frame</span>
+			corr <span class="token operator">+=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate_inversed</span><span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token operator">-</span>vision_hdg_err<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> _param_att_w_ext_hdg<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_ext_hdg_m<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">2</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// Mocap heading correction</span>
+			<span class="token comment">// Project heading to global frame and extract XY component</span>
+			Vector3f mocap_hdg_earth <span class="token operator">=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate</span><span class="token punctuation">(</span>_mocap_hdg<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			float mocap_hdg_err <span class="token operator">=</span> <span class="token function">wrap_pi</span><span class="token punctuation">(</span><span class="token function">atan2f</span><span class="token punctuation">(</span><span class="token function">mocap_hdg_earth</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">mocap_hdg_earth</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">// Project correction to body frame</span>
+			corr <span class="token operator">+=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate_inversed</span><span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token operator">-</span>mocap_hdg_err<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> _param_att_w_ext_hdg<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token comment">//使用磁力计</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_ext_hdg_m<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token operator">!</span>_ext_hdg_good<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// Magnetometer correction</span>
+    <span class="token comment">//我们使用磁力计的目的是得到无人机的偏航角，因此我们需要将磁力计的值投影到NED坐标系的XY平面，</span>
+    <span class="token comment">//磁力计得到数据是位于机体坐标系，需要把其转换到NED坐标系后投影</span>
+		<span class="token comment">// Project mag field vector to global frame and extract XY component</span>
+		<span class="token comment">//从机体坐标系转到NED系</span>
+		Vector3f mag_earth <span class="token operator">=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate</span><span class="token punctuation">(</span>_mag<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//_mag_decl就是刚刚查表得到的磁偏角，这里是对磁力计补偿，得到磁偏角误差</span>
+		<span class="token comment">//wrap_pi（）函数是个限幅函数，保证磁力计误差在-pi到pi（因为我们拿磁力计去算偏航，偏航范围是这个）</span>
+		float mag_err <span class="token operator">=</span> <span class="token function">wrap_pi</span><span class="token punctuation">(</span><span class="token function">atan2f</span><span class="token punctuation">(</span><span class="token function">mag_earth</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">mag_earth</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">-</span> _mag_decl<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//以下四句代码，个人理解是在对磁力计进行标度因数的校正</span>
+		float gainMult <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">.</span>0f<span class="token punctuation">;</span><span class="token comment">//标度因数</span>
+		<span class="token keyword">const</span> float fifty_dps <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">.</span>873f<span class="token punctuation">;</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>spinRate <span class="token operator">&gt;</span> fifty_dps<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			gainMult <span class="token operator">=</span> math<span class="token operator">:</span><span class="token operator">:</span><span class="token function">min</span><span class="token punctuation">(</span>spinRate <span class="token operator">/</span> fifty_dps<span class="token punctuation">,</span> <span class="token number">10</span><span class="token punctuation">.</span>0f<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+<span class="token comment">//转换到机体坐标系，conjugate_inversed（）是将NED坐标系向量转为机体坐标系，_param_att_w_mag为磁力计滤波系数</span>
+<span class="token comment">//磁力计标度因子</span>
+        <span class="token comment">// Project magnetometer correction to body frame</span>
+		corr <span class="token operator">+=</span> _q<span class="token punctuation">.</span><span class="token function">conjugate_inversed</span><span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">.</span>0f<span class="token punctuation">,</span> <span class="token operator">-</span>mag_err<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> _param_att_w_mag<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> gainMult<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+<span class="token comment">//四元数归一化</span>
+	_q<span class="token punctuation">.</span><span class="token function">normalize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//加速度计的修正</span>
+<span class="token comment">//首先，实际加速度 =加速度计的值-重力加速度</span>
+<span class="token comment">//下面的k向量是重力加速度归一化后从NED系转到机体坐标系后的表示</span>
+	<span class="token comment">// Accelerometer correction</span>
+	<span class="token comment">// Project 'k' unit vector of earth frame to body frame</span>
+	<span class="token comment">// Vector3f k = _q.conjugate_inversed(Vector3f(0.0f, 0.0f, 1.0f));</span>
+	<span class="token comment">// Optimized version with dropped zeros</span>
+ 
+
+	Vector3f <span class="token function">k</span><span class="token punctuation">(</span>
+		<span class="token number">2</span><span class="token punctuation">.</span>0f <span class="token operator">*</span> <span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span> <span class="token operator">-</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		<span class="token number">2</span><span class="token punctuation">.</span>0f <span class="token operator">*</span> <span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+		<span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">-</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">-</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+	<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// If we are not using acceleration compensation based on GPS velocity,</span>
+	<span class="token comment">// fuse accel data only if its norm is close to 1 g (reduces drift).</span>
+	<span class="token comment">//对数据进行限幅处理</span>
+	<span class="token keyword">const</span> float accel_norm_sq <span class="token operator">=</span> _accel<span class="token punctuation">.</span><span class="token function">norm_squared</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">const</span> float upper_accel_limit <span class="token operator">=</span> <span class="token constant">CONSTANTS_ONE_G</span> <span class="token operator">*</span> <span class="token number">1</span><span class="token punctuation">.</span>1f<span class="token punctuation">;</span>
+	<span class="token keyword">const</span> float lower_accel_limit <span class="token operator">=</span> <span class="token constant">CONSTANTS_ONE_G</span> <span class="token operator">*</span> <span class="token number">0</span><span class="token punctuation">.</span>9f<span class="token punctuation">;</span>
+
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>_param_att_acc_comp<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>accel_norm_sq <span class="token operator">&gt;</span> lower_accel_limit <span class="token operator">*</span> lower_accel_limit<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span>
+					  <span class="token punctuation">(</span>accel_norm_sq <span class="token operator">&lt;</span> upper_accel_limit <span class="token operator">*</span> upper_accel_limit<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token comment">//这句代码是重点，我来解释一下：_accel这是加速度计的值，_pos_acc是通过两次速度之差计算出的运动加速度，都在机体坐标系下</span>
+<span class="token comment">//那么，_accel-_pos_acc就是机体坐标系下的重力加速度，然后再归一化。这里%代表向量叉乘，在传感器都是理想情况下，k向量与</span>
+<span class="token comment">//(_accel - _pos_acc).normalized()向量的叉乘应该为0，但由于存在传感器误差，这一项不为0，于是就得到了相应的加速度计误差.</span>
+<span class="token comment">//_param_att_w_acc.get（）为互补滤波中加速度计权重</span>
+		corr <span class="token operator">+=</span> <span class="token punctuation">(</span>k <span class="token operator">%</span> <span class="token punctuation">(</span>_accel <span class="token operator">-</span> _pos_acc<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">normalized</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> _param_att_w_acc<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+<span class="token comment">//陀螺仪偏移估计</span>
+<span class="token comment">//_param_att_w_gyro_bias.get()陀螺仪偏移的初始值</span>
+	<span class="token comment">// Gyro bias estimation</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>spinRate <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">.</span>175f<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		_gyro_bias <span class="token operator">+=</span> corr <span class="token operator">*</span> <span class="token punctuation">(</span>_param_att_w_gyro_bias<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> dt<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//对陀螺仪偏移每一项的限幅</span>
+		<span class="token keyword">for</span> <span class="token punctuation">(</span>int i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> <span class="token number">3</span><span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token function">_gyro_bias</span><span class="token punctuation">(</span>i<span class="token punctuation">)</span> <span class="token operator">=</span> math<span class="token operator">:</span><span class="token operator">:</span><span class="token function">constrain</span><span class="token punctuation">(</span><span class="token function">_gyro_bias</span><span class="token punctuation">(</span>i<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token operator">-</span>_bias_max<span class="token punctuation">,</span> _bias_max<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+
+	<span class="token punctuation">}</span>
+<span class="token comment">//经过修正后的角速度</span>
+	_rates <span class="token operator">=</span> _gyro <span class="token operator">+</span> _gyro_bias<span class="token punctuation">;</span>
+<span class="token comment">//得到角速度的校正值</span>
+	<span class="token comment">// Feed forward gyro</span>
+	corr <span class="token operator">+=</span> _rates<span class="token punctuation">;</span>
+
+	<span class="token comment">// Apply correction to state</span>
+    <span class="token comment">//四元数微分方程求解</span>
+	_q <span class="token operator">+=</span> _q<span class="token punctuation">.</span><span class="token function">derivative1</span><span class="token punctuation">(</span>corr<span class="token punctuation">)</span> <span class="token operator">*</span> dt<span class="token punctuation">;</span>
+
+	<span class="token comment">// Normalize quaternion</span>
+    <span class="token comment">//四元数归一化</span>
+	_q<span class="token punctuation">.</span><span class="token function">normalize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token comment">//如果四元数数据出现异常，恢复到最近一次的正常的状态，并将漂移和角速率置为零．</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token punctuation">(</span><span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span>
+	      <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token constant">PX4_ISFINITE</span><span class="token punctuation">(</span><span class="token function">_q</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+		<span class="token comment">// Reset quaternion to last good state</span>
+		_q <span class="token operator">=</span> q_last<span class="token punctuation">;</span>
+		_rates<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		_gyro_bias<span class="token punctuation">.</span><span class="token function">zero</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h2><a id="_509"></a>五、参考文献及博客</h2> 
+<p>[1]储开斌, 赵爽, 冯成涛. 基于Mahony-EKF的无人机姿态解算算法[J]. 电子测量与仪器学报, 2020, 32(12):7.<br> [2]Valenti, Roberto G , Dryanovski, et al. Sensors, Vol. 15, Pages 19302-19330: Keeping a Good Attitude: A Quaternion-Based Orientation Filter for IMUs and MARGs. 2015.<br> [3]米刚, 田增山, 金悦,等. 基于MIMU和磁力计的姿态更新算法研究[J]. 传感技术学报, 2015, 28(1):6.<br> [4]<a href="https://blog.csdn.net/r1ch4rd/article/details/80473348">姿态估计（互补滤波）</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/6d77b4d49fc4a6dd04555483606d39e8/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Postgres时间字段设置默认值</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/7d63d7120327618bcb91b62dc6a42b3f/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">pytorch MNIST 手写数字识别 &#43; 使用自己的测试集 &#43; 数据增强后再训练</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>JAVA选择合适的垃圾收集器&#43;内存分配实战 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="JAVA选择合适的垃圾收集器&#43;内存分配实战" />
+<meta property="og:description" content="《深入理解Java虚拟机：JVM高级特性与最佳实践（第3版）》
+目录
+低延迟垃圾收集器
+Shenandoah收集器
+ZGC收集器
+选择合适的垃圾收集器
+Epsilon收集器
+收集器的权衡
+虚拟机及垃圾收集器日志
+垃圾收集器参数总结 实战：内存分配与回收策略
+对象优先在Eden分配
+大对象直接进入老年代
+长期存活的对象将进入老年代
+动态对象年龄判定
+空间分配担保
+低延迟垃圾收集器 Shenandoah收集器 Shenandoah也是使用基于Region的堆内存布局，同样有着用于存放大对象的Humongous Region，默认的回收策略也同样是优先处理回收价值最大的Region……
+但在管理堆内存方面，它与G1至少有三个明显的不同之处，最重要的当然是支持并发的整理算法，G1的回收阶段是可以多线程并行的，但却不能与用户线程并发。
+其次，Shenandoah（目前）是默认不使用分代收集的，换言之，不会有专门的新生代Region或者老年代Region的存在，没有实现分代，并不是说分代对Shenandoah没有价值， 这更多是出于性价比的权衡，基于工作量上的考虑而将其放到优先级较低的位置上。
+最后， Shenandoah摒弃了在G1中耗费大量内存和计算资源去维护的记忆集，改用名为“连接矩阵”（Connection Matrix）的全局数据结构来记录跨Region的引用关系，降低了处理跨代指针时的记忆集维护消耗，也降低了伪共享问题的发生概率。
+连接矩阵可以简单理解为一张二维表格，如果Region N有对象指向Region M，就在表格的N行M列中打上一个标记。
+如果Region 5中的对象Baz 引用了Region 3的Foo，Foo又引用了Region 1的Bar，那连接矩阵中的5行3列、3行1列就应该被打上标 记。在回收时通过这张表格就可以得出哪些Region之间产生了跨代引用。
+Shenandoah收集器的工作过程大致可以划分为以下九个阶段
+初始标记（Initial Marking）：与G1一样，首先标记与GC Roots直接关联的对象，这个阶段仍 是“Stop The World”的，但停顿时间与堆大小无关，只与GC Roots的数量相关。并发标记（Concurrent Marking）：与G1一样，遍历对象图，标记出全部可达的对象，这个阶段是与用户线程一起并发的，时间长短取决于堆中存活对象的数量以及对象图的结构复杂程度。最终标记（Final Marking）：与G1一样，处理剩余的SATB扫描，并在这个阶段统计出回收价值最高的Region，将这些Region构成一组回收集（Collection Set）。最终标记阶段也会有一小段短暂的停顿。并发清理（Concurrent Cleanup）：这个阶段用于清理那些整个区域内连一个存活对象都没有找到的Region（这类Region被称为Immediate Garbage Region）。并发回收（Concurrent Evacuation）：并发回收阶段是Shenandoah与之前HotSpot中其他收集器的核心差异。 在这个阶段，Shenandoah要把回收集里面的存活对象先复制一份到其他未被使用的Region之中。复制对象这件事情如果将用户线程冻结起来再做那是相当简单的，但如果两者必须要同时并发进行的话，就变得复杂起来了。其困难点是在移动对象的同时，用户线程仍然可能不停对被移动的对象进行读写访问，移动对象是一次性的行为，但移动之后整个内存中所有指向该对象的引用都还是旧对象的地址，这是很难一瞬间全部改变过来的。对于并发回收阶段遇到的这些困难，Shenandoah将会通过读屏障和被称为“Brooks Pointers”的转发指针来解决。并发回收阶段运行的时间长短取决于回收集的大小。初始引用更新（Initial Update Reference）：并发回收阶段复制对象结束后，还需要把堆中所有指向旧对象的引用修正到复制后的新地址，这个操作称为引用更新。 引用更新的初始化阶段实际上并未做什么具体的处理，设立这个阶段只是为了建立一个线程集合点，确保所有并发回收阶段中进行的收集器线程都已完成分配给它们的对象移动任务而已。初始引用更新时间很短，会产生一个非常短暂的停顿。并发引用更新（Concurrent Update Reference）：真正开始进行引用更新操作，这个阶段是与用户线程一起并发的，时间长短取决于内存中涉及的引用数量的多少。 并发引用更新与并发标记不同，它不再需要沿着对象图来搜索，只需要按照内存物理地址的顺序，线性地搜索出引用类型，把旧值改为新值即可。最终引用更新（Final Update Reference）：解决了堆中的引用更新后，还要修正存在于GC Roots 中的引用。这个阶段是Shenandoah的最后一次停顿，停顿时间只与GC Roots的数量相关。并发清理（Concurrent Cleanup）：经过并发回收和引用更新之后，整个回收集中所有的Region已再无存活对象，这些Region都变成Immediate Garbage Regions了，最后再调用一次并发清理过程来回收这些Region的内存空间，供以后新对象分配使用。 Shenandoah收集器的工作过程 并发回收——转发指针： 此前，要做类似的并发操作，通常是在被移动对象原有的内存上设置保护陷阱（Memory Protection Trap），一旦用户程序访问到归属于旧对象的内存空间就会产生自陷中断，进入预设好的异常处理器中，再由其中的代码逻辑把访问转发到复制后的新对象上。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/f44767aad38ebbb59f53664449b94b1d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-10-16T14:39:01+08:00" />
+<meta property="article:modified_time" content="2022-10-16T14:39:01+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">JAVA选择合适的垃圾收集器&#43;内存分配实战</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <blockquote> 
+ <p>《深入理解Java虚拟机：JVM高级特性与最佳实践（第3版）》</p> 
+</blockquote> 
+<p id="main-toc"><strong>目录</strong></p> 
+<p id="%E4%BD%8E%E5%BB%B6%E8%BF%9F%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8-toc" style="margin-left:0px;"><a href="#%E4%BD%8E%E5%BB%B6%E8%BF%9F%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8" rel="nofollow">低延迟垃圾收集器</a></p> 
+<p id="Shenandoah%E6%94%B6%E9%9B%86%E5%99%A8-toc" style="margin-left:40px;"><a href="#Shenandoah%E6%94%B6%E9%9B%86%E5%99%A8" rel="nofollow">Shenandoah收集器</a></p> 
+<p id="ZGC%E6%94%B6%E9%9B%86%E5%99%A8-toc" style="margin-left:40px;"><a href="#ZGC%E6%94%B6%E9%9B%86%E5%99%A8" rel="nofollow">ZGC收集器</a></p> 
+<p id="%E9%80%89%E6%8B%A9%E5%90%88%E9%80%82%E7%9A%84%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8-toc" style="margin-left:0px;"><a href="#%E9%80%89%E6%8B%A9%E5%90%88%E9%80%82%E7%9A%84%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8" rel="nofollow">选择合适的垃圾收集器</a></p> 
+<p id="Epsilon%E6%94%B6%E9%9B%86%E5%99%A8-toc" style="margin-left:40px;"><a href="#Epsilon%E6%94%B6%E9%9B%86%E5%99%A8" rel="nofollow">Epsilon收集器</a></p> 
+<p id="%E6%94%B6%E9%9B%86%E5%99%A8%E7%9A%84%E6%9D%83%E8%A1%A1-toc" style="margin-left:40px;"><a href="#%E6%94%B6%E9%9B%86%E5%99%A8%E7%9A%84%E6%9D%83%E8%A1%A1" rel="nofollow">收集器的权衡</a></p> 
+<p id="%E8%99%9A%E6%8B%9F%E6%9C%BA%E5%8F%8A%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E6%97%A5%E5%BF%97-toc" style="margin-left:40px;"><a href="#%E8%99%9A%E6%8B%9F%E6%9C%BA%E5%8F%8A%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E6%97%A5%E5%BF%97" rel="nofollow">虚拟机及垃圾收集器日志</a></p> 
+<p id="%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E5%8F%82%E6%95%B0%E6%80%BB%E7%BB%93%C2%A0-toc" style="margin-left:40px;"><a href="#%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E5%8F%82%E6%95%B0%E6%80%BB%E7%BB%93%C2%A0" rel="nofollow">垃圾收集器参数总结 </a></p> 
+<p id="%E5%AE%9E%E6%88%98%EF%BC%9A%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E4%B8%8E%E5%9B%9E%E6%94%B6%E7%AD%96%E7%95%A5-toc" style="margin-left:0px;"><a href="#%E5%AE%9E%E6%88%98%EF%BC%9A%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E4%B8%8E%E5%9B%9E%E6%94%B6%E7%AD%96%E7%95%A5" rel="nofollow">实战：内存分配与回收策略</a></p> 
+<p id="%E5%AF%B9%E8%B1%A1%E4%BC%98%E5%85%88%E5%9C%A8Eden%E5%88%86%E9%85%8D-toc" style="margin-left:40px;"><a href="#%E5%AF%B9%E8%B1%A1%E4%BC%98%E5%85%88%E5%9C%A8Eden%E5%88%86%E9%85%8D" rel="nofollow">对象优先在Eden分配</a></p> 
+<p id="%E5%A4%A7%E5%AF%B9%E8%B1%A1%E7%9B%B4%E6%8E%A5%E8%BF%9B%E5%85%A5%E8%80%81%E5%B9%B4%E4%BB%A3-toc" style="margin-left:40px;"><a href="#%E5%A4%A7%E5%AF%B9%E8%B1%A1%E7%9B%B4%E6%8E%A5%E8%BF%9B%E5%85%A5%E8%80%81%E5%B9%B4%E4%BB%A3" rel="nofollow">大对象直接进入老年代</a></p> 
+<p id="%E9%95%BF%E6%9C%9F%E5%AD%98%E6%B4%BB%E7%9A%84%E5%AF%B9%E8%B1%A1%E5%B0%86%E8%BF%9B%E5%85%A5%E8%80%81%E5%B9%B4%E4%BB%A3-toc" style="margin-left:40px;"><a href="#%E9%95%BF%E6%9C%9F%E5%AD%98%E6%B4%BB%E7%9A%84%E5%AF%B9%E8%B1%A1%E5%B0%86%E8%BF%9B%E5%85%A5%E8%80%81%E5%B9%B4%E4%BB%A3" rel="nofollow">长期存活的对象将进入老年代</a></p> 
+<p id="%E5%8A%A8%E6%80%81%E5%AF%B9%E8%B1%A1%E5%B9%B4%E9%BE%84%E5%88%A4%E5%AE%9A-toc" style="margin-left:40px;"><a href="#%E5%8A%A8%E6%80%81%E5%AF%B9%E8%B1%A1%E5%B9%B4%E9%BE%84%E5%88%A4%E5%AE%9A" rel="nofollow">动态对象年龄判定</a></p> 
+<p id="%E7%A9%BA%E9%97%B4%E5%88%86%E9%85%8D%E6%8B%85%E4%BF%9D-toc" style="margin-left:40px;"><a href="#%E7%A9%BA%E9%97%B4%E5%88%86%E9%85%8D%E6%8B%85%E4%BF%9D" rel="nofollow">空间分配担保</a></p> 
+<hr id="hr-toc"> 
+<p></p> 
+<h2 id="%E4%BD%8E%E5%BB%B6%E8%BF%9F%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8">低延迟垃圾收集器</h2> 
+<h3 id="Shenandoah%E6%94%B6%E9%9B%86%E5%99%A8">Shenandoah收集器</h3> 
+<p>Shenandoah也是<strong>使用基于Region的堆内存布局，同样有着用于存放大对象的Humongous Region，默认的回收策略也同样是优先处理回收价值最大的Region</strong>……</p> 
+<p>但在管理堆内存方面，它与G1至少有三个明显的不同之处，最重要的当然是<strong>支持并发的整理算法</strong>，G1的回收阶段是可以多线程并行的，但却不能与用户线程并发。</p> 
+<p>其次，Shenandoah（目前）是默认不使用分代收集的，换言之，不会有专门的新生代Region或者老年代Region的存在，没有实现分代，并不是说分代对Shenandoah没有价值， 这更多是出于性价比的权衡，基于工作量上的考虑而将其放到优先级较低的位置上。</p> 
+<p>最后， Shenandoah摒弃了在G1中耗费大量内存和计算资源去维护的记忆集，改用名为“<strong>连接矩阵</strong>”（Connection Matrix）的全局数据结构来<strong>记录跨Region的引用关系</strong>，<strong>降低了处理跨代指针时的记忆集维护消耗，也降低了伪共享问题的发生概率</strong>。</p> 
+<p>连接矩阵可以简单理解为一张二维表格，如果Region N有对象指向Region M，就在表格的N行M列中打上一个标记。</p> 
+<p>如果Region 5中的对象Baz 引用了Region 3的Foo，Foo又引用了Region 1的Bar，那连接矩阵中的5行3列、3行1列就应该被打上标 记。在回收时通过这张表格就可以得出哪些Region之间产生了跨代引用。</p> 
+<blockquote> 
+ <p>Shenandoah收集器的工作过程大致可以划分为以下九个阶段</p> 
+</blockquote> 
+<ul><li>初始标记（Initial Marking）：与G1一样，首先标记与GC Roots直接关联的对象，这个阶段仍 是“Stop The World”的，但停顿时间与堆大小无关，只与GC Roots的数量相关。</li><li><strong>并发标记</strong>（Concurrent Marking）：与G1一样，遍历对象图，标记出全部可达的对象，这个阶段是与用户线程一起并发的，时间长短取决于堆中存活对象的数量以及对象图的结构复杂程度。</li><li>最终标记（Final Marking）：与G1一样，处理剩余的SATB扫描，并在这个阶段统计出回收价值最高的Region，将这些Region构成一组回收集（Collection Set）。最终标记阶段也会有一小段短暂的停顿。</li><li>并发清理（Concurrent Cleanup）：这个阶段用于<strong>清理那些整个区域内连一个存活对象都没有找到的Region</strong>（这类Region被称为Immediate Garbage Region）。</li><li><strong>并发回收</strong>（Concurrent Evacuation）：并发回收阶段是Shenandoah与之前HotSpot中其他收集器的核心差异。 
+  <ul><li>在这个阶段，Shenandoah要把回收集里面的存活对象先复制一份到其他未被使用的Region之中。复制对象这件事情如果将用户线程冻结起来再做那是相当简单的，但如果两者必须要同时并发进行的话，就变得复杂起来了。</li><li>其困难点是<strong>在移动对象的同时，用户线程仍然可能不停对被移动的对象进行读写访问，移动对象是一次性的行为，但移动之后整个内存中所有指向该对象的引用都还是旧对象的地址，这是很难一瞬间全部改变过来的。</strong></li><li>对于并发回收阶段遇到的这些困难，Shenandoah将会通过读屏障和被称为“Brooks Pointers”的<strong>转发指针</strong>来解决。并发回收阶段运行的时间长短取决于回收集的大小。</li></ul></li><li>初始引用更新（Initial Update Reference）：并发回收阶段复制对象结束后，还需要把堆中所有指向旧对象的引用修正到复制后的新地址，这个操作称为引用更新。 
+  <ul><li>引用更新的初始化阶段实际上并未做什么具体的处理，设立这个阶段只是<strong>为了建立一个线程集合点</strong>，确保所有并发回收阶段中进行的收集器线程都已完成分配给它们的对象移动任务而已。初始引用更新时间很短，会产生一个非常短暂的停顿。</li></ul></li><li><strong>并发引用更新</strong>（Concurrent Update Reference）：真正开始进行引用更新操作，这个阶段是与用户线程一起并发的，时间长短取决于内存中涉及的引用数量的多少。 
+  <ul><li>并发引用更新与并发标记不同，它不再需要沿着对象图来搜索，只需要按照内存物理地址的顺序，线性地搜索出引用类型，把旧值改为新值即可。</li></ul></li><li>最终引用更新（Final Update Reference）：解决了堆中的引用更新后，还要<strong>修正存在于GC Roots 中的引用</strong>。这个阶段是Shenandoah的最后一次停顿，停顿时间只与GC Roots的数量相关。</li><li>并发清理（Concurrent Cleanup）：经过并发回收和引用更新之后，整个回收集中所有的Region已再无存活对象，这些Region都变成Immediate Garbage Regions了，最后再调用一次并发清理过程来回收这些Region的内存空间，供以后新对象分配使用。</li></ul> 
+<figure class="image"> 
+ <img alt="" height="387" src="https://images2.imgbox.com/e7/6a/Slvmv74E_o.png" width="1200"> 
+ <figcaption>
+   Shenandoah收集器的工作过程 
+ </figcaption> 
+</figure> 
+<p><strong>并发回收——转发指针： </strong></p> 
+<blockquote> 
+ <p> 此前，要做类似的并发操作，通常是在被移动对象原有的内存上设置保护陷阱（Memory Protection Trap），一旦用户程序访问到归属于旧对象的内存空间就会产生自陷中断，进入预设好的异常处理器中，再由其中的代码逻辑把访问转发到复制后的新对象上。</p> 
+ <p>虽然确实能够实现对象移动与用户线程并发，但是如果没有操作系统层面的直接支持，这种方案将导致用户态频繁切换到核心态， 代价是非常大的，不能频繁使用</p> 
+</blockquote> 
+<figure class="image"> 
+ <img alt="" height="654" src="https://images2.imgbox.com/e7/64/a7RRpR2X_o.png" width="803"> 
+ <figcaption>
+   Brooks Pointers示意图（一） 
+ </figcaption> 
+</figure> 
+<p><strong>在原有对象布局结构的最前面统一增加一个新的引用字段，在正常不处于并发移动的情况下，该引用指向对象自己。（</strong>从结构上来看，Brooks提出的转发指针与某些早期Java虚拟机使用过的句柄定位有一些相似之处，两者都是一种<strong>间接性的对象访问方式</strong>，差别是句柄通常会统一存储在专门的句柄池中，而转发指针是分散存放在每一个对象头前面。<strong>）</strong></p> 
+<blockquote> 
+ <p><strong>转发指针加入后带来的收益自然是当对象拥有了一份新的副本时，只需要修改一处指针的值，即旧对象上转发指针的引用位置，使其指向新对象，便可将所有对该对象的访问转发到新的副本上。</strong></p> 
+ <p><strong>这样只要旧对象的内存仍然存在，未被清理掉，虚拟机内存中所有通过旧引用地址访问的代码便仍然可用，都会被自动转发到新对象上继续工作。</strong></p> 
+</blockquote> 
+<figure class="image"> 
+ <img alt="" height="848" src="https://images2.imgbox.com/13/28/K1JJ3Yev_o.png" width="1200"> 
+ <figcaption>
+   Brooks Pointers示意图（二） 
+ </figcaption> 
+</figure> 
+<p></p> 
+<p>Brooks形式的转发指针在设计上决定了它是必然会出现多线程竞争问题的，如果收集器线程与用户线程发生的只是<strong>并发读取，那无论读到旧对象还是新对象上的字段，返回的结果都应该 是一样的</strong>，这个场景还可以有一些“偷懒”的处理余地；但如果发生的是<strong>并发写入，就一定必须保证写 操作只能发生在新复制的对象上，而不是写入旧对象的内存中。</strong></p> 
+<p><strong>并发更新操作（修改到旧对象中）：</strong></p> 
+<p> 1）收集器线程复制了新的对象副本；</p> 
+<p>2）用户线程更新对象的某个字段；</p> 
+<p>3）收集器线程更新转发指针的引用值为新副本地址。</p> 
+<blockquote> 
+ <p>必须针对转发指针的访问操作采取同步措施，让收集器线程或者用户线程对转发指针的访问只有其中之一能够成功，另外一个必须等待，避免两者交替进行。</p> 
+ <p>Shenandoah收集器是通过比较并交换（Compare And Swap，CAS）操作来保证并发时对象的访问正确性的。</p> 
+</blockquote> 
+<p><strong>执行频率的问题</strong></p> 
+<p>对于一门面向对象的编程语言来说，对象的读取、写入，对象的比较，为对象哈希值计算，用对象加锁等，这些操作都属于对象访问的范畴，它们在代码中比比皆是，要覆盖全部对象访 问操作，Shenandoah不得不同时设置读、写屏障去拦截。</p> 
+<p>为了实现Brooks Pointer，Shenandoah在读、写屏障中都加入了额外的转发处理，尤其是使用读屏障的代价，这是比写屏障更大的。</p> 
+<p>计划在JDK 13中将Shenandoah的内存屏障模型改进为基于引用访问屏障（Load Reference Barrier）的实现</p> 
+<ul><li>所谓“引用访问屏障”是指内存屏障只拦截对象中数据类型为引用类型的读写操作，而不去管原生数据类型等其他非引用字段的读写，这能够省去大量对原生类型、对象比较、对象加锁等场景中设置内存屏障所带来的消耗。</li></ul> 
+<hr> 
+<h3 id="ZGC%E6%94%B6%E9%9B%86%E5%99%A8">ZGC收集器</h3> 
+<p>ZGC收集器是一款基于<strong>Region</strong>内存布局的，（暂时） 不设分代的，使用了<strong>读屏障、染色指针和内存多重映射</strong>等技术来实现<strong>可并发的标记-整理</strong>算法的，以<strong>低延迟</strong>为首要目标的一款垃圾收集器。</p> 
+<blockquote> 
+ <p>ZGC的内存布局：具有动态性——动态创建和销毁，以及动态的区域容量大小</p> 
+</blockquote> 
+<ul><li>小型Region（Small Region）：容量固定为<strong>2</strong>MB，用于<strong>放置小于256KB的小对象</strong>。</li><li>中型Region（Medium Region）：容量固定为<strong>32</strong>MB，用于<strong>放置大于等于256KB但小于4MB的对象。</strong></li><li>大型Region（Large Region）：<strong>容量不固定，可以动态变化，但必须为2MB的整数倍</strong>，用于放置 4MB或以上的大对象。 
+  <ul><li>每个大型Region中只会存放一个大对象，这也预示着虽然名字叫作“大型 Region”，但它的实际容量完全有可能小于中型Region，最小容量可低至4MB。</li><li>大型Region在ZGC的实现中是<strong>不会被重分配</strong>（重分配是ZGC的一种处理动作，用于复制对象的收集器阶段，稍后会介绍到） 的，因为复制一个大对象的代价非常高昂。</li></ul></li></ul> 
+<blockquote> 
+ <p>ZGC的核心问题——并发整理算法的实现</p> 
+</blockquote> 
+<p>ZGC收集器有一个标志性的设计是它采用的<strong>染色指针</strong>技术（Colored Pointer）它直接把<strong>标记信息</strong>记在<strong>引用对象的指针</strong>上。</p> 
+<blockquote> 
+ <p>染色指针是一种直接将少量额外的信息存储在指针上的技术</p> 
+</blockquote> 
+<p>为什么指针本身也可以存储额外信息呢？</p> 
+<ul><li>在64位系统中，理论可以访问的内存高达16EB（2的64次幂）字节[3]。实际上，基于需求 （用不到那么多内存）、性能（地址越宽在做地址转换时需要的页表级数越多）和成本（消耗更多晶 体管）的考虑，在AMD64架构[4]中只支持到52位（4PB）的地址总线和48位（256TB）的虚拟地址空 间，所以目前64位的硬件实际能够支持的最大内存只有256TB。</li><li>操作系统一侧也还会施加自己 的约束，64位的Linux则分别支持47位（128TB）的进程虚拟地址空间和46位（64TB）的物理地址空 间，64位的Windows系统甚至只支持44位（16TB）的物理地址空间。</li></ul> 
+<p>尽管Linux下64位指针的高18位不能用来寻址，但剩余的46位指针所能支持的64TB内存在今天仍 然能够充分满足大型服务器的需要。</p> 
+<p>鉴于此，ZGC的染色指针技术继续盯上了这剩下的46位指针宽度，将其<strong>高4位</strong>提取出来<strong>存储四个标志信息</strong>。</p> 
+<p><strong>通过这些标志位，虚拟机可以直接从指针中看到其引用对象的三色标记状态、是否进入了重分配集（即被移动过）、是否只能通过finalize()方法才能被访问到。</strong></p> 
+<p>由于这些标志位进一步压缩了原本就只有46位的地址空间，也<strong>直接导致 ZGC能够管理的内存不可以超过4TB（2的42次幂）</strong>。</p> 
+<figure class="image"> 
+ <img alt="" height="481" src="https://images2.imgbox.com/51/f3/vMpi7eAZ_o.png" width="1200"> 
+ <figcaption>
+   染色指针示意 
+ </figcaption> 
+</figure> 
+<blockquote> 
+ <p> 染色指针的三大优势：</p> 
+</blockquote> 
+<ul><li><strong>染色指针可以使得一旦某个Region的存活对象被移走之后，这个Region立即就能够被释放和重用掉，而不必等待整个堆中所有指向该Region的引用都被修正后才能清理。</strong> 
+  <ul><li>这点相比起Shenandoah是一个颇大的优势，使得理论上只要还有一个空闲Region，ZGC就能完成收集，而Shenandoah需要等到引用更新阶段结束以后才能释放回收集中的Region，这意味着堆中几乎所有对象都存活的极端情况，需要 1∶1复制对象到新Region的话，就必须要有一半的空闲Region来完成收集。</li></ul></li><li>染色指针可以<strong>大幅减少在垃圾收集过程中内存屏障的使用数量，设置内存屏障</strong>，尤其是写屏障的目的通常是为了记录对象引用的变动情况，如果将这些信息直接维护在指针中，显然就可以省去一些专门的记录操作。 
+  <ul><li>实际上，到目前为止ZGC都<strong>并未使用任何写屏障，只使用了读屏障（一部分是染色指针的功劳，一部分是ZGC现在还不支持分代收集，天然就没有跨代引用的问题）</strong>。内存屏障对程序 运行时性能的损耗在前面章节中已经讲解过，能够省去一部分的内存屏障，显然对程序运行效率是大有裨益的，所以<strong>ZGC对吞吐量的影响也相对较低</strong>。</li></ul></li><li>染色指针可以作为一种<strong>可扩展</strong>的存储结构用来记录更多与对象标记、重定位过程相关的数据，以便日后进一步提高性能。</li></ul> 
+<blockquote> 
+ <p>Java虚拟机作为一个普普通通的进程， 这样随意重新定义内存中某些指针的其中几位，操作系统是否支持？处理器是否支持？</p> 
+</blockquote> 
+<p>在Solaris/SPARC平台上比较容易解决，因为SPARC硬件层面本身就支持虚拟 地址掩码，设置之后其机器指令直接就可以忽略掉染色指针中的标志位。</p> 
+<ul><li>x86计算机体系中的经典设计 
+  <ul><li>在远古时代的x86计算机系统里面，所有进程都是共用同一块物理内存空间的，这样会导致不同进 程之间的内存无法相互隔离，当一个进程污染了别的进程内存后，就只能对整个系统进行复位后才能得以恢复。</li><li>为了解决这个问题，从Intel 80386处理器开始，提供了“保护模式”用于隔离进程。在保护模 式下，386处理器的全部32条地址寻址线都有效，进程可访问最高也可达4GB的内存空间，但此时已不同于之前实模式下的物理内存寻址了，处理器会使用分页管理机制把线性地址空间和物理地址空间分别划分为大小相同的块，这样的内存块被称为“页”（Page）。</li><li><strong>通过在线性虚拟空间的页与物理地址空间的页之间建立的映射表，分页管理机制会进行线性地址到物理地址空间的映射，完成线性地址到物理地址的转换</strong>。</li></ul></li></ul> 
+<p>Linux/x86-64平台上的ZGC使用了<strong>多重映射（Multi-Mapping）将多个不同的虚拟内存地址映射到同一 个物理内存地址上</strong>，这是一种多对一映射，意味着<strong>ZGC在虚拟内存中看到的地址空间要比实际的堆内存容量来得更大</strong>。把染色指针中的标志位看作是地址的分段符，那只要将这些不同的地址段都映射到同一个物理内存空间，经过多重映射转换后，就可以使用染色指针正常进行寻址了。</p> 
+<figure class="image"> 
+ <img alt="" height="716" src="https://images2.imgbox.com/b8/5f/ErczpIzv_o.png" width="1200"> 
+ <figcaption>
+   多重映射下的寻址 
+ </figcaption> 
+</figure> 
+<p>在某些场景下，多重映射技术确实可能会带来一些诸如<strong>复制大对象时会更容易</strong>这样的额外好处， 可从根源上讲，ZGC的多重映射只是它采用染色指针技术的伴生产物，并不是专门为了实现其他某种特性需求而去做的。</p> 
+<blockquote> 
+ <p>ZGC收集器是如何工作的</p> 
+</blockquote> 
+<figure class="image"> 
+ <img alt="" height="375" src="https://images2.imgbox.com/9f/c9/1RBhzZxj_o.png" width="1200"> 
+ <figcaption>
+   ZGC运作过程 
+ </figcaption> 
+</figure> 
+<ul><li> <strong>并发标记（Concurrent Mark）</strong>：与G1、Shenandoah一样，并发标记是遍历对象图做可达性分析的阶段，前后也要经过类似于G1、Shenandoah的初始标记、最终标记（尽管ZGC中的名字不叫这些）的 短暂停顿，而且这些停顿阶段所做的事情在目标上也是相类似的。与G1、Shenandoah不同的是，<strong>ZGC 的标记是在指针上而不是在对象上进行的，标记阶段会更新染色指针中的Marked 0、Marked 1标志 位。</strong></li><li><strong>并发预备重分配（Concurrent Prepare for Relocate）</strong>：这个阶段需要根据特定的查询条件统计得出本次收集过程要清理哪些Region，将这些Region组成重分配集（Relocation Set）。 
+  <ul><li>重分配集与G1收集器的回收集（Collection Set）还是有区别的，ZGC划分Region的目的并非为了像G1那样做收益优先的增量回收。相反，<strong>ZGC每次回收都会扫描所有的Region，用范围更大的扫描成本换取省去G1中记忆集的维护成本。</strong></li><li>因此，<strong>ZGC的重分配集只是决定了里面的存活对象会被重新复制到其他的Region中，里面的Region会被释放，而并不能说回收行为就只是针对这个集合里面的Region进行，因为标记过程是针对全堆的。</strong>此外，在JDK 12的ZGC中开始支持的类卸载以及弱引用的处理，也是在这个阶段中完成的。</li></ul></li><li><strong>并发重分配（Concurrent Relocate）</strong>：重分配是ZGC执行过程中的核心阶段，这个过程要<strong>把重分配集中的存活对象复制到新的Region上，并为重分配集中的每个Region维护一个转发表（Forward Table），记录从旧对象到新对象的转向关系。</strong> 
+  <ul><li>得益于染色指针的支持，ZGC收集器能仅从引用上就明确得知一个对象是否处于重分配集之中，<strong>如果用户线程此时并发访问了位于重分配集中的对象，这次访问将会被预置的内存屏障所截获，然后立即根据Region上的转发表记录将访问转发到新复制的对象上，并同时修正更新该引用的值，使其直接指向新对象，ZGC将这种行为称为指针的“自愈”（SelfHealing）能力。</strong></li><li>这样做的好处是<strong>只有第一次访问旧对象会陷入转发</strong>，也就是只慢一次，对比 Shenandoah的Brooks转发指针，那是每次对象访问都必须付出的固定开销，简单地说就是每次都慢， 因此ZGC对用户程序的运行时负载要比Shenandoah来得更低一些。</li><li>还有另外一个直接的好处是由于染色指针的存在，<strong>一旦重分配集中某个Region的存活对象都复制完毕后，这个Region就可以立即释放用于新对象的分配（但是转发表还得留着不能释放掉），哪怕堆中还有很多指向这个对象的未更新指针也没有关系，这些旧指针一旦被使用，它们都是可以自愈的。</strong></li></ul></li><li><strong>并发重映射（Concurrent Remap）</strong>：重映射所做的就是<strong>修正整个堆中指向重分配集中旧对象的所有引用</strong>，这一点从目标角度看是与Shenandoah并发引用更新阶段一样的，但是ZGC的并发重映射并不是一个必须要“迫切”去完成的任务，因为前面说过，即使是旧引用，它也是可以自愈的，最多只是第一次使用时多一次转发和修正操作。 
+  <ul><li>重映射清理这些旧引用的主要目的是为了不变慢（还有清理结束后可以释放转发表这样的附带收益），所以说这并不是很“迫切”。</li><li>因此，<strong>ZGC很巧妙地把并发重映射阶段要做的工作，合并到了下一次垃圾收集循环中的并发标记阶段里去完成，反正它们都是要遍历所有对象的，这样合并就节省了一次遍历对象图(</strong>如果不是由于两个阶段合并考虑，其实做重映射不需要按照对象图的顺序去做，只需线性地扫描整个堆来清理旧引用即可。<strong>)的开销。一旦所有指针都被修正之后，原来记录新旧 对象关系的转发表就可以释放掉了。</strong></li></ul></li></ul> 
+<hr> 
+<h2 id="%E9%80%89%E6%8B%A9%E5%90%88%E9%80%82%E7%9A%84%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8">选择合适的垃圾收集器</h2> 
+<h3 id="Epsilon%E6%94%B6%E9%9B%86%E5%99%A8">Epsilon收集器</h3> 
+<blockquote> 
+ <p>如果读者的应用只要运行数分钟甚至数秒， 只要Java虚拟机能正确分配内存，在堆耗尽之前就会退出，那显然运行负载极小、没有任何回收行为的Epsilon便是很恰当的选择。</p> 
+</blockquote> 
+<p><strong>一个垃圾收集器除了垃圾收集这个本职工作之外，它还要负责堆的管理与布局、对象的分配、与解释器的协作、与编译器的协作、与监控子系统协作等职责</strong>，其中至少堆的管理和对象的分配这部分功能是Java虚拟机能够正常运作的必要支持，是一个最小化功能的垃圾收集器也必须实现的内容。</p> 
+<hr> 
+<h3 id="%E6%94%B6%E9%9B%86%E5%99%A8%E7%9A%84%E6%9D%83%E8%A1%A1">收集器的权衡</h3> 
+<blockquote> 
+ <p>三个因素影响：</p> 
+</blockquote> 
+<ul><li>应用程序的主要关注点是什么？如果是数据分析、科学计算类的任务，目标是能尽快算出结果， 那吞吐量就是主要关注点；如果是SLA应用，那停顿时间直接影响服务质量，严重的甚至会导致事务超时，这样延迟就是主要关注点；而如果是客户端应用或者嵌入式应用，那垃圾收集的内存占用则是不可忽视的。</li><li>运行应用的基础设施如何？譬如硬件规格，要涉及的系统架构是x86-32/64、SPARC还是 ARM/Aarch64；处理器的数量多少，分配内存的大小；选择的操作系统是Linux、Solaris还是Windows 等。</li><li>使用JDK的发行商是什么？版本号是多少？是ZingJDK/Zulu、OracleJDK、Open-JDK、OpenJ9抑或是其他公司的发行版？该JDK对应了《Java虚拟机规范》的哪个版本？</li></ul> 
+<p>举个例子，假设某个直接面向用户提供服 务的B/S系统准备选择垃圾收集器，一般来说延迟时间是这类应用的主要关注点，那么：</p> 
+<ul><li>如果你有充足的预算但没有太多调优经验，那么一套带商业技术支持的专有硬件或者软件解决方 案是不错的选择，Azul公司以前主推的Vega系统和现在主推的Zing VM是这方面的代表，这样你就可以 使用传说中的C4收集器了。</li><li>如果你虽然没有足够预算去使用商业解决方案，但能够掌控软硬件型号，使用较新的版本，同时 又特别注重延迟，那ZGC很值得尝试。</li><li>如果你对还处于实验状态的收集器的稳定性有所顾虑，或者应用必须运行在Win-dows操作系统 下，那ZGC就无缘了，试试Shenandoah吧。</li><li>如果你接手的是遗留系统，软硬件基础设施和JDK版本都比较落后，那就根据内存规模衡量一 下，对于大概4GB到6GB以下的堆内存，CMS一般能处理得比较好，而对于更大的堆内存，可重点考 察一下G1。</li></ul> 
+<hr> 
+<h3 id="%E8%99%9A%E6%8B%9F%E6%9C%BA%E5%8F%8A%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E6%97%A5%E5%BF%97">虚拟机及垃圾收集器日志</h3> 
+<p><strong>JDK 9</strong>开始，HotSpot所有功能的日志都收归到了“-Xlog”参数上。</p> 
+<pre><code>-Xlog[:[selector][:[output][:[decorators][:output-options]]]]</code></pre> 
+<blockquote> 
+ <p>选择器（Selector）</p> 
+</blockquote> 
+<p>它由标签（Tag）和日志级别（Level）共同组成。 标签可理解为虚拟机中某个功能模块的名字，它告诉日志框架用户希望得到虚拟机哪些功能的日志输 出。垃圾收集器的标签名称为“gc”，由此可见，垃圾收集器日志只是HotSpot众多功能日志的其中一 项，全部支持的功能模块标签名如下所示：</p> 
+<pre><code>add，age，alloc，annotation，aot，arguments，attach，barrier，biasedlocking，blocks，bot，breakpoint，bytecode</code></pre> 
+<blockquote> 
+ <p>日志级别</p> 
+</blockquote> 
+<p>从低到高，共有Trace，Debug，Info，Warning，Error，Off六种级别，日志级别决定了输 出信息的详细程度，默认级别为Info，HotSpot的日志规则与Log4j、SLF4j这类Java日志框架大体上是 一致的。另外，还可以使用修饰器（Decorator）来要求每行日志输出都附加上额外的内容，支持附加在日志行上的信息包括：</p> 
+<ul><li>time：当前日期和时间。</li><li>uptime：虚拟机启动到现在经过的时间，以秒为单位。</li><li>timemillis：当前时间的毫秒数，相当于System.currentTimeMillis()的输出。</li><li>uptimemillis：虚拟机启动到现在经过的毫秒数。</li><li>timenanos：当前时间的纳秒数，相当于System.nanoTime()的输出。</li><li>uptimenanos：虚拟机启动到现在经过的纳秒数。</li><li>pid：进程ID。</li><li>tid：线程ID。</li><li>level：日志级别。</li><li>tags：日志输出的标签集。</li></ul> 
+<p>如果不指定，默认值是uptime、level、tags这三个，此时日志输出类似于以下形式：</p> 
+<pre><code>[3.080s][info][gc,cpu] GC(5) User=0.03s Sys=0.00s Real=0.01s
+</code></pre> 
+<blockquote> 
+ <p>展示在JDK 9统一日志框架前、后是如何获得垃圾收集器过程的相关信 息，以下均以JDK 9的G1收集器（JDK 9下默认收集器就是G1，所以命令行中没有指定收集器）为 例。</p> 
+</blockquote> 
+<p>1）<strong>查看GC基本信息</strong>，</p> 
+<p>在JDK 9之前使用-XX：+PrintGC，JDK 9后使用-Xlog：gc；</p> 
+<p>2）<strong>查看GC详细信息</strong>，</p> 
+<p>在JDK 9之前使用-XX：+PrintGCDetails，在JDK 9之后使用-X-log：gc*， 用通配符*将GC标签下所有细分过程都打印出来，如果把日志级别调整到Debug或者Trace，还将获得更多细节信息；</p> 
+<p>3）<strong>查看GC前后的堆、方法区可用容量变化</strong>，</p> 
+<p>在JDK 9之前使用-XX：+PrintHeapAtGC，JDK 9之 后使用-Xlog：gc+heap=debug；</p> 
+<p>4）<strong>查看GC过程中用户线程并发时间以及停顿的时间</strong>，</p> 
+<p>在JDK 9之前使用-XX：+PrintGCApplicationConcurrentTime以及</p> 
+<p>-XX：+PrintGCApplicationStoppedTime，JDK 9之后使用-Xlog： safepoint；</p> 
+<p>5）<strong>查看收集器Ergonomics机制（自动设置堆空间各分代区域大小、收集目标等内容，从Parallel收集器开始支持）自动调节的相关信息。</strong></p> 
+<p>在JDK 9之前使用-XX：+PrintAdaptive-SizePolicy，JDK 9之后使用-Xlog：gc+ergo*=trace</p> 
+<p>6）<strong>查看熬过收集后剩余对象的年龄分布信息</strong>，</p> 
+<p>在JDK 9前使用-XX：+PrintTenuring-Distribution， JDK 9之后使用-Xlog：gc+age=trace</p> 
+<blockquote> 
+ <p>JDK 9前后日志参数变化 </p> 
+</blockquote> 
+<p><img alt="" height="523" src="https://images2.imgbox.com/ed/ec/WvjvzdG2_o.png" width="1200"></p> 
+<p id="%E2%80%8B%E7%BC%96%E8%BE%91"><img alt="" height="1084" src="https://images2.imgbox.com/77/fd/I3H2Npfv_o.png" width="987"></p> 
+<hr> 
+<h3 id="%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E5%8F%82%E6%95%B0%E6%80%BB%E7%BB%93%C2%A0">垃圾收集器参数总结 </h3> 
+<p> <img alt="" height="1136" src="https://images2.imgbox.com/e0/91/yoEMDam5_o.png" width="896"></p> 
+<p><img alt="" height="480" src="https://images2.imgbox.com/5a/57/xOnRybrd_o.png" width="933"></p> 
+<hr> 
+<h2 id="%E5%AE%9E%E6%88%98%EF%BC%9A%E5%86%85%E5%AD%98%E5%88%86%E9%85%8D%E4%B8%8E%E5%9B%9E%E6%94%B6%E7%AD%96%E7%95%A5">实战：内存分配与回收策略</h2> 
+<p> Java技术体系的自动内存管理，最根本的目标是自动化地解决两个问题：自动给对象分配内存以 及自动回收分配给对象的内存。</p> 
+<p> 对象的内存分配，从概念上讲，应该都是在堆上分配（而实际上也有可能经过即时编译后被拆散 为标量类型并间接地在栈上分配）。在经典分代的设计下，新生对象通常会分配在新生代中，少数 情况下（例如对象大小超过一定阈值）也可能会直接分配在老年代。对象分配的规则并不是固定的。</p> 
+<blockquote> 
+ <p>均使用HotSpot虚拟机，以客户端模式运行，使用Serial加Serial Old客户端默认收集器组合下的内存分配和回收的策略。</p> 
+</blockquote> 
+<h3 id="%E5%AF%B9%E8%B1%A1%E4%BC%98%E5%85%88%E5%9C%A8Eden%E5%88%86%E9%85%8D">对象优先在Eden分配</h3> 
+<p>大多数情况下，对象在新生代Eden区中分配。当Eden区没有足够空间进行分配时，虚拟机将发起 一次Minor GC。</p> 
+<pre><code class="language-java">private static final int _1MB = 1024 * 1024;
+/**
+* VM参数：-verbose:gc -Xms20M -Xmx20M -Xmn10M -XX:+PrintGCDetails -XX:SurvivorRatio=8
+*/
+public static void testAllocation() {
+    byte[] allocation1, allocation2, allocation3, allocation4;
+    allocation1 = new byte[2 * _1MB];
+    allocation2 = new byte[2 * _1MB];
+    allocation3 = new byte[2 * _1MB];
+    allocation4 = new byte[4 * _1MB]; // 出现一次Minor GC
+}</code></pre> 
+<p><img alt="" height="99" src="https://images2.imgbox.com/a3/1e/kMiJJCAn_o.png" width="1200"></p> 
+<p><img alt="" height="154" src="https://images2.imgbox.com/08/33/0TxnAFzi_o.png" width="1061"></p> 
+<p></p> 
+<p>执行testAllocation()中分配allocation4对象的语句时会发生一次Minor GC，这次回收的结果是新生 代6651KB变为148KB，而总内存占用量则几乎没有减少（因为allocation1、2、3三个对象都是存活的，虚拟机几乎没有找到可回收的对象）。</p> 
+<p>产生这次垃圾收集的原因是为allocation4分配内存时，发现 Eden已经被占用了6MB，剩余空间已不足以分配allocation4所需的4MB内存，因此发生Minor GC。</p> 
+<p>垃圾收集期间虚拟机又发现已有的三个2MB大小的对象全部无法放入Survivor空间（Survivor空间只有 1MB大小），所以只好通过分配担保机制提前转移到老年代去。</p> 
+<hr> 
+<h3 id="%E5%A4%A7%E5%AF%B9%E8%B1%A1%E7%9B%B4%E6%8E%A5%E8%BF%9B%E5%85%A5%E8%80%81%E5%B9%B4%E4%BB%A3">大对象直接进入老年代</h3> 
+<p>大对象就是指需要大量连续内存空间的Java对象，最典型的大对象便是那种很长的字符串，或者 元素数量很庞大的数组。</p> 
+<p>在Java虚拟机中要避免大对象的原因是，在分配空间时，它容易导致内存明明还有不少空间时就提前触发垃圾收集，以获取足够的连续空间才能安置好它们，而当复制对象时，大对象就意味着高额的内存复制开销。</p> 
+<p>HotSpot虚拟机提供了<strong>-XX：PretenureSizeThreshold</strong> 参数，指定大于该设置值的对象直接在老年代分配，这样做的目的就是<strong>避免在Eden区及两个Survivor区之间来回复制，产生大量的内存复制操作。</strong></p> 
+<pre><code class="language-java">private static final int _1MB = 1024 * 1024;
+/**
+* VM参数：-verbose:gc -Xms20M -Xmx20M -Xmn10M -XX:+PrintGCDetails -XX:SurvivorRatio=8
+* -XX:PretenureSizeThreshold=3145728
+*/
+public static void testPretenureSizeThreshold() {
+byte[] allocation;
+allocation = new byte[4 * _1MB]; //直接分配在老年代中
+}
+</code></pre> 
+<p>testPretenureSizeThreshold()方法后，我们看到Eden空间几乎没有被使用，而 老年代的10MB空间被使用了40%，也就是4MB的allocation对象直接就分配在老年代中，这是因为XX：PretenureSizeThreshold被设置为3MB（就是3145728，这个参数不能与-Xmx之类的参数一样直接 写3MB），因此超过3MB的对象都会直接在老年代进行分配。</p> 
+<blockquote> 
+ <p>-XX：PretenureSizeThreshold参数只对Serial和ParNew两款新生代收集器有效，HotSpot 的其他新生代收集器，如Parallel Scavenge并不支持这个参数。如果必须使用此参数进行调优，可考虑 ParNew加CMS的收集器组合。</p> 
+</blockquote> 
+<hr> 
+<h3 id="%E9%95%BF%E6%9C%9F%E5%AD%98%E6%B4%BB%E7%9A%84%E5%AF%B9%E8%B1%A1%E5%B0%86%E8%BF%9B%E5%85%A5%E8%80%81%E5%B9%B4%E4%BB%A3">长期存活的对象将进入老年代</h3> 
+<p>HotSpot虚拟机中多数收集器都采用了分代收集来管理堆内存，那内存回收时就必须能决策哪些存 活对象应当放在新生代，哪些存活对象放在老年代中。</p> 
+<p>为做到这点，虚拟机给每个对象定义了一个对象年龄（Age）计数器，存储在对象头中。</p> 
+<p>对象通常在Eden区里诞生，如果经过第一次 Minor GC后仍然存活，并且能被Survivor容纳的话，该对象会被移动到Survivor空间中，并且将其对象年龄设为1岁。</p> 
+<p>对象在Survivor区中每熬过一次Minor GC，年龄就增加1岁，当它的年龄增加到一定程度（默认为15），就会被晋升到老年代中。<strong>对象晋升老年代的年龄阈值，可以通过参数-XX： MaxTenuringThreshold设置。</strong></p> 
+<pre><code class="language-java">private static final int _1MB = 1024 * 1024;
+/**
+* VM参数：-verbose:gc -Xms20M -Xmx20M -Xmn10M -XX:+PrintGCDetails -XX:SurvivorRatio=8 -XX:MaxTenuringThreshold=1
+* -XX:+PrintTenuringDistribution
+*/
+@SuppressWarnings("unused")
+public static void testTenuringThreshold() {
+    byte[] allocation1, allocation2, allocation3;
+    allocation1 = new byte[_1MB / 4]; // 什么时候进入老年代决定于XX:MaxTenuringThreshold设置
+    allocation2 = new byte[4 * _1MB];
+    allocation3 = new byte[4 * _1MB];
+    allocation3 = null;
+    allocation3 = new byte[4 * _1MB];
+}</code></pre> 
+<p>的testTenuringThreshold()方法，此方法中allocation1对象需要256KB内存，Survivor 空间可以容纳。当-XX：MaxTenuringThreshold=1时，allocation1对象在第二次GC发生时进入老年代， 新生代已使用的内存在垃圾收集以后非常干净地变成0KB。而当-XX：MaxTenuringThreshold=15时， 第二次GC发生后，allocation1对象则还留在新生代Survivor空间，这时候新生代仍然有404KB被占用。</p> 
+<hr> 
+<h3 id="%E5%8A%A8%E6%80%81%E5%AF%B9%E8%B1%A1%E5%B9%B4%E9%BE%84%E5%88%A4%E5%AE%9A">动态对象年龄判定</h3> 
+<p>为了能更好地适应不同程序的内存状况，HotSpot虚拟机并不是永远要求对象的年龄必须达到XX：MaxTenuringThreshold才能晋升老年代，<strong>如果在Survivor空间中相同年龄所有对象大小的总和大于 Survivor空间的一半，年龄大于或等于该年龄的对象就可以直接进入老年代</strong>，无须等到-XX： MaxTenuringThreshold中要求的年龄。</p> 
+<pre><code class="language-java">private static final int _1MB = 1024 * 1024;
+/**
+* VM参数：-verbose:gc -Xms20M -Xmx20M -Xmn10M -XX:+PrintGCDetails -XX:SurvivorRatio=8
+-XX:MaxTenuringThreshold=15
+* -XX:+PrintTenuringDistribution
+*/
+@SuppressWarnings("unused")
+public static void testTenuringThreshold2() {
+    byte[] allocation1, allocation2, allocation3, allocation4;
+    allocation1 = new byte[_1MB / 4]; // allocation1+allocation2大于survivo空间一半
+    allocation2 = new byte[_1MB / 4];
+    allocation3 = new byte[4 * _1MB];
+    allocation4 = new byte[4 * _1MB];
+    allocation4 = null;
+    allocation4 = new byte[4 * _1MB];
+}</code></pre> 
+<p>testTenuringThreshold2()方法，并将设置-XX：MaxTenuring-Threshold=15， 发现运行结果中Survivor占用仍然为0%，而老年代比预期增加了6%，也就是说allocation1、allocation2 对象都直接进入了老年代，并没有等到15岁的临界年龄。因为这两个对象加起来已经到达了512KB， 并且它们是同年龄的，满足同年对象达到Survivor空间一半的规则。我们只要注释掉其中一个对象的 new操作，就会发现另外一个就不会晋升到老年代了。</p> 
+<hr> 
+<h3 id="%E7%A9%BA%E9%97%B4%E5%88%86%E9%85%8D%E6%8B%85%E4%BF%9D">空间分配担保</h3> 
+<p>在发生Minor GC之前，虚拟机必须<strong>先检查老年代最大可用的连续空间是否大于新生代所有对象总 空间，如果这个条件成立，那这一次Minor GC可以确保是安全的。</strong></p> 
+<ul><li>如果不成立，则虚拟机会先查看XX：HandlePromotionFailure参数的设置值是否允许担保失败（Handle Promotion Failure）； 
+  <ul><li>如果允许，那会继续检查老年代最大可用的连续空间是否大于历次晋升到老年代对象的平均大小， 
+    <ul><li>如果大于，将尝试进行一次Minor GC，尽管这次Minor GC是有风险的；</li><li>如果小于，或者-XX： HandlePromotionFailure设置不允许冒险，那这时就要改为进行一次Full GC。</li></ul></li></ul></li></ul> 
+<p>解释一下“冒险”是冒了什么风险：</p> 
+<p>前面提到过，新生代使用复制收集算法，但为了内存利用率， 只使用其中一个Survivor空间来作为轮换备份，因此当出现大量对象在Minor GC后仍然存活的情况 ——最极端的情况就是内存回收后新生代中所有对象都存活，需要老年代进行分配担保，把Survivor无法容纳的对象直接送入老年代，这与生活中贷款担保类似。</p> 
+<p>老年代要进行这样的担保，前提是老年代本身还有容纳这些对象的剩余空间，但一共有多少对象会在这次回收中活下来在实际完成内存回收之前是无法明确知道的，所以只能取之前每一次回收晋升到老年代对象容量的平均大小作为经验值，与老年代的剩余空间进行比较，决定是否进行Full GC来让老年代腾出更多空间。</p> 
+<p>取历史平均值来比较其实仍然是一种赌概率的解决办法，也就是说假如某次Minor GC存活后的对 象突增，远远高于历史平均值的话，依然会导致担保失败。</p> 
+<p>如果出现了担保失败，那就只好老老实实地重新发起一次Full GC，这样停顿时间就很长了。</p> 
+<p>虽然担保失败时绕的圈子是最大的，但通常情况下 都还是会将-XX：HandlePromotionFailure开关打开，避免Full GC过于频繁。</p> 
+<pre><code class="language-java">private static final int _1MB = 1024 * 1024;
+/**
+* VM参数：-Xms20M -Xmx20M -Xmn10M -XX:+PrintGCDetails -XX:SurvivorRatio=8 -XX:-HandlePromotionFailure
+*/
+@SuppressWarnings("unused")
+public static void testHandlePromotion() {
+byte[] allocation1, allocation2, allocation3, allocation4, allocation5, alloca-tion6, allocation7;
+allocation1 = new byte[2 * _1MB];
+allocation2 = new byte[2 * _1MB];
+allocation3 = new byte[2 * _1MB];
+allocation1 = null;
+allocation4 = new byte[2 * _1MB];
+allocation5 = new byte[2 * _1MB];
+allocation6 = new byte[2 * _1MB];
+allocation4 = null;
+allocation5 = null;
+allocation6 = null;
+allocation7 = new byte[2 * _1MB];
+}
+</code></pre> 
+<p>在JDK 6 Update 24之后，这个测试结果就有了差异，-XX：HandlePromotionFailure参数不会再影 响到虚拟机的空间分配担保策略，观察OpenJDK中的源码变化（见代码清单3-12），虽然源码中还定 义了-XX：HandlePromotionFailure参数，但是在实际虚拟机中已经不会再使用它。JDK 6 Update 24之 后的规则变为<strong>只要老年代的连续空间大于新生代对象总大小或者历次晋升的平均大小，就会进行 Minor GC，否则将进行Full GC。</strong></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2629e04514478d7f372764ed753ecf32/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">电路设计之电压采样低功耗设计</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/52d8021afac3e31ae37e9b4cea86741a/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">谷粒商城项目学-分布式基础</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

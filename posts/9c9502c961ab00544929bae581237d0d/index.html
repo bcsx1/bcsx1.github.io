@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【案例实战】高并发业务的多级缓存架构一致性解决方案 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【案例实战】高并发业务的多级缓存架构一致性解决方案" />
+<meta property="og:description" content="我们在高并发的项目中基本上都离不开缓存，那么既然引入缓存，那就会有一个缓存与数据库数据一致性的问题。
+首先，我们先来看看高并发项目里面Redis常见的三种缓存读写模式。
+Cache Aside
+读写分离模式，是最常见的Redis缓存模式，多数采用。 读写数据时需要先查找缓存，如果缓存中没有，则从数据库中查找数据。 如果查询到数据，需要将数据放到缓存中，下次访问再直接从缓存中获取数据，以提高访问效率。 写操作通常不会直接更新缓存，而是删除缓存，因为存储结构是hash、list，则更新数据需要遍历。 优点 读取效率高，缓存命中率高，写操作与数据库同步，数据一致性较高，实现较为简单。 缺点 数据库和缓存之间存在数据不一致的问题，需要考虑缓存失效和数据库更新操作带来的缓存不一致问题。 应用场景 适用于读操作非常频繁而写操作相对比较少的情况，如电商网站的商品详情页，读取次数远高于更新和添加操作。 Read/Write Through
+读写穿透模式，读写操作会直接修改缓存，然后再同步更新数据库中的数据，开发较为复杂，一般少用。 在Read/Write Through模式下，每次数据的读写操作都会操作缓存，再同步到数据库，以保证缓存和数据库数据的一致性。 应用程序将缓存作为主要的数据源，数据库对于应用程序是透明的，更新数据库和从数据库的读取的任务都交给缓存来实现。 优点 写操作速度较快，一致性较高，缓存与数据库的数据保持一致，缓存命中率较高。 缺点 读操作较慢，如果缓存没有可用数据，每次都会进行数据库查询，数据量较大时会对性能带来较大的影响。 应用场景 系统处理写操作频繁且读操作不频繁的场景，如云存储Ceph Write Behind
+被称为Write Back模式或异步写入模式，一般较少使用。 如果有写操作，缓存会记录修改了缓存的数据，但是并不会立即同步到数据库中。 一般会把缓存中的数据更新到磁盘中，等到后续有查询数据操作时，再异步批量更新数据库中的数据。 该模式的优点就是写操作速度很快，不会对性能产生影响，同时也避免了频繁更新数据库的情况，提升了数据库性能。 优点 写操作速度快，性能较高，数据一致性一般较高。 缺点 读操作较慢，由于异步方式更新数据库，可能会存在数据的延迟。 应用场景： 用于较数据读写比重较高的场景，如游戏中的用户活动积分等信息，刚开始对写操作性能要求很高，后续查询比较少。 业务开发里面，基本都是从数据库读取到缓存里面，那缓存和数据库的读写顺序是怎样的？
+场景一：先更新数据库，再更新缓存
+线程A 更新数据库，更新完数据库，线程A 更新缓存，缓存更新成功，但是线程A 数据库事务commit失败，或者方法体发生异常，进行rollback 。会导致缓存和数据库不一致 。 场景二：先删缓存，再更新数据库
+线程A 删除缓存，更新数据库，但是还没commit。这时线程B访问缓存，发现没数据，去数据库读取未commit的放到缓存，也就是老数据。线程A 进行了commit操作。这也会导致缓存是老数据和数据库是新数据，不一致。 场景三：先删除缓存，再更新数据库，再删除缓存
+线程A 删除缓存，更新数据库，但是还没commit。线程B访问缓存，发现没数据，去数据库读取未commit的放到缓存（老数据 ）。线程A 进行了commit操作。线程A 再次删除缓存数据（这时缓存为空，后续读取就是最新的数据）。保证了数据的一致性，但是浪费了多次IO，相当于每次都要多删一次Redis。 OK，我们回归正题，什么是多级缓存架构？
+多级缓存架构是一种通常用于优化应用程序性能且高可用的缓存技术，通常由多层缓存组成，其中每一层缓存可以根据其不同的特征和作用进行选择和调整。通过缓存数据的多份副本，最大化应用程序性能和可用性，避免缓存穿透、缓存击穿、以及数据不一致的问题。
+这里我们采用Nginx&#43;Lua&#43;Canal&#43;Redis&#43;Mysql架构，也就是说读操作通过Lua查询Nginx的缓存，如果Nginx缓存没有数据，则查询Redis缓存，如果Redis缓存也没有数据，直接查询mysql。写操作时，Canal监听数据库指定表的增量变化，Java程序消费Canal监听到的增量变化写到Redis中。Java-canal程序操作Redis缓存，Nginx本地缓存是否应用和失效，取决项目类型。
+OK，什么是Canal呢？
+阿里巴巴基于 MySQL 的增量日志解析和订阅发布系统，主要用于解决数据订阅与消费问题。Canal主要支持了MySQL的binlog解析，解析完成利用canal client 用来处理获得的相关数据。
+早期阿里巴巴因为杭州和美国双机房部署，存在跨机房同步的业务需求，实现方式主要是基于业务 trigger 获取增量变更。从 2010 年开始，业务逐步尝试数据库日志解析获取增量变更进行同步，由此衍生出了大量的数据库增量订阅和消费业务。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/9c9502c961ab00544929bae581237d0d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-07-01T19:29:06+08:00" />
+<meta property="article:modified_time" content="2023-07-01T19:29:06+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【案例实战】高并发业务的多级缓存架构一致性解决方案</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-tomorrow-night">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p><strong>我们在高并发的项目中基本上都离不开缓存，那么既然引入缓存，那就会有一个缓存与数据库数据一致性的问题。</strong></p> 
+<p>首先，我们先来看看高并发项目里面Redis常见的三种缓存读写模式。</p> 
+<p><img src="https://images2.imgbox.com/de/a8/75YibHon_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>Cache Aside</strong></p> 
+<pre><code class="prism language-bash">读写分离模式，是最常见的Redis缓存模式，多数采用。
+读写数据时需要先查找缓存，如果缓存中没有，则从数据库中查找数据。
+如果查询到数据，需要将数据放到缓存中，下次访问再直接从缓存中获取数据，以提高访问效率。
+写操作通常不会直接更新缓存，而是删除缓存，因为存储结构是hash、list，则更新数据需要遍历。
+</code></pre> 
+<ul><li>优点 
+  <ul><li>读取效率高，缓存命中率高，写操作与数据库同步，数据一致性较高，实现较为简单。</li></ul> </li><li>缺点 
+  <ul><li>数据库和缓存之间存在数据不一致的问题，需要考虑缓存失效和数据库更新操作带来的缓存不一致问题。</li></ul> </li><li>应用场景 
+  <ul><li>适用于读操作非常频繁而写操作相对比较少的情况，如电商网站的商品详情页，读取次数远高于更新和添加操作。</li></ul> </li></ul> 
+<p><strong>Read/Write Through</strong></p> 
+<pre><code class="prism language-bash">读写穿透模式，读写操作会直接修改缓存，然后再同步更新数据库中的数据，开发较为复杂，一般少用。
+在Read/Write  Through模式下，每次数据的读写操作都会操作缓存，再同步到数据库，以保证缓存和数据库数据的一致性。
+应用程序将缓存作为主要的数据源，数据库对于应用程序是透明的，更新数据库和从数据库的读取的任务都交给缓存来实现。
+</code></pre> 
+<ul><li>优点 
+  <ul><li>写操作速度较快，一致性较高，缓存与数据库的数据保持一致，缓存命中率较高。</li></ul> </li><li>缺点 
+  <ul><li>读操作较慢，如果缓存没有可用数据，每次都会进行数据库查询，数据量较大时会对性能带来较大的影响。</li></ul> </li><li>应用场景 
+  <ul><li>系统处理写操作频繁且读操作不频繁的场景，如云存储Ceph</li></ul> </li></ul> 
+<p><strong>Write Behind</strong></p> 
+<pre><code class="prism language-bash">被称为Write Back模式或异步写入模式，一般较少使用。
+如果有写操作，缓存会记录修改了缓存的数据，但是并不会立即同步到数据库中。
+一般会把缓存中的数据更新到磁盘中，等到后续有查询数据操作时，再异步批量更新数据库中的数据。
+该模式的优点就是写操作速度很快，不会对性能产生影响，同时也避免了频繁更新数据库的情况，提升了数据库性能。
+</code></pre> 
+<ul><li>优点 
+  <ul><li>写操作速度快，性能较高，数据一致性一般较高。</li></ul> </li><li>缺点 
+  <ul><li>读操作较慢，由于异步方式更新数据库，可能会存在数据的延迟。</li></ul> </li><li>应用场景： 
+  <ul><li>用于较数据读写比重较高的场景，如游戏中的用户活动积分等信息，刚开始对写操作性能要求很高，后续查询比较少。</li></ul> </li></ul> 
+<p><strong>业务开发里面，基本都是从数据库读取到缓存里面，那缓存和数据库的读写顺序是怎样的？</strong></p> 
+<p><strong>场景一：先更新数据库，再更新缓存</strong></p> 
+<ul><li>线程A 更新数据库，更新完数据库，线程A 更新缓存，缓存更新成功，但是线程A 数据库事务commit失败，或者方法体发生异常，进行rollback 。会导致缓存和数据库不一致 。</li></ul> 
+<p><img src="https://images2.imgbox.com/92/79/YIdhmR48_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>场景二：先删缓存，再更新数据库</strong></p> 
+<ul><li>线程A 删除缓存，更新数据库，但是还没commit。这时线程B访问缓存，发现没数据，去数据库读取未commit的放到缓存，也就是老数据。线程A 进行了commit操作。这也会导致缓存是老数据和数据库是新数据，不一致。</li></ul> 
+<p><img src="https://images2.imgbox.com/fc/73/oVeo4GXq_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>场景三：先删除缓存，再更新数据库，再删除缓存</strong></p> 
+<ul><li>线程A 删除缓存，更新数据库，但是还没commit。线程B访问缓存，发现没数据，去数据库读取未commit的放到缓存（老数据 ）。线程A 进行了commit操作。线程A 再次删除缓存数据（这时缓存为空，后续读取就是最新的数据）。保证了数据的一致性，但是浪费了多次IO，相当于每次都要多删一次Redis。</li></ul> 
+<p><img src="https://images2.imgbox.com/f6/13/CL9lW2J6_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>OK，我们回归正题，什么是多级缓存架构？</strong></p> 
+<p>多级缓存架构是一种通常用于优化应用程序性能且高可用的缓存技术，通常由多层缓存组成，其中每一层缓存可以根据其不同的特征和作用进行选择和调整。通过缓存数据的多份副本，最大化应用程序性能和可用性，避免缓存穿透、缓存击穿、以及数据不一致的问题。</p> 
+<p>这里我们采用<strong>Nginx+Lua+Canal+Redis+Mysql</strong>架构，也就是说<strong>读操作通过Lua查询Nginx的缓存，如果Nginx缓存没有数据，则查询Redis缓存，如果Redis缓存也没有数据，直接查询mysql</strong>。<strong>写操作时，Canal监听数据库指定表的增量变化，Java程序消费Canal监听到的增量变化写到Redis中。Java-canal程序操作Redis缓存，Nginx本地缓存是否应用和失效，取决项目类型。</strong></p> 
+<p><img src="https://images2.imgbox.com/09/f5/Xp3HkwfL_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>OK，什么是Canal呢？</strong></p> 
+<p>阿里巴巴基于 MySQL 的增量日志解析和订阅发布系统，主要用于解决数据订阅与消费问题。Canal主要支持了MySQL的binlog解析，解析完成利用canal client 用来处理获得的相关数据。</p> 
+<p>早期阿里巴巴因为杭州和美国双机房部署，存在跨机房同步的业务需求，实现方式主要是基于业务 trigger 获取增量变更。从 2010 年开始，业务逐步尝试数据库日志解析获取增量变更进行同步，由此衍生出了大量的数据库增量订阅和消费业务。</p> 
+<ul><li> <p>基于日志增量订阅和消费的业务包括</p> 
+  <ul><li>数据库镜像</li><li>数据库实时备份</li><li>索引构建和实时维护(拆分异构索引、倒排索引等)</li><li>业务 cache 刷新</li><li>带业务逻辑的增量数据处理</li></ul> </li></ul> 
+<p><strong>当前的 canal 支持源端 MySQL 版本包括 5.1.x , 5.5.x , 5.6.x , 5.7.x , 8.0.x</strong></p> 
+<p><img src="https://images2.imgbox.com/7d/7e/BZLoEpjm_o.jpg" alt="在这里插入图片描述"></p> 
+<ul><li>Canal 模拟 MySQL slave 的交互协议，伪装自己为 MySQL slave ，向 MySQL master 发送dump 协议。</li><li>MySQL master 收到 dump 请求，开始推送 binary log 给 slave (即 canal )。</li><li>Canal 解析 binary log 对象(原始为 byte 流) ，并解析成独立的数据操作事件，如插入、更新、删除等。</li></ul> 
+<p><strong>环境准备</strong></p> 
+<p>OK，前面主要是给大家介绍了下多级缓存的一个架构，接下来我们先做一些环境的准备。</p> 
+<p><strong>首先部署MySQL，这里我们采用docker容器化的方式部署MySQL。部署完成后一定要开启MySQL的binlog日志。</strong></p> 
+<pre><code class="prism language-bash"><span class="token comment">#创建目录</span>
+<span class="token function">mkdir</span> -p /home/data/mysql/
+
+<span class="token comment">#部署</span>
+<span class="token function">docker</span> run <span class="token punctuation">\</span>
+    -p <span class="token number">3306</span>:3306 <span class="token punctuation">\</span>
+    -e <span class="token assign-left variable">MYSQL_ROOT_PASSWORD</span><span class="token operator">=</span><span class="token number">123456</span> <span class="token punctuation">\</span>
+    -v /home/data/mysql/conf:/etc/mysql/conf.d <span class="token punctuation">\</span>
+    -v /home/data/mysql/data:/var/lib/mysql:rw <span class="token punctuation">\</span>
+    --name mysql_test <span class="token punctuation">\</span>
+    --restart<span class="token operator">=</span>always <span class="token punctuation">\</span>
+    -d mysql:8.0
+</code></pre> 
+<p>编辑配置文件<code>my.cnf</code>，在mysqld模块下，编辑完成后重启mysql服务。</p> 
+<pre><code class="prism language-cnf"># 开启 binlog, 可以不加，默认开启
+log-bin=mysql-bin
+
+# 选择 ROW 模式
+binlog_format=row
+
+#server_id不要和canal的slaveId重复
+server-id=1
+</code></pre> 
+<p><img src="https://images2.imgbox.com/54/90/hrDFY9uv_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>以下是MySQL三种binlog模式的简介</strong></p> 
+<p><code>STATEMENT</code> 格式</p> 
+<pre><code class="prism language-bash">Statement-Based Replication,SBR，每一条会修改数据的 SQL 都会记录在 binlog 中。
+每一条会修改数据 SQL 都会记录在 binlog 中，性能高，发生的变更操作只记录所执行的 SQL 语句，而不记录具体变更的值。
+不需要记录每一行数据的变化，极大的减少了 binlog 的日志量，避免了大量的 IO 操作，提升了系统的性能。
+由于 Statement 模式只记录 SQL，而如果一些 SQL 中 包含了函数，那么可能会出现执行结果不一致的情况。
+缺点：uuid<span class="token punctuation">(</span><span class="token punctuation">)</span> 函数，每次执行都会生成随机字符串，在 master 中记录了 uuid，当同步到 slave 后再次执行，结果不一样，now<span class="token punctuation">(</span><span class="token punctuation">)</span>之类的函数以及获取系统参数的操作， 都会出现主从数据不同步的问题。
+</code></pre> 
+<p><code>ROW</code> 格式（默认）</p> 
+<pre><code class="prism language-bash">Row-Based Replication,RBR，不记录 SQL 语句上下文信息，仅保存哪条记录被修改。
+Row 格式不记录 SQL 语句上下文相关信息，仅记录某一条记录被修改成什么样子。
+清楚地记录下每一行数据修改的细节，不会出现 Statement 中存在的那种数据无法被正常复制的情况，保证最高精度和粒度。
+缺点：Row 格式存在问题，就是日志量太大，批量 update、整表 delete、alter 表等操作，要记录每一行数据的变化，此时会产生大量的日志，大量的日志也会带来 IO 性能问题。
+</code></pre> 
+<p><code>MIXED</code> 格式</p> 
+<pre><code class="prism language-bash">在 STATEMENT 和 ROW 之间自动进行切换的模式。在没有大量变更时使用 STATEMENT 格式。
+而在发生大量变更时使用 ROW 格式，以确保日志具有高精度和粒度，同时保证存储空间的有效使用。
+</code></pre> 
+<p>运行以下命令检查是否开启了binlog：<code>SHOW VARIABLES LIKE 'log_bin'</code></p> 
+<p><img src="https://images2.imgbox.com/34/01/FY8m2JOq_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>数据库授权</strong></p> 
+<pre><code class="prism language-bash">-- 创建同步用户
+CREATE <span class="token environment constant">USER</span> <span class="token string">'canal'</span>@<span class="token string">'%'</span><span class="token punctuation">;</span>
+-- 设置密码
+ALTER <span class="token environment constant">USER</span> <span class="token string">'canal'</span>@<span class="token string">'%'</span> IDENTIFIED WITH mysql_native_password BY <span class="token string">'123456'</span><span class="token punctuation">;</span>
+-- 授予复制权限
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO <span class="token string">'canal'</span>@<span class="token string">'%'</span><span class="token punctuation">;</span>
+-- 刷新权限
+FLUSH PRIVILEGES<span class="token punctuation">;</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/07/2d/iepgzWnI_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>然后我们部署一下Redis，也是采用docker部署，很简单。</strong></p> 
+<pre><code class="prism language-bash"><span class="token function">docker</span> run -itd --name redis -p <span class="token number">6379</span>:6379 <span class="token punctuation">\</span>
+--privileged<span class="token operator">=</span>true <span class="token punctuation">\</span>
+-v /redis/data:/data --restart always redis <span class="token punctuation">\</span>
+--requirepass <span class="token string">"psd"</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/8b/01/TvVVR5mK_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>然后，我们来部署下canal-server，我们也是采用docker部署。</strong></p> 
+<pre><code class="prism language-bash"> <span class="token function">docker</span> run -p <span class="token number">11111</span>:11111 --name canal -d canal/canal-server:v1.1.4
+</code></pre> 
+<p>进入容器内部，修改配置文件</p> 
+<pre><code class="prism language-bash"><span class="token function">docker</span> <span class="token builtin class-name">exec</span> -it canal /bin/bash
+
+<span class="token comment"># 修改配置文件</span>
+<span class="token function">vi</span> canal-server/conf/example/instance.properties
+
+<span class="token comment">#################################################</span>
+<span class="token comment">## mysql serverId , 修改id，不要和mysql 主节点一致即可----------</span>
+canal.instance.mysql.slaveId<span class="token operator">=</span><span class="token number">2</span>
+canal.instance.gtidon<span class="token operator">=</span>false
+
+<span class="token comment"># 修改 mysql 主节点的ip----------</span>
+canal.instance.master.address<span class="token operator">=</span>ip:3306
+canal.instance.tsdb.enable<span class="token operator">=</span>true
+
+<span class="token comment"># username/password 授权的数据库账号密码----------</span>
+canal.instance.dbUsername<span class="token operator">=</span>canal
+canal.instance.dbPassword<span class="token operator">=</span><span class="token number">123456</span>
+canal.instance.connectionCharset <span class="token operator">=</span> UTF-8
+canal.instance.enableDruid<span class="token operator">=</span>false
+
+<span class="token comment"># mysql 数据解析关注的表，正则表达式. 多个正则之间以逗号(,)分隔，转义符需要双斜杠 \\，所有表:.* 或 .*\\..*</span>
+canal.instance.filter.regex<span class="token operator">=</span>.*<span class="token punctuation">\</span><span class="token punctuation">\</span><span class="token punctuation">..</span>*
+canal.instance.filter.black.regex<span class="token operator">=</span>
+</code></pre> 
+<p><strong>重启容器，进入容器查看日志。</strong></p> 
+<pre><code class="prism language-bash"><span class="token function">docker</span> restart canal
+</code></pre> 
+<p><img src="https://images2.imgbox.com/cc/e7/R2TV6x5o_o.jpg" alt="在这里插入图片描述"></p> 
+<pre><code class="prism language-bash"><span class="token function">docker</span> <span class="token builtin class-name">exec</span> -it canal /bin/bash
+
+<span class="token function">tail</span> -100f canal-server/logs/example/example.log
+</code></pre> 
+<p><img src="https://images2.imgbox.com/b0/cf/a1FVUPmO_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>接下来我们来部署一下最后一项Nginx。这里我们直接部署OpenResty，这里面涵盖Nginx和Lua。</strong></p> 
+<p><strong>依次执行以下命令。</strong></p> 
+<pre><code class="prism language-bash"><span class="token comment"># add the yum repo:</span>
+<span class="token function">wget</span> https://openresty.org/package/centos/openresty.repo
+<span class="token function">sudo</span> <span class="token function">mv</span> openresty.repo /etc/yum.repos.d/
+
+<span class="token comment"># update the yum index:</span>
+<span class="token function">sudo</span> yum check-update
+
+<span class="token function">sudo</span> yum <span class="token function">install</span> openresty
+
+<span class="token comment">#安装命令行工具</span>
+<span class="token function">sudo</span> yum <span class="token function">install</span> openresty-resty
+
+<span class="token comment"># 列出所有 openresty 仓库里的软件包</span>
+<span class="token function">sudo</span> yum --disablerepo<span class="token operator">=</span><span class="token string">"*"</span> --enablerepo<span class="token operator">=</span><span class="token string">"openresty"</span> list available
+
+<span class="token comment">#查看版本</span>
+resty -V
+</code></pre> 
+<p><img src="https://images2.imgbox.com/1d/66/3ICD7VOx_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>OK，前置的服务器环境部署完成啦，下面我们开始编码环节。</strong></p> 
+<p>首先我们要先创建一个数据库表格。然后对于这个表写一套增删改查逻辑。这快我们创建一个商品表。</p> 
+<pre><code class="prism language-sql"><span class="token keyword">CREATE</span> <span class="token keyword">TABLE</span> <span class="token identifier"><span class="token punctuation">`</span>product<span class="token punctuation">`</span></span> <span class="token punctuation">(</span>
+  <span class="token identifier"><span class="token punctuation">`</span>id<span class="token punctuation">`</span></span> <span class="token keyword">bigint</span> <span class="token operator">NOT</span> <span class="token boolean">NULL</span> <span class="token keyword">AUTO_INCREMENT</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>title<span class="token punctuation">`</span></span> <span class="token keyword">varchar</span><span class="token punctuation">(</span><span class="token number">255</span><span class="token punctuation">)</span> <span class="token keyword">CHARACTER</span> <span class="token keyword">SET</span> utf8mb4 <span class="token keyword">COLLATE</span> utf8mb4_bin <span class="token keyword">DEFAULT</span> <span class="token boolean">NULL</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>cover_img<span class="token punctuation">`</span></span> <span class="token keyword">varchar</span><span class="token punctuation">(</span><span class="token number">255</span><span class="token punctuation">)</span> <span class="token keyword">CHARACTER</span> <span class="token keyword">SET</span> utf8mb4 <span class="token keyword">COLLATE</span> utf8mb4_bin <span class="token keyword">DEFAULT</span> <span class="token boolean">NULL</span> <span class="token keyword">COMMENT</span> <span class="token string">'封面图'</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>amount<span class="token punctuation">`</span></span> <span class="token keyword">decimal</span><span class="token punctuation">(</span><span class="token number">10</span><span class="token punctuation">,</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token keyword">DEFAULT</span> <span class="token boolean">NULL</span> <span class="token keyword">COMMENT</span> <span class="token string">'现价'</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>summary<span class="token punctuation">`</span></span> <span class="token keyword">varchar</span><span class="token punctuation">(</span><span class="token number">2048</span><span class="token punctuation">)</span> <span class="token keyword">CHARACTER</span> <span class="token keyword">SET</span> utf8mb4 <span class="token keyword">COLLATE</span> utf8mb4_bin <span class="token keyword">DEFAULT</span> <span class="token boolean">NULL</span> <span class="token keyword">COMMENT</span> <span class="token string">'概要'</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>detail<span class="token punctuation">`</span></span> <span class="token keyword">longtext</span> <span class="token keyword">CHARACTER</span> <span class="token keyword">SET</span> utf8mb4 <span class="token keyword">COLLATE</span> utf8mb4_bin <span class="token keyword">COMMENT</span> <span class="token string">'详情'</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>gmt_modified<span class="token punctuation">`</span></span> <span class="token keyword">datetime</span> <span class="token keyword">DEFAULT</span> <span class="token keyword">CURRENT_TIMESTAMP</span> <span class="token keyword">ON</span> <span class="token keyword">UPDATE</span> <span class="token keyword">CURRENT_TIMESTAMP</span><span class="token punctuation">,</span>
+  <span class="token identifier"><span class="token punctuation">`</span>gmt_create<span class="token punctuation">`</span></span> <span class="token keyword">datetime</span> <span class="token keyword">DEFAULT</span> <span class="token keyword">CURRENT_TIMESTAMP</span><span class="token punctuation">,</span>
+  <span class="token keyword">PRIMARY</span> <span class="token keyword">KEY</span> <span class="token punctuation">(</span><span class="token identifier"><span class="token punctuation">`</span>id<span class="token punctuation">`</span></span><span class="token punctuation">)</span> <span class="token keyword">USING</span> <span class="token keyword">BTREE</span>
+<span class="token punctuation">)</span> <span class="token keyword">ENGINE</span><span class="token operator">=</span><span class="token keyword">InnoDB</span> <span class="token keyword">DEFAULT</span> <span class="token keyword">CHARSET</span><span class="token operator">=</span>utf8mb4 <span class="token keyword">COLLATE</span><span class="token operator">=</span>utf8mb4_bin ROW_FORMAT<span class="token operator">=</span>DYNAMIC<span class="token punctuation">;</span>
+</code></pre> 
+<p><strong>创建SpringBoot项目，加入redis、mysql、mybatis、canal依赖，并且配置yml文件。</strong></p> 
+<pre><code class="prism language-xml">     <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependencies</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>org.springframework.boot<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>spring-boot-starter-web<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+        <span class="token comment">&lt;!-- redis --&gt;</span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>org.springframework.boot<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>spring-boot-starter-data-redis<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>3.0.6<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+        <span class="token comment">&lt;!--数据库连接--&gt;</span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>mysql<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>mysql-connector-java<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+        <span class="token comment">&lt;!--mybatis plus--&gt;</span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>com.baomidou<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>mybatis-plus-boot-starter<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>3.4.0<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+        <span class="token comment">&lt;!--lombok--&gt;</span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>org.projectlombok<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>lombok<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>1.18.16<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>com.alibaba.otter<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>canal.client<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>1.1.4<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependencies</span><span class="token punctuation">&gt;</span></span>
+</code></pre> 
+<p>编写商品的增删改查逻辑。具体的编码这里就不做展示啦，就是一些基础的增删改查。大家在操作时可以去下载源码包，我会上传到CSDN上。</p> 
+<pre><code class="prism language-java">
+<span class="token comment">/**
+ * @author lixiang
+ * @date 2023/6/25 17:20
+ */</span>
+<span class="token keyword">public</span> <span class="token keyword">interface</span> <span class="token class-name">ProductService</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token comment">/**
+     * 新增商品
+     * @param product
+     */</span>
+    <span class="token keyword">void</span> <span class="token function">addProduct</span><span class="token punctuation">(</span><span class="token class-name">ProductDO</span> product<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/**
+     * 修改商品
+     * @param product
+     */</span>
+    <span class="token keyword">void</span> <span class="token function">updateProduct</span><span class="token punctuation">(</span><span class="token class-name">ProductDO</span> product<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/**
+     * 删除商品
+     * @param id
+     */</span>
+    <span class="token keyword">void</span> <span class="token function">deleteProductById</span><span class="token punctuation">(</span><span class="token class-name">Long</span> id<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/**
+     * 根据ID查询商品
+     * @param id
+     * @return
+     */</span>
+    <span class="token class-name">ProductDO</span> <span class="token function">selectProductById</span><span class="token punctuation">(</span><span class="token class-name">Long</span> id<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/**
+     * 分页查询商品信息
+     * @param current
+     * @param size
+     * @return
+     */</span>
+    <span class="token class-name">Map</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">String</span><span class="token punctuation">,</span><span class="token class-name">Object</span><span class="token punctuation">&gt;</span></span> <span class="token function">selectProductList</span><span class="token punctuation">(</span><span class="token keyword">int</span> current<span class="token punctuation">,</span> <span class="token keyword">int</span> size<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/78/79/Qy5m2h4x_o.jpg" alt="在这里插入图片描述"></p> 
+<p>启动项目验证没有问题，我们开始下一步的操作。在开发canal监听时，我们先了解一下什么是<strong>ApplicationRunner</strong>。</p> 
+<p><strong>ApplicationRunner</strong>是<code>Spring Boot</code>框架提供的一个接口，它用于在<code>Spring Boot</code>应用程序启动后运行一些任务或代码。当应用程序启动后，如果想在启动后自动执行一些任务或初始化操作，可以使用这个接口。</p> 
+<p>使用步骤：创建一个类，并实现该接口，并在该类上添加<code>@Component</code>注解，以确保<code>Spring Boot</code>能够扫描该类并执行它的<code>run</code>方法。</p> 
+<pre><code class="prism language-java"><span class="token comment">/**
+ * @author lixiang
+ * @date 2023/6/29 23:08
+ */</span>
+<span class="token annotation punctuation">@Component</span>
+<span class="token annotation punctuation">@Slf4j</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">CanalRedisConsumer</span> <span class="token keyword">implements</span> <span class="token class-name">ApplicationRunner</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token annotation punctuation">@Override</span>
+    <span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token class-name">ApplicationArguments</span> args<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+        log<span class="token punctuation">.</span><span class="token function">info</span><span class="token punctuation">(</span><span class="token string">"CanalRedisConsumer执行"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/fa/2d/CmJnTVfq_o.jpg" alt="在这里插入图片描述"></p> 
+<p>Ok，接下来我们主要关注核心逻辑的实现就可以啦。直接上代码。</p> 
+<pre><code class="prism language-java"><span class="token comment">/**
+ * 这里我们直接操作redis的String类型
+ * @author lixiang
+ * @date 2023/6/29 23:08
+ */</span>
+<span class="token annotation punctuation">@Component</span>
+<span class="token annotation punctuation">@Slf4j</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">CanalRedisConsumer</span> <span class="token keyword">implements</span> <span class="token class-name">ApplicationRunner</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> <span class="token class-name">RedisTemplate</span> redisTemplate<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Override</span>
+    <span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token class-name">ApplicationArguments</span> args<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 创建一个 CanalConnector 连接器</span>
+        <span class="token class-name">CanalConnector</span> canalConnector <span class="token operator">=</span> <span class="token class-name">CanalConnectors</span><span class="token punctuation">.</span><span class="token function">newSingleConnector</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">InetSocketAddress</span><span class="token punctuation">(</span><span class="token string">"payne.f3322.net"</span><span class="token punctuation">,</span> <span class="token number">11111</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+                <span class="token string">"example"</span><span class="token punctuation">,</span> <span class="token string">""</span><span class="token punctuation">,</span> <span class="token string">""</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// 连接 Canal Server，尝试多次重连</span>
+            <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                    canalConnector<span class="token punctuation">.</span><span class="token function">connect</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">CanalClientException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    log<span class="token punctuation">.</span><span class="token function">info</span><span class="token punctuation">(</span><span class="token string">"Connect to Canal Server failed, retrying..."</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            log<span class="token punctuation">.</span><span class="token function">info</span><span class="token punctuation">(</span><span class="token string">"Connect to Canal Server success"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//订阅数据库表,默认监听所有的数据库、表，等同于：.*\\..*</span>
+            canalConnector<span class="token punctuation">.</span><span class="token function">subscribe</span><span class="token punctuation">(</span><span class="token string">".*\\..*"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// 回滚到上一次的 batchId，取消已经消费过的日志</span>
+            canalConnector<span class="token punctuation">.</span><span class="token function">rollback</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token comment">// 持续监听 Canal Server 推送的数据，并将数据写入 Redis 中</span>
+            <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token class-name">Message</span> message <span class="token operator">=</span> canalConnector<span class="token punctuation">.</span><span class="token function">getWithoutAck</span><span class="token punctuation">(</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">long</span> batchId <span class="token operator">=</span> message<span class="token punctuation">.</span><span class="token function">getId</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">// 如果没有新数据，则暂停固定时间后继续获取</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>batchId <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">||</span> message<span class="token punctuation">.</span><span class="token function">getEntries</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">isEmpty</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                        <span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">sleep</span><span class="token punctuation">(</span><span class="token number">1000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token keyword">continue</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">InterruptedException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                        e<span class="token punctuation">.</span><span class="token function">printStackTrace</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                <span class="token punctuation">}</span>
+                <span class="token comment">//处理数据</span>
+                <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Entry</span> entry <span class="token operator">:</span> message<span class="token punctuation">.</span><span class="token function">getEntries</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>entry<span class="token punctuation">.</span><span class="token function">getEntryType</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>EntryType</span><span class="token punctuation">.</span>TRANSACTIONBEGIN <span class="token operator">||</span> entry<span class="token punctuation">.</span><span class="token function">getEntryType</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>EntryType</span><span class="token punctuation">.</span>TRANSACTIONEND<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                        <span class="token keyword">continue</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                    <span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowChange</span> rowChange <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+                    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                        rowChange <span class="token operator">=</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowChange</span><span class="token punctuation">.</span><span class="token function">parseFrom</span><span class="token punctuation">(</span>entry<span class="token punctuation">.</span><span class="token function">getStoreValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                        <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">RuntimeException</span><span class="token punctuation">(</span><span class="token string">"Error parsing Canal Entry."</span><span class="token punctuation">,</span> e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+
+                    <span class="token class-name">String</span> table <span class="token operator">=</span> entry<span class="token punctuation">.</span><span class="token function">getHeader</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getTableName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token class-name">CanalEntry<span class="token punctuation">.</span>EventType</span> eventType <span class="token operator">=</span> rowChange<span class="token punctuation">.</span><span class="token function">getEventType</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    log<span class="token punctuation">.</span><span class="token function">info</span><span class="token punctuation">(</span><span class="token string">"Canal监听数据变化,DB:{},Table:{},Type:{}"</span><span class="token punctuation">,</span>entry<span class="token punctuation">.</span><span class="token function">getHeader</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getSchemaName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>table<span class="token punctuation">,</span>eventType<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token comment">// 变更后的新数据</span>
+                    <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowData</span> rowData <span class="token operator">:</span> rowChange<span class="token punctuation">.</span><span class="token function">getRowDatasList</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span>eventType <span class="token operator">==</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>EventType</span><span class="token punctuation">.</span>DELETE<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">deleteData</span><span class="token punctuation">(</span>table<span class="token punctuation">,</span> rowData<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">insertOrUpdateData</span><span class="token punctuation">(</span>table<span class="token punctuation">,</span> rowData<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                    <span class="token punctuation">}</span>
+                <span class="token punctuation">}</span>
+
+                <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                    canalConnector<span class="token punctuation">.</span><span class="token function">ack</span><span class="token punctuation">(</span>batchId<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">// 回滚所有未确认的 Batch</span>
+                    canalConnector<span class="token punctuation">.</span><span class="token function">rollback</span><span class="token punctuation">(</span>batchId<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+
+        <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+            canalConnector<span class="token punctuation">.</span><span class="token function">disconnect</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/**
+     * 删除行数据
+     */</span>
+    <span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">deleteData</span><span class="token punctuation">(</span><span class="token class-name">String</span> table<span class="token punctuation">,</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowData</span> rowData<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">List</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Column</span><span class="token punctuation">&gt;</span></span> columns <span class="token operator">=</span> rowData<span class="token punctuation">.</span><span class="token function">getBeforeColumnsList</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">JSONObject</span> json <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">JSONObject</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        columns<span class="token punctuation">.</span><span class="token function">forEach</span><span class="token punctuation">(</span>column<span class="token operator">-&gt;</span>json<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span>column<span class="token punctuation">.</span><span class="token function">getName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> column<span class="token punctuation">.</span><span class="token function">getValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">String</span> key <span class="token operator">=</span> table <span class="token operator">+</span> <span class="token string">":"</span> <span class="token operator">+</span> columns<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        log<span class="token punctuation">.</span><span class="token function">info</span><span class="token punctuation">(</span><span class="token string">"Redis中删除Key为: {} 的数据"</span><span class="token punctuation">,</span>key<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        redisTemplate<span class="token punctuation">.</span><span class="token function">delete</span><span class="token punctuation">(</span>key<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/**
+     * 新增或者修改数据
+     */</span>
+    <span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">insertOrUpdateData</span><span class="token punctuation">(</span><span class="token class-name">String</span> table<span class="token punctuation">,</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowData</span> rowData<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">List</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Column</span><span class="token punctuation">&gt;</span></span> columns <span class="token operator">=</span> rowData<span class="token punctuation">.</span><span class="token function">getAfterColumnsList</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">JSONObject</span> json <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">JSONObject</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        columns<span class="token punctuation">.</span><span class="token function">forEach</span><span class="token punctuation">(</span>column<span class="token operator">-&gt;</span>json<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span>column<span class="token punctuation">.</span><span class="token function">getName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> column<span class="token punctuation">.</span><span class="token function">getValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">String</span> key <span class="token operator">=</span> table <span class="token operator">+</span> <span class="token string">":"</span> <span class="token operator">+</span> columns<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        log<span class="token punctuation">.</span><span class="token function">info</span><span class="token punctuation">(</span><span class="token string">"Redis中新增或修改Key为: {} 的数据"</span><span class="token punctuation">,</span>key<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        redisTemplate<span class="token punctuation">.</span><span class="token function">opsForValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">set</span><span class="token punctuation">(</span>key<span class="token punctuation">,</span> json<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>然后，我们开发商品增删改查的接口。</p> 
+<pre><code class="prism language-java"><span class="token comment">/**
+ * @author lixiang
+ * @date 2023/6/30 17:48
+ */</span>
+<span class="token annotation punctuation">@RestController</span>
+<span class="token annotation punctuation">@RequestMapping</span><span class="token punctuation">(</span><span class="token string">"/api/v1/product"</span><span class="token punctuation">)</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ProductController</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> <span class="token class-name">ProductService</span> productService<span class="token punctuation">;</span>
+
+    <span class="token comment">/**
+     * 新增
+     * @param product
+     * @return
+     */</span>
+    <span class="token annotation punctuation">@PostMapping</span><span class="token punctuation">(</span><span class="token string">"/save"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> <span class="token class-name">String</span> <span class="token function">save</span><span class="token punctuation">(</span><span class="token annotation punctuation">@RequestBody</span> <span class="token class-name">ProductDO</span> product<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">int</span> flag <span class="token operator">=</span> productService<span class="token punctuation">.</span><span class="token function">addProduct</span><span class="token punctuation">(</span>product<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> flag<span class="token operator">==</span><span class="token number">1</span><span class="token operator">?</span><span class="token string">"SUCCESS"</span><span class="token operator">:</span><span class="token string">"FAIL"</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/**
+     * 修改
+     * @param product
+     * @return
+     */</span>
+    <span class="token annotation punctuation">@PostMapping</span><span class="token punctuation">(</span><span class="token string">"/update"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> <span class="token class-name">String</span> <span class="token function">update</span><span class="token punctuation">(</span><span class="token annotation punctuation">@RequestBody</span> <span class="token class-name">ProductDO</span> product<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">int</span> flag <span class="token operator">=</span> productService<span class="token punctuation">.</span><span class="token function">updateProduct</span><span class="token punctuation">(</span>product<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> flag<span class="token operator">==</span><span class="token number">1</span><span class="token operator">?</span><span class="token string">"SUCCESS"</span><span class="token operator">:</span><span class="token string">"FAIL"</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/**
+     * 根据ID查询
+     * @param id
+     * @return
+     */</span>
+    <span class="token annotation punctuation">@GetMapping</span><span class="token punctuation">(</span><span class="token string">"/findById"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> <span class="token class-name">ProductDO</span> <span class="token function">update</span><span class="token punctuation">(</span><span class="token annotation punctuation">@RequestParam</span><span class="token punctuation">(</span><span class="token string">"id"</span><span class="token punctuation">)</span> <span class="token class-name">Long</span> id<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">ProductDO</span> productDO <span class="token operator">=</span> productService<span class="token punctuation">.</span><span class="token function">selectProductById</span><span class="token punctuation">(</span>id<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> productDO<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/**
+     * 分页查询
+     * @param current
+     * @param size
+     * @return
+     */</span>
+    <span class="token annotation punctuation">@GetMapping</span><span class="token punctuation">(</span><span class="token string">"/page"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> <span class="token class-name">Map</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">String</span><span class="token punctuation">,</span> <span class="token class-name">Object</span><span class="token punctuation">&gt;</span></span> <span class="token function">update</span><span class="token punctuation">(</span><span class="token annotation punctuation">@RequestParam</span><span class="token punctuation">(</span><span class="token string">"current"</span><span class="token punctuation">)</span> <span class="token keyword">int</span> current<span class="token punctuation">,</span><span class="token annotation punctuation">@RequestParam</span><span class="token punctuation">(</span><span class="token string">"size"</span><span class="token punctuation">)</span> <span class="token keyword">int</span> size<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">Map</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">String</span><span class="token punctuation">,</span> <span class="token class-name">Object</span><span class="token punctuation">&gt;</span></span> stringObjectMap <span class="token operator">=</span> productService<span class="token punctuation">.</span><span class="token function">selectProductList</span><span class="token punctuation">(</span>current<span class="token punctuation">,</span> size<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> stringObjectMap<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>新增一个商品进行验证。</p> 
+<p><img src="https://images2.imgbox.com/c0/20/FOSM2ffu_o.jpg" alt="在这里插入图片描述"><img src="https://images2.imgbox.com/d2/16/o1zviyId_o.jpg" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/73/ca/iy0eamnp_o.jpg" alt="在这里插入图片描述"></p> 
+<p>接下来我们将SpringBoot程序打包放到服务器上运行。</p> 
+<pre><code class="prism language-bash">mvn clean package
+</code></pre> 
+<p><img src="https://images2.imgbox.com/48/c8/Y6tIFYW8_o.jpg" alt="在这里插入图片描述"></p> 
+<pre><code class="prism language-bash">守护进程启动  <span class="token function">nohup</span> java -jar multi-level-cache-1.0-SNAPSHOT.jar  <span class="token operator">&amp;</span> 
+</code></pre> 
+<p><img src="https://images2.imgbox.com/40/7d/5QYdeBhJ_o.jpg" alt="在这里插入图片描述"><img src="https://images2.imgbox.com/ef/9d/3SFqHfZJ_o.jpg" alt="在这里插入图片描述"></p> 
+<p>我们验证了DB变化同步缓存，接下来我们来开发，通过Nginx直接读取Redis部分。</p> 
+<p><strong>首先，我们先了解下什么是OpenResty, 为什么要用OpenResty？</strong></p> 
+<pre><code class="prism language-bash">OpenResty由章亦春发起，是基于Ngnix和Lua的高性能web平台，内部集成精良的LUa库、第三方模块、依赖, 开发者可以方便搭建能够处理高并发、扩展性极高的动态web应用、web服务、动态网关。 
+
+OpenResty将Nginx核心、LuaJIT、许多有用的Lua库和Nginx第三方模块打包在一起。
+
+Nginx是C语言开发，如果要二次扩展是很麻烦的，而基于OpenResty，开发人员可以使用 Lua 编程语言对 Nginx 核心模块进行二次开发拓展。
+
+性能强大，OpenResty可以快速构造出1万以上并发连接响应的超高性能Web应用系统。
+</code></pre> 
+<ul><li> <p>对于一些高性能的服务来说，可以直接使用 OpenResty 访问 Mysql或Redis等，</p> </li><li> <p>不需要通过第三方语言（PHP、Python、Ruby）等来访问数据库再返回，这大大提高了应用的性能</p> </li></ul> 
+<p><strong>那么什么是Lua脚本呢？</strong></p> 
+<pre><code class="prism language-bash">Lua 由标准 C 编写而成,没有提供强大的库,但可以很容易的被 C/C++ 代码调用，也可以反过来调用 C/C++ 的函数。 
+
+在应用程序中可以被广泛应用，不过Lua是一种脚本/动态语言，不适合业务逻辑比较重的场景，适合小巧的应用场景
+</code></pre> 
+<p>Ok，接下来我们就开始开发Nginx通过Lua脚本直接读取Redis部分。</p> 
+<pre><code class="prism language-lua"><span class="token comment">-- 引入需要使用到的库</span>
+<span class="token keyword">local</span> redis <span class="token operator">=</span> require <span class="token string">"resty.redis"</span>
+<span class="token keyword">local</span> redis_server <span class="token operator">=</span> <span class="token string">"ip地址"</span>
+<span class="token keyword">local</span> redis_port <span class="token operator">=</span> <span class="token number">6379</span>
+<span class="token keyword">local</span> redis_pwd <span class="token operator">=</span> <span class="token string">"123456"</span>
+
+<span class="token comment">-- 获取 Redis 中存储的数据</span>
+<span class="token keyword">local</span> <span class="token keyword">function</span> <span class="token function">get_from_redis</span><span class="token punctuation">(</span>key<span class="token punctuation">)</span>
+    <span class="token keyword">local</span> red <span class="token operator">=</span> redis<span class="token punctuation">:</span><span class="token function">new</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">local</span> ok<span class="token punctuation">,</span> err <span class="token operator">=</span> red<span class="token punctuation">:</span><span class="token function">connect</span><span class="token punctuation">(</span>redis_server<span class="token punctuation">,</span> redis_port<span class="token punctuation">)</span>
+    red<span class="token punctuation">:</span><span class="token function">auth</span><span class="token punctuation">(</span>redis_pwd<span class="token punctuation">)</span>
+    <span class="token keyword">if</span> <span class="token keyword">not</span> ok <span class="token keyword">then</span>
+    <span class="token comment">-- 如果从 Redis 中获取数据失败，将错误信息写入 Nginx 的错误日志中</span>
+        ngx<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>ERR<span class="token punctuation">,</span> <span class="token string">"failed to connect to Redis: "</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+        <span class="token keyword">return</span> <span class="token string">""</span>
+    <span class="token keyword">end</span>
+    <span class="token keyword">local</span> result<span class="token punctuation">,</span> err <span class="token operator">=</span> red<span class="token punctuation">:</span><span class="token function">get</span><span class="token punctuation">(</span>key<span class="token punctuation">)</span>
+    <span class="token keyword">if</span> <span class="token keyword">not</span> result <span class="token keyword">then</span>
+        ngx<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>ERR<span class="token punctuation">,</span> <span class="token string">"failed to get "</span><span class="token punctuation">,</span> key<span class="token punctuation">,</span> <span class="token string">" from Redis: "</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+        <span class="token keyword">return</span> <span class="token string">""</span>
+    <span class="token keyword">end</span>
+    <span class="token comment">-- 将 Redis 连接放回连接池中</span>
+    red<span class="token punctuation">:</span><span class="token function">set_keepalive</span><span class="token punctuation">(</span><span class="token number">10000</span><span class="token punctuation">,</span> <span class="token number">100</span><span class="token punctuation">)</span>
+    <span class="token keyword">return</span> result
+<span class="token keyword">end</span>
+
+<span class="token comment">-- 获取缓存数据</span>
+<span class="token keyword">local</span> <span class="token keyword">function</span> <span class="token function">get_cache_data</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+		<span class="token comment">-- 获取当前请求的 URI</span>
+    <span class="token keyword">local</span> uri <span class="token operator">=</span> ngx<span class="token punctuation">.</span>var<span class="token punctuation">.</span>uri
+    <span class="token comment">-- 获取当前请求的 id 参数</span>
+    <span class="token keyword">local</span> id <span class="token operator">=</span> ngx<span class="token punctuation">.</span>var<span class="token punctuation">.</span>arg_id
+		<span class="token comment">-- 将 URI 写入 Nginx 的错误日志中</span>
+    ngx<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>ERR<span class="token punctuation">,</span> <span class="token string">"URI： "</span><span class="token punctuation">,</span> uri<span class="token punctuation">)</span> 
+    <span class="token comment">-- 将当前请求的所有参数写入 Nginx 的错误日志中</span>
+    ngx<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>ERR<span class="token punctuation">,</span> <span class="token string">"Args： "</span><span class="token punctuation">,</span> ngx<span class="token punctuation">.</span>var<span class="token punctuation">.</span>args<span class="token punctuation">)</span>
+
+    <span class="token keyword">local</span> start_pos <span class="token operator">=</span> string<span class="token punctuation">.</span><span class="token function">find</span><span class="token punctuation">(</span>uri<span class="token punctuation">,</span> <span class="token string">"/"</span><span class="token punctuation">,</span> <span class="token number">6</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token number">1</span>  
+    <span class="token keyword">local</span> end_pos <span class="token operator">=</span> string<span class="token punctuation">.</span><span class="token function">find</span><span class="token punctuation">(</span>uri<span class="token punctuation">,</span> <span class="token string">"/"</span><span class="token punctuation">,</span> start_pos<span class="token punctuation">)</span>
+    <span class="token comment">-- 截取第三个和第四个斜杠之间的子串</span>
+    <span class="token keyword">local</span> cache_prefix <span class="token operator">=</span> string<span class="token punctuation">.</span><span class="token function">sub</span><span class="token punctuation">(</span>uri<span class="token punctuation">,</span> start_pos<span class="token punctuation">,</span> end_pos <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">)</span>   
+    <span class="token comment">-- Redis 中键的名称由子串和 id 组成</span>
+    <span class="token keyword">local</span> key <span class="token operator">=</span> cache_prefix <span class="token operator">..</span> <span class="token string">":"</span> <span class="token operator">..</span> id
+
+    <span class="token keyword">local</span> result <span class="token operator">=</span> <span class="token function">get_from_redis</span><span class="token punctuation">(</span>key<span class="token punctuation">)</span>
+
+    <span class="token keyword">if</span> result <span class="token operator">==</span> <span class="token keyword">nil</span> <span class="token keyword">or</span> result <span class="token operator">==</span> ngx<span class="token punctuation">.</span>null <span class="token keyword">or</span> result <span class="token operator">==</span> <span class="token string">""</span> <span class="token keyword">then</span>
+				<span class="token comment">-- Redis 中未命中，需要到服务器后端获取数据</span>
+        ngx<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>ERR<span class="token punctuation">,</span> <span class="token string">"not hit cache, key = "</span><span class="token punctuation">,</span> key<span class="token punctuation">)</span>
+    <span class="token keyword">else</span>
+        <span class="token comment">-- Redis 命中，返回结果</span>
+        ngx<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>ERR<span class="token punctuation">,</span> <span class="token string">"hit cache, key = "</span><span class="token punctuation">,</span> key<span class="token punctuation">)</span>
+        <span class="token comment">-- 直接将 Redis 中存储的结果返回给客户端</span>
+        ngx<span class="token punctuation">.</span><span class="token function">say</span><span class="token punctuation">(</span>result<span class="token punctuation">)</span>
+        <span class="token comment">-- 结束请求，客户端无需再等待响应</span>
+        ngx<span class="token punctuation">.</span><span class="token function">exit</span><span class="token punctuation">(</span>ngx<span class="token punctuation">.</span>HTTP_OK<span class="token punctuation">)</span>
+    <span class="token keyword">end</span>
+<span class="token keyword">end</span>
+
+<span class="token comment">-- 执行获取缓存数据的功能</span>
+<span class="token function">get_cache_data</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>将Lua脚本放到服务器制定的目录下。</p> 
+<p><img src="https://images2.imgbox.com/5c/34/qr1jnas2_o.jpg" alt="在这里插入图片描述"></p> 
+<p>新建lua目录，创建cache.lua文件。</p> 
+<p><img src="https://images2.imgbox.com/46/7c/KOyJCvks_o.jpg" alt="在这里插入图片描述"></p> 
+<p>然后，我们进行配置nginx。</p> 
+<ul><li>nginx配置反向代理，结合lua脚本读取redis。</li><li>如果redis缓存命中，则读取缓存数据直接返回。</li><li>如果缓存未命中，则反向代理请求后端接口获取数据返回。</li></ul> 
+<pre><code class="prism language-conf">#user  nobody;
+worker_processes  1;
+
+#error_log  logs/error.log;
+#error_log  logs/error.log  notice;
+#error_log  logs/error.log  info;
+
+#pid        logs/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    #配置下编码，不然浏览器会乱码
+    charset utf-8;
+    #log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+    #                  '$status $body_bytes_sent "$http_referer" '
+    #                  '"$http_user_agent" "$http_x_forwarded_for"';
+
+    #access_log  logs/access.log  main;
+
+    sendfile        on;
+    #tcp_nopush     on;
+
+    #keepalive_timeout  0;
+    keepalive_timeout  65;
+
+    #gzip  on;
+    # 这里设置为 off，是为了避免每次修改之后都要重新 reload 的麻烦。
+		# 在生产环境上需要 lua_code_cache 设置成 on。
+		
+    lua_code_cache off;
+     # 虚拟机主机块,还需要配置lua文件扫描路径
+    lua_package_path "$prefix/lualib/?.lua;;";
+    lua_package_cpath "$prefix/lualib/?.so;;";
+	
+		#配置反向代理到后端spring boot程序
+    upstream backend {
+      server 127.0.0.1:8888;
+    }
+
+    server {
+        listen       80;
+        server_name  localhost;
+        location /api {
+            default_type 'text/plain';
+            if ($request_method = GET) {
+                access_by_lua_file /usr/local/openresty/lua/cache.lua;
+            }
+            proxy_pass http://backend;
+            proxy_set_header Host $http_host;
+        }
+    }
+}
+</code></pre> 
+<pre><code class="prism language-bash">./nginx -c /usr/local/openresty/nginx/conf/nginx.conf -s reload
+</code></pre> 
+<p><strong>nginx启动成功。</strong></p> 
+<p><img src="https://images2.imgbox.com/d2/61/bCyPcbPB_o.jpg" alt="在这里插入图片描述"></p> 
+<p>OK，我们接下来进行测试验证，首先先访问Redis中有缓存的数据。通过Nginx直接访问Redis。</p> 
+<pre><code class="prism language-bash">http://payne.f3322.net:8888/api/v1/product/findById?id<span class="token operator">=</span><span class="token number">3</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/e1/0b/FFygvaLU_o.jpg" alt="在这里插入图片描述"></p> 
+<p>然后我们在访问Redis中没有缓存的数据。没有命中到缓存，直接穿透到SpringBoot程序。</p> 
+<pre><code class="prism language-bash">http://payne.f3322.net:8888/api/v1/product/findById?id<span class="token operator">=</span><span class="token number">2</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/56/ed/ZDCMZufj_o.jpg" alt="在这里插入图片描述"><img src="https://images2.imgbox.com/11/2c/LZnikSDw_o.jpg" alt="在这里插入图片描述"></p> 
+<p>新增数据时，会往Redis中进行同步。</p> 
+<pre><code class="prism language-bash">http://payne.f3322.net:8888/api/v1/product/save
+
+<span class="token punctuation">{<!-- --></span>
+    <span class="token string">"title"</span><span class="token builtin class-name">:</span><span class="token string">"Mac Pro 13"</span>,
+    <span class="token string">"coverImg"</span><span class="token builtin class-name">:</span><span class="token string">"/group/4.png"</span>,
+    <span class="token string">"amount"</span><span class="token builtin class-name">:</span><span class="token string">"19999.00"</span>,
+    <span class="token string">"summary"</span><span class="token builtin class-name">:</span><span class="token string">"Mac Pro 13"</span>,
+    <span class="token string">"detail"</span><span class="token builtin class-name">:</span><span class="token string">"Mac Pro 13"</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/80/0c/LIHosoxh_o.jpg" alt="在这里插入图片描述"></p> 
+<p><strong>OK，至此多级缓存案例就完成啦。记得给博主一个三连哦！</strong></p> 
+<p><img src="https://images2.imgbox.com/5e/a1/oKYkRHvQ_o.jpg" alt="在这里插入图片描述"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/438a9b0453100d5014912c567a8283f9/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">推荐一个好用的Python词云展示库-wordcloud</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f78f74c3a95930c684fbcec557bc90e1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">2020电赛F题总结回顾（openmv实现视觉）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

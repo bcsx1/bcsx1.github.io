@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Array王锐力作：osg与PhysX结合系列内容——第5节 角色动画效果（下） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Array王锐力作：osg与PhysX结合系列内容——第5节 角色动画效果（下）" />
+<meta property="og:description" content="〖Array王锐大神力作〗osg与PhysX结合系列内容——角色动画效果（下） 角色动作的过渡切换角色动画高级技巧构建测试场景并运行数据驱动的角色运动 角色动作的过渡切换 我们在研究下一步的高级角色动作之前，先看一下ozz的角色运动更新机制，这样也可以为我们后续“魔改”这个引擎的内部逻辑打下更好的基础。
+ozz的动画更新流程主要分为下面四个步骤：
+动画数据的采样：即根据上一帧到这一帧的时间间隔，计算动画应该经过的时间，进而从关键帧插值解算出每个关节点的局部坐标。多个动画的融合：将多个动画采样的结果按照独立的权重，融合在一起，得到最终叠加后每个关节点的局部坐标。这个步骤对于角色动画的过渡效果实现是至关重要的。骨骼数据的更新：将之前解算得到的角色动画关节点的局部坐标，匹配到实际角色的骨骼上，并计算得到骨骼坐标系（“世界”坐标系）下每个关节的实际位置矩阵。蒙皮和模型网格的更新：根据每个关节位置的变化，以及关节与模型各顶点之间的权重关系（即蒙皮），计算每个顶点更新后的位置坐标，以及法线结果，更新到模型网格上。 ozz将这套流程中的每个步骤都封装成独立的工作线程，也就是一个独立的Job。ozz自己负责每个Job的并行执行和效率效果，而各个步骤之间输入和输出的中间数据，我们随时都可以介入修改或者替换，这也使得ozz成为了一个非常灵活而且强大的中间件工具。
+角色动画高级技巧 如图所示就是整个ozz系统大致的工作流程。注意SoA的含义是“Struct of Array”，在这里也就是一组关节数据的意思。
+ozz允许多个动画被同时载入和采样，然后将它们计算的结果融合到一起。当然，每个动画应当有不同的权重值设置。一般来说，所有动画的权重之和不应该超过1.0，否则可能会有一些奇怪的结果出现。
+从工作流程图中可以看出，每个动画都会用到一个独立的SamplingJob采样器，它会在动画数据的时间线上选择一个时刻，并计算该时刻对应的各关节位置姿态数值。
+每个采样器输出的位置姿态结果，合并到BlendingJob中，按照不同的权重混合，就可以得到介于两个动画效果之间的一组新的位置姿态值。
+采样器的权重值即可以全局设置，也可以根据每个关节来独立设置，因此可以实现精准的动画融合策略。
+我们先来考虑全局权重设置的典型应用场景：假设有两个动画采样器，分别对应于“站立”（idle）和“走路”（walking）。
+从站立姿态切换到走路姿态，或者反之的时候。如果直接切换，那么骨骼关节肯定会从当前的位置姿态突变到一个新的姿态。这个过程显得比较突兀，有必要加入一个合理的过渡过程。
+考虑从站立姿态切换到走路姿态，过渡时间为0.5s。那么所谓的过渡实质上就是：idle采样器的权重值从1到0，而walking采样器的权重值从0到1。每个时刻t的动画融合结果应该是：
+sampler[idle] * (1.0 - t / 0.5) &#43;sampler[walking] * (t / 0.5)，其中t∈[0, 0.5] 实现的过渡过程如视频所示。在osgPhysX中这一切都是通过select()和seek()函数结合动画和权重参数配合完成，此处不再赘述。
+角色动画效果-part1
+简单的方法，无疑能够让我们的动画系统增色不少。那么下一步我们再看看有没有更高级的动画技巧可用。
+1、分部融合（Partial Blend）
+考虑两个动画采样器，例如“走路”（walking）和“手枪瞄准”（pistol_aiming），它们各自有独立完整的动画流程，直接融合在一起肯定是不伦不类的。但是在实际应用中显然存在着这样一类需求：角色没有持枪的时候双手下垂，跑步的时候则是摆臂姿势；但是如果角色同时持枪瞄准，则无论站立还是跑步的时候，都需要做出举枪瞄准的手势，虽然这个时候角色下半身的运动姿态通常是不变的。如果为所有“持枪”和“未持枪”的动作都制作两套动画，那么无疑是一种资源的浪费。因此，前文提出的“根据每个关节来独立设置权重”的方案在这里就非常有价值了。我们可以设置walking采样器中，所有脊柱（spine）之下的关节的独立权重都是1.0，而脊柱之上的关节权重都是0.0；同理，pistol_aiming采样器中，脊柱之下的关节权重都是0.0，而脊柱之上的关节权重是1.0，从而得到这种融合的效果，如视频所示。 角色动画效果-part2
+osgPhysX中通过selectPartial()函数来实现这类复杂的权重设置。 2、附属物品（Attachment）
+附属物品，顾名思义就是随着人体某个关节运动的物品。例如拿在手中的手枪和棍棒，或者别在腰间的腰带，手机，抑或头上戴的帽子和脖子上绕着的披风。附属物品的设计可以复杂（例如柔体，衣物，或者和多个关节关联）也可以简单，不过它们都需要一个最基本的信息，就是被附属的关节在当前时刻的位置和姿态。这个位置姿态矩阵属于角色自身的模型坐标系，也就是以角色根节点为原点的坐标系统。以Mixamo的角色为例，角色模型坐标系的原点位于站立姿态时双脚在地面的中心点，Y&#43;方向为角色向上的方向，Z&#43;方向为角色向前的方向。如视频所示，osgPhysX提供了专门的封装函数getModelSpaceJointMatrix()来实时获取任何关节的模型坐标系矩阵，注意一定要在update()和update*IK()之后再执行这个函数，否则得到的矩阵值可能不是最新的。 角色动画效果-part3
+3、反向运动学（IK）
+反向运动学，简单来说就是通过子骨骼关节的目标位置姿态来反推算上级父关节的位置姿态。这样得到的结果可能有多个，但是我们可以添加更多的约束条件来更精准的结果。IK算法有很多的分支，例如Unreal中的TwoBoneIK，FABRIK，CCDIK等。ozz本身实现了TwoBoneIK（定义三个关节为一组，通过末端关节的运动推算前两个关节）和AimIK（定义一组多个关节和权重，通过末端点的运动位置和方向，推算各个关节的位置姿态）。osgPhysX中通过updateAimIK()和updateTwoBoneIK()两个函数来封装ozz的IK功能，如视频所示，因为部分参数设置和调优的问题，在某些角度IK肯定还是存在变形，但是大多数情况下已经可以用于具体的应用需求了。 角色动画效果-part4
+构建测试场景并运行 我们在osgPhysX/tests/character_animation_test.cpp中实现了上述所有的动画功能，这样至少能够让我们的系统看起来像是一个高级游戏角色引擎的原型了。
+程序代码中，首先通过loadAnimations()加载所有的预设动画：这些动画都来自于mixamo，并保存到osgPhysX/utils/ozz/tools/data目录下，我们将所有的动画ozz文件都保存到执行程序目录中的一个子文件夹animations中，并且将skeleton和mesh的ozz文件放在执行目录下。
+程序运行时，可以通过PageUp/PageDown来切换显示不同的动画效果，每次切换中间已经做了0.5秒的过渡。
+可以通过Home键来显示PartialBlend的效果，即当前动画效果与持枪效果的叠加；按End键恢复正常状态。
+可以通过Insert/Delete键来显隐IK效果，并通过数字键0-4切换不同的IK部位（头/手/脚）跟随鼠标运动。
+按Tab键之后，角色会始终手持一个圆柱体（用来演示Attachment功能），无论他在什么动画状态下。
+更多的动画功能，就有待读者去挖掘了，下一章我们还是回归物理引擎比较好。
+数据驱动的角色运动 因为ozz的存在，我们完全有可能通过外部输入的骨骼数据来驱动一个动画角色。只要能够提供每个关节在角色模型坐标系下的位置和姿态数据，就可以通过外部的数据来驱动角色的实时肢体运动。
+这里所说的外部数据包括但不限于Microsoft Kinect，运动捕捉设备，或者一些比较新的AI运动预测算法（例如OpenPose&#43;3dbaseline）等。对于osgPhysX而言，只需要逐帧通过setModelSpaceJointMatrix()来设置关节数据；另一种方案是只采集头部，双手和双脚的IK数据，然后推算中间的关节姿态。不过相关的实现案例，暂时并不属于本教程所关注的内容。
+至此，我们花了巨大的篇幅，在实现和讲解物理引擎的同时，重新塑造了基于osg的角色动画系统，并且让它有了完整的工作流程（从Mixamo到ozz，再到osg中显示），以及支持多种常用的角色动画技巧（动画过渡，动作叠加，附属物，IK等）。
+也许后续我们会将这个角色动画系统从osgPhysX中独立出来，单独开源和加以改造应用；又或者有感兴趣的朋友可以加入到osgPhysX的贡献工作中，或者单独摘出这部分代码进行魔改，将角色系统调优和发扬光大。不过截至目前，它还只是一个独立的类（osgPhysicsUtils::PlayerAnimation），以及一个独立的例子罢了。
+更多的可能性，就随着这个教程的延续（不过我们下一章会开始一个全新的话题），以及随着时间，慢慢发酵吧~" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/47aead7c0f3ef9560fa7960dbefd9ec4/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-11-05T17:39:59+08:00" />
+<meta property="article:modified_time" content="2021-11-05T17:39:59+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Array王锐力作：osg与PhysX结合系列内容——第5节 角色动画效果（下）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-github-gist">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>〖Array王锐大神力作〗osg与PhysX结合系列内容——角色动画效果（下）</h4> 
+ <ul><li><ul><li><a href="#_1" rel="nofollow">角色动作的过渡切换</a></li><li><a href="#_13" rel="nofollow">角色动画高级技巧</a></li><li><a href="#_64" rel="nofollow">构建测试场景并运行</a></li><li><a href="#_79" rel="nofollow">数据驱动的角色运动</a></li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<h3><a id="_1"></a>角色动作的过渡切换</h3> 
+<p>我们在研究下一步的高级角色动作之前，先看一下ozz的角色运动更新机制，这样也可以为我们后续“魔改”这个引擎的内部逻辑打下更好的基础。</p> 
+<p>ozz的动画更新流程主要分为下面四个步骤：</p> 
+<ul><li>动画数据的采样：即根据上一帧到这一帧的时间间隔，计算动画应该经过的时间，进而从关键帧插值解算出每个关节点的局部坐标。</li><li>多个动画的融合：将多个动画采样的结果按照独立的权重，融合在一起，得到最终叠加后每个关节点的局部坐标。这个步骤对于角色动画的过渡效果实现是至关重要的。</li><li>骨骼数据的更新：将之前解算得到的角色动画关节点的局部坐标，匹配到实际角色的骨骼上，并计算得到骨骼坐标系（“世界”坐标系）下每个关节的实际位置矩阵。</li><li>蒙皮和模型网格的更新：根据每个关节位置的变化，以及关节与模型各顶点之间的权重关系（即蒙皮），计算每个顶点更新后的位置坐标，以及法线结果，更新到模型网格上。</li></ul> 
+<p>ozz将这套流程中的每个步骤都封装成独立的工作线程，也就是一个独立的Job。ozz自己负责每个Job的并行执行和效率效果，而各个步骤之间输入和输出的中间数据，我们随时都可以介入修改或者替换，这也使得ozz成为了一个非常灵活而且强大的中间件工具。</p> 
+<h3><a id="_13"></a>角色动画高级技巧</h3> 
+<p>如图所示就是整个ozz系统大致的工作流程。注意SoA的含义是“Struct of Array”，在这里也就是一组关节数据的意思。</p> 
+<p><img src="https://images2.imgbox.com/d5/b4/UWytZVpv_o.png" alt="在这里插入图片描述"><br> ozz允许多个动画被同时载入和采样，然后将它们计算的结果融合到一起。当然，每个动画应当有不同的权重值设置。一般来说，所有动画的权重之和不应该超过1.0，否则可能会有一些奇怪的结果出现。</p> 
+<p>从工作流程图中可以看出，每个动画都会用到一个独立的SamplingJob采样器，它会在动画数据的时间线上选择一个时刻，并计算该时刻对应的各关节位置姿态数值。</p> 
+<p>每个采样器输出的位置姿态结果，合并到BlendingJob中，按照不同的权重混合，就可以得到介于两个动画效果之间的一组新的位置姿态值。</p> 
+<p>采样器的权重值即可以全局设置，也可以根据每个关节来独立设置，因此可以实现精准的动画融合策略。</p> 
+<p>我们先来考虑全局权重设置的典型应用场景：假设有两个动画采样器，分别对应于“站立”（idle）和“走路”（walking）。</p> 
+<p>从站立姿态切换到走路姿态，或者反之的时候。如果直接切换，那么骨骼关节肯定会从当前的位置姿态突变到一个新的姿态。这个过程显得比较突兀，有必要加入一个合理的过渡过程。</p> 
+<p>考虑从站立姿态切换到走路姿态，过渡时间为0.5s。那么所谓的过渡实质上就是：idle采样器的权重值从1到0，而walking采样器的权重值从0到1。每个时刻t的动画融合结果应该是：</p> 
+<ul><li>sampler[idle] * (1.0 - t / 0.5) +</li><li>sampler[walking] * (t / 0.5)，其中t∈[0, 0.5]</li></ul> 
+<p>实现的过渡过程如视频所示。在osgPhysX中这一切都是通过select()和seek()函数结合动画和权重参数配合完成，此处不再赘述。</p> 
+<p></p> 
+<div class="csdn-video-box"> 
+ <iframe id="8m0gS4rD-1636103609219" frameborder="0" src="https://player.bilibili.com/player.html?aid=591489290&amp;page=1" allowfullscreen="true" data-mediaembed="bilibili"></iframe> 
+ <p>角色动画效果-part1</p> 
+</div> 
+<p></p> 
+<p>简单的方法，无疑能够让我们的动画系统增色不少。那么下一步我们再看看有没有更高级的动画技巧可用。</p> 
+<p><strong>1、分部融合（Partial Blend）</strong></p> 
+<ul><li>考虑两个动画采样器，例如“走路”（walking）和“手枪瞄准”（pistol_aiming），它们各自有独立完整的动画流程，直接融合在一起肯定是不伦不类的。</li><li>但是在实际应用中显然存在着这样一类需求：角色没有持枪的时候双手下垂，跑步的时候则是摆臂姿势；但是如果角色同时持枪瞄准，则无论站立还是跑步的时候，都需要做出举枪瞄准的手势，虽然这个时候角色下半身的运动姿态通常是不变的。如果为所有“持枪”和“未持枪”的动作都制作两套动画，那么无疑是一种资源的浪费。因此，前文提出的“根据每个关节来独立设置权重”的方案在这里就非常有价值了。</li><li>我们可以设置walking采样器中，所有脊柱（spine）之下的关节的独立权重都是1.0，而脊柱之上的关节权重都是0.0；同理，pistol_aiming采样器中，脊柱之下的关节权重都是0.0，而脊柱之上的关节权重是1.0，从而得到这种融合的效果，如视频所示。</li></ul> 
+<p></p> 
+<div class="csdn-video-box"> 
+ <iframe id="YGMGr1LN-1636104628137" frameborder="0" src="https://player.bilibili.com/player.html?aid=591489290&amp;page=2" allowfullscreen="true" data-mediaembed="bilibili"></iframe> 
+ <p>角色动画效果-part2</p> 
+</div> 
+<p></p> 
+<ul><li>osgPhysX中通过selectPartial()函数来实现这类复杂的权重设置。</li></ul> 
+<p><strong>2、附属物品（Attachment）</strong></p> 
+<ul><li>附属物品，顾名思义就是随着人体某个关节运动的物品。例如拿在手中的手枪和棍棒，或者别在腰间的腰带，手机，抑或头上戴的帽子和脖子上绕着的披风。</li><li>附属物品的设计可以复杂（例如柔体，衣物，或者和多个关节关联）也可以简单，不过它们都需要一个最基本的信息，就是被附属的关节在当前时刻的位置和姿态。</li><li>这个位置姿态矩阵属于角色自身的模型坐标系，也就是以角色根节点为原点的坐标系统。以Mixamo的角色为例，角色模型坐标系的原点位于站立姿态时双脚在地面的中心点，Y+方向为角色向上的方向，Z+方向为角色向前的方向。</li><li>如视频所示，osgPhysX提供了专门的封装函数getModelSpaceJointMatrix()来实时获取任何关节的模型坐标系矩阵，注意一定要在update()和update*IK()之后再执行这个函数，否则得到的矩阵值可能不是最新的。</li></ul> 
+<p></p> 
+<div class="csdn-video-box"> 
+ <iframe id="klLkJ5b6-1636104335201" frameborder="0" src="https://player.bilibili.com/player.html?aid=591489290&amp;page=3" allowfullscreen="true" data-mediaembed="bilibili"></iframe> 
+ <p>角色动画效果-part3</p> 
+</div> 
+<p></p> 
+<p><strong>3、反向运动学（IK）</strong></p> 
+<ul><li>反向运动学，简单来说就是通过子骨骼关节的目标位置姿态来反推算上级父关节的位置姿态。这样得到的结果可能有多个，但是我们可以添加更多的约束条件来更精准的结果。</li><li>IK算法有很多的分支，例如Unreal中的TwoBoneIK，FABRIK，CCDIK等。ozz本身实现了TwoBoneIK（定义三个关节为一组，通过末端关节的运动推算前两个关节）和AimIK（定义一组多个关节和权重，通过末端点的运动位置和方向，推算各个关节的位置姿态）。</li><li>osgPhysX中通过updateAimIK()和updateTwoBoneIK()两个函数来封装ozz的IK功能，如视频所示，因为部分参数设置和调优的问题，在某些角度IK肯定还是存在变形，但是大多数情况下已经可以用于具体的应用需求了。</li></ul> 
+<p></p> 
+<div class="csdn-video-box"> 
+ <iframe id="l9eThMk0-1636104944094" frameborder="0" src="https://player.bilibili.com/player.html?aid=591489290&amp;page=4" allowfullscreen="true" data-mediaembed="bilibili"></iframe> 
+ <p>角色动画效果-part4</p> 
+</div> 
+<p></p> 
+<h3><a id="_64"></a>构建测试场景并运行</h3> 
+<p>我们在osgPhysX/tests/character_animation_test.cpp中实现了上述所有的动画功能，这样至少能够让我们的系统看起来像是一个高级游戏角色引擎的原型了。</p> 
+<p>程序代码中，首先通过loadAnimations()加载所有的预设动画：这些动画都来自于mixamo，并保存到osgPhysX/utils/ozz/tools/data目录下，我们将所有的动画ozz文件都保存到执行程序目录中的一个子文件夹animations中，并且将skeleton和mesh的ozz文件放在执行目录下。<br> <img src="https://images2.imgbox.com/00/25/OnjtoaKW_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/bc/1f/suLPgV8S_o.png" alt="在这里插入图片描述"><br> 程序运行时，可以通过PageUp/PageDown来切换显示不同的动画效果，每次切换中间已经做了0.5秒的过渡。</p> 
+<p>可以通过Home键来显示PartialBlend的效果，即当前动画效果与持枪效果的叠加；按End键恢复正常状态。</p> 
+<p>可以通过Insert/Delete键来显隐IK效果，并通过数字键0-4切换不同的IK部位（头/手/脚）跟随鼠标运动。</p> 
+<p>按Tab键之后，角色会始终手持一个圆柱体（用来演示Attachment功能），无论他在什么动画状态下。<br> 更多的动画功能，就有待读者去挖掘了，下一章我们还是回归物理引擎比较好。</p> 
+<h3><a id="_79"></a>数据驱动的角色运动</h3> 
+<p>因为ozz的存在，我们完全有可能通过外部输入的骨骼数据来驱动一个动画角色。只要能够提供每个关节在角色模型坐标系下的位置和姿态数据，就可以通过外部的数据来驱动角色的实时肢体运动。</p> 
+<p>这里所说的外部数据包括但不限于Microsoft Kinect，运动捕捉设备，或者一些比较新的AI运动预测算法（例如OpenPose+3dbaseline）等。对于osgPhysX而言，只需要逐帧通过setModelSpaceJointMatrix()来设置关节数据；另一种方案是只采集头部，双手和双脚的IK数据，然后推算中间的关节姿态。不过相关的实现案例，暂时并不属于本教程所关注的内容。</p> 
+<p>至此，我们花了巨大的篇幅，在实现和讲解物理引擎的同时，重新塑造了基于osg的角色动画系统，并且让它有了完整的工作流程（从Mixamo到ozz，再到osg中显示），以及支持多种常用的角色动画技巧（动画过渡，动作叠加，附属物，IK等）。</p> 
+<p>也许后续我们会将这个角色动画系统从osgPhysX中独立出来，单独开源和加以改造应用；又或者有感兴趣的朋友可以加入到osgPhysX的贡献工作中，或者单独摘出这部分代码进行魔改，将角色系统调优和发扬光大。不过截至目前，它还只是一个独立的类（osgPhysicsUtils::PlayerAnimation），以及一个独立的例子罢了。</p> 
+<p>更多的可能性，就随着这个教程的延续（不过我们下一章会开始一个全新的话题），以及随着时间，慢慢发酵吧~</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2d15dd67db9777e9cf0fe49678041a0a/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">研究一下exp, ln, pow的数值计算</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/80ae6cfa5ddc4f1791ed44f333f99d36/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">线性代数代码实现（七）求解线性方程组（C&#43;&#43;）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

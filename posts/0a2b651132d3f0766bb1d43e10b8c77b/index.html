@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Phoenix构建HBase二级索引案例实战 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Phoenix构建HBase二级索引案例实战" />
+<meta property="og:description" content="目录
+一、为什么要使用二级索引？
+二、全局索引和本地索引
+三、可变索引和不可变索引
+四、配置HBase支持Phoenix二级索引
+五、实战
+5.1 在phoenix中创建表
+5.2 导入测试数据
+5.3 Global Indexing的二级索引测试
+5.4 Local Indexing的二级索引测试
+5.5 如何确保query查询使用Index
+5.6 索引重建
+5.7 删除索引
+六、索引性能调优
+一、为什么要使用二级索引？ 对于HBase而言，如果想精确地定位到某行记录，唯一的办法是通过rowkey来查询。如果不通过rowkey来查找数据，就必须逐行地比较每一列的值，即全表扫瞄。
+对于较大的表，全表扫描的代价是不可接受的。但是，很多情况下，需要从多个角度查询数据。
+例如，在定位某个人的时候，可以通过姓名、身份证号、学籍号等不同的角度来查询
+要想把这么多角度的数据都放到rowkey中几乎不可能（业务的灵活性不允许，对rowkey长度的要求也不允许）。
+所以需要secondary index（二级索引）来完成这件事。secondary index的原理很简单，但是如果自己维护的话则会麻烦一些。
+现在，Phoenix已经提供了对HBase secondary index的支持。
+二、全局索引和本地索引 2.1 Global Indexing
+Global indexing，全局索引，适用于==读多写少==的业务场景。
+使用Global indexing在写数据的时候开销很大，因为所有对数据表的更新操作（DELETE, UPSERT VALUES and UPSERT SELECT），都会引起索引表的更新，而索引表是分布在不同的数据节点上的，跨节点的数据传输带来了较大的性能消耗。
+在读数据的时候Phoenix会选择索引表来降低查询消耗的时间。
+在默认情况下如果想查询的字段不是索引字段的话索引表不会被使用，也就是说不会带来查询速度的提升。
+2.2 Local Indexing
+Local indexing，本地索引，适用于==写操作频繁==以及空间受限制的场景。
+与Global indexing一样，Phoenix会自动判定在进行查询的时候是否使用索引。
+使用Local indexing时，索引数据和数据表的数据存放在相同的服务器中，这样避免了在写操作的时候往不同服务器的索引表中写索引带来的额外开销。
+使用Local indexing的时候即使查询的字段不是索引字段索引表也会被使用，这会带来查询速度的提升，这点跟Global indexing不同。对于Local Indexing，一个数据表的所有索引数据都存储在一个单一的独立的可共享的表中。
+三、可变索引和不可变索引 3.1 immutable index
+immutable index，不可变索引，适用于数据==只增加不更新并且按照时间先后顺序存储==（time-series data）的场景，如保存日志数据或者事件数据等。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/0a2b651132d3f0766bb1d43e10b8c77b/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-08-28T16:06:47+08:00" />
+<meta property="article:modified_time" content="2020-08-28T16:06:47+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Phoenix构建HBase二级索引案例实战</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p id="main-toc"><strong>目录</strong></p> 
+<p id="%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E7%94%A8%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%EF%BC%9F-toc" style="margin-left:40px;"><a href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E7%94%A8%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%EF%BC%9F" rel="nofollow">一、为什么要使用二级索引？</a></p> 
+<p id="%E4%BA%8C%E3%80%81%E5%85%A8%E5%B1%80%E7%B4%A2%E5%BC%95%E5%92%8C%E6%9C%AC%E5%9C%B0%E7%B4%A2%E5%BC%95-toc" style="margin-left:40px;"><a href="#%E4%BA%8C%E3%80%81%E5%85%A8%E5%B1%80%E7%B4%A2%E5%BC%95%E5%92%8C%E6%9C%AC%E5%9C%B0%E7%B4%A2%E5%BC%95" rel="nofollow">二、全局索引和本地索引</a></p> 
+<p id="%E4%B8%89%E3%80%81%E5%8F%AF%E5%8F%98%E7%B4%A2%E5%BC%95%E5%92%8C%E4%B8%8D%E5%8F%AF%E5%8F%98%E7%B4%A2%E5%BC%95-toc" style="margin-left:40px;"><a href="#%E4%B8%89%E3%80%81%E5%8F%AF%E5%8F%98%E7%B4%A2%E5%BC%95%E5%92%8C%E4%B8%8D%E5%8F%AF%E5%8F%98%E7%B4%A2%E5%BC%95" rel="nofollow">三、可变索引和不可变索引</a></p> 
+<p id="%E5%9B%9B%E3%80%81%E9%85%8D%E7%BD%AEHBase%E6%94%AF%E6%8C%81Phoenix%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95-toc" style="margin-left:40px;"><a href="#%E5%9B%9B%E3%80%81%E9%85%8D%E7%BD%AEHBase%E6%94%AF%E6%8C%81Phoenix%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95" rel="nofollow">四、配置HBase支持Phoenix二级索引</a></p> 
+<p id="%E4%BA%94%E3%80%81%E5%AE%9E%E6%88%98-toc" style="margin-left:40px;"><a href="#%E4%BA%94%E3%80%81%E5%AE%9E%E6%88%98" rel="nofollow">五、实战</a></p> 
+<p id="5.1%20%E5%9C%A8phoenix%E4%B8%AD%E5%88%9B%E5%BB%BA%E8%A1%A8-toc" style="margin-left:80px;"><a href="#5.1%20%E5%9C%A8phoenix%E4%B8%AD%E5%88%9B%E5%BB%BA%E8%A1%A8" rel="nofollow">5.1 在phoenix中创建表</a></p> 
+<p id="5.2%20%E5%AF%BC%E5%85%A5%E6%B5%8B%E8%AF%95%E6%95%B0%E6%8D%AE-toc" style="margin-left:80px;"><a href="#5.2%20%E5%AF%BC%E5%85%A5%E6%B5%8B%E8%AF%95%E6%95%B0%E6%8D%AE" rel="nofollow">5.2 导入测试数据</a></p> 
+<p id="5.3%20Global%20Indexing%E7%9A%84%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E6%B5%8B%E8%AF%95-toc" style="margin-left:80px;"><a href="#5.3%20Global%20Indexing%E7%9A%84%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E6%B5%8B%E8%AF%95" rel="nofollow">5.3 Global Indexing的二级索引测试</a></p> 
+<p id="5.4%20Local%20Indexing%E7%9A%84%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E6%B5%8B%E8%AF%95-toc" style="margin-left:80px;"><a href="#5.4%20Local%20Indexing%E7%9A%84%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E6%B5%8B%E8%AF%95" rel="nofollow">5.4 Local Indexing的二级索引测试</a></p> 
+<p id="5.5%20%E5%A6%82%E4%BD%95%E7%A1%AE%E4%BF%9Dquery%E6%9F%A5%E8%AF%A2%E4%BD%BF%E7%94%A8Index-toc" style="margin-left:80px;"><a href="#5.5%20%E5%A6%82%E4%BD%95%E7%A1%AE%E4%BF%9Dquery%E6%9F%A5%E8%AF%A2%E4%BD%BF%E7%94%A8Index" rel="nofollow">5.5 如何确保query查询使用Index</a></p> 
+<p id="5.6%20%E7%B4%A2%E5%BC%95%E9%87%8D%E5%BB%BA-toc" style="margin-left:80px;"><a href="#5.6%20%E7%B4%A2%E5%BC%95%E9%87%8D%E5%BB%BA" rel="nofollow">5.6 索引重建</a></p> 
+<p id="5.7%20%E5%88%A0%E9%99%A4%E7%B4%A2%E5%BC%95-toc" style="margin-left:80px;"><a href="#5.7%20%E5%88%A0%E9%99%A4%E7%B4%A2%E5%BC%95" rel="nofollow">5.7 删除索引</a></p> 
+<p id="%E5%85%AD%E3%80%81%E7%B4%A2%E5%BC%95%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98-toc" style="margin-left:40px;"><a href="#%E5%85%AD%E3%80%81%E7%B4%A2%E5%BC%95%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98" rel="nofollow">六、索引性能调优</a></p> 
+<hr id="hr-toc"> 
+<h3 id="%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E7%94%A8%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%EF%BC%9F">一、为什么要使用二级索引？</h3> 
+<p>对于HBase而言，如果想精确地定位到某行记录，唯一的办法是通过rowkey来查询。如果不通过rowkey来查找数据，就必须逐行地比较每一列的值，即全表扫瞄。</p> 
+<p>对于较大的表，全表扫描的代价是不可接受的。但是，很多情况下，需要从多个角度查询数据。</p> 
+<ul><li> <p>例如，在定位某个人的时候，可以通过姓名、身份证号、学籍号等不同的角度来查询</p> </li><li> <p>要想把这么多角度的数据都放到rowkey中几乎不可能（业务的灵活性不允许，对rowkey长度的要求也不允许）。</p> </li><li> <p>所以需要secondary index（二级索引）来完成这件事。secondary index的原理很简单，但是如果自己维护的话则会麻烦一些。</p> </li><li> <p>现在，Phoenix已经提供了对HBase secondary index的支持。</p> </li></ul> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/de/05/Xu0g1GXC_o.png"></p> 
+<h3 id="%E4%BA%8C%E3%80%81%E5%85%A8%E5%B1%80%E7%B4%A2%E5%BC%95%E5%92%8C%E6%9C%AC%E5%9C%B0%E7%B4%A2%E5%BC%95">二、全局索引和本地索引</h3> 
+<p><strong>2.1 Global Indexing</strong></p> 
+<ul><li> <p>Global indexing，全局索引，适用于==读多写少==的业务场景。</p> </li><li> <p>使用Global indexing在写数据的时候开销很大，因为所有对数据表的更新操作（DELETE, UPSERT VALUES and UPSERT SELECT），都会引起索引表的更新，而索引表是分布在不同的数据节点上的，跨节点的数据传输带来了较大的性能消耗。</p> </li><li> <p>在读数据的时候Phoenix会选择索引表来降低查询消耗的时间。</p> </li><li> <p><u>在默认情况下如果想查询的字段不是索引字段的话索引表不会被使用</u>，也就是说不会带来查询速度的提升。</p> </li></ul> 
+<p><strong>2.2 Local Indexing</strong></p> 
+<ul><li> <p>Local indexing，本地索引，适用于==写操作频繁==以及空间受限制的场景。</p> </li><li> <p>与Global indexing一样，Phoenix会自动判定在进行查询的时候是否使用索引。</p> </li><li> <p>使用Local indexing时，索引数据和数据表的数据存放在相同的服务器中，这样避免了在写操作的时候往不同服务器的索引表中写索引带来的额外开销。</p> </li><li> <p><u>使用Local indexing的时候即使查询的字段不是索引字段索引表也会被使用，这会带来查询速度的提升，这点跟Global indexing不同。</u>对于Local Indexing，一个数据表的所有索引数据都存储在一个单一的独立的可共享的表中。</p> </li></ul> 
+<h3 id="%E4%B8%89%E3%80%81%E5%8F%AF%E5%8F%98%E7%B4%A2%E5%BC%95%E5%92%8C%E4%B8%8D%E5%8F%AF%E5%8F%98%E7%B4%A2%E5%BC%95">三、可变索引和不可变索引</h3> 
+<p><strong>3.1 immutable index</strong></p> 
+<ul><li> <p>immutable index，不可变索引，适用于数据==只增加不更新并且按照时间先后顺序存储==（time-series data）的场景，如保存日志数据或者事件数据等。</p> </li><li> <p>不可变索引的存储方式是write one，append only。</p> </li><li> <p>当在Phoenix使用create table语句时指定IMMUTABLE_ROWS = true表示该表上创建的索引将被设置为不可变索引。</p> </li><li> <p>不可变索引分为Global immutable index和Local immutable index两种。</p> </li><li> <p>Phoenix默认情况下如果在create table时不指定IMMUTABLE_ROW = true时，表示该表为mutable。</p> </li></ul> 
+<p><strong>3.2 mutable index</strong></p> 
+<ul><li> <p>mutable index，可变索引，适用于数据有==增删改==的场景。</p> </li><li> <p>Phoenix默认情况创建的索引都是可变索引，除非在create table的时候显式地指定IMMUTABLE_ROWS = true。</p> </li><li> <p>可变索引同样分为Global mutable index和Local mutable index两种。</p> </li></ul> 
+<h3 id="%E5%9B%9B%E3%80%81%E9%85%8D%E7%BD%AEHBase%E6%94%AF%E6%8C%81Phoenix%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95">四、配置HBase支持Phoenix二级索引</h3> 
+<p><strong>4.1 修改配置文件</strong></p> 
+<ul><li> <p>如果要启用phoenix的二级索引功能，需要修改配置文件hbase-site.xml</p> </li><li> <p>注意：</p> </li><li> <p>vim hbase-site.xml</p> </li></ul> 
+<pre><code>&lt;!-- 添加配置 --&gt;
+&lt;property&gt;
+    &lt;name&gt;hbase.regionserver.wal.codec&lt;/name&gt;
+    &lt;value&gt;org.apache.hadoop.hbase.regionserver.wal.IndexedWALEditCodec&lt;/value&gt;
+&lt;/property&gt;
+&lt;property&gt;
+   &lt;name&gt;hbase.region.server.rpc.scheduler.factory.class&lt;/name&gt;
+   &lt;value&gt;org.apache.hadoop.hbase.ipc.PhoenixRpcSchedulerFactory&lt;/value&gt;
+&lt;/property&gt;
+&lt;property&gt;
+        &lt;name&gt;hbase.rpc.controllerfactory.class&lt;/name&gt;
+        &lt;value&gt;org.apache.hadoop.hbase.ipc.controller.ServerRpcControllerFactory&lt;/value&gt;
+&lt;/property&gt;</code></pre> 
+<p><strong>4.2 重启hbase</strong></p> 
+<ul><li> <p>完成上述修改后重启hbase集群使配置生效。</p> </li></ul> 
+<h3 id="%E4%BA%94%E3%80%81%E5%AE%9E%E6%88%98">五、实战</h3> 
+<h4 id="5.1%20%E5%9C%A8phoenix%E4%B8%AD%E5%88%9B%E5%BB%BA%E8%A1%A8"><strong>5.1 在phoenix中创建表</strong></h4> 
+<ul><li> <p>首先，在phoenix中创建一个user table</p> </li><li> <p>node02执行以下命令，进入phoenix客户端，并创建表</p> </li></ul> 
+<pre><code>cd /xsluo/install/apache-phoenix-4.14.0-cdh5.14.2-bin/
+bin/sqlline.py node01:2181
+​
+create  table user (
+"session_id" varchar(100) not null primary key, 
+"f"."cookie_id" varchar(100), 
+"f"."visit_time" varchar(100), 
+"f"."user_id" varchar(100), 
+"f"."age" varchar(100), 
+"f"."sex" varchar(100), 
+"f"."visit_url" varchar(100), 
+"f"."visit_os" varchar(100), 
+"f"."browser_name" varchar(100),
+"f"."visit_ip" varchar(100), 
+"f"."province" varchar(100),
+"f"."city" varchar(100),
+"f"."page_id" varchar(100), 
+"f"."goods_id" varchar(100),
+"f"."shop_id" varchar(100)) column_encoded_bytes=0;</code></pre> 
+<h4 id="5.2%20%E5%AF%BC%E5%85%A5%E6%B5%8B%E8%AF%95%E6%95%B0%E6%8D%AE"><strong>5.2 导入测试数据</strong></h4> 
+<ul><li> <p>将事先准备好的 user50w.csv 这个文件上传到node02的/xsluo/install/phoenixsql 这个路径下，该CSV文件中有50万条记录</p> </li><li> <p>node02执行以下命令，导入50W的测试数据</p> </li></ul> 
+<pre><code>cd /xsluo/install/apache-phoenix-4.14.0-cdh5.14.2-bin/
+bin/psql.py -t USER node01:2181 /xsluo/install/phoenixsql/user50w.csv</code></pre> 
+<h4 id="5.3%20Global%20Indexing%E7%9A%84%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E6%B5%8B%E8%AF%95"><strong>5.3 Global Indexing的二级索引测试</strong></h4> 
+<p>5.3.1 正常查询一条数据所需的时间</p> 
+<ul><li> <p>在为表USER创建secondary index之前，先看看查询一条数据所需的时间 在node02服务器，进入phoenix的客户端，然后执行以下sql语句，查询数据，查看耗费时间</p> </li></ul> 
+<pre><code>cd /xsluo/install/apache-phoenix-4.14.0-cdh5.14.2-bin
+bin/sqlline.py node01:2181</code></pre> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select "cookie_id" from user where "cookie_id" = '99738fd1-2084-44e9';
++---------------------+
+|      cookie_id      |
++---------------------+
+| 99738fd1-2084-44e9  |
++---------------------+
+1 row selected (6.678 seconds)</code></pre> 
+<p>可以看到，对名为cookie_id的列进行按值查询需要6秒左右。</p> 
+<p>我们可以通过explain来查看执行计划 ​ EXPLAIN(语句的执行逻辑及计划):</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; explain select "cookie_id" from user where "cookie_id" = '99738fd1-2084-44e9';
++--------------------------------------------------------------------------------------------+-----------------+----+
+|                                            PLAN                                            | EST_BYTES_READ  | ES |
++--------------------------------------------------------------------------------------------+-----------------+----+
+| CLIENT 2-CHUNK 289067 ROWS 314572862 BYTES PARALLEL 1-WAY ROUND ROBIN FULL SCAN OVER USER  | 314572862       | 28 |
+|     SERVER FILTER BY f."cookie_id" = '99738fd1-2084-44e9'                                  | 314572862       | 28 |
++--------------------------------------------------------------------------------------------+-----------------+----+
+2 rows selected (0.054 seconds)</code></pre> 
+<p>由此看出先进行了全表扫描再通过过滤器来筛选出目标数据，显示这种查询方式效率是很低的。</p> 
+<p>5.3.2 给表USER创建基于Global Indexing的二级索引</p> 
+<ul><li> <p>进入到phoenix的客户端，然后执行以下命令创建索引</p> </li><li> <p>在cookie_id列上面创建二级索引：</p> </li></ul> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; create index USER_COOKIE_ID_INDEX on USER ("f"."cookie_id"); 
+
+-- 查看当前所有表会发现多一张USER_COOKIE_ID_INDEX索引表，查询该表数据。
+0: jdbc:phoenix:node01:2181&gt; select * from USER_COOKIE_ID_INDEX limit 5;</code></pre> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/30/9c/3FduY3Rh_o.png"></p> 
+<p>再次执行查询"cookie_id"='99738fd1-2084-44e9'的数据记录 :</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select "cookie_id" from user where "cookie_id" = '99738fd1-2084-44e9';
++---------------------+
+|      cookie_id      |
++---------------------+
+| 99738fd1-2084-44e9  |
++---------------------+
+1 row selected (0.031 seconds)</code></pre> 
+<p>此时：<span style="color:#f33b45;">查询速度由6秒左右减少到了毫秒级别</span>。</p> 
+<p>注意：select所带的字段必须包含在覆盖索引内，EXPLAIN(语句的执行逻辑及计划):</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; explain select "cookie_id" from user where "cookie_id" = '99738fd1-2084-44e9';
++--------------------------------------------------------------------------------------------------------+----------+
+|                                                  PLAN                                                  | EST_BYTE |
++--------------------------------------------------------------------------------------------------------+----------+
+| CLIENT 1-CHUNK PARALLEL 1-WAY ROUND ROBIN RANGE SCAN OVER USER_COOKIE_ID_INDEX ['99738fd1-2084-44e9']  | null     |
+|     SERVER FILTER BY FIRST KEY ONLY                                                                    | null     |
++--------------------------------------------------------------------------------------------------------+----------+
+2 rows selected (0.051 seconds)</code></pre> 
+<p>可以看到使用到了创建的索引USER_COOKIE_ID_INDEX。</p> 
+<p>5.3.3 以下查询不会用到索引表</p> 
+<ul><li> <p>虽然cookie_id是索引字段，但age不是索引字段，所以不会使用到索引</p> </li></ul> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select "cookie_id","age" from user where "cookie_id"='99738fd1-2084-44e9';
++---------------------+------+
+|      cookie_id      | age  |
++---------------------+------+
+| 99738fd1-2084-44e9  | 47   |
++---------------------+------+
+1 row selected (6.137 seconds)</code></pre> 
+<p>也可以通过EXPLAIN查询语句的执行逻辑及计划：</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; explain select "cookie_id","age" from user where "cookie_id"='99738fd1-2084-44e9';
++--------------------------------------------------------------------------------------------+-----------------+----+
+|                                            PLAN                                            | EST_BYTES_READ  | ES |
++--------------------------------------------------------------------------------------------+-----------------+----+
+| CLIENT 2-CHUNK 289067 ROWS 314572862 BYTES PARALLEL 1-WAY ROUND ROBIN FULL SCAN OVER USER  | 314572862       | 28 |
+|     SERVER FILTER BY f."cookie_id" = '99738fd1-2084-44e9'                                  | 314572862       | 28 |
++--------------------------------------------------------------------------------------------+-----------------+----+
+2 rows selected (0.101 seconds)</code></pre> 
+<p>同理要查询的字段不是索引字段，也不会使用到索引表：</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select "sex" from user where "cookie_id"='99738fd1-2084-44e9';
++---------+
+|   sex   |
++---------+
+| female  |
++---------+
+1 row selected (2.856 seconds)</code></pre> 
+<h4 id="5.4%20Local%20Indexing%E7%9A%84%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E6%B5%8B%E8%AF%95"><strong>5.4 Local Indexing的二级索引测试</strong></h4> 
+<p>5.4.1 正常查询一条数据所需的时间</p> 
+<ul><li> <p>在为表USER创建secondary index之前，先看看查询一条数据所需的时间</p> </li></ul> 
+<pre><code>select * from user where "user_id"='371e963d-c-487065';</code></pre> 
+<ul><li> <p>可以看到，对名为user_id的列进行按值查询需要<span style="color:#f33b45;">3秒左右</span>。</p> </li></ul> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select * from user where "user_id"='371e963d-c-487065';
++---------------------------------------+---------------------+----------------------+--------------------+------+--+
+|              session_id               |      cookie_id      |      visit_time      |      user_id       | age  |  |
++---------------------------------------+---------------------+----------------------+--------------------+------+--+
+| 99738fd1-2084-44e9-90b7-3cd43d36d0f0  | 99738fd1-2084-44e9  | 2016-12-10 08:51:11  | 371e963d-c-487065  | 47   |  |
++---------------------------------------+---------------------+----------------------+--------------------+------+--+
+1 row selected (3.913 seconds)</code></pre> 
+<p>EXPLAIN(语句的执行逻辑及计划):</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; explain select * from user where "user_id"='371e963d-c-487065';
++--------------------------------------------------------------------------------------------+-----------------+----+
+|                                            PLAN                                            | EST_BYTES_READ  | ES |
++--------------------------------------------------------------------------------------------+-----------------+----+
+| CLIENT 2-CHUNK 289067 ROWS 314572862 BYTES PARALLEL 1-WAY ROUND ROBIN FULL SCAN OVER USER  | 314572862       | 28 |
+|     SERVER FILTER BY f."user_id" = '371e963d-c-487065'                                     | 314572862       | 28 |
++--------------------------------------------------------------------------------------------+-----------------+----+
+2 rows selected (0.25 seconds)</code></pre> 
+<p>由此知道先进行了全表扫描再通过过滤器来筛选出目标数据，显示这种查询方式效率是很低的。</p> 
+<p>5.4.2 给表USER创建基于Local Indexing的二级索引</p> 
+<ul><li> <p>在user_id列上面创建二级索引：</p> </li></ul> 
+<pre><code>create local index USER_USER_ID_INDEX on USER ("f"."user_id");</code></pre> 
+<ul><li> <p>查看当前所有表会发现多一张USER_USER_ID_INDEX索引表，查询该表数据。</p> </li></ul> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; !tables
++------------+--------------+-----------------------+---------------+----------+------------+-----------------------+
+| TABLE_CAT  | TABLE_SCHEM  |      TABLE_NAME       |  TABLE_TYPE   | REMARKS  | TYPE_NAME  | SELF_REFERENCING_COL_ |
++------------+--------------+-----------------------+---------------+----------+------------+-----------------------+
+|            |              | USER_COOKIE_ID_INDEX  | INDEX         |          |            |                       |
+|            |              | USER_USER_ID_INDEX    | INDEX         |          |            |                       |
+|            | SYSTEM       | CATALOG               | SYSTEM TABLE  |          |            |                       |
+|            | SYSTEM       | FUNCTION              | SYSTEM TABLE  |          |            |                       |
+|            | SYSTEM       | LOG                   | SYSTEM TABLE  |          |            |                       |
+|            | SYSTEM       | SEQUENCE              | SYSTEM TABLE  |          |            |                       |
+|            | SYSTEM       | STATS                 | SYSTEM TABLE  |          |            |                       |
+|            |              | USER                  | TABLE         |          |            |                       |
+|            |              | USER_PHOENIX          | TABLE         |          |            |                       |
+|            |              | employee              | TABLE         |          |            |                       |
++------------+--------------+-----------------------+---------------+----------+------------+-----------------------+</code></pre> 
+<p>再次执行查询"user_id"='371e963d-c-487065'的数据记录：</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select * from user where "user_id"='371e963d-c-487065';
++---------------------------------------+---------------------+----------------------+--------------------+------+--+
+|              session_id               |      cookie_id      |      visit_time      |      user_id       | age  |  |
++---------------------------------------+---------------------+----------------------+--------------------+------+--+
+| 99738fd1-2084-44e9-90b7-3cd43d36d0f0  | 99738fd1-2084-44e9  | 2016-12-10 08:51:11  | 371e963d-c-487065  | 47   |  |
++---------------------------------------+---------------------+----------------------+--------------------+------+--+
+1 row selected (0.375 seconds)</code></pre> 
+<p>可以看到，对名为user_id的列进行按值查询需要<span style="color:#f33b45;">0.3秒左右</span>。</p> 
+<p>EXPLAIN(语句的执行逻辑及计划):</p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; explain select * from user where "user_id"='371e963d-c-487065';
++-----------------------------------------------------------------------------------------+-----------------+-------+
+|                                          PLAN                                           | EST_BYTES_READ  | EST_R |
++-----------------------------------------------------------------------------------------+-----------------+-------+
+| CLIENT 1-CHUNK PARALLEL 1-WAY ROUND ROBIN RANGE SCAN OVER USER [1,'371e963d-c-487065']  | null            | null  |
+|     SERVER FILTER BY FIRST KEY ONLY                                                     | null            | null  |
++-----------------------------------------------------------------------------------------+-----------------+-------+
+2 rows selected (0.233 seconds)</code></pre> 
+<p>查看执行计划，没有执行全表扫描，效率更高了</p> 
+<p>此时：<span style="color:#f33b45;">查询速度由3秒左右减少到了毫秒级别</span>。</p> 
+<p><strong>那如果查询的字段不包含在索引表中，有如何呢？ </strong></p> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select "user_id","age","sex" from user where "user_id"='371e963d-c-487065';
++--------------------+------+---------+
+|      user_id       | age  |   sex   |
++--------------------+------+---------+
+| 371e963d-c-487065  | 47   | female  |
++--------------------+------+---------+
+1 row selected (0.05 seconds)
+0: jdbc:phoenix:node01:2181&gt; explain select "user_id","age","sex" from user where "user_id"='371e963d-c-487065';
++-----------------------------------------------------------------------------------------+-----------------+-------+
+|                                          PLAN                                           | EST_BYTES_READ  | EST_R |
++-----------------------------------------------------------------------------------------+-----------------+-------+
+| CLIENT 1-CHUNK PARALLEL 1-WAY ROUND ROBIN RANGE SCAN OVER USER [1,'371e963d-c-487065']  | null            | null  |
+|     SERVER FILTER BY FIRST KEY ONLY                                                     | null            | null  |
++-----------------------------------------------------------------------------------------+-----------------+-------+
+2 rows selected (0.06 seconds)</code></pre> 
+<p>可以看到，在本地索引当中，<strong>查询的字段不包含在索引表中也使用到了创建的索引USER_USER_ID_INDEX. </strong></p> 
+<h4 id="5.5%20%E5%A6%82%E4%BD%95%E7%A1%AE%E4%BF%9Dquery%E6%9F%A5%E8%AF%A2%E4%BD%BF%E7%94%A8Index"><strong>5.5 如何确保query查询使用Index</strong></h4> 
+<ul><li> <p>要想让一个查询使用index，有三种方式实现。</p> </li></ul> 
+<p><strong>5.5.1 创建 covered index</strong></p> 
+<ul><li> <p>如果在某次查询中，查询项或者查询条件中包含除被索引列之外的列（主键MY_PK除外）。</p> </li><li> <p>默认情况下，该查询会触发full table scan（全表扫描），但是使用covered index则可以避免全表扫描。创建包含某个字段的覆盖索引,创建方式如下：</p> </li></ul> 
+<pre><code>create index USER_COOKIE_ID_AGE_INDEX on USER ("f"."cookie_id") include("f"."age");</code></pre> 
+<ul><li> <p>查看当前所有表会发现多一张USER_COOKIE_ID_AGE_INDEX索引表，查询该表数据。</p> </li></ul> 
+<pre><code>select * from USER_COOKIE_ID_AGE_INDEX limit 5;</code></pre> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; create index USER_COOKIE_ID_AGE_INDEX on USER ("f"."cookie_id") include("f"."age");
+500,000 rows affected (42.897 seconds)
+0: jdbc:phoenix:node01:2181&gt; select * from USER_COOKIE_ID_AGE_INDEX limit 5;
++---------------------+---------------------------------------+--------+
+|     f:cookie_id     |              :session_id              | f:age  |
++---------------------+---------------------------------------+--------+
+| 000036bd-9ede-4d2e  | 000036bd-9ede-4d2e-aac4-110b1924c35d  | 24     |
+| 00003aa1-aacd-4f48  | 00003aa1-aacd-4f48-8057-148d8012abcf  | 13     |
+| 0000417b-4412-445e  | 0000417b-4412-445e-8431-4d9d7459ff40  | 66     |
+| 0000a391-4fd8-44bd  | 0000a391-4fd8-44bd-9970-da721fbe860d  | 36     |
+| 0000ce5e-3121-4da9  | 0000ce5e-3121-4da9-8ffb-19c9a3621548  | 9      |
++---------------------+---------------------------------------+--------+
+5 rows selected (0.038 seconds)</code></pre> 
+<ul><li>查询数据</li></ul> 
+<pre><code>select "age" from user where "cookie_id"='99738fd1-2084-44e9';
+select "age","sex" from user where "cookie_id"='99738fd1-2084-44e9';</code></pre> 
+<pre><code>0: jdbc:phoenix:node01:2181&gt; select "age" from user where "cookie_id"='99738fd1-2084-44e9';
++------+
+| age  |
++------+
+| 47   |
++------+
+1 row selected (0.051 seconds)
+0: jdbc:phoenix:node01:2181&gt; select "age","sex" from user where "cookie_id"='99738fd1-2084-44e9';
++------+---------+
+| age  |   sex   |
++------+---------+
+| 47   | female  |
++------+---------+
+1 row selected (2.394 seconds)</code></pre> 
+<p>由此可见，当查询字段中包含索引的列和查询条件也包含索引的列时，查询会用到索引表；当查询的字段包含了不在索引表中的列，则不会走索引表。</p> 
+<p><strong>5.5.2 在查询中提示其使用index</strong></p> 
+<p>在select和column_name之间加上<code>/*+ Index(&lt;表名&gt; &lt;index表名&gt;)*/</code>，通过这种方式强制使用索引。</p> 
+<pre><code>select /*+ index(user,USER_COOKIE_ID_AGE_INDEX) */ "age" from user where "cookie_id"='99738fd1-2084-44e9';</code></pre> 
+<p>如果age是索引字段，那么就会直接从索引表中查询。如果age不是索引字段，那么将会进行全表扫描，所以当用户明确知道表中数据较少且符合检索条件时才适用，此时的性能才是最佳的。</p> 
+<p style="text-align:center;"><img alt="" height="154" src="https://images2.imgbox.com/37/9b/DkjMW5PQ_o.png" width="1200"></p> 
+<p style="text-align:center;"><img alt="" height="177" src="https://images2.imgbox.com/c2/ec/QFMOIgMU_o.png" width="1200"></p> 
+<p><strong>5.5.3 使用本地索引 (创建Local Indexing 索引)</strong></p> 
+<p>详细见上面。</p> 
+<h4 id="5.6%20%E7%B4%A2%E5%BC%95%E9%87%8D%E5%BB%BA">5.6 索引重建</h4> 
+<p>Phoenix的索引重建是把索引表清空后重新装配数据。</p> 
+<pre><code>alter index USER_COOKIE_ID_INDEX on user rebuild;</code></pre> 
+<h4 id="5.7%20%E5%88%A0%E9%99%A4%E7%B4%A2%E5%BC%95">5.7 删除索引</h4> 
+<p>删除某个表的某张索引： 语法 drop index 索引名称 on 表名 例如：</p> 
+<pre><code>drop index USER_COOKIE_ID_INDEX on user;</code></pre> 
+<p>如果表中的一个索引列被删除，则索引也将被自动删除</p> 
+<p>如果删除的是覆盖索引上的列，则此列将从覆盖索引中被自动删除。</p> 
+<h3 id="%E5%85%AD%E3%80%81%E7%B4%A2%E5%BC%95%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98">六、索引性能调优</h3> 
+<p>一般来说，索引已经很快了，不需要特别的优化。</p> 
+<p>这里也提供了一些方法，让你在面对特定的环境和负载的时候可以进行一些调优。下面的这些需要在hbase-site.xml文件中设置，针对所有的服务器。</p> 
+<pre><code>1. index.builder.threads.max 
+创建索引时，使用的最大线程数。 
+默认值: 10。
+
+2. index.builder.threads.keepalivetime 
+创建索引的创建线程池中线程的存活时间，单位：秒。 
+默认值: 60
+
+3. index.writer.threads.max 
+写索引表数据的写线程池的最大线程数。 
+更新索引表可以用的最大线程数，也就是同时可以更新多少张索引表，数量最好和索引表的数量一致。 
+默认值: 10
+
+4. index.writer.threads.keepalivetime 
+索引写线程池中，线程的存活时间，单位：秒。
+默认值：60
+ 
+5. hbase.htable.threads.max 
+每一张索引表可用于写的线程数。 
+默认值: 2,147,483,647
+
+6. hbase.htable.threads.keepalivetime 
+索引表线程池中线程的存活时间，单位：秒。 
+默认值: 60
+
+7. index.tablefactory.cache.size 
+允许缓存的索引表的数量。 
+增加此值，可以在写索引表时不用每次都去重复的创建htable，这个值越大，内存消耗越多。 
+默认值: 10
+
+8. org.apache.phoenix.regionserver.index.handler.count 
+处理全局索引写请求时，可以使用的线程数。 
+默认值: 30</code></pre> 
+<p> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/6cafb3603b14a1d1b269f1b170693cee/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">策略设计模式</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/6a3863a5c23e2f87c8aba15b7b84f1c2/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">windows cmd删除指定文件夹下指定时间文件</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

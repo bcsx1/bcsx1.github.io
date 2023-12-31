@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Redis中string数据结构的实现 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Redis中string数据结构的实现" />
+<meta property="og:description" content="Redis有string、hash、list、set、zset几种数据结构，这些数据结构仅仅是面向使用者的上层结构，其底层的具体实现有多种。string的内部编码有三种：raw，embstr，int，其如图所示：
+我们可以通过type命令查看数据结构类型，object encoding命令查看内部编码：
+127.0.0.1:6379&gt; type hello string 127.0.0.1:6379&gt; object encoding hello &#34;raw&#34; 这里我们结合redis源码，来看一下这几种底层的数据结构是如何实现的。
+redisObject Redis的设计颇有“万物皆对象”的意思，无论是string，还是hash等其他的数据类型，皆为redisObject,其结构体源码如下：
+typedef struct redisObject { // 类型 unsigned type:4; // 编码 unsigned encoding:4; // 对象最后一次被访问的时间 unsigned lru:REDIS_LRU_BITS; /* lru time (relative to server.lruclock) */ // 引用计数 int refcount; // 指向实际值的指针 void *ptr; } robj; 当我们使用object encoding命令时，访问的就是该结构体内的encoding字段；ptr字段就是指向实际数据的指针。
+sds(Simple Dynamic String) sds对象是字符串的底层实现，raw和embstr类型均基于此实现：
+struct sdshdr { // buf 中已占用空间的长度 int len; // buf 中剩余可用空间的长度，初始化为0 int free; // 数据空间 char buf[]; }; len字段用于保存字符串长度，所以用strlen求字符串长度时，直接读取此值，时间复杂度为 O(1)；free字段指剩余可用的空间，新建字符串时该值为0；buf则为储存字符串的数组。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/7dfd8383d337cd62f686d137db6acf1d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-07-12T00:46:40+08:00" />
+<meta property="article:modified_time" content="2020-07-12T00:46:40+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Redis中string数据结构的实现</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>Redis有string、hash、list、set、zset几种数据结构，这些数据结构仅仅是面向使用者的上层结构，其底层的具体实现有多种。string的内部编码有三种：raw，embstr，int，其如图所示：<br> <img alt="在这里插入图片描述" src="https://images2.imgbox.com/f0/11/9xRVZR3G_o.png"></p> 
+<p>我们可以通过<code>type</code>命令查看数据结构类型，<code>object encoding</code>命令查看内部编码：</p> 
+<pre><code class="prism language-shell">127.0.0.1:6379<span class="token operator">&gt;</span> <span class="token function">type</span> hello
+string
+127.0.0.1:6379<span class="token operator">&gt;</span> object encoding hello
+<span class="token string">"raw"</span>
+</code></pre> 
+<p>这里我们结合redis源码，来看一下这几种底层的数据结构是如何实现的。</p> 
+<h4><a id="redisObject_14"></a>redisObject</h4> 
+<p>Redis的设计颇有“万物皆对象”的意思，无论是string，还是hash等其他的数据类型，皆为<code>redisObject</code>,其结构体源码如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">typedef</span> <span class="token keyword">struct</span> redisObject <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// 类型</span>
+    <span class="token keyword">unsigned</span> type<span class="token punctuation">:</span><span class="token number">4</span><span class="token punctuation">;</span>
+    <span class="token comment">// 编码</span>
+    <span class="token keyword">unsigned</span> encoding<span class="token punctuation">:</span><span class="token number">4</span><span class="token punctuation">;</span>
+    <span class="token comment">// 对象最后一次被访问的时间</span>
+    <span class="token keyword">unsigned</span> lru<span class="token punctuation">:</span>REDIS_LRU_BITS<span class="token punctuation">;</span> <span class="token comment">/* lru time (relative to server.lruclock) */</span>
+    <span class="token comment">// 引用计数</span>
+    <span class="token keyword">int</span> refcount<span class="token punctuation">;</span>
+    <span class="token comment">// 指向实际值的指针</span>
+    <span class="token keyword">void</span> <span class="token operator">*</span>ptr<span class="token punctuation">;</span>
+    
+<span class="token punctuation">}</span> robj<span class="token punctuation">;</span></code></pre> 
+<p>当我们使用<code>object encoding</code>命令时，访问的就是该结构体内的<code>encoding</code>字段；<code>ptr</code>字段就是指向实际数据的指针。</p> 
+<h4><a id="sdsSimple_Dynamic_String_32"></a>sds(Simple Dynamic String)</h4> 
+<p><code>sds</code>对象是字符串的底层实现，<code>raw</code>和<code>embstr</code>类型均基于此实现：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> sdshdr <span class="token punctuation">{<!-- --></span>
+    
+    <span class="token comment">// buf 中已占用空间的长度</span>
+    <span class="token keyword">int</span> len<span class="token punctuation">;</span>
+    <span class="token comment">// buf 中剩余可用空间的长度，初始化为0</span>
+    <span class="token keyword">int</span> free<span class="token punctuation">;</span>
+     <span class="token comment">// 数据空间</span>
+    <span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span></code></pre> 
+<p><code>len</code>字段用于保存字符串长度，所以用<code>strlen</code>求字符串长度时，直接读取此值，时间复杂度为 O(1)；<code>free</code>字段指剩余可用的空间，新建字符串时该值为0；<code>buf</code>则为储存字符串的数组。</p> 
+<h4><a id="rawembstr_46"></a>raw与embstr</h4> 
+<p><code>raw</code>是string的默认编码类型，<code>embstr</code>与其类似，创建两者的函数如下：</p> 
+<pre><code class="prism language-c"><span class="token comment">// 创建一个 REDIS_ENCODING_RAW 编码的字符对象</span>
+robj <span class="token operator">*</span><span class="token function">createRawStringObject</span><span class="token punctuation">(</span><span class="token keyword">char</span> <span class="token operator">*</span>ptr<span class="token punctuation">,</span> size_t len<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">return</span> <span class="token function">createObject</span><span class="token punctuation">(</span>REDIS_STRING<span class="token punctuation">,</span><span class="token function">sdsnewlen</span><span class="token punctuation">(</span>ptr<span class="token punctuation">,</span>len<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ <span class="token punctuation">}</span>
+</code></pre> 
+<p>我们可以看到，创建raw 类型字符串时，首先创建 sds 对象（<code>sdsnewlen</code>函数），然后将新建的redisObject 中的 ptr 字段指向该 sds 对象，共进行了两次内存分配，如图所示：<br> <img alt="在这里插入图片描述" src="https://images2.imgbox.com/84/81/YsxY47Bh_o.png"></p> 
+<center> 
+ <em>图来自《Redis设计与实现》</em> 
+</center> 
+<p></p> 
+<pre><code class="prism language-c"><span class="token comment">// 创建一个 REDIS_ENCODING_EMBSTR 编码的字符对象</span>
+robj <span class="token operator">*</span><span class="token function">createEmbeddedStringObject</span><span class="token punctuation">(</span><span class="token keyword">char</span> <span class="token operator">*</span>ptr<span class="token punctuation">,</span> size_t len<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    robj <span class="token operator">*</span>o <span class="token operator">=</span> <span class="token function">zmalloc</span><span class="token punctuation">(</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span>robj<span class="token punctuation">)</span><span class="token operator">+</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token keyword">struct</span> sdshdr<span class="token punctuation">)</span><span class="token operator">+</span>len<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span> 
+    <span class="token keyword">struct</span> sdshdr <span class="token operator">*</span>sh <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">void</span><span class="token operator">*</span><span class="token punctuation">)</span><span class="token punctuation">(</span>o<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    o<span class="token operator">-&gt;</span>type <span class="token operator">=</span> REDIS_STRING<span class="token punctuation">;</span>
+    o<span class="token operator">-&gt;</span>encoding <span class="token operator">=</span> REDIS_ENCODING_EMBSTR<span class="token punctuation">;</span>
+    o<span class="token operator">-&gt;</span>ptr <span class="token operator">=</span> sh<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">;</span>
+    o<span class="token operator">-&gt;</span>refcount <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+    o<span class="token operator">-&gt;</span>lru <span class="token operator">=</span> <span class="token function">LRU_CLOCK</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    sh<span class="token operator">-&gt;</span>len <span class="token operator">=</span> len<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>ptr<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">memcpy</span><span class="token punctuation">(</span>sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">,</span>ptr<span class="token punctuation">,</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">[</span>len<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">'\0'</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">memset</span><span class="token punctuation">(</span>sh<span class="token operator">-&gt;</span>buf<span class="token punctuation">,</span><span class="token number">0</span><span class="token punctuation">,</span>len<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> o<span class="token punctuation">;</span><span class="token punctuation">}</span></code></pre> 
+<p>与 raw 类型类似，embstr 编码类型同样由 sds 对象和 redisObject 实现；但与 raw 类型不用的是，sds 和 redisObject 是同时分配的，在内存中是连续的，如图所示：<br> <img alt="在这里插入图片描述" src="https://images2.imgbox.com/c2/d0/wAYKyAyT_o.png"></p> 
+<center> 
+ <em>图来自《Redis设计与实现》</em> 
+</center> 
+<p></p> 
+<p>同时，embstr 是只读的。所谓只读是指，如果embstr 对象有修改，则会转变成 raw 类型。<br> 那么什么时候选择 raw， 什么时候是 emstr 呢？</p> 
+<pre><code class="prism language-c"><span class="token macro property">#<span class="token directive keyword">define</span> OBJ_ENCODING_EMBSTR_SIZE_LIMIT 39</span>
+robj <span class="token operator">*</span><span class="token function">createStringObject</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span>ptr<span class="token punctuation">,</span> size_t len<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>len <span class="token operator">&lt;=</span> OBJ_ENCODING_EMBSTR_SIZE_LIMIT<span class="token punctuation">)</span>
+            <span class="token keyword">return</span> <span class="token function">createEmbeddedStringObject</span><span class="token punctuation">(</span>ptr<span class="token punctuation">,</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">else</span>
+            <span class="token keyword">return</span> <span class="token function">createRawStringObject</span><span class="token punctuation">(</span>ptr<span class="token punctuation">,</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span></code></pre> 
+<p><code>OBJ_ENCODING_EMBSTR_SIZE_LIMIT</code>这个宏定义了限制长度为39（新版本为44），即长度小于39字节的字符串采用 embstr 编码，否则为 raw。我们可以把 embstr 看作为短字符串的优化。</p> 
+<h4><a id="int_94"></a>int</h4> 
+<p>Redis中整数有共享对象的概念，也就是驻留，通过<code>REDIS_SHARED_INTEGERS</code>定义，值为10000：</p> 
+<pre><code class="prism language-c"><span class="token macro property">#<span class="token directive keyword">define</span> REDIS_SHARED_INTEGERS 10000</span></code></pre> 
+<p>当欲创建的整数值在0到10000之间时，为节约内存，并不会创建新的对象，而是增加一个引用，返回共享对象：</p> 
+<pre><code class="prism language-c">robj <span class="token operator">*</span><span class="token function">createStringObjectFromLongLong</span><span class="token punctuation">(</span><span class="token keyword">long</span> <span class="token keyword">long</span> value<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	robj <span class="token operator">*</span>o<span class="token punctuation">;</span>
+	<span class="token comment">// 如果值符合范围，则不创建新对象，仅仅返回一个共享对象</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>value <span class="token operator">&gt;=</span> <span class="token number">0</span> <span class="token operator">&amp;&amp;</span> value <span class="token operator">&lt;</span> REDIS_SHARED _INTEGERS<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	    <span class="token function">incrRefCount</span><span class="token punctuation">(</span>shared<span class="token punctuation">.</span>integers<span class="token punctuation">[</span>value<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	    o <span class="token operator">=</span> shared<span class="token punctuation">.</span>integers<span class="token punctuation">[</span>value<span class="token punctuation">]</span><span class="token punctuation">;</span>
+	 <span class="token punctuation">}</span></code></pre> 
+<p>这里我们在 redis 客户端可以用<code>object refcount</code> 命令查看一个对象的引用数：</p> 
+<pre><code class="prism language-shell">127.0.0.1:6379<span class="token operator">&gt;</span> <span class="token keyword">set</span> number1 100
+OK
+127.0.0.1:6379<span class="token operator">&gt;</span> object refcount number1
+<span class="token punctuation">(</span>integer<span class="token punctuation">)</span> 2
+127.0.0.1:6379<span class="token operator">&gt;</span> <span class="token keyword">set</span> number2 100
+OK
+127.0.0.1:6379<span class="token operator">&gt;</span> object refcount number2
+<span class="token punctuation">(</span>integer<span class="token punctuation">)</span> 3</code></pre> 
+<p>如果整数值属于 long 类型范围，则创建一个 REDIS_ENCODING_INT 编码的字符串对象，否则用 REDIS_ENCODING_RAW 类型的字符串保存。</p> 
+<pre><code class="prism language-c"><span class="token comment">//值可以用 long 类型保存</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>value <span class="token operator">&gt;=</span> LONG_MIN <span class="token operator">&amp;&amp;</span> value <span class="token operator">&lt;=</span> LONG_MAX<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            o <span class="token operator">=</span> <span class="token function">createObject</span><span class="token punctuation">(</span>REDIS_STRING<span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            o<span class="token operator">-&gt;</span>encoding <span class="token operator">=</span> REDIS_ENCODING_INT<span class="token punctuation">;</span>
+            o<span class="token operator">-&gt;</span>ptr <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">void</span><span class="token operator">*</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token keyword">long</span><span class="token punctuation">)</span>value<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            o <span class="token operator">=</span> <span class="token function">createObject</span><span class="token punctuation">(</span>REDIS_STRING<span class="token punctuation">,</span><span class="token function">sdsfromlonglong</span><span class="token punctuation">(</span>value<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span></code></pre> 
+<h4><a id="_131"></a>字符串的扩容</h4> 
+<p>当对字符串进行修改时，如<code>append</code>操作，可能会触发字符串的扩容机制。该机制的具体实现如下：</p> 
+<pre><code class="prism language-c">sds <span class="token function">sdsMakeRoomFor</span><span class="token punctuation">(</span>sds s<span class="token punctuation">,</span> size_t addlen<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">struct</span> sdshdr <span class="token operator">*</span>sh<span class="token punctuation">,</span> <span class="token operator">*</span>newsh<span class="token punctuation">;</span>
+    size_t free <span class="token operator">=</span> <span class="token function">sdsavail</span><span class="token punctuation">(</span>s<span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">// 获取 s 目前的空余空间长度，时间复杂度 O(1)</span>
+    size_t len<span class="token punctuation">,</span> newlen<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>free <span class="token operator">&gt;=</span> addlen<span class="token punctuation">)</span> <span class="token keyword">return</span> s<span class="token punctuation">;</span> <span class="token comment">//剩余空间足够，无需扩容</span>
+    len <span class="token operator">=</span> <span class="token function">sdslen</span><span class="token punctuation">(</span>s<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    sh <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">void</span><span class="token operator">*</span><span class="token punctuation">)</span> <span class="token punctuation">(</span>s<span class="token operator">-</span><span class="token punctuation">(</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token keyword">struct</span> sdshdr<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    newlen <span class="token operator">=</span> <span class="token punctuation">(</span>len<span class="token operator">+</span>addlen<span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">//新字符串的长度</span>
+
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>newlen <span class="token operator">&lt;</span> SDS_MAX_PREALLOC<span class="token punctuation">)</span> <span class="token comment">// SDS_MAX_PREALLOC的值为1024*1024，即 1Mb</span>
+        newlen <span class="token operator">*</span><span class="token operator">=</span> <span class="token number">2</span><span class="token punctuation">;</span>
+    <span class="token keyword">else</span>
+        newlen <span class="token operator">+</span><span class="token operator">=</span> SDS_MAX_PREALLOC<span class="token punctuation">;</span>
+    <span class="token comment">// 分配内存,这里多出的 1 字节是为 "\0"准备的</span>
+    newsh <span class="token operator">=</span> <span class="token function">zrealloc</span><span class="token punctuation">(</span>sh<span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token keyword">struct</span> sdshdr<span class="token punctuation">)</span><span class="token operator">+</span>newlen<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span> 
+   <span class="token comment">// ...</span>
+   <span class="token punctuation">}</span></code></pre> 
+<p>可以看到，字符串的扩容的过程：</p> 
+<ul><li>初次创建字符串时，剩余空间（ free 字段）为0；</li><li>进行扩容时，如果新字符串小于1MB，则预分配两倍的容量；例如原有len=50，新增addlen=100，则新长度 newlen=300，最终使用情况为used(50+100)+free(150)；</li><li>若新字符串大于等于1MB，则预分配1MB空间；如原有len=10MB，新增addlen=50，新长度newlen=10MB+50+1MB，最终使用情况为used(10MB+50)+free(1MB)。</li></ul> 
+<p>字符串修改后，因预分配机制的存在，可能会有空余的空间未使用，这是为了多次修改时，减少内存的分配次数以及拷贝操作次数，但这同时也增加了内存消耗。我们在使用字符串时需要清楚这一点。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/781e9243a481c4f0b3862343bad404a7/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Vulkan Specification(Vulkan规范)：第十四章 14.4 片元着色器输入附件接口</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/c57dfe92a975e2ea849200c9a5bc604d/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Vulkan Specification(Vulkan规范)：第十四章 14.6 内置变量</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

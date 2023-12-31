@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>分享一个串口高效收发数据的方案 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="分享一个串口高效收发数据的方案" />
+<meta property="og:description" content="摘要：本文在探讨传统数据收发不足之后，介绍如何使用带FIFO的串口来减少接收中断次数，通过一种自定义通讯协议格式，给出帧打包方法；之后介绍一种特殊的串口数据发送方法，可在避免使用串口发送中断的情况下，提高系统的响应速度。
+1. 简介 串口由于使用简单，价格低廉，配合RS485芯片可以实现长距离、抗干扰能力强的局域网络而被广泛使用。随着产品功能的增多，需要处理的任务也越来越复杂，系统任务也越来越需要及时响应。
+绝大多数的现代单片机（ARM7、Cortex-M3）串口都带有一定数量的硬件FIFO，本文将介绍如何使用硬件FIFO来减少接收中断次数，提高发送效率。在此之前，先来列举一下传统串口数据收发的不足之处：
+（1）每接收一个字节数据，产生一次接收中断。不能有效的利用串口硬件FIFO，减少中断次数。
+（2）应答数据采用等待发送的方法。由于串行数据传输的时间远远跟不上CPU的处理时间，等待串口发送完当前字节再发送下一字节会造成CPU资源浪费，不利于系统整体响应（在1200bps下，发送一字节大约需要10ms，如果一次发送几十个字节数据，CPU会长时间处于等待状态）。
+（3）应答数据采用中断发送。增加一个中断源，增加系统的中断次数，这会影响系统整体稳定性（从可靠性角度考虑，中断事件应越少越好）。
+（4）针对上述的不足之处，将结合一个常用自定义通讯协议，提供一个完整的解决方案。
+2.串口FIFO 串口FIFO可以理解为串口专用的缓存，该缓存采用先进先出方式。数据接收FIFO和数据发送FIFO通常是独立的两个硬件。
+串口接收的数据，先放入接收FIFO中，当FIFO中的数据达到触发值（通常触发值为1、2、4、8、14字节）或者FIFO中的数据虽然没有达到设定值但是一段时间（通常为3.5个字符传输时间）没有再接收到数据，则通知CPU产生接收中断；发送的数据要先写入发送FIFO，只要发送FIFO未空，硬件会自动发送FIFO中的数据。
+写入发送FIFO的字节个数受FIFO最大深度影响，通常一次写入最多允许16字节。上述列举的数据跟具体的硬件有关，CPU类型不同，特性也不尽相同，使用前应参考相应的数据手册。
+3.数据接收与打包 FIFO可以缓存串口接收到的数据，因此我们可以利用FIFO来减少中断次数。以NXP的lpc1778芯片为例，接收FIFO的触发级别可以设置为1、2、4、8、14字节，推荐使用8字节或者14字节，这也是PC串口接收FIFO的默认值。
+这样，当接收到大量数据时，每8个字节或者14个字节才会产生一次中断（最后一次接收除外），相比接收一个字节即产生一个中断，这种方法串口接收中断次数大大减少。
+将接收FIFO设置为8或者14字节也十分简单，还是以lpc1778为例，只需要设置UART FIFO控制寄存器UnFCR即可。
+接收的数据要符合通讯协议规定，数据与协议是密不可分的。通常我们需要将接收到的数据根据协议打包成一帧，然后交由上层处理。下面介绍一个自定义的协议帧格式，并给出一个通用打包成帧的方法。
+自定义协议格式如图3-1所示。
+帧首：通常是3~5个0xFF或者0xEE
+地址号：要进行通讯的设备的地址编号，1字节
+命令号：对应不同的功能，1字节
+长度：数据区域的字节个数，1字节
+数据：与具体的命令号有关，数据区长度可以为0，整个帧的长度不应超过256字节
+校验：异或和校验（1字节）或者CRC16校验（2字节），本例使用CRC16校验
+下面介绍如何将接收到的数据按照图3-1所示的格式打包成一帧。
+3.1 定义数据结构 typedef struct { uint8_t * dst_buf; //指向接收缓存 uint8_t sfd; //帧首标志,为0xFF或者0xEE uint8_t sfd_flag; //找到帧首,一般是3~5个FF或EE uint8_t sfd_count; //帧首的个数,一般3~5个 uint8_t received_len; //已经接收的字节数 uint8_t find_fram_flag; //找到完整帧后,置1 uint8_t frame_len; //本帧数据总长度，这个区域是可选的 }find_frame_struct; 3.2 初始化数据结构，一般放在串口初始化中 /** * @brief 初始化寻找帧的数据结构 * @param p_fine_frame:指向打包帧数据结构体变量 * @param dst_buf:指向帧缓冲区 * @param sfd:帧首标志,一般为0xFF或者0xEE */ void init_find_frame_struct(find_frame_struct * p_find_frame,uint8_t *dst_buf,uint8_t sfd) { p_find_frame-&gt;dst_buf=dst_buf; p_find_frame-&gt;sfd=sfd; p_find_frame-&gt;find_fram_flag=0; p_find_frame-&gt;frame_len=10; p_find_frame-&gt;received_len=0; p_find_frame-&gt;sfd_count=0; p_find_frame-&gt;sfd_flag=0; } 3." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/7816d998b896c62268980e5ba2798e34/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-26T12:02:24+08:00" />
+<meta property="article:modified_time" content="2023-12-26T12:02:24+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">分享一个串口高效收发数据的方案</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p>摘要：本文在探讨传统数据收发不足之后，介绍如何使用带FIFO的串口来减少接收中断次数，通过一种自定义通讯协议格式，给出帧打包方法；之后介绍一种特殊的串口数据发送方法，可在避免使用串口发送中断的情况下，提高系统的响应速度。</p> 
+ <h4>1. 简介</h4> 
+ <p>串口由于使用简单，价格低廉，配合RS485芯片可以实现长距离、抗干扰能力强的局域网络而被广泛使用。随着产品功能的增多，需要处理的任务也越来越复杂，系统任务也越来越需要及时响应。</p> 
+ <p>绝大多数的现代单片机（ARM7、Cortex-M3）串口都带有一定数量的硬件FIFO，本文将介绍如何使用硬件FIFO来减少接收中断次数，提高发送效率。在此之前，先来列举一下传统串口数据收发的不足之处：</p> 
+ <p>（1）每接收一个字节数据，产生一次接收中断。不能有效的利用串口硬件FIFO，减少中断次数。</p> 
+ <p>（2）应答数据采用等待发送的方法。由于串行数据传输的时间远远跟不上CPU的处理时间，等待串口发送完当前字节再发送下一字节会造成CPU资源浪费，不利于系统整体响应（在1200bps下，发送一字节大约需要10ms，如果一次发送几十个字节数据，CPU会长时间处于等待状态）。</p> 
+ <p>（3）应答数据采用中断发送。增加一个中断源，增加系统的中断次数，这会影响系统整体稳定性（从可靠性角度考虑，中断事件应越少越好）。</p> 
+ <p>（4）针对上述的不足之处，将结合一个常用自定义通讯协议，提供一个完整的解决方案。</p> 
+ <h4>2.串口FIFO</h4> 
+ <p>串口FIFO可以理解为串口专用的缓存，该缓存采用先进先出方式。数据接收FIFO和数据发送FIFO通常是独立的两个硬件。</p> 
+ <p>串口接收的数据，先放入接收FIFO中，当FIFO中的数据达到触发值（通常触发值为1、2、4、8、14字节）或者FIFO中的数据虽然没有达到设定值但是一段时间（通常为3.5个字符传输时间）没有再接收到数据，则通知CPU产生接收中断；发送的数据要先写入发送FIFO，只要发送FIFO未空，硬件会自动发送FIFO中的数据。</p> 
+ <p>写入发送FIFO的字节个数受FIFO最大深度影响，通常一次写入最多允许16字节。上述列举的数据跟具体的硬件有关，CPU类型不同，特性也不尽相同，使用前应参考相应的数据手册。</p> 
+ <h4>3.数据接收与打包</h4> 
+ <p>FIFO可以缓存串口接收到的数据，因此我们可以利用FIFO来减少中断次数。以NXP的lpc1778芯片为例，接收FIFO的触发级别可以设置为1、2、4、8、14字节，推荐使用8字节或者14字节，这也是PC串口接收FIFO的默认值。</p> 
+ <p>这样，当接收到大量数据时，每8个字节或者14个字节才会产生一次中断（最后一次接收除外），相比接收一个字节即产生一个中断，这种方法串口接收中断次数大大减少。</p> 
+ <p>将接收FIFO设置为8或者14字节也十分简单，还是以lpc1778为例，只需要设置UART FIFO控制寄存器UnFCR即可。</p> 
+ <p>接收的数据要符合通讯协议规定，数据与协议是密不可分的。通常我们需要将接收到的数据根据协议打包成一帧，然后交由上层处理。下面介绍一个自定义的协议帧格式，并给出一个通用打包成帧的方法。</p> 
+ <p>自定义协议格式如图3-1所示。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/1e/2c/qcH3pXjS_o.png" alt="6eb695c1271765c35b841ae5302dcb73.png"></p> 
+ <ul><li><p style="text-align:justify;">帧首：通常是3~5个0xFF或者0xEE</p></li><li><p style="text-align:justify;">地址号：要进行通讯的设备的地址编号，1字节</p></li><li><p style="text-align:justify;">命令号：对应不同的功能，1字节</p></li><li><p style="text-align:justify;">长度：数据区域的字节个数，1字节</p></li><li><p style="text-align:justify;">数据：与具体的命令号有关，数据区长度可以为0，整个帧的长度不应超过256字节</p></li><li><p style="text-align:justify;">校验：异或和校验（1字节）或者CRC16校验（2字节），本例使用CRC16校验</p></li></ul> 
+ <p>下面介绍如何将接收到的数据按照图3-1所示的格式打包成一帧。</p> 
+ <h5>3.1 定义数据结构</h5> 
+ <pre class="has"><code class="language-go">typedef struct 
+{  
+    uint8_t * dst_buf;                  //指向接收缓存  
+    uint8_t sfd;                        //帧首标志,为0xFF或者0xEE  
+    uint8_t sfd_flag;                   //找到帧首,一般是3~5个FF或EE  
+    uint8_t sfd_count;                  //帧首的个数,一般3~5个  
+    uint8_t received_len;               //已经接收的字节数  
+    uint8_t find_fram_flag;             //找到完整帧后,置1  
+    uint8_t frame_len;                  //本帧数据总长度，这个区域是可选的  
+}find_frame_struct;</code></pre> 
+ <h5>3.2 初始化数据结构，一般放在串口初始化中</h5> 
+ <pre class="has"><code class="language-go">/** 
+* @brief    初始化寻找帧的数据结构 
+* @param    p_fine_frame:指向打包帧数据结构体变量 
+* @param    dst_buf:指向帧缓冲区 
+* @param    sfd:帧首标志,一般为0xFF或者0xEE 
+*/  
+void init_find_frame_struct(find_frame_struct * p_find_frame,uint8_t *dst_buf,uint8_t sfd)  
+{  
+    p_find_frame-&gt;dst_buf=dst_buf;  
+    p_find_frame-&gt;sfd=sfd;  
+    p_find_frame-&gt;find_fram_flag=0;  
+    p_find_frame-&gt;frame_len=10;       
+    p_find_frame-&gt;received_len=0;  
+    p_find_frame-&gt;sfd_count=0;  
+    p_find_frame-&gt;sfd_flag=0;  
+}</code></pre> 
+ <h5>3.3 数据打包程序</h5> 
+ <pre class="has"><code class="language-go">/** 
+* @brief    寻找一帧数据  返回处理的数据个数 
+* @param    p_find_frame:指向打包帧数据结构体变量 
+* @param    src_buf:指向串口接收的原始数据 
+* @param    data_len:src_buf本次串口接收到的原始数据个数 
+* @param    sum_len:帧缓存的最大长度 
+* @return   本次处理的数据个数 
+*/  
+uint32_t find_one_frame(find_frame_struct * p_find_frame,const uint8_t * src_buf,uint32_t data_len,uint32_t sum_len)  
+{  
+    uint32_t src_len=0;  
+    while(data_len--)  
+    {  
+        if(p_find_frame -&gt;sfd_flag==0)                        
+        {   //没有找到起始帧首  
+            if(src_buf[src_len++]==p_find_frame -&gt;sfd)  
+            {  
+                p_find_frame -&gt;dst_buf[p_find_frame -&gt;received_len++]=p_find_frame -&gt;sfd;  
+                if(++p_find_frame -&gt;sfd_count==5)          
+                {  
+                    p_find_frame -&gt;sfd_flag=1;  
+                    p_find_frame -&gt;sfd_count=0;  
+                    p_find_frame -&gt;frame_len=10;  
+                }  
+            }  
+            else  
+            {  
+                p_find_frame -&gt;sfd_count=0;   
+                p_find_frame -&gt;received_len=0;   
+            }  
+        }  
+        else   
+        {   //是否是"长度"字节? Y-&gt;获取这帧的数据长度  
+            if(7==p_find_frame -&gt;received_len)                
+            {  
+                p_find_frame-&gt;frame_len=src_buf[src_len]+5+1+1+1+2; //帧首+地址号+命令号+数据长度+校验       
+                if(p_find_frame-&gt;frame_len&gt;=sum_len)  
+                {   //这里处理方法根据具体应用不一定相同  
+                    MY_DEBUGF(SLAVE_DEBUG,("数据长度超出缓存!\n"));  
+                    p_find_frame-&gt;frame_len= sum_len;       
+                }  
+            }  
+              
+            p_find_frame -&gt;dst_buf[p_find_frame-&gt;received_len++]=src_buf[src_len++];                
+            if(p_find_frame -&gt;received_len==p_find_frame -&gt;frame_len)                  
+            {  
+                p_find_frame -&gt;received_len=0;              //一帧完成    
+                p_find_frame -&gt;sfd_flag=0;  
+                p_find_frame -&gt;find_fram_flag=1;                   
+                return src_len;  
+            }  
+        }  
+    }  
+    p_find_frame -&gt;find_fram_flag=0;  
+    return src_len;  
+}</code></pre> 
+ <p>使用例子：</p> 
+ <p>定义数据结构体变量：</p> 
+ <pre class="has"><code class="language-go">find_frame_struct slave_find_frame_srt;</code></pre> 
+ <p>定义接收数据缓冲区：</p> 
+ <pre class="has"><code class="language-go">#define SLAVE_REC_DATA_LEN  128
+uint8_t slave_rec_buf[SLAVE_REC_DATA_LEN];</code></pre> 
+ <p>在串口初始化中调用结构体变量初始化函数：</p> 
+ <pre class="has"><code class="language-go">init_find_frame_struct(&amp;slave_find_frame_srt,slave_rec_buf,0xEE);</code></pre> 
+ <p>在串口接收中断中调用数据打包函数：</p> 
+ <pre class="has"><code class="language-go">find_one_frame(&amp;slave_find_frame_srt,tmp_rec_buf,data_len,SLAVE_REC_DATA_LEN);</code></pre> 
+ <p>其中，rec_buf是串口接收临时缓冲区，data_len是本次接收的数据长度。</p> 
+ <h4>4.数据发送</h4> 
+ <p>前文提到，传统的等待发送方式会浪费CPU资源，而中断发送方式虽然不会造成CPU资源浪费，但又增加了一个中断源。在我们的使用中发现，定时器中断是几乎每个应用都会使用的，我们可以利用定时器中断以及硬件FIFO来进行数据发送，通过合理设计后，这样的发送方法即不会造成CPU资源浪费，也不会多增加中断源和中断事件。</p> 
+ <p>需要提前说明的是，这个方法并不是对所有应用都合适，对于那些没有开定时器中断的应用本方法当然是不支持的，另外如果定时器中断间隔较长而通讯波特率又特别高的话，本方法也不太适用。</p> 
+ <p>公司目前使用的通讯波特率一般比较小（1200bps、2400bps），在这些波特率下，定时器间隔为10ms以下（含10ms）就能满足。如果定时器间隔为1ms以下（含1ms），是可以使用115200bps的。</p> 
+ <p>本方法主要思想是：定时器中断触发后，判断是否有数据要发送，如果有数据要发送并且满足发送条件，则将数据放入发送FIFO中，对于lpc1778来说，一次最多可以放16字节数据。之后硬件会自动启动发送，无需CPU参与。</p> 
+ <p>下面介绍如何使用定时器发送数据，硬件载体为RS485。因为发送需要操作串口寄存器以及RS485方向控制引脚，需跟硬件密切相关，以下代码使用的硬件为lpc1778，但思想是通用的。</p> 
+ <h5>4.1 定义数据结构</h5> 
+ <pre class="has"><code class="language-go">/*串口帧发送结构体*/  
+typedef struct 
+{  
+    uint16_t send_sum_len;          //要发送的帧数据长度  
+    uint8_t  send_cur_len;          //当前已经发送的数据长度  
+    uint8_t  send_flag;             //是否发送标志  
+    uint8_t * send_data;            //指向要发送的数据缓冲区  
+}uart_send_struct;</code></pre> 
+ <h5>4.2 定时处理函数</h5> 
+ <pre class="has"><code class="language-go">/** 
+* @brief    定时发送函数,在定时器中断中调用,不使用发送中断的情况下减少发送等待 
+* @param    UARTx:指向硬件串口寄存器基地址 
+* @param    p:指向串口帧发送结构体变量 
+*/  
+#define FARME_SEND_FALG 0x5A          
+#define SEND_DATA_NUM   12  
+static void uart_send_com(LPC_UART_TypeDef *UARTx,uart_send_struct *p)  
+{  
+    uint32_t i;  
+    uint32_t tmp32;  
+      
+    if(UARTx-&gt;LSR &amp;(0x01&lt;&lt;6))                      //发送为空  
+    {         
+        if(p-&gt;send_flag==FARME_SEND_FALG)  
+        {                          
+            RS485ClrDE;                             // 置485为发送状态  
+              
+            tmp32=p-&gt;send_sum_len-p-&gt;send_cur_len;  
+            if(tmp32&gt;SEND_DATA_NUM)                 //向发送FIFO填充字节数据  
+            {  
+                for(i=0;i&lt;SEND_DATA_NUM;i++)  
+                {  
+                    UARTx-&gt;THR=p-&gt;send_data[p-&gt;send_cur_len++];  
+                }  
+            }  
+            else  
+            {  
+                for(i=0;i&lt;tmp32;i++)  
+                {  
+                    UARTx-&gt;THR=p-&gt;send_data[p-&gt;send_cur_len++];  
+                }  
+                p-&gt;send_flag=0;                      
+            }  
+        }  
+        else  
+        {  
+            RS485SetDE;  
+        }  
+    }  
+}</code></pre> 
+ <p>其中，RS485ClrDE为宏定义，设置RS485为发送模式；RS485SetDE也为宏定义，设置RS485为接收模式。</p> 
+ <p>使用例子：</p> 
+ <p>定义数据结构体变量：</p> 
+ <pre class="has"><code class="language-go">uart_send_struct uart0_send_str;</code></pre> 
+ <p>定义发送缓冲区：</p> 
+ <pre class="has"><code class="language-go">uint8_t uart0_send_buf[UART0_SEND_LEN];</code></pre> 
+ <p>根据使用的硬件串口，对定时处理函数做二次封装：</p> 
+ <pre class="has"><code class="language-go">void uart0_send_data(void)
+{
+ uart_send_com(LPC_UART0,&amp;uart0_send_str);
+}</code></pre> 
+ <p>将封装函数uart0_send_data();放入定时器中断处理函数中；</p> 
+ <p>在需要发送数据的地方，设置串口帧发送结构体变量：</p> 
+ <pre class="has"><code class="language-go">uart0_send_str.send_sum_len=data_len;      //data_len为要发送的数据长度
+uart0_send_str.send_cur_len=0;             //固定为0
+uart0_send_str.send_data=uart0_send_buf;   //绑定发送缓冲区
+uart0_send_str.send_flag=FARME_SEND_FALG;  //设置发送标志</code></pre> 
+ <h4>5. 总结</h4> 
+ <p>本文主要讨论了一种高效的串口数据收发方法，并给出了具体的代码实现。在当前处理器任务不断增加的情况下，提供了一个占用资源少，可提高系统整体性能的新的思路。</p> 
+ <p>❞</p> 
+ <p>版权声明：本文来源网络，免费传达知识，版权归原作者所有。如涉及作品版权问题，请联系我进行删除。</p> 
+ <p style="text-align:center;"><strong><strong>-END-</strong></strong></p> 
+ <hr> 
+ <p style="text-align:center;"><strong><strong>往期推荐：点击链接即可跳转阅读</strong></strong></p> 
+ <p style="text-align:center;"><strong><strong><a href="" rel="nofollow">新手必看的RTOS基础知识</a><br></strong></strong></p> 
+ <p style="text-align:center;"><strong><strong><a href="" rel="nofollow">一招提高单片机代码质量！小改动，大收获</a><br></strong></strong></p> 
+ <p style="text-align:center;"><strong><strong><a href="" rel="nofollow">一个轻量级的开源嵌入式状态机框架</a><br></strong></strong></p> 
+ <p></p> 
+ <p><strong><strong>↓↓<strong>↓点击关注</strong></strong>↓↓↓</strong></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/14477953a4fedd04f979951c3126dc0b/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">在原生HTML文件中引入Vue并使用</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b3598c1b567712af569b7e8e6c47aa11/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Interesting！只需上传照片，GPT-4V精准识别食物的卡路里和摄入热量</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

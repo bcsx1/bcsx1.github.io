@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ffmpeg的avformat_open_input()分析过程--以mp4为例（十） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ffmpeg的avformat_open_input()分析过程--以mp4为例（十）" />
+<meta property="og:description" content="概要 avformat_open_input（），该函数用于打开多媒体数据并且获取一些信息，它的声明位于libavformat/avformat.h。主要工作
+1）通过init_input打开流媒体数据，根据probe探测流媒体最合适的协议类型AVInputFormat，通过open2设置read/write/seek相关回调
+2）read_header即根据对应的协议，读取媒体头信息并创建AVStream，并对流媒体进行解析（会对mp4文件进行解析，本文以MP4为例）
+框架图 函数和文件对应关系
+代码分析 avformat_open_input(http.xxx.m3u8) init_input(s, filename, &amp;tmp)) //提供的文件名信息不能探测格式 av_probe_input_format2(&amp;pd, 0, &amp;score))) io_open(s, &amp;s-&gt;pb, filename, AVIO_FLAG_READ | s-&gt;avio_flags, options)) &lt; 0) io_open_default ffio_open_whitelist ffurl_alloc //探测是HTTP协议 URLProtocol ff_http_protocol url_find_protocol(filename); ffurl_connect //发送HTTP报文头，下载http.xxx.m3u8文件 //读m3u8文件探测解复用是AVInputFormat *iformat =&#34;hls,applehttp&#34; *fmt = av_probe_input_buffer2(s-&gt;pb, &amp;s-&gt;iformat, filename, s, 0, s-&gt;format_probesize); s-&gt;iformat-&gt;read_header(s); //iformat iformat hls.c--&gt;hls_read_header int avformat_open_input(AVFormatContext **ps, const char *filename, AVInputFormat *fmt, AVDictionary **options) { AVFormatContext *s = *ps; int i, ret = 0; AVDictionary *tmp = NULL; ID3v2ExtraMeta *id3v2_extra_meta = NULL; if (!" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/27fa85ff0bc97e355875a11d325d9b61/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-07-05T13:55:37+08:00" />
+<meta property="article:modified_time" content="2022-07-05T13:55:37+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ffmpeg的avformat_open_input()分析过程--以mp4为例（十）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>概要 </h2> 
+<p>avformat_open_input（），该函数用于打开多媒体数据并且获取一些信息，它的声明位于libavformat/avformat.h。主要工作</p> 
+<p>1）通过init_input打开流媒体数据，根据probe探测流媒体最合适的协议类型AVInputFormat，通过open2设置read/write/seek相关回调</p> 
+<p>2）read_header即根据对应的协议，读取媒体头信息并创建AVStream，并对流媒体进行解析（会对mp4文件进行解析，本文以MP4为例）</p> 
+<h2>框架图</h2> 
+<p><img alt="" height="691" src="https://images2.imgbox.com/66/cd/UPjk8sqm_o.png" width="1038"></p> 
+<p> 函数和文件对应关系</p> 
+<p><img alt="" height="178" src="https://images2.imgbox.com/39/ed/tbhddqgI_o.png" width="788"></p> 
+<p></p> 
+<h2>代码分析</h2> 
+<p></p> 
+<pre><code>avformat_open_input(http.xxx.m3u8)
+    init_input(s, filename, &amp;tmp))
+        //提供的文件名信息不能探测格式
+        av_probe_input_format2(&amp;pd, 0, &amp;score)))
+        io_open(s, &amp;s-&gt;pb, filename, AVIO_FLAG_READ | s-&gt;avio_flags, options)) &lt; 0)
+            io_open_default
+                ffio_open_whitelist
+                    ffurl_alloc
+                        //探测是HTTP协议 URLProtocol ff_http_protocol
+                        url_find_protocol(filename);  
+                    ffurl_connect    //发送HTTP报文头，下载http.xxx.m3u8文件
+        //读m3u8文件探测解复用是AVInputFormat *iformat ="hls,applehttp"
+        *fmt = av_probe_input_buffer2(s-&gt;pb, &amp;s-&gt;iformat, filename, s, 0, s-&gt;format_probesize);
+        s-&gt;iformat-&gt;read_header(s);  //iformat iformat  hls.c--&gt;hls_read_header
+</code></pre> 
+<pre><code>int avformat_open_input(AVFormatContext **ps, const char *filename,
+                        AVInputFormat *fmt, AVDictionary **options)
+{
+    AVFormatContext *s = *ps;
+    int i, ret = 0;
+    AVDictionary *tmp = NULL;
+    ID3v2ExtraMeta *id3v2_extra_meta = NULL;
+
+    if (!s &amp;&amp; !(s = avformat_alloc_context())) //如果s没有初始化，先初始化s
+        return AVERROR(ENOMEM);
+    if (!s-&gt;av_class) {
+        av_log(NULL, AV_LOG_ERROR, "Input context has not been properly allocated by avformat_alloc_context() and is not NULL either\n");
+        return AVERROR(EINVAL);
+    }
+    if (fmt)
+        s-&gt;iformat = fmt;
+
+    if (options)
+        av_dict_copy(&amp;tmp, *options, 0);
+
+    if (s-&gt;pb) // must be before any goto fail
+        s-&gt;flags |= AVFMT_FLAG_CUSTOM_IO;
+
+    if ((ret = av_opt_set_dict(s, &amp;tmp)) &lt; 0)
+        goto fail;
+
+    if (!(s-&gt;url = av_strdup(filename ? filename : ""))) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+#if FF_API_FORMAT_FILENAME
+FF_DISABLE_DEPRECATION_WARNINGS
+    av_strlcpy(s-&gt;filename, filename ? filename : "", sizeof(s-&gt;filename));
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+	//	1. 重点在看这里：
+    if ((ret = init_input(s, filename, &amp;tmp)) &lt; 0)
+        goto fail;
+    s-&gt;probe_score = ret;
+
+    if (!s-&gt;protocol_whitelist &amp;&amp; s-&gt;pb &amp;&amp; s-&gt;pb-&gt;protocol_whitelist) {
+        s-&gt;protocol_whitelist = av_strdup(s-&gt;pb-&gt;protocol_whitelist);
+        if (!s-&gt;protocol_whitelist) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
+    if (!s-&gt;protocol_blacklist &amp;&amp; s-&gt;pb &amp;&amp; s-&gt;pb-&gt;protocol_blacklist) {
+        s-&gt;protocol_blacklist = av_strdup(s-&gt;pb-&gt;protocol_blacklist);
+        if (!s-&gt;protocol_blacklist) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
+    if (s-&gt;format_whitelist &amp;&amp; av_match_list(s-&gt;iformat-&gt;name, s-&gt;format_whitelist, ',') &lt;= 0) {
+        av_log(s, AV_LOG_ERROR, "Format not on whitelist \'%s\'\n", s-&gt;format_whitelist);
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+
+    avio_skip(s-&gt;pb, s-&gt;skip_initial_bytes);
+
+    /* Check filename in case an image number is expected. */
+    if (s-&gt;iformat-&gt;flags &amp; AVFMT_NEEDNUMBER) {
+        if (!av_filename_number_test(filename)) {
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+    }
+
+    s-&gt;duration = s-&gt;start_time = AV_NOPTS_VALUE;
+
+    /* Allocate private data. */
+    if (s-&gt;iformat-&gt;priv_data_size &gt; 0) {
+        if (!(s-&gt;priv_data = av_mallocz(s-&gt;iformat-&gt;priv_data_size))) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        if (s-&gt;iformat-&gt;priv_class) {
+            *(const AVClass **) s-&gt;priv_data = s-&gt;iformat-&gt;priv_class;
+            av_opt_set_defaults(s-&gt;priv_data);
+            if ((ret = av_opt_set_dict(s-&gt;priv_data, &amp;tmp)) &lt; 0)
+                goto fail;
+        }
+    }
+
+    /* e.g. AVFMT_NOFILE formats will not have a AVIOContext */
+    if (s-&gt;pb)
+        ff_id3v2_read_dict(s-&gt;pb, &amp;s-&gt;internal-&gt;id3v2_meta, ID3v2_DEFAULT_MAGIC, &amp;id3v2_extra_meta);
+
+
+    if (!(s-&gt;flags&amp;AVFMT_FLAG_PRIV_OPT) &amp;&amp; s-&gt;iformat-&gt;read_header)
+    //重点2
+        if ((ret = s-&gt;iformat-&gt;read_header(s)) &lt; 0)
+            goto fail;
+
+    if (!s-&gt;metadata) {
+        s-&gt;metadata = s-&gt;internal-&gt;id3v2_meta;
+        s-&gt;internal-&gt;id3v2_meta = NULL;
+    } else if (s-&gt;internal-&gt;id3v2_meta) {
+        int level = AV_LOG_WARNING;
+        if (s-&gt;error_recognition &amp; AV_EF_COMPLIANT)
+            level = AV_LOG_ERROR;
+        av_log(s, level, "Discarding ID3 tags because more suitable tags were found.\n");
+        av_dict_free(&amp;s-&gt;internal-&gt;id3v2_meta);
+        if (s-&gt;error_recognition &amp; AV_EF_EXPLODE)
+            return AVERROR_INVALIDDATA;
+    }
+
+    if (id3v2_extra_meta) {
+        if (!strcmp(s-&gt;iformat-&gt;name, "mp3") || !strcmp(s-&gt;iformat-&gt;name, "aac") ||
+            !strcmp(s-&gt;iformat-&gt;name, "tta")) {
+            if ((ret = ff_id3v2_parse_apic(s, &amp;id3v2_extra_meta)) &lt; 0)
+                goto fail;
+            if ((ret = ff_id3v2_parse_chapters(s, &amp;id3v2_extra_meta)) &lt; 0)
+                goto fail;
+            if ((ret = ff_id3v2_parse_priv(s, &amp;id3v2_extra_meta)) &lt; 0)
+                goto fail;
+        } else
+            av_log(s, AV_LOG_DEBUG, "demuxer does not support additional id3 data, skipping\n");
+    }
+    ff_id3v2_free_extra_meta(&amp;id3v2_extra_meta);
+
+    if ((ret = avformat_queue_attached_pictures(s)) &lt; 0)
+        goto fail;
+
+    if (!(s-&gt;flags&amp;AVFMT_FLAG_PRIV_OPT) &amp;&amp; s-&gt;pb &amp;&amp; !s-&gt;internal-&gt;data_offset)
+        s-&gt;internal-&gt;data_offset = avio_tell(s-&gt;pb);
+
+    s-&gt;internal-&gt;raw_packet_buffer_remaining_size = RAW_PACKET_BUFFER_SIZE;
+
+    update_stream_avctx(s);
+
+    for (i = 0; i &lt; s-&gt;nb_streams; i++)
+        s-&gt;streams[i]-&gt;internal-&gt;orig_codec_id = s-&gt;streams[i]-&gt;codecpar-&gt;codec_id;
+
+    if (options) {
+        av_dict_free(options);
+        *options = tmp;
+    }
+    *ps = s;
+    return 0;
+
+fail:
+    ff_id3v2_free_extra_meta(&amp;id3v2_extra_meta);
+    av_dict_free(&amp;tmp);
+    if (s-&gt;pb &amp;&amp; !(s-&gt;flags &amp; AVFMT_FLAG_CUSTOM_IO))
+        avio_closep(&amp;s-&gt;pb);
+    avformat_free_context(s);
+    *ps = NULL;
+    return ret;
+}
+
+</code></pre> 
+<p>avformat_open_input主要执行了三个步骤：</p> 
+<p>1）avformat_alloc_context---上一篇文章已经有单独介绍</p> 
+<p>2）init_input</p> 
+<p>a)提供的文件名信息不能探测格式</p> 
+<p>b)探测是HTTP协议 URLProtocol ff_http_protocol</p> 
+<p>c)读m3u8文件探测解复用是AVInputFormat *iformat ="hls,applehttp"</p> 
+<p>d）s-&gt;iformat-&gt;read_header2(s, &amp;tmp2) iformat iformat  hls.c--&gt;hls_read_header</p> 
+<h3>1、init_input：</h3> 
+<pre><code>int init_input(AVFormatContext *s, const char *filename,
+                      AVDictionary **options)
+{
+    AVProbeData pd = { filename, NULL, 0 };
+    int score = AVPROBE_SCORE_RETRY;
+    //1、如果自定义了AVIOContext 则使用自定义的
+    if (s-&gt;pb) {
+        s-&gt;flags |= AVFMT_FLAG_CUSTOM_IO;
+        //1.2 如果没有定义AVInputFormat 则由ffmpeg去推测
+        if (!s-&gt;iformat)
+            return av_probe_input_buffer2(s-&gt;pb, &amp;s-&gt;iformat, filename,
+                                         s, 0, s-&gt;format_probesize);
+        else if (s-&gt;iformat-&gt;flags &amp; AVFMT_NOFILE)
+            av_log(s, AV_LOG_WARNING, "Custom AVIOContext makes no sense and "
+                                      "will be ignored with AVFMT_NOFILE format.\n");
+        return 0;
+    }
+    //2、如果指定了AVInputFormat 则直接返回
+    //或者如果没有指定AVInputFormat 就av_probe_input_format2(扩展名/文件类型字符串)去推测
+    if ((s-&gt;iformat &amp;&amp; s-&gt;iformat-&gt;flags &amp; AVFMT_NOFILE) ||
+        (!s-&gt;iformat &amp;&amp; (s-&gt;iformat = av_probe_input_format2(&amp;pd, 0, &amp;score))))
+        return score;
+    //3、如果通过文件名或类型没有匹配到 就打开文件 然后读取内容再推测
+    if ((ret = s-&gt;io_open(s, &amp;s-&gt;pb, filename, AVIO_FLAG_READ | s-&gt;avio_flags, options)) &lt; 0)
+        return ret;
+
+    if (s-&gt;iformat)
+        return 0;
+    return av_probe_input_buffer2(s-&gt;pb, &amp;s-&gt;iformat, filename,
+                                 s, 0, s-&gt;format_probesize);
+}</code></pre> 
+<p>init_input 用于打开媒体数据 并根据匹配规则 找到最合适的协议类型(AVInputFormat)</p> 
+<p>分三个步骤进行：</p> 
+<p>1）如果自定义了AVIOContext 则使用自定义的pb，比如</p> 
+<pre><code>        unsigned char *aviobuffer=(unsigned char *)av_malloc(VIDEO_AVIO_BUFFER_SIZE);
+        avio =avio_alloc_context(aviobuffer, VIDEO_AVIO_BUFFER_SIZE,0,NULL,&amp;ff_read_buffer_func_cb,NULL,NULL);
+        ic-&gt;pb = avio;
+        ic-&gt;flags |= AVFMT_FLAG_CUSTOM_IO;</code></pre> 
+<p>这个就是自定义pb = avio</p> 
+<p>如果指定了AVInputFormat 则直接返回，或者如果没有指定AVInputFormat 就av_probe_input_format2(扩展名/文件类型字符串)去推测</p> 
+<pre><code>if (!s-&gt;iformat)
+            return av_probe_input_buffer2(s-&gt;pb, &amp;s-&gt;iformat, filename,
+                                         s, 0, s-&gt;format_probesize);</code></pre> 
+<p>2）如果指定了AVInputFormat 则直接返回，或者如果没有指定AVInputFormat 就av_probe_input_format2(扩展名/文件类型字符串)去推测</p> 
+<p>3）如果通过文件名或类型没有匹配到 就打开文件 然后读取内容再推测</p> 
+<pre><code>s-&gt;io_open(s, &amp;s-&gt;pb, filename, AVIO_FLAG_READ | s-&gt;avio_flags, options))</code></pre> 
+<p>-------------------------------------------------------------------------------------------------------------------------------</p> 
+<p>问题<br>     avformat_open_input函数探测ES流开销是150毫秒，探测PS流开销是500毫秒。avformat_open_input函数里面已经实现了av_probe_input_buffer函数的调用，去探测AVInputFormat结构体的相关变量。所以在avformat_open_input函数之前，调用av_probe_input_buffer函数之后，就不会去探测AVInputFormat结构体</p> 
+<p>优化方向<br>     尝试屏蔽avformat_open_input函数，直接指定码流的输入格式pInputFormat，代码如下：<br>         pInputFormat = av_find_input_format("h264");<br>         pFormatCtx-&gt;iformat = pInputFormat;<br> 如果这个时候屏蔽掉avformat_open_input，图像是条带状的，按照参考文献的说法，该avformat_open_input<br> 函数就是为了探测AVInputFormat结构体的相关变量</p> 
+<p>最终优化方案<br>     没有屏蔽avformat_open_input函数，而是在调用之前指定AVInputFormat的码流输入格式<br> 代码<br>     AVInputFormat* pInputFormat = NULL;<br>     AVFormatContext* pFormatContext = NULL;<br>     pFormatContext = avformat_alloc_context();<br>     pInputFormat = av_find_input_format("h264");</p> 
+<p>从这里可以看到，我们可以通过前端设置“iformat”属性来确定流的输入格式，以减小流的探测时间</p> 
+<p>--------------------------------------------------------------------------------------------------------------------------------</p> 
+<pre><code>AVInputFormat *av_probe_input_format3(ff_const59 AVProbeData *pd
+, int is_opened, int *score_ret) {
+    AVProbeData lpd = *pd;
+    const AVInputFormat *fmt1 = NULL;
+    ff_const59 AVInputFormat *fmt = NULL;
+    int score, score_max = 0;
+
+    //遍历所有的复用解复用器
+    //旧版本demuxer_list位于demuxer_list.c
+//新版本在allformats.c
+    while ((fmt1 = av_demuxer_iterate(&amp;i))) {//ftm1=新版本av_format_next(ftm1)
+        score = 0;
+        //如果有探测函数 则调用
+        if (fmt1-&gt;read_probe) {
+            score = fmt1-&gt;read_probe(&amp;lpd);
+        //否则匹配扩展名(.mp4/.flv)
+        } else if (fmt1-&gt;extensions) {
+            if (av_match_ext(lpd.filename, fmt1-&gt;extensions))
+                score = AVPROBE_SCORE_EXTENSION;//50
+        }
+        //匹配媒体类型(video/x-flv video/mp4)
+        if (av_match_name(lpd.mime_type, fmt1-&gt;mime_type)) {
+            if (AVPROBE_SCORE_MIME &gt; score) {
+                av_log(NULL, AV_LOG_DEBUG, "Probing %s score:%d increased to %d due to MIME type\n", fmt1-&gt;name, score, AVPROBE_SCORE_MIME);
+                score = AVPROBE_SCORE_MIME;//75
+            }
+        }
+        //记录得分最高的
+        if (score &gt; score_max) {
+            score_max = score;
+            fmt       = (AVInputFormat*)fmt1;
+        } else if (score == score_max)
+            fmt = NULL;
+    }
+    *score_ret = score_max;
+
+    return fmt;
+}
+</code></pre> 
+<p>av_iformat_next(fmt1)，fmt1-&gt;name的值为“flac”，“flv”，“hevc” ，“hls”等，这部分是否可以优化？</p> 
+<p>以mp4为例，read_probe为调用moov.c的mov_probe,<em>mov_probe</em>,其实就是判断第一个box是不是ftyp,若是则就是mov格式的了</p> 
+<pre><code>mov_probe(AVProbeData *p)
+{
+    int64_t offset;
+    uint32_t tag;
+    int score = 0;
+    int moov_offset = -1;
+
+    /* check file header */
+    offset = 0;
+    for (;;) {
+        /* ignore invalid offset */
+        if ((offset + 8) &gt; (unsigned int)p-&gt;buf_size)
+            break;
+        tag = AV_RL32(p-&gt;buf + offset + 4);
+        switch(tag) {
+        /* check for obvious tags */
+        case MKTAG('m','o','o','v'):
+            moov_offset = offset + 4;
+        case MKTAG('m','d','a','t'):
+        case MKTAG('p','n','o','t'): /* detect movs with preview pics like ew.mov and april.mov */
+        case MKTAG('u','d','t','a'): /* Packet Video PVAuthor adds this and a lot of more junk */
+        case MKTAG('f','t','y','p'):å
+            if (AV_RB32(p-&gt;buf+offset) &lt; 8 &amp;&amp;
+                (AV_RB32(p-&gt;buf+offset) != 1 ||
+                 offset + 12 &gt; (unsigned int)p-&gt;buf_size ||
+                 AV_RB64(p-&gt;buf+offset + 8) == 0)) {
+                score = FFMAX(score, AVPROBE_SCORE_EXTENSION);
+            } else if (tag == MKTAG('f','t','y','p') &amp;&amp;
+                       (   AV_RL32(p-&gt;buf + offset + 8) == MKTAG('j','p','2',' ')
+                        || AV_RL32(p-&gt;buf + offset + 8) == MKTAG('j','p','x',' ')
+                    )) {
+                score = FFMAX(score, 5);
+            } else {
+                score = AVPROBE_SCORE_MAX;
+            }
+            offset = FFMAX(4, AV_RB32(p-&gt;buf+offset)) + offset;
+            break;
+        /* those are more common words, so rate then a bit less */
+        case MKTAG('e','d','i','w'): /* xdcam files have reverted first tags */
+        case MKTAG('w','i','d','e'):
+        case MKTAG('f','r','e','e'):
+        case MKTAG('j','u','n','k'):
+        case MKTAG('p','i','c','t'):
+            score  = FFMAX(score, AVPROBE_SCORE_MAX - 5);
+            offset = FFMAX(4, AV_RB32(p-&gt;buf+offset)) + offset;
+            break;
+        case MKTAG(0x82,0x82,0x7f,0x7d):
+        case MKTAG('s','k','i','p'):
+        case MKTAG('u','u','i','d'):
+        case MKTAG('p','r','f','l'):
+            /* if we only find those cause probedata is too small at least rate them */
+            score  = FFMAX(score, AVPROBE_SCORE_EXTENSION);
+            offset = FFMAX(4, AV_RB32(p-&gt;buf+offset)) + offset;
+            break;
+        default:
+            offset = FFMAX(4, AV_RB32(p-&gt;buf+offset)) + offset;
+        }
+    }
+    if(score &gt; AVPROBE_SCORE_MAX - 50 &amp;&amp; moov_offset != -1) {
+        /* moov atom in the header - we should make sure that this is not a
+         * MOV-packed MPEG-PS */
+        offset = moov_offset;
+
+        while(offset &lt; (p-&gt;buf_size - 16)){ /* Sufficient space */
+               /* We found an actual hdlr atom */
+            if(AV_RL32(p-&gt;buf + offset     ) == MKTAG('h','d','l','r') &amp;&amp;
+               AV_RL32(p-&gt;buf + offset +  8) == MKTAG('m','h','l','r') &amp;&amp;
+               AV_RL32(p-&gt;buf + offset + 12) == MKTAG('M','P','E','G')){
+                av_log(NULL, AV_LOG_WARNING, "Found media data tag MPEGå indicating this is a MOV-packed MPEG-PS.\n");
+                /* We found a media handler reference atom describing an
+                 * MPEG-PS-in-MOV, return a
+                 * low score to force expanding the probe window until
+                 * mpegps_probe finds what it needs */
+                return 5;
+            }else
+                /* Keep looking */
+                offset+=2;
+        }
+    }
+
+    return score;
+}</code></pre> 
+<p>以hls为例，当Name为hls时，相对应的函数指针均会指向hls.c的函数指针</p> 
+<p><img alt="" height="436" src="https://images2.imgbox.com/22/5e/bWv4J8vW_o.png" width="598"><img alt="" height="378" src="https://images2.imgbox.com/d7/9c/vtId2635_o.png" width="619"></p> 
+<p><img alt="" height="438" src="https://images2.imgbox.com/2c/9d/1cLSYpf6_o.png" width="573"></p> 
+<p>av_probe_input_format3总结:</p> 
+<p>遍历所有的解复用器 然后记录最匹配的解复用器<br> 1、如果有探测函数 则调用 并记录分数 否则匹配扩展名(50分)<br> 2、然后匹配媒体类型 如果匹配且比以前分高 就为75分</p> 
+<p>由于调试的例程是私有协议，所以会走第3个步骤</p> 
+<p>3）如果通过文件名或类型没有匹配到 就打开文件 然后读取内容再推测</p> 
+<p>s-&gt;io_open函数指针指向io_open_default</p> 
+<pre><code>static int io_open_default(AVFormatContext *s, AVIOContext **pb,
+                           const char *url, int flags, AVDictionary **options)
+{
+    int loglevel;
+
+    if (!strcmp(url, s-&gt;filename) ||
+        s-&gt;iformat &amp;&amp; !strcmp(s-&gt;iformat-&gt;name, "image2") ||
+        s-&gt;oformat &amp;&amp; !strcmp(s-&gt;oformat-&gt;name, "image2")
+    ) {
+        loglevel = AV_LOG_DEBUG;
+    } else
+        loglevel = AV_LOG_INFO;
+
+    av_log(s, loglevel, "Opening \'%s\' for %s\n", url, flags &amp; AVIO_FLAG_WRITE ? "writing" : "reading");
+
+#if FF_API_OLD_OPEN_CALLBACKS
+FF_DISABLE_DEPRECATION_WARNINGS
+    if (s-&gt;open_cb)
+        return s-&gt;open_cb(s, pb, url, flags, &amp;s-&gt;interrupt_callback, options);
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+
+    return ffio_open_whitelist(pb, url, flags, &amp;s-&gt;interrupt_callback, options, s-&gt;protocol_whitelist, s-&gt;protocol_blacklist);
+}</code></pre> 
+<p><img alt="" height="137" src="https://images2.imgbox.com/51/c2/TkICoBDa_o.png" width="195"></p> 
+<pre><code>int ffurl_connect(URLContext *uc, AVDictionary **options)
+{
+    int err;
+    AVDictionary *tmp_opts = NULL;
+    AVDictionaryEntry *e;
+
+    if (!options)
+        options = &amp;tmp_opts;
+
+    // Check that URLContext was initialized correctly and lists are matching if set
+    av_assert0(!(e=av_dict_get(*options, "protocol_whitelist", NULL, 0)) ||
+               (uc-&gt;protocol_whitelist &amp;&amp; !strcmp(uc-&gt;protocol_whitelist, e-&gt;value)));
+    av_assert0(!(e=av_dict_get(*options, "protocol_blacklist", NULL, 0)) ||
+               (uc-&gt;protocol_blacklist &amp;&amp; !strcmp(uc-&gt;protocol_blacklist, e-&gt;value)));
+
+    if (uc-&gt;protocol_whitelist &amp;&amp; av_match_list(uc-&gt;prot-&gt;name, uc-&gt;protocol_whitelist, ',') &lt;= 0) {
+        av_log(uc, AV_LOG_ERROR, "Protocol '%s' not on whitelist '%s'!\n", uc-&gt;prot-&gt;name, uc-&gt;protocol_whitelist);
+        return AVERROR(EINVAL);
+    }
+
+    if (uc-&gt;protocol_blacklist &amp;&amp; av_match_list(uc-&gt;prot-&gt;name, uc-&gt;protocol_blacklist, ',') &gt; 0) {
+        av_log(uc, AV_LOG_ERROR, "Protocol '%s' on blacklist '%s'!\n", uc-&gt;prot-&gt;name, uc-&gt;protocol_blacklist);
+        return AVERROR(EINVAL);
+    }
+
+    if (!uc-&gt;protocol_whitelist &amp;&amp; uc-&gt;prot-&gt;default_whitelist) {
+        av_log(uc, AV_LOG_DEBUG, "Setting default whitelist '%s'\n", uc-&gt;prot-&gt;default_whitelist);
+        uc-&gt;protocol_whitelist = av_strdup(uc-&gt;prot-&gt;default_whitelist);
+        if (!uc-&gt;protocol_whitelist) {
+            return AVERROR(ENOMEM);
+        }
+    } else if (!uc-&gt;protocol_whitelist)
+        av_log(uc, AV_LOG_DEBUG, "No default whitelist set\n"); // This should be an error once all declare a default whitelist
+
+    if ((err = av_dict_set(options, "protocol_whitelist", uc-&gt;protocol_whitelist, 0)) &lt; 0)
+        return err;
+    if ((err = av_dict_set(options, "protocol_blacklist", uc-&gt;protocol_blacklist, 0)) &lt; 0)
+        return err;
+
+    err =
+        uc-&gt;prot-&gt;url_open2 ? uc-&gt;prot-&gt;url_open2(uc,
+                                                  uc-&gt;filename,
+                                                  uc-&gt;flags,
+                                                  options) :
+        uc-&gt;prot-&gt;url_open(uc, uc-&gt;filename, uc-&gt;flags);
+
+    av_dict_set(options, "protocol_whitelist", NULL, 0);
+    av_dict_set(options, "protocol_blacklist", NULL, 0);
+
+    if (err)
+        return err;
+    uc-&gt;is_connected = 1;
+    /* We must be careful here as ffurl_seek() could be slow,
+     * for example for http */
+    if ((uc-&gt;flags &amp; AVIO_FLAG_WRITE) || !strcmp(uc-&gt;prot-&gt;name, "file"))
+        if (!uc-&gt;is_streamed &amp;&amp; ffurl_seek(uc, 0, SEEK_SET) &lt; 0)
+            uc-&gt;is_streamed = 1;
+    return 0;
+}</code></pre> 
+<p><img alt="" height="361" src="https://images2.imgbox.com/36/05/3JmzLb6S_o.png" width="628"><img alt="" height="483" src="https://images2.imgbox.com/f2/dd/ksMd86hw_o.png" width="296"></p> 
+<p>uc-&gt;prot-&gt;url_open2根据协议，会调用对应协议的open2，这里协议是私有协议ijkbds，所以会调用ijkbds_open</p> 
+<p><img alt="" height="167" src="https://images2.imgbox.com/91/16/aDtalPZL_o.png" width="208"></p> 
+<p>ijkbds_open会打开流，最终uc-&gt;is_connected = 1</p> 
+<pre><code>int ffio_open_whitelist(AVIOContext **s, const char *filename, int flags,
+                         const AVIOInterruptCB *int_cb, AVDictionary **options,
+                         const char *whitelist, const char *blacklist
+                        )
+{
+    URLContext *h;
+    int err;
+
+    err = ffurl_open_whitelist(&amp;h, filename, flags, int_cb, options, whitelist, blacklist, NULL);
+    if (err &lt; 0)
+        return err;
+    err = ffio_fdopen(s, h);
+    if (err &lt; 0) {
+        ffurl_close(h);
+        return err;
+    }
+    return 0;
+}</code></pre> 
+<p>两个步骤：</p> 
+<p>1）ffurl_connect会最终调用open2打开对应协议的open</p> 
+<p>2）ffio_fdopen会通过avio_alloc_context设置read/write/seek相关回调</p> 
+<pre><code>int ffio_fdopen(AVIOContext **s, URLContext *h)
+{
+    AVIOInternal *internal = NULL;
+    uint8_t *buffer = NULL;
+    int buffer_size, max_packet_size;
+
+    max_packet_size = h-&gt;max_packet_size;
+    if (max_packet_size) {
+        buffer_size = max_packet_size; /* no need to bufferize more than one packet */
+    } else {
+        buffer_size = IO_BUFFER_SIZE;
+    }
+    buffer = av_malloc(buffer_size);
+    if (!buffer)
+        return AVERROR(ENOMEM);
+
+    internal = av_mallocz(sizeof(*internal));
+    if (!internal)
+        goto fail;
+
+    internal-&gt;h = h;
+//设置read/write/seek相关回调
+    *s = avio_alloc_context(buffer, buffer_size, h-&gt;flags &amp; AVIO_FLAG_WRITE,
+                            internal, io_read_packet, io_write_packet, io_seek);
+    if (!*s)
+        goto fail;
+
+    (*s)-&gt;protocol_whitelist = av_strdup(h-&gt;protocol_whitelist);
+    if (!(*s)-&gt;protocol_whitelist &amp;&amp; h-&gt;protocol_whitelist) {
+        avio_closep(s);
+        goto fail;
+    }
+    (*s)-&gt;protocol_blacklist = av_strdup(h-&gt;protocol_blacklist);
+    if (!(*s)-&gt;protocol_blacklist &amp;&amp; h-&gt;protocol_blacklist) {
+        avio_closep(s);
+        goto fail;
+    }
+    (*s)-&gt;direct = h-&gt;flags &amp; AVIO_FLAG_DIRECT;
+
+    (*s)-&gt;seekable = h-&gt;is_streamed ? 0 : AVIO_SEEKABLE_NORMAL;
+    (*s)-&gt;max_packet_size = max_packet_size;
+    (*s)-&gt;min_packet_size = h-&gt;min_packet_size;
+    if(h-&gt;prot) {
+        (*s)-&gt;read_pause = io_read_pause;
+        (*s)-&gt;read_seek  = io_read_seek;
+
+        if (h-&gt;prot-&gt;url_read_seek)
+            (*s)-&gt;seekable |= AVIO_SEEKABLE_TIME;
+    }
+    (*s)-&gt;short_seek_get = io_short_seek;
+    (*s)-&gt;av_class = &amp;ff_avio_class;
+    return 0;
+fail:
+    av_freep(&amp;internal);
+    av_freep(&amp;buffer);
+    return AVERROR(ENOMEM);
+}</code></pre> 
+<p><img alt="" height="590" src="https://images2.imgbox.com/cd/f0/bhgoCvjJ_o.png" width="612"></p> 
+<h3>2、read_header</h3> 
+<p>mp4的函数指针会指向mov.c文件的mov_read_header</p> 
+<p>因为本文以mp4为例，这里先了解mp4的文件结构</p> 
+<p><img alt="" height="656" src="https://images2.imgbox.com/cc/fc/VeJ7EeVt_o.png" width="1200"></p> 
+<p><img alt="" height="556" src="https://images2.imgbox.com/25/d2/jZsBEx1N_o.png" width="856"></p> 
+<p><code>从图中可以看出来这些box是有层级关系的。每一个box它的头部的</code><code>8</code><code>个字节是固定的，前四个字节是这个box的大小，后四个字节是这个box的类型，也就是途中的fytp,moov之类的。这个信息在ffmpeg中使用MOVAtom来标示：</code></p> 
+<pre><code>//在代码中atom,其实就是MP4协议中的box，总共8个字节
+typedef struct MOVAtom {
+    uint32_t type;//box类型
+    int64_t size; /* box整体大小（size+type+body三部分） total size (excluding the size and type fields) */
+} MOVAtom;</code></pre> 
+<p>MP4格式是以BOX的形式存储数据的，包括嵌套box，所有的box都是由size+type+body三部分组成。在最外层的BOX中主要有ftyp、moov、mdat三种类型的BOX。ftyp主要为MP4格式的标识信息，moov为这个MP4文件sample数据的metadata，用来描述sample大小，位置，dts等，mdat为sample具体数据。每个sample数据在文件中的位置，是通过moov中的trak得到的。mp4 box的解析其实就是读取各种类型box，将里面的一些数据通过file_read读取并赋值。</p> 
+<pre><code>static int mov_read_header(AVFormatContext *s)
+{
+    MOVContext *mov = s-&gt;priv_data;  //AVClass类型 memset 为0
+    AVIOContext *pb = s-&gt;pb;
+    int j, err;
+    MOVAtom atom = { AV_RL32("root") }; //创建父box,包含ftyp、moov、mdat三种类型的box并赋初值
+    int i;
+    ...
+    mov-&gt;fc = s; //将AVFormatContext 赋值给MOVContext 方便书写，代码具有扩展性
+    mov-&gt;trak_index = -1;
+    /* .mov and .mp4 aren't streamable anyway (only progressive download if moov is before mdat) */
+    if (pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL)
+        atom.size = avio_size(pb); //源MP4文件整体大小
+    else
+        atom.size = INT64_MAX;
+
+    /* check MOV header */
+    //当读完moov的box时跳出，但这里只读一次，因为有mov_read_default接口会不断向下读取嵌套box,只要atom.size还有足够数据
+    do {
+        if (mov-&gt;moov_retry)
+            avio_seek(pb, 0, SEEK_SET);
+            //有嵌套BOX，继续往下读
+        if ((err = mov_read_default(mov, pb, atom)) &lt; 0) {
+            av_log(s, AV_LOG_ERROR, "error reading header\n");
+            goto fail;
+        }
+    } while ((pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL) &amp;&amp; !mov-&gt;found_moov &amp;&amp; !mov-&gt;moov_retry++);
+    if (!mov-&gt;found_moov) { //moov是否读完标志
+        av_log(s, AV_LOG_ERROR, "moov atom not found\n");
+        err = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+    av_log(mov-&gt;fc, AV_LOG_TRACE, "on_parse_exit_offset=%"PRId64"\n", avio_tell(pb));
+
+    if (pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL) {
+        ......
+    }
+
+    /* copy timecode metadata from tmcd tracks to the related video streams */
+    for (i = 0; i &lt; s-&gt;nb_streams; i++) {
+        ...
+    }
+    export_orphan_timecode(s);
+
+    //s-&gt;streams是在读取trak box开的内存并赋值的
+    for (i = 0; i &lt; s-&gt;nb_streams; i++) {
+        AVStream *st = s-&gt;streams[i];
+        MOVStreamContext *sc = st-&gt;priv_data;
+        fix_timescale(mov, sc); //mdhd中的时间缩放比例，一般为1
+        if (st-&gt;codecpar-&gt;codec_type == AVMEDIA_TYPE_AUDIO &amp;&amp;
+            st-&gt;codecpar-&gt;codec_id   == AV_CODEC_ID_AAC) {
+            st-&gt;internal-&gt;skip_samples = sc-&gt;start_pad;
+        }
+        if (st-&gt;codecpar-&gt;codec_type == AVMEDIA_TYPE_VIDEO &amp;&amp; sc-&gt;nb_frames_for_fps &gt; 0 &amp;&amp; sc-&gt;duration_for_fps &gt; 0)
+            av_reduce(&amp;st-&gt;avg_frame_rate.num, &amp;st-&gt;avg_frame_rate.den,
+                      sc-&gt;time_scale*(int64_t)sc-&gt;nb_frames_for_fps, sc-&gt;duration_for_fps, INT_MAX);
+        if (st-&gt;codecpar-&gt;codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            if (st-&gt;codecpar-&gt;width &lt;= 0 || st-&gt;codecpar-&gt;height &lt;= 0) {
+                st-&gt;codecpar-&gt;width  = sc-&gt;width;
+                st-&gt;codecpar-&gt;height = sc-&gt;height;
+            }
+            if (st-&gt;codecpar-&gt;codec_id == AV_CODEC_ID_DVD_SUBTITLE) {
+                if ((err = mov_rewrite_dvd_sub_extradata(st)) &lt; 0)
+                    goto fail;
+            }
+        }
+        ...
+    }
+    if (mov-&gt;trex_data) {
+        ...
+    }
+    if (mov-&gt;use_mfra_for &gt; 0) {
+        ...
+    }
+    for (i = 0; i &lt; mov-&gt;bitrates_count &amp;&amp; i &lt; s-&gt;nb_streams; i++) {
+        if (mov-&gt;bitrates[i]) {
+            s-&gt;streams[i]-&gt;codecpar-&gt;bit_rate = mov-&gt;bitrates[i];//计算码率
+        }
+    }
+
+    ff_rfps_calculate(s);
+
+    for (i = 0; i &lt; s-&gt;nb_streams; i++) {
+        AVStream *st = s-&gt;streams[i];
+        MOVStreamContext *sc = st-&gt;priv_data;
+
+        switch (st-&gt;codecpar-&gt;codec_type) {
+        case AVMEDIA_TYPE_AUDIO:
+            err = ff_replaygain_export(st, s-&gt;metadata);
+            if (err &lt; 0)
+                goto fail;
+            break;
+        case AVMEDIA_TYPE_VIDEO:
+            ...
+    }
+    ff_configure_buffers_for_index(s, AV_TIME_BASE);
+
+    for (i = 0; i &lt; mov-&gt;frag_index.nb_items; i++)
+        if (mov-&gt;frag_index.item[i].moof_offset &lt;= mov-&gt;fragment.moof_offset)
+            mov-&gt;frag_index.item[i].headers_read = 1;
+
+    return 0;
+fail:
+    mov_read_close(s);
+    return err;
+}
+</code></pre> 
+<pre><code>//将所有解析atom的接口都注册到一起
+typedef struct MOVParseTableEntry {
+    uint32_t type;
+    int (*parse)(MOVContext *ctx, AVIOContext *pb, MOVAtom atom);
+} MOVParseTableEntry;
+
+static const MOVParseTableEntry mov_default_parse_table[] = {
+{ MKTAG('f','t','y','p'), mov_read_ftyp },
+{ MKTAG('t','r','a','k'), mov_read_trak },
+{ MKTAG('t','r','a','f'), mov_read_default },
+{ MKTAG('s','t','s','c'), mov_read_stsc },
+{ MKTAG('s','t','s','d'), mov_read_stsd }, /* sample description */
+{ MKTAG('s','t','s','s'), mov_read_stss }, /* sync sample */
+{ MKTAG('s','t','s','z'), mov_read_stsz }, /* sample size */
+{ MKTAG('s','t','t','s'), mov_read_stts },
+{ MKTAG('s','t','z','2'), mov_read_stsz }, /* compact sample size */
+.....
+}
+
+//这个接口是最重要的接口，主要是负责读取嵌套的box，里面有循环代码，只要atom.size数据足够多的
+//比如 moov-&gt;trak-&gt;mdia-&gt;stbl-&gt;stsd、stts、stss、ctts、stco等
+//所以上面mov_read_header接口中只用执行一次mov_read_default就行了，就是从创建的父box开始循环读取嵌套box
+static int mov_read_default(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    int64_t total_size = 0;//读取一个atom(无论是否是嵌套box),已经读取的字节数
+    MOVAtom a;
+    int i;
+
+    if (c-&gt;atom_depth &gt; 10) {
+        av_log(c-&gt;fc, AV_LOG_ERROR, "Atoms too deeply nested\n");
+        return AVERROR_INVALIDDATA;
+    }
+    c-&gt;atom_depth ++; //atom读取层数
+
+    if (atom.size &lt; 0)
+        atom.size = INT64_MAX;
+    while (total_size &lt;= atom.size - 8 &amp;&amp; !avio_feof(pb)) {
+        int (*parse)(MOVContext*, AVIOContext*, MOVAtom) = NULL;
+        a.size = atom.size;
+        a.type=0;
+        if (atom.size &gt;= 8) {
+            a.size = avio_rb32(pb);//avio_rb32读四字节函数，该box大小（size+type+body大小）
+            a.type = avio_rl32(pb);//avio_rb32读四字节函数，该box类型
+            //类型比对
+            if (((a.type == MKTAG('f','r','e','e') &amp;&amp; c-&gt;moov_retry) ||
+                  a.type == MKTAG('h','o','o','v')) &amp;&amp;
+                a.size &gt;= 8 &amp;&amp;
+                c-&gt;fc-&gt;strict_std_compliance &lt; FF_COMPLIANCE_STRICT) {
+                uint32_t type;
+                avio_skip(pb, 4);
+                type = avio_rl32(pb);
+                avio_seek(pb, -8, SEEK_CUR);
+                if (type == MKTAG('m','v','h','d') ||
+                    type == MKTAG('c','m','o','v')) {
+                    av_log(c-&gt;fc, AV_LOG_ERROR, "Detected moov in a free or hoov atom.\n");
+                    a.type = MKTAG('m','o','o','v');
+                }
+            }
+            if (atom.type != MKTAG('r','o','o','t') &amp;&amp;
+                atom.type != MKTAG('m','o','o','v')) {
+                if (a.type == MKTAG('t','r','a','k') ||
+                    a.type == MKTAG('m','d','a','t')) {
+                    av_log(c-&gt;fc, AV_LOG_ERROR, "Broken file, trak/mdat not at top-level\n");
+                    avio_skip(pb, -8);
+                    c-&gt;atom_depth --;
+                    return 0;
+                }
+            }
+            total_size += 8; //一次读取8个字节，其中4个字节为box长度，4个字节为box的tpye
+            if (a.size == 1 &amp;&amp; total_size + 8 &lt;= atom.size) { /* 64 bit extended size */
+                a.size = avio_rb64(pb) - 8;
+                total_size += 8;
+            }
+        }
+        av_log(c-&gt;fc, AV_LOG_TRACE, "type:'%s' parent:'%s' sz: %"PRId64" %"PRId64" %"PRId64"\n",
+               av_fourcc2str(a.type), av_fourcc2str(atom.type), a.size, total_size, atom.size);
+        if (a.size == 0) {
+            a.size = atom.size - total_size + 8;
+        }
+        a.size -= 8;
+        if (a.size &lt; 0)
+            break;
+        a.size = FFMIN(a.size, atom.size - total_size);
+
+       //通过mov_default_parse_table与type比较，对将对应的解析box接口进行赋值
+        for (i = 0; mov_default_parse_table[i].type; i++)
+            if (mov_default_parse_table[i].type == a.type) {
+                parse = mov_default_parse_table[i].parse;
+                break;//找到对应的box，退出比较
+            }
+
+        // container is user data
+        if (!parse &amp;&amp; (atom.type == MKTAG('u','d','t','a') ||
+                       atom.type == MKTAG('i','l','s','t')))
+            parse = mov_read_udta_string;
+
+        // Supports parsing the QuickTime Metadata Keys.
+        // https://developer.apple.com/library/mac/documentation/QuickTime/QTFF/Metadata/Metadata.html
+        if (!parse &amp;&amp; c-&gt;found_hdlr_mdta &amp;&amp;
+            atom.type == MKTAG('m','e','t','a') &amp;&amp;
+            a.type == MKTAG('k','e','y','s') &amp;&amp;
+            c-&gt;meta_keys_count == 0) {
+            parse = mov_read_keys;
+        }
+
+        if (!parse) { /* 如果没有找到对应的type类型，就跳过这个atom数据skip leaf atoms data */
+            avio_skip(pb, a.size);
+        } else {
+            int64_t start_pos = avio_tell(pb);//当前文件指针位置和文件首地址的偏移，为了验证该box或atom是否已经读完，比如第一次执行解析，start_pos=8
+            int64_t left;
+            int err = parse(c, pb, a);//parse是个函数指针，如果tpye=ftyp，则会调用mov_read_ftyp
+            if (err &lt; 0) {
+                c-&gt;atom_depth --;
+                return err;
+            }
+            if (c-&gt;found_moov &amp;&amp; c-&gt;found_mdat &amp;&amp;
+                ((!(pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL) || c-&gt;fc-&gt;flags &amp; AVFMT_FLAG_IGNIDX || c-&gt;frag_index.complete) ||
+                 start_pos + a.size == avio_size(pb))) {
+                if (!(pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL) || c-&gt;fc-&gt;flags &amp; AVFMT_FLAG_IGNIDX || c-&gt;frag_index.complete)
+                    c-&gt;next_root_atom = start_pos + a.size;
+                c-&gt;atom_depth --;
+                return 0;
+            }
+            left = a.size - avio_tell(pb) + start_pos;//验证 该box或atom是否已经读完;avio_tell相对于文件起始位置的偏移量，第一次执行：a.size = 16,start_pos = 8,avio_tell(pb) = 24，left = 0
+            if (left &gt; 0) /* 跳过box剩余的偏移量skip garbage at atom end */
+                avio_skip(pb, left);
+            else if (left &lt; 0) {
+                av_log(c-&gt;fc, AV_LOG_WARNING,
+                       "overread end of atom '%s' by %"PRId64" bytes\n",
+                       av_fourcc2str(a.type), -left);
+                avio_seek(pb, left, SEEK_CUR);
+            }
+        }
+//total_size 为一个循环总共读取的size
+        total_size += a.size;//一个atom已经读完
+    }
+
+    if (total_size &lt; atom.size &amp;&amp; atom.size &lt; 0x7ffff)
+        avio_skip(pb, atom.size - total_size);
+
+    c-&gt;atom_depth --;
+    return 0;
+}
+</code></pre> 
+<p>mov_read_header的工作</p> 
+<ul><li>检测参数的有效性。 
+  <ul><li>比如<code>decryption_key_len</code>的范围。</li></ul></li><li>调用mov_read_default进行root下的box解析。</li></ul> 
+<p>其中</p> 
+<pre><code>int (*parse)(MOVContext*, AVIOContext*, MOVAtom) = NULL</code></pre> 
+<p>这个是个函数指针，会根据type的类型调用相关的解析函数。比如box的type为ftyp的时候，就会调用mov_read_ftyp</p> 
+<pre><code>/* read major brand, minor version and compatible brands and store them as metadata */
+static int mov_read_ftyp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    uint32_t minor_ver;
+    int comp_brand_size;
+    char* comp_brands_str;
+    uint8_t type[5] = {0};
+    int ret = ffio_read_size(pb, type, 4);
+    if (ret &lt; 0)
+        return ret;
+
+    if (strcmp(type, "qt  "))
+        c-&gt;isom = 1;
+    av_log(c-&gt;fc, AV_LOG_DEBUG, "ISO: File Type Major Brand: %.4s\n",(char *)&amp;type);
+    av_dict_set(&amp;c-&gt;fc-&gt;metadata, "major_brand", type, 0);
+    minor_ver = avio_rb32(pb); /* minor version */
+    av_dict_set_int(&amp;c-&gt;fc-&gt;metadata, "minor_version", minor_ver, 0);
+
+    comp_brand_size = atom.size - 8;
+    if (comp_brand_size &lt; 0)
+        return AVERROR_INVALIDDATA;
+    comp_brands_str = av_malloc(comp_brand_size + 1); /* Add null terminator */
+    if (!comp_brands_str)
+        return AVERROR(ENOMEM);
+
+    ret = ffio_read_size(pb, comp_brands_str, comp_brand_size);
+    if (ret &lt; 0) {
+        av_freep(&amp;comp_brands_str);
+        return ret;
+    }
+    comp_brands_str[comp_brand_size] = 0;
+    av_dict_set(&amp;c-&gt;fc-&gt;metadata, "compatible_brands", comp_brands_str, 0);//comp_brands_str = "ios4hvc1"
+    av_freep(&amp;comp_brands_str);
+
+    return 0;
+}</code></pre> 
+<p>由于ftyp没有嵌套，所以没有调用mov_read_default，而moov就会有嵌套</p> 
+<p><img alt="" height="90" src="https://images2.imgbox.com/c7/8b/6f947oIP_o.png" width="549"></p> 
+<p>ftyp的长度为0x18，即对应avio_tell(pb) = 24，moov的长度为0x00110b48，即1117000，所以mdat的真实数据其实地址为ftyp+moov+8(其中4个字节为mdat长度，4个字节为mdat的tpye）=24+1117000+8=1117032</p> 
+<pre><code>static int mov_read_moov(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    int ret;
+
+    if (c-&gt;found_moov) {
+        av_log(c-&gt;fc, AV_LOG_WARNING, "Found duplicated MOOV Atom. Skipped it\n");
+        avio_skip(pb, atom.size);
+        return 0;
+    }
+
+    if ((ret = mov_read_default(c, pb, atom)) &lt; 0)
+        return ret;
+    /* 我们解析了'moov'这个box，只要找到'mdat'，我们就可以终止解析 */
+    /* 因此，如果通过网络，我们不会解析整个文件 */
+    c-&gt;found_moov=1;
+    return 0; /* now go for mdat */
+}</code></pre> 
+<p>c-&gt;found_moov &amp;&amp; c-&gt;found_mdat均为1的时候</p> 
+<pre><code>            if (c-&gt;found_moov &amp;&amp; c-&gt;found_mdat &amp;&amp;
+                ((!(pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL) || c-&gt;fc-&gt;flags &amp; AVFMT_FLAG_IGNIDX || c-&gt;frag_index.complete) ||
+                 start_pos + a.size == avio_size(pb))) {
+                if (!(pb-&gt;seekable &amp; AVIO_SEEKABLE_NORMAL) || c-&gt;fc-&gt;flags &amp; AVFMT_FLAG_IGNIDX || c-&gt;frag_index.complete)
+                    c-&gt;next_root_atom = start_pos + a.size;
+                c-&gt;atom_depth --;
+                return 0;
+            }</code></pre> 
+<p>发现 start_pos + a.size == avio_size(pb)这个条件不满足要求，不会退出解析，为啥要这个条件呢？能不能把这个条件去掉？</p> 
+<p>由于这个box只是并没有真正去读取数据，只是把标志置1</p> 
+<pre><code>static int mov_read_mdat(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    if (atom.size == 0) /* wrong one (MP4) */
+        return 0;
+    c-&gt;found_mdat=1;
+    return 0; /* now go for moov */
+}</code></pre> 
+<p>所以后面会走到</p> 
+<pre><code>left = a.size - avio_tell(pb) + start_pos;//验证 该box或atom是否已经读完
+            if (left &gt; 0) /* skip garbage at atom end */
+                avio_skip(pb, left);//起播的时候，会先seek到文件结尾
+</code></pre> 
+<h2>总结</h2> 
+<p>可以看到，avformat_open_input的主要主要就是根据输入的文件，创建AVFormatContext，根据文件的头格式，后缀找到合适的AVInputFormat，并初始化AVIOContext，完成读写协议，然后读取文件头。完成AVFormatContext的初始化。</p> 
+<h2>优化点</h2> 
+<p>1）前端设置“iformat”属性</p> 
+<p>2）probe_input去掉部分格式</p> 
+<p>3）去掉free的box或者是修改c-&gt;found_moov &amp;&amp; c-&gt;found_mdat均为1后的执行逻辑</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3bf9af7bfb4fba065f4b469dbfc6f930/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">LiveMedia视频平台是如何实现基于网页的语音对讲</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/867a7d0d40c5a63a8c16993712de169b/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">将二进制bin文件转换为pcd文件或ply文件（matlab）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

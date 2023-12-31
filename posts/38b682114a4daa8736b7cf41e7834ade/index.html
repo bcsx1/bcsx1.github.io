@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>自研海外PCDN系统技术架构与演进 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="自研海外PCDN系统技术架构与演进" />
+<meta property="og:description" content="Photo by Nick Wehrli from Pexels
+本文来自小溪流科技首席架构师张道远在LiveVideoStackCon 2019深圳站上的演讲，演讲内容主要涉及PCDN海外复杂环境中如何提高穿透率和分享率的同时，保证弱网的用户体验和内容版权的保护中采用的技术，架构演进及实际落地效果展示。
+文 / 张道远
+整理 / LiveVideoStack
+大家好，我是来自深圳市小溪流科技有限公司的系统架构师张道远，主要负责公司PCDN的系统架构设计。我们公司主要是做方案集成商，包括CDN和PCDN这块，一直耕耘于海外。
+今天我带来的主要内容是自研PCDN系统技术架构与演进。演讲主要从四个方面进行分享。如何提高穿透率和分享率，在海外弱网环境下的实践，另外就是安全体系建设的一些方面。
+1. PCDN提高穿透率
+1.1 NAT的分类
+提到穿透率，避免不了提到NAT。快速给大家讲一下NAT的分类。
+（1）完全锥形
+完全锥形的特性是只要知道网关上映射的端口和IP，在任何一个地方都可以通过内网IP访问。
+（2）限制锥形
+限制锥形的映射方式与完全锥形相似，但在安全性上有所不同。它拒绝“不请自来”的IP访问。
+（3）端口限制锥形
+它的映射方式和限制锥形一样，但它对IP和端口都做了访问限制。如图，对于同一个IP，通过另外的端口访问时接收不到数据的。同一个端口，没有主动发出请求的IP也是收不到数据包的。
+（4）对称型
+不同的请求、目的、地址有不同的映射。同时它与限制锥形NAT映射相似，但它拒绝主动请求的IP及端口的访问。如上图，对S1、S2发出请求，S1虽然知道出口IP，但是主动发出请求并不会被接收。
+实际中NAT类型还有很多种，例如公网IP、UDP Block等。
+1.2 全球家庭级别网关NAT类型分布
+我们对国外各类型网关NAT类型做了初步研究。上图是我们搜集的数据。我们发现端口限型和对称型分别占比75%和16%，两者占比非常高达91%，这意味着打通它们两者之间是我们面临的主要难题，也是提高穿透率的关键所在。
+1.3 穿透率提高的关键
+由于端口限制类型会拒绝接收主动请求的端口和IP的访问数据，对称型对新的访问数据会发起新的映射方式，所以正常情况下两者之间无法打洞。
+对称型和对称型之间的都使用新的映射关系，而且对称型会拒绝主动请求的IP和端口访问，所以正常情况下，两者之间打洞是不成功的。我们用了以下方法成功打洞。
+1.4 如何提高对称型的穿透率？
+（1）生日算法
+生日算法来源于生日悖论，应用到打洞场景上主要使用数据集有64511个端口(1024以下的端口不用)。据我们实验，假如设定对撞碰出端口的成功率是70%尝试的次数大概是三百到四百次。
+（2）UPNP
+UPNP是即插即用的通用缩写，主要用于智能设备的相互发现和通讯。我们在打洞时主要使用它将内网IP直接映射到出口IP当作公网服务模式使用。
+（3）中继模式。
+例如我有A、B、C三个节点，A和B之间可以打通，B和C之间可以打通，但是A和C之间由于NAT映射关系无法打通。当A和C通讯时可以将B作为中继点。中继节点具有服务器和客户端的特性，我们在选取中继节点时，最好选取带宽优质、能用内网或者UPNP模式开启的节点。
+（4）MDNS
+MDNS是多播协议。没有传统DNS的情况下，用于内部节点的相互发现和通讯。在打洞过程中可不通过服务器使内网节点相互发现通讯。它使用UDP端口协议，组播特性端口为5353。
+1.5 全球UPNP开启NAT分布情况
+我们搜集分析数据验证了这些方法的有效性。我们对全球UPNP开启NAT分布情况总结发现，端口映射型数据会增高，对称型基本不变，其它类型也基本不变。将样本总结分析发现，端口限制型的数据下降了，对称型增加了。我们关键要看的是第四个图。我们发现有46%的节点可直接以公共服务的方式提供P2P分享，保守估计P2P之间组网穿透率可达90%以上。我个人觉得穿透率的提高并不会直接带动分享率的提高。
+2. PCDN提高分享率
+接下来我会给大家介绍P2P节点组网模型、调度策略、跨区域或国际策略以及一些落地案例。
+2.1 P2P组网模型
+P2P常见组网模型有以下几种：
+（1）树形组网
+树形组网以顶层节点获取资源，常见的就是一分二、二分四这种模式，节点带宽够的话也可以一分多。但是我们可以很明显的看到它的缺点。随着树形高度增加，底层的累计延时会越来越大，如果父节点离线会导致子节点处于孤儿状态。同时，最底层的节点是一个完全消费者模型，无法进行数据分享。
+（2）网状组网
+网状模型中每个节点都是被动请求，只要节点的数据量级客观，数据肯定可以从周围节点请求得到。但是如果用于低延时，高可变的情况（比如直播），此模型就不是很合适。同时，此模型中消息互动是高频率互动的状态。
+（3）分布式星际组网
+分布式星级组网是去中心化，它的优势是每个节点状态容易同步一致，上线下线对网络影响状态小。但是它的缺点是消息冗余和消息延时，不适用于直播场景。这个模型稍作改动可作为点播类、文件分享比较合适；
+2.2 调度策略
+按照不同的国家，我们会按照区域调度，调度原则就是同城同网。对于跨区域调度，我们遵循同网划分，以节点间RTT值越小等级越高来区分。跨国调度以距离、RTT带宽为条件区分。混合调度结合了以上三种调度方式。
+上图是我们自己的P2P组网模型。我们采用了树形组网，但是我们规避优化了传统树形模型的缺点。为防止延时过高，我们在调度时会严格控制树形高度。为弥补父节点掉线造成孤儿状态的不足，我们使系统中每个节点都首先从CDN拉流。如果出现父节点掉线的情况，它立即向服务器补片，同时触发新的组网。对于纯粹的消费者模型，我们目前有两种方案，其中一种是节点可以做中继服务。第二种方式我们目前还在规划，我们希望将树形组网与网状组网融合。这种方案目前还没有落地。
+我们会在每个区域形成一张区域层级图，用mdns方式将同一内网用户串联起来，通过打洞调度将同区域同ISP节点组网，这样形成了ISP多根树模型。需要跨国际节点通过RTT等级区分并结合国际时差提供调度服务。通过这种方式，实现了不同国家，不同区域的层级拓扑图。
+3. 全球弱网环境实践" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/38b682114a4daa8736b7cf41e7834ade/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-02-07T08:00:00+08:00" />
+<meta property="article:modified_time" content="2020-02-07T08:00:00+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">自研海外PCDN系统技术架构与演进</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/0a/1a/upombDmc_o.png"></p> 
+ <p style="text-align: right">Photo by Nick Wehrli from Pexels</p> 
+ <blockquote> 
+  <p>本文来自小溪流科技首席架构师张道远在LiveVideoStackCon 2019深圳站上的演讲，演讲内容主要涉及PCDN海外复杂环境中如何提高穿透率和分享率的同时，保证弱网的用户体验和内容版权的保护中采用的技术，架构演进及实际落地效果展示。</p> 
+ </blockquote> 
+ <p> <br></p> 
+ <p>文 / 张道远</p> 
+ <p>整理 / LiveVideoStack</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/12/99/xYjP89UG_o.png"></p> 
+ <p>大家好，我是来自深圳市小溪流科技有限公司的系统架构师张道远，主要负责公司PCDN的系统架构设计。我们公司主要是做方案集成商，包括CDN和PCDN这块，一直耕耘于海外。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/be/a4/ASOtHUWK_o.png"></p> 
+ <p> </p> 
+ <p>今天我带来的主要内容是自研PCDN系统技术架构与演进。演讲主要从四个方面进行分享。如何提高穿透率和分享率，在海外弱网环境下的实践，另外就是安全体系建设的一些方面。</p> 
+ <p> </p> 
+ <p>1. PCDN提高穿透率</p> 
+ <p> </p> 
+ <p>1.1 NAT的分类</p> 
+ <p>提到穿透率，避免不了提到NAT。快速给大家讲一下NAT的分类。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/6f/50/5fce7CAU_o.png"></p> 
+ <p>（1）完全锥形</p> 
+ <p>完全锥形的特性是只要知道网关上映射的端口和IP，在任何一个地方都可以通过内网IP访问。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/26/59/b3bHJxwQ_o.png"></p> 
+ <p> </p> 
+ <p>（2）限制锥形</p> 
+ <p>限制锥形的映射方式与完全锥形相似，但在安全性上有所不同。它拒绝“不请自来”的IP访问。</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/a9/40/a3kGDV3o_o.png"></p> 
+ <p> </p> 
+ <p>（3）端口限制锥形</p> 
+ <p>它的映射方式和限制锥形一样，但它对IP和端口都做了访问限制。如图，对于同一个IP，通过另外的端口访问时接收不到数据的。同一个端口，没有主动发出请求的IP也是收不到数据包的。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/73/62/MsBymoC8_o.png"></p> 
+ <p> </p> 
+ <p>（4）对称型</p> 
+ <p>不同的请求、目的、地址有不同的映射。同时它与限制锥形NAT映射相似，但它拒绝主动请求的IP及端口的访问。如上图，对S1、S2发出请求，S1虽然知道出口IP，但是主动发出请求并不会被接收。</p> 
+ <p> </p> 
+ <p>实际中NAT类型还有很多种，例如公网IP、UDP Block等。</p> 
+ <p> </p> 
+ <p>1.2 全球家庭级别网关NAT类型分布</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/97/03/E6GI5C8X_o.png"></p> 
+ <p> </p> 
+ <p>我们对国外各类型网关NAT类型做了初步研究。上图是我们搜集的数据。我们发现端口限型和对称型分别占比75%和16%，两者占比非常高达91%，这意味着打通它们两者之间是我们面临的主要难题，也是提高穿透率的关键所在。</p> 
+ <p> </p> 
+ <p>1.3 穿透率提高的关键</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/c3/77/gtMwF1ES_o.png"></p> 
+ <p>由于端口限制类型会拒绝接收主动请求的端口和IP的访问数据，对称型对新的访问数据会发起新的映射方式，所以正常情况下两者之间无法打洞。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/12/f4/QpWXYxDu_o.png"></p> 
+ <p> </p> 
+ <p>对称型和对称型之间的都使用新的映射关系，而且对称型会拒绝主动请求的IP和端口访问，所以正常情况下，两者之间打洞是不成功的。我们用了以下方法成功打洞。</p> 
+ <p> </p> 
+ <p>1.4 如何提高对称型的穿透率？</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/7b/4c/Lma1Vnmv_o.png"></p> 
+ <p> </p> 
+ <p>（1）生日算法</p> 
+ <p>生日算法来源于生日悖论，应用到打洞场景上主要使用数据集有64511个端口(1024以下的端口不用)。据我们实验，假如设定对撞碰出端口的成功率是70%尝试的次数大概是三百到四百次。</p> 
+ <p>（2）UPNP</p> 
+ <p>UPNP是即插即用的通用缩写，主要用于智能设备的相互发现和通讯。我们在打洞时主要使用它将内网IP直接映射到出口IP当作公网服务模式使用。</p> 
+ <p>（3）中继模式。</p> 
+ <p>例如我有A、B、C三个节点，A和B之间可以打通，B和C之间可以打通，但是A和C之间由于NAT映射关系无法打通。当A和C通讯时可以将B作为中继点。中继节点具有服务器和客户端的特性，我们在选取中继节点时，最好选取带宽优质、能用内网或者UPNP模式开启的节点。</p> 
+ <p>（4）MDNS</p> 
+ <p>MDNS是多播协议。没有传统DNS的情况下，用于内部节点的相互发现和通讯。在打洞过程中可不通过服务器使内网节点相互发现通讯。它使用UDP端口协议，组播特性端口为5353。</p> 
+ <p> </p> 
+ <p>1.5 全球UPNP开启NAT分布情况</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/97/ae/if9oQsNP_o.png"></p> 
+ <p> </p> 
+ <p>我们搜集分析数据验证了这些方法的有效性。我们对全球UPNP开启NAT分布情况总结发现，端口映射型数据会增高，对称型基本不变，其它类型也基本不变。将样本总结分析发现，端口限制型的数据下降了，对称型增加了。我们关键要看的是第四个图。我们发现有46%的节点可直接以公共服务的方式提供P2P分享，保守估计P2P之间组网穿透率可达90%以上。我个人觉得穿透率的提高并不会直接带动分享率的提高。</p> 
+ <p> </p> 
+ <p>2.  PCDN提高分享率</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/85/16/WQjaH7wM_o.png"></p> 
+ <p> </p> 
+ <p>接下来我会给大家介绍P2P节点组网模型、调度策略、跨区域或国际策略以及一些落地案例。</p> 
+ <p> </p> 
+ <p>2.1 P2P组网模型</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/44/c4/hz5FjjYR_o.png"></p> 
+ <p>P2P常见组网模型有以下几种：</p> 
+ <p>（1）树形组网</p> 
+ <p>树形组网以顶层节点获取资源，常见的就是一分二、二分四这种模式，节点带宽够的话也可以一分多。但是我们可以很明显的看到它的缺点。随着树形高度增加，底层的累计延时会越来越大，如果父节点离线会导致子节点处于孤儿状态。同时，最底层的节点是一个完全消费者模型，无法进行数据分享。</p> 
+ <p>（2）网状组网</p> 
+ <p>网状模型中每个节点都是被动请求，只要节点的数据量级客观，数据肯定可以从周围节点请求得到。但是如果用于低延时，高可变的情况（比如直播），此模型就不是很合适。同时，此模型中消息互动是高频率互动的状态。</p> 
+ <p>（3）分布式星际组网</p> 
+ <p>分布式星级组网是去中心化，它的优势是每个节点状态容易同步一致，上线下线对网络影响状态小。但是它的缺点是消息冗余和消息延时，不适用于直播场景。这个模型稍作改动可作为点播类、文件分享比较合适；</p> 
+ <p> </p> 
+ <p>2.2 调度策略</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/a8/3a/MQ8yGytT_o.png"></p> 
+ <p> </p> 
+ <p>按照不同的国家，我们会按照区域调度，调度原则就是同城同网。对于跨区域调度，我们遵循同网划分，以节点间RTT值越小等级越高来区分。跨国调度以距离、RTT带宽为条件区分。混合调度结合了以上三种调度方式。</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/2e/65/DJuuRfhd_o.png"></p> 
+ <p> </p> 
+ <p>上图是我们自己的P2P组网模型。我们采用了树形组网，但是我们规避优化了传统树形模型的缺点。为防止延时过高，我们在调度时会严格控制树形高度。为弥补父节点掉线造成孤儿状态的不足，我们使系统中每个节点都首先从CDN拉流。如果出现父节点掉线的情况，它立即向服务器补片，同时触发新的组网。对于纯粹的消费者模型，我们目前有两种方案，其中一种是节点可以做中继服务。第二种方式我们目前还在规划，我们希望将树形组网与网状组网融合。这种方案目前还没有落地。</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/dd/ad/h5IAtl9H_o.png"></p> 
+ <p>我们会在每个区域形成一张区域层级图，用mdns方式将同一内网用户串联起来，通过打洞调度将同区域同ISP节点组网，这样形成了ISP多根树模型。需要跨国际节点通过RTT等级区分并结合国际时差提供调度服务。通过这种方式，实现了不同国家，不同区域的层级拓扑图。</p> 
+ <p> </p> 
+ <p>3. 全球弱网环境实践</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/d6/2c/59NEMMQF_o.png"></p> 
+ <p> </p> 
+ <p>不同国家的网络有很多复杂的情况，弱网环境是常见的情况。国际上有几种协议来处理弱网环境问题。</p> 
+ <p>（1）Google QUIC一款出名的谷歌定制的基于UDP的低延时互联网传输层协议。</p> 
+ <p>（2）SRT是Haivision新一代低延迟开源视频协议，同样基于UDP协议。</p> 
+ <p>（3）KCP是一个快速可靠的协议，能以牺牲 TCP10%-20%的带宽为代价，换取平均延迟30%-40%的降低 ，且最大延迟降低三倍的传输效果。</p> 
+ <p>（4）BGTP是我们自研发的基于GOP分片的流媒体传输协议。</p> 
+ <p> </p> 
+ <p>3.1 各协议实际流媒体传输测试</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/b6/9f/r9Y0SHYL_o.png"></p> 
+ <p>我们在方案选择前做了测试。我们把QUIC、SRT、KCP在不丢包的情况下使用恒定码率进行了对比测试。我们发现QUIC、KCP的带宽有略微增幅，SRT的带宽大约涨了10%。</p> 
+ <p> </p> 
+ <p>在30%丢包率效果下，网络抖动越大，HTTP使用带宽的效率会越低。从应用侧看，QUIC和KCP都能流畅的播放观看，但是带宽基本涨了一倍。我们实验时没有得到SRT的相关数据，也许是方法不对，实验时传输了正确的数据，由于设置了低延时，客户端收到的数据会导致视频出现马赛克、花屏等情况。我们的应用场景是要保证丢包率在30%左右时能稳定传输，同时在带宽成本考量范围内，所以以上方案都没有纳入选择范围。根据以往的经验，我们基于现有协议做了深度改造，形成了BGTP传输协议。</p> 
+ <p> </p> 
+ <p>3.2 BGTP抗抖动</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/8c/70/gL6b1Zte_o.png"></p> 
+ <p>BGTP抗抖动没有特别复杂的技术。我们按照TS流通过封闭式GOP切片，每个GOP切片分组分包编号。客户端认证成功之后，服务器端主动推流，这个过程中如果发现丢包，由客户端请求丢包重传，同时GOP时延参数配置在服务器端主控。如果客户端GOP接收不完整，客户端会主动丢弃GOP，避免出现马赛克、花屏情况。</p> 
+ <h6><br></h6> 
+ <h6>BGTP优点：</h6> 
+ <h6><br></h6> 
+ <ol><li><p>低延时，首屏块。它没有http那样复杂的握手过程，一个包接收到就可以完成认证推流过程。</p></li><li><p>能在低于30%丢包情况下稳定传输。</p></li><li><p>配置灵活适应不同场景。</p></li></ol> 
+ <h6><br></h6> 
+ <h6>BGTP缺点：</h6> 
+ <h6><br></h6> 
+ <ol><li><p>协议目前只适合封闭式GOP的TS流，不适用于通用数据传输。</p></li><li><p>同比环境下比HTTP占用更多资源。</p></li></ol> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/c8/b6/krv9y125_o.png"></p> 
+ <p>如上图是我们BGTP和HTTP落地效果对比。我们从两个维度收集了用户端数据。第一张图是卡顿率。用户最直观的就是卡顿。我们可以看出，对于弱网用户BGTP比HTTP减少了超过10%的卡顿率。第二张图表示的是首屏加载速度。BGTP对弱网用户首屏加载速度提升了大约2%。</p> 
+ <p> </p> 
+ <p>4. PCDN安全体系</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/44/ce/YGrcCuwo_o.png"></p> 
+ <p> </p> 
+ <p>我们通过三个问题解决PCDN安全体系建设问题。</p> 
+ <p> </p> 
+ <p>4.1 OTT流媒体业务的数字版权如何保护？</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/4e/5d/DhY0an6R_o.png"></p> 
+ <p>说起OTT数字版权，首先想到业内有名的DRM标准，例如微软PLAY READY、谷歌WIDEVINE以及VERIMATRIX。我们提炼了VERIMATRIX的一些机制，做了自己的版权保护体系。我们的版权保护体系有两个重要点，首先是节点认证体系，另外就是节点间传输加密。</p> 
+ <p> </p> 
+ <p>4.2 PEER节点接入组网时候如何保证安全性？</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/1e/d1/KQbqKIz4_o.png"></p> 
+ <p>（1）节点认证体系</p> 
+ <p>节点认证体系分了三大板块完成。</p> 
+ <p>终端管理系统，主要是管控OTT类产品，简单来讲是在生产过程烧录license+key。</p> 
+ <p>终端认证系统，主要负责在用户端甄别OTT类产品，校验license+key的合法性。</p> 
+ <p>认证、授权、计算系统和我们的实际业务相关。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/06/d6/4ThSCdk3_o.png"></p> 
+ <p>（2）节点间传输机密体系</p> 
+ <p>用户要接入我们系统，首先要通过TMS+TAS+AAA认证，之后会在后端获取有时效性TOKEN，我们的TRACKER调度只调度有时效合法的TOKEN。组网之后，节点间直接协商流媒体加密。重要的是要保证每个节点间的密钥和加密算法都不一样。</p> 
+ <p> </p> 
+ <p>4.3 恶意请求及非法流量如何拒之门外？</p> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/cb/bd/kCiLUw2z_o.png"></p> 
+ <p> </p> 
+ <p>从近年来互联网事件来看，单靠自己的安全体系是不够的。我们在安全问题上，不仅完善自己的安全体系，还考虑利用各大厂商的防御策略。在业务层，我们使用了特定的TOKEN机制结合各大厂商的防护规则来保护我们的CND和业务体型。DDOS流量通过P2P节点网络分流，减轻核心CDN系统压力。这个目前还没有做完，只做了小区域的尝试。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/c5/75/NxTCsBcW_o.png"></p> 
+ <p>只做防范不做预警是被动的。我们对P２P节点做了实时预警系统。具体做法是我们在tracker集群上部署了一套节点监控预警系统，每个tracker收到的数据包都会在系统日志留下记录，日志数据清洗时，将生成IP、协议类型、geo位置信息等数据源作为事件，以可视化方式展现出来。如图是我们其中一台机器上的实时监控图像。破解外面的协议、使用其它协议访问服务器都会预警。后台对不是P2P协议的数据按照不同级别，分级别预警。</p> 
+ <p> </p> 
+ <p>5. 自研PCDN技术总结</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/5c/00/KtGgyEFZ_o.png"></p> 
+ <p> </p> 
+ <ol><li><p>P2P打洞成功率和组网调度策略决定分享率高低；</p></li><li><p>海外网络环境极度复杂，弱网是首要解决的难题；</p></li><li><p>数字版权资源保护是海外推广落地敲门砖；</p></li><li><p>海外商业环境不同于国内，安全预警和安全防护需要并行。</p></li></ol> 
+ <p> </p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/95/2f/UGqOCrwq_o.png"></p> 
+ <p> </p> 
+ <p>我们对于PCND技术走向有一些自己的想法。我们虽然选择了现有协议，但是面对复杂的环境，需要各大CDN厂商的传输协议融合。另外，对于安全问题，我们所做的远远不够，我们在安全领域还有很长的路要走。第三点海外OTT盒子加速节点已经出现，近几年又提出云计算、物计算的相关概念，但是服务是一切的前提，这也是以后要考虑的范畴。</p> 
+ <p>LiveVideoStackCon 2020 讲师招募</p> 
+ <p>2020年LiveVideoStackCon将持续迭代，欢迎将你的技术实践、踩坑与填坑经历、技术与商业创业的思考分享出来，独乐不如众乐。请将个人资料和话题信息邮件到 speaker@livevideostack.com 或点击<strong>【阅读原文】</strong>了解成为LiveVideoStackCon讲师的权益与义务，我们会在48小时内回复。</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/7b3bdbb41e92aa56707992732998f990/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">最新解决Toolbar toolbar = (Toolbar)findViewById(R.id.toolbar); setSupportActionBar(toolbar);报错</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/a4c3cf1769f25f5b9444568a896973dd/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">【工具使用】Vmware安装使用（问题汇总）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

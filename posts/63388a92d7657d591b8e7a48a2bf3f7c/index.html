@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>GAMES101作业7及课程总结（重点实现多线程加速，微表面模型材质） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="GAMES101作业7及课程总结（重点实现多线程加速，微表面模型材质）" />
+<meta property="og:description" content="目录 闲言碎语最终全部效果展示（均为1024×1024×512ssp）课程总结与理解（Path Tracing）框架梳理任务一：迁移相关代码任务二：实现path tracing任务三：多线程加速（包括其他加速的小trick）1.随机数构造器优化2.多线程加速3.debug改成release版本 任务四：微表面模型1. 微表面材质定义2. 微表面分布的表达2.1. D(h)：法线分布函数（**Normal Distribution Fuction，NDF**）2.1. G(i,o,h)：几何遮挡函数（**Shadowing and Making term**） 3.光在每个微表面散射的BRDF4.Torrance-Sparrow Model5.代码实现 任务五：完美反射模型（看到顺便实现了，作业没要求）代码实现可能遇到的问题1.光源融入到整个天花板，没有出现黑色2.箱子背阴处有很多黑色噪点3.有白色噪点（ssp调高仍然有） 理论思考1.偏移为什么要分两种情况这么偏移？2.为什么path tracing有软阴影？3.把witted style和path tracing的结果对比一下，两者的实现的不同点有哪些？4.为什么程序中，渲染方程的入射radiance是光源的emit，是一个常量？5.为什么说光栅化比光追快？ 个人感悟参考资料 闲言碎语 前言：从这篇文章开始，转知乎了，感觉知乎的社区氛围更好，emmm，哈哈哈主要还是想接触一下知乎的图形学大佬们。知乎账号链接：https://www.zhihu.com/people/xuu-27-24
+emmm，距离完成作业6已经过去了一个月多的时间（我承认中间有段时间在摆烂==），怎么说呢，感觉作业7真的知识体系非常庞大，虽然实现的代码量不多，但是里面真的很多细节很多trick，对我这种小菜鸡感觉还是有挺大难度的。。。再加上感觉自己挺钻牛角尖的，所以搞了挺久的，也最终算是完成了作业7的全部要求，害，希望后面本科毕设不要太赶吧。
+提个建议：如果遇到实在解决不了的问题，可以上games论坛看看，里面有很多共性的问题，上面的问题我几乎都遇到了。。。
+最终全部效果展示（均为1024×1024×512ssp） 基础path tracing实现（作业基本要求）
+微表面材质
+完美镜面反射材质
+课程总结与理解（Path Tracing） 课程方面，主要是先讲辐射度量学，然后推导出渲染方程，之后介绍用来求解积分的蒙特卡洛方法，最后讲如何在程序中求解渲染方程计算颜色（包括很多的trick细节，比如对光源进行直接采样提高采样效率，俄罗斯轮盘赌解决无限递归等等），从而实现path tracing。
+path tracing流程：整体的渲染流程实际上更多的是在Whitted-Style上的改进，前期添加物体，构建包围盒，这些都是一样的。不一样的地方在于path tracing在最终着色的时候本质上是求解一个渲染方程，需要做大量的采样，近似积分结果，里面小trick非常多。而Whitted-Style并没有做采样求积分，就是简单的光线反射和折射，无法像path tracing一样考虑全局光照。 总体上来说，就是每个像素点发出多条光线，每条光线会通过之前构建的包围盒找到与场景中物体的第一个交点，然后根据渲染方程计算该交点的颜色，并返回，最后将全部发射的光线的颜色求平均，就得到该像素的颜色。
+其实这个渲染方程本身的原理还是挺复杂的，可以研究的很深入，尤其辐射度量学那块，课程本身其实讲的并不是很细，如果想细致了解的话可以去翻虎书，虎书可以说对辐射度量学进行了深度的解刨，直接从光子开始讲。。。
+框架梳理 和作业6使用的框架其实差不多，可以参考我之前写的https://blog.csdn.net/Xuuuuuuuuuuu/article/details/128556319
+作业7的框架实际上主要就是castRay函数有所不同，因为path tracing的最终实现是在castRay中实现。
+任务一：迁移相关代码 之前写的在这里：https://blog.csdn.net/Xuuuuuuuuuuu/article/details/128556319，把相关的代码贴进去就行。其中要注意的一个点，IntersectP中的等于号一定要去掉，要不然之后会出现部分物体不可见的情况，去掉的位置在这里，见下图：
+为什么这里要去掉等于号，之前闫老师说，图形学编程中很少考虑等于号的情况，几乎是可以忽略的。这是因为这次的场景比较特殊，以右边的绿色墙壁为例，实际上它的Boundbox就是一个与某一轴平行长方形（不是长方体，不信的话可以printBoundbox的那两个点出来看看）所以光线和这个Boundbox相交检测的时候，算出来的t_enter和t_exit是相等的。此时如果相等时仍判断为不相交，就会出错，此时部分物体不可见，如下图：
+任务二：实现path tracing 代码量也不是很大，主要就是跟着作业中给的伪代码照着敲，但是想呈现出最终的结果有很多小细节要注意，其中这里面各个向量的方向问题就很容易搞错，一定要仔细琢磨清楚。因为里面要修的细节太多了，我这边直接给出任务二完整的代码（个人建议不要完全照抄，可以自己先跟着作业提供的伪代码敲一下，遇到问题再去自己想办法找资料解决，在最终得到想要的结果后，你会发现这个过程非常值得。），具体的很多细节问题放到后文讨论。很多细节的问题建议直接看代码，可以理解的更清楚。
+Vector3f Scene::castRay(const Ray&amp; ray, int depth) const { // TO DO Implement Path Tracing Algorithm here Vector3f hitColor = this-&gt;backgroundColor; Intersection shade_point_inter = Scene::intersect(ray); if (shade_point_inter." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/63388a92d7657d591b8e7a48a2bf3f7c/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-02-13T22:47:06+08:00" />
+<meta property="article:modified_time" content="2023-02-13T22:47:06+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">GAMES101作业7及课程总结（重点实现多线程加速，微表面模型材质）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>目录</h4> 
+ <ul><li><a href="#_1" rel="nofollow">闲言碎语</a></li><li><a href="#10241024512ssp_7" rel="nofollow">最终全部效果展示（均为1024×1024×512ssp）</a></li><li><a href="#Path_Tracing_15" rel="nofollow">课程总结与理解（Path Tracing）</a></li><li><a href="#_22" rel="nofollow">框架梳理</a></li><li><a href="#_27" rel="nofollow">任务一：迁移相关代码</a></li><li><a href="#path_tracing_34" rel="nofollow">任务二：实现path tracing</a></li><li><a href="#trick_96" rel="nofollow">任务三：多线程加速（包括其他加速的小trick）</a></li><li><ul><li><a href="#1_101" rel="nofollow">1.随机数构造器优化</a></li><li><a href="#2_114" rel="nofollow">2.多线程加速</a></li><li><a href="#3debugrelease_196" rel="nofollow">3.debug改成release版本</a></li></ul> 
+  </li><li><a href="#_199" rel="nofollow">任务四：微表面模型</a></li><li><ul><li><a href="#1__219" rel="nofollow">1. 微表面材质定义</a></li><li><a href="#2__245" rel="nofollow">2. 微表面分布的表达</a></li><li><ul><li><a href="#21_DhNormal_Distribution_FuctionNDF_249" rel="nofollow">2.1. D(h)：法线分布函数（**Normal Distribution Fuction，NDF**）</a></li><li><a href="#21_GiohShadowing_and_Making_term_288" rel="nofollow">2.1. G(i,o,h)：几何遮挡函数（**Shadowing and Making term**）</a></li></ul> 
+   </li><li><a href="#3BRDF_299" rel="nofollow">3.光在每个微表面散射的BRDF</a></li><li><a href="#4TorranceSparrow_Model_307" rel="nofollow">4.Torrance-Sparrow Model</a></li><li><a href="#5_314" rel="nofollow">5.代码实现</a></li></ul> 
+  </li><li><a href="#_446" rel="nofollow">任务五：完美反射模型（看到顺便实现了，作业没要求）</a></li><li><a href="#_717" rel="nofollow">代码实现可能遇到的问题</a></li><li><ul><li><a href="#1_718" rel="nofollow">1.光源融入到整个天花板，没有出现黑色</a></li><li><a href="#2_741" rel="nofollow">2.箱子背阴处有很多黑色噪点</a></li><li><a href="#3ssp_747" rel="nofollow">3.有白色噪点（ssp调高仍然有）</a></li></ul> 
+  </li><li><a href="#_764" rel="nofollow">理论思考</a></li><li><ul><li><a href="#1_765" rel="nofollow">1.偏移为什么要分两种情况这么偏移？</a></li><li><a href="#2path_tracing_768" rel="nofollow">2.为什么path tracing有软阴影？</a></li><li><a href="#3witted_stylepath_tracing_772" rel="nofollow">3.把witted style和path tracing的结果对比一下，两者的实现的不同点有哪些？</a></li><li><a href="#4radianceemit_776" rel="nofollow">4.为什么程序中，渲染方程的入射radiance是光源的emit，是一个常量？</a></li><li><a href="#5_781" rel="nofollow">5.为什么说光栅化比光追快？</a></li></ul> 
+  </li><li><a href="#_784" rel="nofollow">个人感悟</a></li><li><a href="#_789" rel="nofollow">参考资料</a></li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_1"></a>闲言碎语</h2> 
+<p><strong>前言</strong>：从这篇文章开始，转知乎了，感觉知乎的社区氛围更好，emmm，哈哈哈主要还是想接触一下知乎的图形学大佬们。<strong>知乎账号链接：https://www.zhihu.com/people/xuu-27-24</strong></p> 
+<p>emmm，距离完成作业6已经过去了一个月多的时间（我承认中间有段时间在摆烂==），怎么说呢，<strong>感觉作业7真的知识体系非常庞大，虽然实现的代码量不多，但是里面真的很多细节很多trick，对我这种小菜鸡感觉还是有挺大难度的</strong>。。。再加上感觉自己挺钻牛角尖的，所以搞了挺久的，<strong>也最终算是完成了作业7的全部要求</strong>，害，希望后面本科毕设不要太赶吧。</p> 
+<p>提个建议：<strong>如果遇到实在解决不了的问题，可以上games论坛看看</strong>，里面有很多共性的问题，上面的问题我几乎都遇到了。。。</p> 
+<h2><a id="10241024512ssp_7"></a>最终全部效果展示（均为1024×1024×512ssp）</h2> 
+<p>基础path tracing实现（作业基本要求）<br> <img src="https://images2.imgbox.com/30/33/sB1K0GY8_o.png" alt="在这里插入图片描述"><br> 微表面材质<br> <img src="https://images2.imgbox.com/e7/b2/Fhhah0cH_o.png" alt="在这里插入图片描述"><br> 完美镜面反射材质<br> <img src="https://images2.imgbox.com/64/c7/Fc1Nyju8_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="Path_Tracing_15"></a>课程总结与理解（Path Tracing）</h2> 
+<p>课程方面，主要是先讲辐射度量学，然后推导出渲染方程，之后介绍用来求解积分的蒙特卡洛方法，最后讲如何在程序中求解渲染方程计算颜色（包括很多的trick细节，比如对光源进行直接采样提高采样效率，俄罗斯轮盘赌解决无限递归等等），从而实现path tracing。</p> 
+<p><strong>path tracing流程</strong>：整体的渲染流程实际上更多的是在Whitted-Style上的改进，前期添加物体，构建包围盒，这些都是一样的。<strong>不一样的地方在于path tracing在最终着色的时候本质上是求解一个渲染方程</strong>，需要做大量的采样，近似积分结果，里面小trick非常多。而Whitted-Style并没有做采样求积分，就是简单的光线反射和折射，无法像path tracing一样考虑全局光照。 <strong>总体上来说，就是每个像素点发出多条光线，每条光线会通过之前构建的包围盒找到与场景中物体的第一个交点，然后根据渲染方程计算该交点的颜色，并返回，最后将全部发射的光线的颜色求平均，就得到该像素的颜色。</strong></p> 
+<p>其实这个渲染方程本身的原理还是挺复杂的，可以研究的很深入，<strong>尤其辐射度量学那块，课程本身其实讲的并不是很细，如果想细致了解的话可以去翻虎书</strong>，虎书可以说对辐射度量学进行了深度的解刨，直接从光子开始讲。。。</p> 
+<h2><a id="_22"></a>框架梳理</h2> 
+<p>和作业6使用的框架其实差不多，可以参考我之前写的https://blog.csdn.net/Xuuuuuuuuuuu/article/details/128556319</p> 
+<p><strong>作业7的框架实际上主要就是castRay函数有所不同，因为path tracing的最终实现是在castRay中实现。</strong></p> 
+<h2><a id="_27"></a>任务一：迁移相关代码</h2> 
+<p>之前写的在这里：https://blog.csdn.net/Xuuuuuuuuuuu/article/details/128556319，把相关的代码贴进去就行。<strong>其中要注意的一个点，IntersectP中的等于号一定要去掉</strong>，要不然之后会出现部分物体不可见的情况，去掉的位置在这里，见下图：</p> 
+<p><img src="https://images2.imgbox.com/18/8d/gz8BcH0y_o.png" alt="在这里插入图片描述"><br> <strong>为什么这里要去掉等于号</strong>，之前闫老师说，图形学编程中很少考虑等于号的情况，几乎是可以忽略的。这是因为这次的场景比较特殊，以右边的绿色墙壁为例，<strong>实际上它的Boundbox就是一个与某一轴平行长方形</strong>（不是长方体，不信的话可以printBoundbox的那两个点出来看看）所以光线和这个Boundbox相交检测的时候，算出来的t_enter和t_exit是相等的。<strong>此时如果相等时仍判断为不相交，就会出错，此时部分物体不可见，如下图：</strong></p> 
+<p><img src="https://images2.imgbox.com/39/28/S5njwPeO_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="path_tracing_34"></a>任务二：实现path tracing</h2> 
+<p>代码量也不是很大，主要就是跟着作业中给的伪代码照着敲，但是想呈现出最终的结果有很多小细节要注意，<strong>其中这里面各个向量的方向问题就很容易搞错，一定要仔细琢磨清楚</strong>。因为里面要修的细节太多了，我这边直接给出任务二完整的代码（<strong>个人建议不要完全照抄，可以自己先跟着作业提供的伪代码敲一下，遇到问题再去自己想办法找资料解决，在最终得到想要的结果后，你会发现这个过程非常值得。</strong>），具体的很多细节问题放到后文讨论。<strong>很多细节的问题建议直接看代码，可以理解的更清楚。</strong></p> 
+<pre><code class="prism language-cpp">Vector3f <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">castRay</span><span class="token punctuation">(</span><span class="token keyword">const</span> Ray<span class="token operator">&amp;</span> ray<span class="token punctuation">,</span> <span class="token keyword">int</span> depth<span class="token punctuation">)</span> <span class="token keyword">const</span>
+<span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// TO DO Implement Path Tracing Algorithm here</span>
+    Vector3f hitColor <span class="token operator">=</span> <span class="token keyword">this</span><span class="token operator">-&gt;</span>backgroundColor<span class="token punctuation">;</span>
+    Intersection shade_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>shade_point_inter<span class="token punctuation">.</span>happened<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+
+        Vector3f p <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>coords<span class="token punctuation">;</span>
+        Vector3f wo <span class="token operator">=</span> ray<span class="token punctuation">.</span>direction<span class="token punctuation">;</span>
+        Vector3f N <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>normal<span class="token punctuation">;</span>
+        Vector3f <span class="token function">L_dir</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">L_indir</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+       <span class="token comment">//sampleLight(inter,pdf_light)</span>
+        Intersection light_point_inter<span class="token punctuation">;</span>
+        <span class="token keyword">float</span> pdf_light<span class="token punctuation">;</span>
+        <span class="token function">sampleLight</span><span class="token punctuation">(</span>light_point_inter<span class="token punctuation">,</span> pdf_light<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//Get x,ws,NN,emit from inter</span>
+        Vector3f x <span class="token operator">=</span> light_point_inter<span class="token punctuation">.</span>coords<span class="token punctuation">;</span>
+        Vector3f ws <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span>x<span class="token operator">-</span>p<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Vector3f NN <span class="token operator">=</span> light_point_inter<span class="token punctuation">.</span>normal<span class="token punctuation">;</span>
+        Vector3f emit <span class="token operator">=</span> light_point_inter<span class="token punctuation">.</span>emit<span class="token punctuation">;</span>
+        <span class="token keyword">float</span> distance_pTox <span class="token operator">=</span> <span class="token punctuation">(</span>x <span class="token operator">-</span> p<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">norm</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//Shoot a ray from p to x</span>
+        Vector3f p_deviation <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>ray<span class="token punctuation">.</span>direction<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">?</span>
+                p <span class="token operator">+</span> N <span class="token operator">*</span> EPSILON <span class="token operator">:</span>
+                p <span class="token operator">-</span> N <span class="token operator">*</span> EPSILON <span class="token punctuation">;</span>
+
+        Ray <span class="token function">ray_pTox</span><span class="token punctuation">(</span>p_deviation<span class="token punctuation">,</span> ws<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//If the ray is not blocked in the middleff</span>
+        Intersection blocked_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray_pTox<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">abs</span><span class="token punctuation">(</span>distance_pTox <span class="token operator">-</span> blocked_point_inter<span class="token punctuation">.</span>distance <span class="token operator">&lt;</span> <span class="token number">0.01</span> <span class="token punctuation">)</span><span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            L_dir <span class="token operator">=</span> emit <span class="token operator">*</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">eval</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> ws<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>ws<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span><span class="token operator">-</span>ws<span class="token punctuation">,</span> NN<span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span>distance_pTox <span class="token operator">*</span> distance_pTox <span class="token operator">*</span> pdf_light<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">//Test Russian Roulette with probability RussianRouolette</span>
+        <span class="token keyword">float</span> ksi <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>ksi <span class="token operator">&lt;</span> RussianRoulette<span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//wi=sample(wo,N)</span>
+            Vector3f wi <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span>shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">sample</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//Trace a ray r(p,wi)</span>
+            Ray <span class="token function">ray_pTowi</span><span class="token punctuation">(</span>p_deviation<span class="token punctuation">,</span> wi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//If ray r hit a non-emitting object at q</span>
+            Intersection bounce_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>bounce_point_inter<span class="token punctuation">.</span>happened <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span>bounce_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">hasEmission</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">float</span> pdf <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">pdf</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token keyword">if</span><span class="token punctuation">(</span>pdf<span class="token operator">&gt;</span> EPSILON<span class="token punctuation">)</span>
+					L_indir <span class="token operator">=</span> <span class="token function">castRay</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">,</span> depth <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">eval</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span>pdf <span class="token operator">*</span>RussianRoulette<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        hitColor <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">getEmission</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">+</span> L_dir <span class="token operator">+</span> L_indir<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> hitColor<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>应该能得到下图所示的结果（<strong>1024×1024×512ssp</strong>）：<img src="https://images2.imgbox.com/c5/ce/00wm1hpS_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="trick_96"></a>任务三：多线程加速（包括其他加速的小trick）</h2> 
+<p>我觉得加速是渲染中一个非常重要的点，也是我个人比较感兴趣的点。tmd没有加速之前，代码的运行速度简直惨不忍睹。。。<strong>一开始1024×1024×512ssp的图渲染了七八个小时才渲染了百分之20（渲染到百分之20我就直接放弃了==）。。。最终经过不懈努力，总算把速度优化到了40分钟，可以说快了几乎60-80倍。渲染速度的提高可以说极大地帮助了后面的调试！！！</strong></p> 
+<p>按照下面三步逐步进行优化，<strong>我渲染一张512×512×8ssp的图的速度从13分钟提到了10秒钟</strong>。</p> 
+<h3><a id="1_101"></a>1.随机数构造器优化</h3> 
+<p>使用<strong>C++的性能分析器</strong>：https://blog.csdn.net/u011942101/article/details/123656944</p> 
+<p>不难发现，主要是<strong>求交和采样</strong>两部分花了很多的时间，求交这部分本来就耗时很长，里面很多递归。<strong>但是为啥，采样这部分要这么长时间？</strong></p> 
+<p><img src="https://images2.imgbox.com/49/d1/FHptW1FT_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-nHT8YMY1-1676280691347)(C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20230120142906735.png)]"></p> 
+<p>最后发现是这个函数，特别耗时。一分析是因为构建开销过大，实际上把里面三个变量都定义成static就行（只会初始化一次，避免重复构建），没必要重新构建。<strong>经测试，改成static后，512×512×8ssp的渲染速度从13分钟提到了5分钟。</strong></p> 
+<p><img src="https://images2.imgbox.com/da/4e/rWL7vleB_o.png" alt="在这里插入图片描述"><br> <strong>参考</strong>：https://games-cn.org/forums/topic/zuoyeqidexingnengpingjingshisuijishushengcheng/</p> 
+<h3><a id="2_114"></a>2.多线程加速</h3> 
+<p>使用多线程加速之前，问自己一个问题，<strong>为什么这里可以使用多线程加速</strong>？因为这里满足两个条件：1.这个场景下程序可以写成多线程，2.电脑多核。</p> 
+<p>实际上实现多线程加速不是很难，因为整个场景太适合写成多线程加速了。。。就每个线程分别独立一定数量计算像素颜色就行。<strong>原则上就是要最大化每个线程的计算量，对整个frame计算使用多线程。</strong> 具体使用过的是C++里面的thread进行多线程，代码如下：</p> 
+<pre><code class="prism language-cpp"><span class="token comment">// The main render function. This where we iterate over all pixels in the image,</span>
+<span class="token comment">// generate primary rays and cast these rays into the scene. The content of the</span>
+<span class="token comment">// framebuffer is saved to a file.</span>
+<span class="token keyword">void</span> <span class="token class-name">Renderer</span><span class="token double-colon punctuation">::</span><span class="token function">Render</span><span class="token punctuation">(</span><span class="token keyword">const</span> Scene<span class="token operator">&amp;</span> scene<span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+    std<span class="token double-colon punctuation">::</span>vector<span class="token operator">&lt;</span>Vector3f<span class="token operator">&gt;</span> <span class="token function">framebuffer</span><span class="token punctuation">(</span>scene<span class="token punctuation">.</span>width <span class="token operator">*</span> scene<span class="token punctuation">.</span>height<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">float</span> scale <span class="token operator">=</span> <span class="token function">tan</span><span class="token punctuation">(</span><span class="token function">deg2rad</span><span class="token punctuation">(</span>scene<span class="token punctuation">.</span>fov <span class="token operator">*</span> <span class="token number">0.5</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">float</span> imageAspectRatio <span class="token operator">=</span> scene<span class="token punctuation">.</span>width <span class="token operator">/</span> <span class="token punctuation">(</span><span class="token keyword">float</span><span class="token punctuation">)</span>scene<span class="token punctuation">.</span>height<span class="token punctuation">;</span>
+    Vector3f <span class="token function">eye_pos</span><span class="token punctuation">(</span><span class="token number">278</span><span class="token punctuation">,</span> <span class="token number">273</span><span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">800</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">int</span> m <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// change the spp value to change sample ammount</span>
+    <span class="token keyword">int</span> spp <span class="token operator">=</span> <span class="token number">512</span><span class="token punctuation">;</span><span class="token comment">//16</span>
+    <span class="token keyword">int</span> thread_num <span class="token operator">=</span> <span class="token number">8</span><span class="token punctuation">;</span><span class="token comment">//我的电脑有8核，所以开8个线程。注：屏幕的高度一定要是线程数的倍数</span>
+    <span class="token keyword">int</span> thread_height <span class="token operator">=</span> scene<span class="token punctuation">.</span>height <span class="token operator">/</span> thread_num<span class="token punctuation">;</span>
+    std<span class="token double-colon punctuation">::</span>vector<span class="token operator">&lt;</span>std<span class="token double-colon punctuation">::</span>thread<span class="token operator">&gt;</span> <span class="token function">threads</span><span class="token punctuation">(</span>thread_num<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    std<span class="token double-colon punctuation">::</span>cout <span class="token operator">&lt;&lt;</span> <span class="token string">"SPP: "</span> <span class="token operator">&lt;&lt;</span> spp <span class="token operator">&lt;&lt;</span> <span class="token string">"\n"</span><span class="token punctuation">;</span>
+    
+    <span class="token comment">//多线程实现</span>
+    std<span class="token double-colon punctuation">::</span>mutex mtx<span class="token punctuation">;</span>
+    <span class="token keyword">float</span> process<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token keyword">float</span> Reciprocal_Scene_height<span class="token operator">=</span><span class="token number">1.f</span><span class="token operator">/</span> <span class="token punctuation">(</span><span class="token keyword">float</span><span class="token punctuation">)</span>scene<span class="token punctuation">.</span>height<span class="token punctuation">;</span>
+    <span class="token keyword">auto</span> castRay <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token operator">&amp;</span><span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token keyword">int</span> thread_index<span class="token punctuation">)</span> 
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">int</span> height <span class="token operator">=</span> thread_height <span class="token operator">*</span> <span class="token punctuation">(</span>thread_index <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">uint32_t</span> j <span class="token operator">=</span> height <span class="token operator">-</span> thread_height<span class="token punctuation">;</span> j <span class="token operator">&lt;</span> height<span class="token punctuation">;</span> j<span class="token operator">++</span><span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">uint32_t</span> i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> scene<span class="token punctuation">.</span>width<span class="token punctuation">;</span> <span class="token operator">++</span>i<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// generate primary ray direction</span>
+                <span class="token keyword">float</span> x <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token number">2</span> <span class="token operator">*</span> <span class="token punctuation">(</span>i <span class="token operator">+</span> <span class="token number">0.5</span><span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span><span class="token keyword">float</span><span class="token punctuation">)</span>scene<span class="token punctuation">.</span>width <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span>
+                    imageAspectRatio <span class="token operator">*</span> scale<span class="token punctuation">;</span>
+                <span class="token keyword">float</span> y <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">-</span> <span class="token number">2</span> <span class="token operator">*</span> <span class="token punctuation">(</span>j <span class="token operator">+</span> <span class="token number">0.5</span><span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span><span class="token keyword">float</span><span class="token punctuation">)</span>scene<span class="token punctuation">.</span>height<span class="token punctuation">)</span> <span class="token operator">*</span> scale<span class="token punctuation">;</span>
+
+                <span class="token comment">//eye的位置对结果有影响</span>
+                Vector3f dir <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token operator">-</span>x<span class="token punctuation">,</span> y<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">int</span> k <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> k <span class="token operator">&lt;</span> spp<span class="token punctuation">;</span> k<span class="token operator">++</span><span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    framebuffer<span class="token punctuation">[</span>j<span class="token operator">*</span>scene<span class="token punctuation">.</span>width<span class="token operator">+</span>i<span class="token punctuation">]</span> <span class="token operator">+=</span> scene<span class="token punctuation">.</span><span class="token function">castRay</span><span class="token punctuation">(</span><span class="token function">Ray</span><span class="token punctuation">(</span>eye_pos<span class="token punctuation">,</span> dir<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">/</span> spp<span class="token punctuation">;</span>  
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            mtx<span class="token punctuation">.</span><span class="token function">lock</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            process <span class="token operator">=</span> process <span class="token operator">+</span> Reciprocal_Scene_height<span class="token punctuation">;</span>
+            <span class="token function">UpdateProgress</span><span class="token punctuation">(</span>process<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            mtx<span class="token punctuation">.</span><span class="token function">unlock</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">int</span> k <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> k <span class="token operator">&lt;</span> thread_num<span class="token punctuation">;</span> k<span class="token operator">++</span><span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        threads<span class="token punctuation">[</span>k<span class="token punctuation">]</span> <span class="token operator">=</span> std<span class="token double-colon punctuation">::</span><span class="token function">thread</span><span class="token punctuation">(</span>castRay<span class="token punctuation">,</span>k<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">int</span> k <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> k <span class="token operator">&lt;</span> thread_num<span class="token punctuation">;</span> k<span class="token operator">++</span><span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        threads<span class="token punctuation">[</span>k<span class="token punctuation">]</span><span class="token punctuation">.</span><span class="token function">join</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">UpdateProgress</span><span class="token punctuation">(</span><span class="token number">1.f</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    
+    <span class="token comment">// save framebuffer to file</span>
+    FILE<span class="token operator">*</span> fp <span class="token operator">=</span> <span class="token function">fopen</span><span class="token punctuation">(</span><span class="token string">"binary.ppm"</span><span class="token punctuation">,</span> <span class="token string">"wb"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span><span class="token function">fprintf</span><span class="token punctuation">(</span>fp<span class="token punctuation">,</span> <span class="token string">"P6\n%d %d\n255\n"</span><span class="token punctuation">,</span> scene<span class="token punctuation">.</span>width<span class="token punctuation">,</span> scene<span class="token punctuation">.</span>height<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">auto</span> i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> scene<span class="token punctuation">.</span>height <span class="token operator">*</span> scene<span class="token punctuation">.</span>width<span class="token punctuation">;</span> <span class="token operator">++</span>i<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">static</span> <span class="token keyword">unsigned</span> <span class="token keyword">char</span> color<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+        color<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">unsigned</span> <span class="token keyword">char</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">255</span> <span class="token operator">*</span> std<span class="token double-colon punctuation">::</span><span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> framebuffer<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>x<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0.6f</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        color<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">unsigned</span> <span class="token keyword">char</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">255</span> <span class="token operator">*</span> std<span class="token double-colon punctuation">::</span><span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> framebuffer<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>y<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0.6f</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        color<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">unsigned</span> <span class="token keyword">char</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">255</span> <span class="token operator">*</span> std<span class="token double-colon punctuation">::</span><span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> framebuffer<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>z<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0.6f</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">fwrite</span><span class="token punctuation">(</span>color<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">3</span><span class="token punctuation">,</span> fp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">fclose</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span><span class="token punctuation">;</span>    
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p><strong>512×512×8ssp的渲染速度从5分钟提到了1分钟！！！</strong><br> 真的很担心cpu被烧坏。。。<strong>这种情况下说明多线程编程成功，CPU被疯狂地调用。</strong></p> 
+<p><img src="https://images2.imgbox.com/96/71/Pbz0hmGu_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="3debugrelease_196"></a>3.debug改成release版本</h3> 
+<p><strong>无心之举，512×512×8ssp的渲染速度从1分钟提到了10秒钟。。。</strong> 只能说release比debug版本快了真的不止一点半点。</p> 
+<h2><a id="_199"></a>任务四：微表面模型</h2> 
+<p><strong>101讲的不是很细，因此我就花了不少时间仔细地看了下202和一些其他资料。</strong></p> 
+<p>参考1：https://zhuanlan.zhihu.com/p/434964126（写得贼nb，推导地很深入）</p> 
+<p>参考2：https://zhuanlan.zhihu.com/p/152226698（这个更加全面一点，涉及的更广，但1更深）</p> 
+<p><strong>本质上微表面材质是描述高光项</strong>，真正的brdf是由漫反射项＋高光项组成的，如下（<strong>参考2</strong>）：</p> 
+<p><img src="https://images2.imgbox.com/90/a7/Di1ULMop_o.png" alt="在这里插入图片描述"></p> 
+<p>各自的比例是由菲涅尔项计算的，而菲涅尔项是折射和反射的比例，<strong>这里漫反射等价于折射</strong>（因为漫反射从微观角度是折射进入物体，然后多次反弹弹出表面，产生漫反射现象）。</p> 
+<p><strong>说白了就是一部分算折射然后反弹出来的能量，一部分算反射出来的能量。</strong></p> 
+<p><img src="https://images2.imgbox.com/6c/f5/PmMfBSXU_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="1__219"></a>1. 微表面材质定义</h3> 
+<p>说白了，就是把一个物体表面<strong>看作有多个微表面组成的表面</strong>，从而展示更加真实的材质细节。</p> 
+<p>下图的虚线就是<strong>物体表面</strong>，而对其<strong>着色的时候</strong>，<strong>微表面模型</strong>会将物体表面近似成<strong>下图实线尖尖样子</strong>进行着色，具体就是通过定义<strong>微表面模型的prdf</strong>实现的。</p> 
+<p><strong>思想和凹凸贴图那边有点想</strong>，实际上<strong>没有改变物体的几何模型</strong>，但是通过改变了prdf，使物体有了多个微表面组成的感觉。所以有了这句话：<strong>远处看是材质和外观，近处看是几何。</strong></p> 
+<p><img src="https://images2.imgbox.com/87/05/GHC5pjK8_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>以太空图为例</strong>，远处看一个物体的时候看不到很微小的东西，看到的是一个全局效果。</p> 
+<p><img src="https://images2.imgbox.com/34/f9/Y7Iad2MW_o.png" alt="在这里插入图片描述"></p> 
+<p>ok，上面主要大致讲微表面模型大概是个什么东西，下面就是具体深入的理解，</p> 
+<p>微表面模型主要分成<strong>两个部分</strong>（也就是说设计一个微表面模型就必须要考虑到这两部分）：</p> 
+<p><strong>①微表面分布的表达</strong>（全局，比如法线分布、几何遮挡等）</p> 
+<p><strong>②光在每个微表面散射的BRDF</strong>（细节，单个微表面的材质，即prdf，可以是完美镜面反射，又可以是理想漫反射）</p> 
+<p><strong>接下来依次介绍以上两部分，然后再介绍最常见的Torrance-Sparrow模型。</strong></p> 
+<h3><a id="2__245"></a>2. 微表面分布的表达</h3> 
+<p>包括D(h)和G(i,o,h)两块，即法线分布和几何遮挡。</p> 
+<h4><a id="21_DhNormal_Distribution_FuctionNDF_249"></a>2.1. D(h)：法线分布函数（<strong>Normal Distribution Fuction，NDF</strong>）</h4> 
+<p>不同的法线分布会产生完全不一样的材质。</p> 
+<p><img src="https://images2.imgbox.com/82/de/EA95akCK_o.png" alt="在这里插入图片描述"></p> 
+<p>D(h)本质上是<strong>面积微元dA上的法向为h的全部微表面的面积和</strong>与<strong>面积微元dA</strong>的<strong>比例</strong>。</p> 
+<p>注：dA是宏观表面上的面积微元。</p> 
+<p>不难发现，<strong>D(h)实际上是针对物体宏观表面上的一个面积微元的，而不是整个物体。</strong></p> 
+<p><img src="https://images2.imgbox.com/53/7b/2D5q4gDw_o.png" alt="在这里插入图片描述"></p> 
+<p>D(h)的<strong>推导公式</strong>。</p> 
+<p><img src="https://images2.imgbox.com/c2/9f/JWMutU4s_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>①beckmann NDF</strong></p> 
+<p>类似高斯分布函数，里面就是有那两个量，α应该是超参数，控制整个分布的宽瘦，θ就是h代进去计算得到的。<strong>为什么这么去设计这个函数，是有它的意义在里面。</strong></p> 
+<p><img src="https://images2.imgbox.com/2c/3a/kWS5xUYt_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>②GGX NDF</strong></p> 
+<p>相较于Beckmann NDF，有了个长尾巴，意味着会有更好的过渡。</p> 
+<p><img src="https://images2.imgbox.com/bd/ab/tcTT4BQa_o.png" alt="在这里插入图片描述"></p> 
+<p><img src="https://images2.imgbox.com/5f/31/cFGyg3eC_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="21_GiohShadowing_and_Making_term_288"></a>2.1. G(i,o,h)：几何遮挡函数（<strong>Shadowing and Making term</strong>）</h4> 
+<p><strong>描述微表面之间互相遮挡的几何现象的数学模型，本质上是法向为h的微表面在w方向上可见的比例（因为有部分被遮挡了，见下面第一张图）</strong>。</p> 
+<p>遮挡项，因为光线或者视线非常平（第二张图的球边界，此时角度称为<strong>grazing angle</strong>），f的分母会非常小，因此f就会非常大，边界就会非常亮，此时就要引入遮挡项解决这个问题，进行衰减，因为这种情况下，是最容易出现shadowing-masking现象的。</p> 
+<p><strong>具体推导可以看上述的链接，讲的非常清楚！！！</strong></p> 
+<p><img src="https://images2.imgbox.com/4b/b5/niHMspKD_o.png" alt="在这里插入图片描述"></p> 
+<p><img src="https://images2.imgbox.com/0d/64/jezGtODo_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="3BRDF_299"></a>3.光在每个微表面散射的BRDF</h3> 
+<p><strong>这里又可以有很多文章可以做</strong>，可以把每个微表面看作理想镜面（完美反射），也可以看成理想玻璃表面（又有折射又有反射），还可以看成漫反射表面。</p> 
+<p><strong>结合上述两个微表面的分布项，再定义每个微表面的材质，就能推导出相关的微表面模型。</strong></p> 
+<p>下文以<strong>Torrance-Sparrow Model</strong>为例。</p> 
+<h3><a id="4TorranceSparrow_Model_307"></a>4.Torrance-Sparrow Model</h3> 
+<p><strong>把每个微表面看成理想镜面。</strong></p> 
+<p>推导过程看不懂，我太菜了，就这样吧，该章节一开始的链接里有。</p> 
+<p><img src="https://images2.imgbox.com/56/36/sTvIpXq2_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="5_314"></a>5.代码实现</h3> 
+<p>实现的是<strong>上述的Torrance-Sparrow Model</strong>，F项是代码中已经写好的菲涅尔项，<strong>D项和G项选择GGX</strong>，如下图所示：<br> <img src="https://images2.imgbox.com/40/7c/2hItqkCc_o.png" alt="在这里插入图片描述"></p> 
+<p><img src="https://images2.imgbox.com/53/6f/ICdleznD_o.png" alt="在这里插入图片描述"><br> <strong>其中各参数的含义可以查看原文https://zhuanlan.zhihu.com/p/434964126，或者可以直接看代码，应该也能够理解</strong>。代码实现方面，先在定义里面添加Microfacet材质，如下：</p> 
+<pre><code class="prism language-cpp"><span class="token keyword">enum</span> <span class="token class-name">MaterialType</span> <span class="token punctuation">{<!-- --></span> DIFFUSE<span class="token punctuation">,</span> MICROFACET<span class="token punctuation">}</span>
+</code></pre> 
+<p>然后在main函数中添加物体，并对其赋予Microfacet材质，如下：</p> 
+<pre><code class="prism language-cpp">    Material<span class="token operator">*</span> microfacet <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token function">Material</span><span class="token punctuation">(</span>MICROFACET<span class="token punctuation">,</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    microfacet<span class="token operator">-&gt;</span>Ks <span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.45</span><span class="token punctuation">,</span> <span class="token number">0.45</span><span class="token punctuation">,</span> <span class="token number">0.45</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    microfacet<span class="token operator">-&gt;</span>Kd <span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.3</span><span class="token punctuation">,</span> <span class="token number">0.3</span><span class="token punctuation">,</span> <span class="token number">0.25</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    microfacet<span class="token operator">-&gt;</span>ior <span class="token operator">=</span> <span class="token number">12.85</span><span class="token punctuation">;</span>
+    Sphere <span class="token function">sphere1</span><span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">150</span><span class="token punctuation">,</span> <span class="token number">100</span><span class="token punctuation">,</span> <span class="token number">200</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">100</span><span class="token punctuation">,</span> microfacet<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    scene<span class="token punctuation">.</span><span class="token function">Add</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>sphere1<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>sample和pdf直接照抄原本的就行。最后修改eval，在其中实现Torrance-Sparrow Model模型即可，如下：</p> 
+<pre><code class="prism language-cpp">Vector3f <span class="token class-name">Material</span><span class="token double-colon punctuation">::</span><span class="token function">eval</span><span class="token punctuation">(</span><span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wi<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wo<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>N<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">switch</span><span class="token punctuation">(</span>m_type<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> DIFFUSE<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// calculate the contribution of diffuse model</span>
+            <span class="token keyword">float</span> cosalpha <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>cosalpha <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                Vector3f diffuse <span class="token operator">=</span> Kd <span class="token operator">/</span> M_PI<span class="token punctuation">;</span>
+                <span class="token keyword">return</span> diffuse<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MICROFACET<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">float</span> cosalpha <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>cosalpha <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span> 
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// calculate the contribution of Microfacet model</span>
+                <span class="token keyword">float</span> F<span class="token punctuation">,</span> G<span class="token punctuation">,</span> D<span class="token punctuation">;</span>
+
+                <span class="token function">fresnel</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">,</span> ior<span class="token punctuation">,</span> F<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token keyword">float</span> Roughness <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span><span class="token comment">//超参数，控制粗糙度</span>
+                <span class="token keyword">auto</span> G_function <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token operator">&amp;</span><span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">float</span><span class="token operator">&amp;</span> Roughness<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> wi<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> wo<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> N<span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token keyword">float</span> A_wi<span class="token punctuation">,</span> A_wo<span class="token punctuation">;</span>
+                    A_wi <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">+</span> <span class="token function">sqrt</span><span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">+</span> Roughness <span class="token operator">*</span> Roughness <span class="token operator">*</span> <span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">tan</span><span class="token punctuation">(</span><span class="token function">acos</span><span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token number">2</span><span class="token punctuation">;</span>
+                    A_wo <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">+</span> <span class="token function">sqrt</span><span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">+</span> Roughness <span class="token operator">*</span> Roughness <span class="token operator">*</span> <span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">tan</span><span class="token punctuation">(</span><span class="token function">acos</span><span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token number">2</span><span class="token punctuation">;</span>
+                    <span class="token keyword">float</span> divisor <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">+</span> A_wi <span class="token operator">+</span> A_wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span>
+                        <span class="token keyword">return</span> <span class="token number">1.f</span><span class="token punctuation">;</span>
+                    <span class="token keyword">else</span>
+                        <span class="token keyword">return</span> <span class="token number">1.0f</span> <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token punctuation">}</span><span class="token punctuation">;</span>
+                G <span class="token operator">=</span> <span class="token function">G_function</span><span class="token punctuation">(</span>Roughness<span class="token punctuation">,</span> <span class="token operator">-</span>wi<span class="token punctuation">,</span> wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token keyword">auto</span> D_function <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token operator">&amp;</span><span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">float</span><span class="token operator">&amp;</span> Roughness<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> h<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> N<span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token keyword">float</span> cos_sita <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>h<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">float</span> divisor <span class="token operator">=</span> <span class="token punctuation">(</span>M_PI <span class="token operator">*</span> <span class="token function">pow</span><span class="token punctuation">(</span><span class="token number">1.0</span> <span class="token operator">+</span> cos_sita <span class="token operator">*</span> cos_sita <span class="token operator">*</span> <span class="token punctuation">(</span>Roughness <span class="token operator">*</span> Roughness <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span>
+                        <span class="token keyword">return</span> <span class="token number">1.f</span><span class="token punctuation">;</span>
+                    <span class="token keyword">else</span> 
+                        <span class="token keyword">return</span> <span class="token punctuation">(</span>Roughness <span class="token operator">*</span> Roughness<span class="token punctuation">)</span> <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token punctuation">}</span><span class="token punctuation">;</span>
+                Vector3f h <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span><span class="token operator">-</span>wi <span class="token operator">+</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                D <span class="token operator">=</span> <span class="token function">D_function</span><span class="token punctuation">(</span>Roughness<span class="token punctuation">,</span> h<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">// energy balance</span>
+                Vector3f diffuse <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">1.0f</span><span class="token punctuation">)</span> <span class="token operator">-</span> F<span class="token punctuation">)</span> <span class="token operator">*</span> Kd <span class="token operator">/</span> M_PI<span class="token punctuation">;</span>
+                Vector3f specular<span class="token punctuation">;</span>
+                <span class="token keyword">float</span> divisor<span class="token operator">=</span> <span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token number">4</span> <span class="token operator">*</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> <span class="token operator">-</span>wi<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span>
+                    specular<span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">else</span>
+                    specular <span class="token operator">=</span> F <span class="token operator">*</span>G <span class="token operator">*</span> D <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token comment">//std::cout &lt;&lt; "F:"&lt;&lt;F &lt;&lt; "\n";</span>
+                <span class="token comment">//std::cout &lt;&lt; "diffuse:"&lt;&lt;diffuse&lt;&lt;"\n";</span>
+                <span class="token comment">//std::cout &lt;&lt; "specular:" &lt;&lt; specular &lt;&lt; "\n";</span>
+                <span class="token keyword">return</span> diffuse<span class="token operator">+</span>specular<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p><strong>最终效果（均为1024×1024×512ssp）</strong><br> <img src="https://images2.imgbox.com/49/de/AXG41GKb_o.png" alt="在这里插入图片描述"><br> <strong>如果黑色噪点很多</strong>，尝试修改一下sphere的求交判断阈值，有可能是精度的问题，如下：</p> 
+<pre><code class="prism language-cpp">    Intersection <span class="token function">getIntersection</span><span class="token punctuation">(</span>Ray ray<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        Intersection result<span class="token punctuation">;</span>
+        result<span class="token punctuation">.</span>happened <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+        Vector3f L <span class="token operator">=</span> ray<span class="token punctuation">.</span>origin <span class="token operator">-</span> center<span class="token punctuation">;</span>
+        <span class="token keyword">float</span> a <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>ray<span class="token punctuation">.</span>direction<span class="token punctuation">,</span> ray<span class="token punctuation">.</span>direction<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">float</span> b <span class="token operator">=</span> <span class="token number">2</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>ray<span class="token punctuation">.</span>direction<span class="token punctuation">,</span> L<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">float</span> c <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>L<span class="token punctuation">,</span> L<span class="token punctuation">)</span> <span class="token operator">-</span> radius2<span class="token punctuation">;</span>
+        <span class="token keyword">float</span> t0<span class="token punctuation">,</span> t1<span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">solveQuadratic</span><span class="token punctuation">(</span>a<span class="token punctuation">,</span> b<span class="token punctuation">,</span> c<span class="token punctuation">,</span> t0<span class="token punctuation">,</span> t1<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token keyword">return</span> result<span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>t0 <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> t0 <span class="token operator">=</span> t1<span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>t0 <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token keyword">return</span> result<span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>t0 <span class="token operator">&gt;</span> <span class="token number">0.5</span><span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            result<span class="token punctuation">.</span>happened <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+            result<span class="token punctuation">.</span>coords <span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span>ray<span class="token punctuation">.</span>origin <span class="token operator">+</span> ray<span class="token punctuation">.</span>direction <span class="token operator">*</span> t0<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            result<span class="token punctuation">.</span>normal <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span>result<span class="token punctuation">.</span>coords <span class="token operator">-</span> center<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            result<span class="token punctuation">.</span>m <span class="token operator">=</span> <span class="token keyword">this</span><span class="token operator">-&gt;</span>m<span class="token punctuation">;</span>
+            result<span class="token punctuation">.</span>obj <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">;</span>
+            result<span class="token punctuation">.</span>distance <span class="token operator">=</span> t0<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+
+        <span class="token keyword">return</span> result<span class="token punctuation">;</span>
+
+    <span class="token punctuation">}</span>
+</code></pre> 
+<p><strong>如果白色噪点很多</strong>，在castRay函数的最后，限制一下hitColor的范围，避免出现特别大的值，影响采样质量。如下：</p> 
+<pre><code class="prism language-cpp">        hitColor <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">getEmission</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token operator">+</span>L_dir <span class="token operator">+</span> L_indir<span class="token punctuation">;</span>
+        hitColor<span class="token punctuation">.</span>x <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> hitColor<span class="token punctuation">.</span>x<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        hitColor<span class="token punctuation">.</span>y <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> hitColor<span class="token punctuation">.</span>y<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        hitColor<span class="token punctuation">.</span>z <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> hitColor<span class="token punctuation">.</span>z<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<h2><a id="_446"></a>任务五：完美反射模型（看到顺便实现了，作业没要求）</h2> 
+<p><strong>核心是重要性采样</strong>，参考这篇文章实现的：https://blog.csdn.net/ycrsw/article/details/124408789，各种细节这里面已经讲得非常清楚了，因此就不再赘述，直接给出代码，和Microfacet材质的实现流程差不多，首先添加材质，如下：</p> 
+<pre><code class="prism language-cpp"><span class="token keyword">enum</span> <span class="token class-name">MaterialType</span> <span class="token punctuation">{<!-- --></span> DIFFUSE<span class="token punctuation">,</span> MICROFACET<span class="token punctuation">,</span>MIRROR<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>main函数中添加物体，赋予材质，</p> 
+<pre><code class="prism language-cpp">    Material<span class="token operator">*</span> mirror <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token function">Material</span><span class="token punctuation">(</span>MIRROR<span class="token punctuation">,</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    mirror<span class="token operator">-&gt;</span>Ks <span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.45</span><span class="token punctuation">,</span> <span class="token number">0.45</span><span class="token punctuation">,</span> <span class="token number">0.45</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    mirror<span class="token operator">-&gt;</span>Kd <span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.3</span><span class="token punctuation">,</span> <span class="token number">0.3</span><span class="token punctuation">,</span> <span class="token number">0.25</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    mirror<span class="token operator">-&gt;</span>ior <span class="token operator">=</span> <span class="token number">12.85</span><span class="token punctuation">;</span>
+    
+    MeshTriangle <span class="token function">floor</span><span class="token punctuation">(</span><span class="token string">"../models/cornellbox/floor.obj"</span><span class="token punctuation">,</span> white<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    MeshTriangle <span class="token function">shortbox</span><span class="token punctuation">(</span><span class="token string">"../models/cornellbox/shortbox.obj"</span><span class="token punctuation">,</span> white<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    MeshTriangle <span class="token function">tallbox</span><span class="token punctuation">(</span><span class="token string">"../models/cornellbox/tallbox.obj"</span><span class="token punctuation">,</span> mirror<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    MeshTriangle <span class="token function">left</span><span class="token punctuation">(</span><span class="token string">"../models/cornellbox/left.obj"</span><span class="token punctuation">,</span> red<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    MeshTriangle <span class="token function">right</span><span class="token punctuation">(</span><span class="token string">"../models/cornellbox/right.obj"</span><span class="token punctuation">,</span> green<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    MeshTriangle <span class="token function">light_</span><span class="token punctuation">(</span><span class="token string">"../models/cornellbox/light.obj"</span><span class="token punctuation">,</span> light<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>最后修改eval，在eval中实现完美镜面反射（Mirror），如下：</p> 
+<pre><code class="prism language-cpp">Vector3f <span class="token class-name">Material</span><span class="token double-colon punctuation">::</span><span class="token function">eval</span><span class="token punctuation">(</span><span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wi<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wo<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>N<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">switch</span><span class="token punctuation">(</span>m_type<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> DIFFUSE<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// calculate the contribution of diffuse model</span>
+            <span class="token keyword">float</span> cosalpha <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>cosalpha <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                Vector3f diffuse <span class="token operator">=</span> Kd <span class="token operator">/</span> M_PI<span class="token punctuation">;</span>
+                <span class="token keyword">return</span> diffuse<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MIRROR<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">float</span> cosalpha <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>cosalpha <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span> 
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">float</span> divisor <span class="token operator">=</span> cosalpha<span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+                Vector3f mirror <span class="token operator">=</span> <span class="token number">1</span> <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token keyword">float</span> F<span class="token punctuation">;</span>
+                <span class="token function">fresnel</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">,</span> ior<span class="token punctuation">,</span> F<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">return</span> F <span class="token operator">*</span> mirror<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MICROFACET<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">float</span> cosalpha <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>cosalpha <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span> 
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// calculate the contribution of Microfacet model</span>
+                <span class="token keyword">float</span> F<span class="token punctuation">,</span> G<span class="token punctuation">,</span> D<span class="token punctuation">;</span>
+
+                <span class="token function">fresnel</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">,</span> ior<span class="token punctuation">,</span> F<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token keyword">float</span> Roughness <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span><span class="token comment">//超参数，控制粗糙度</span>
+                <span class="token keyword">auto</span> G_function <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token operator">&amp;</span><span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">float</span><span class="token operator">&amp;</span> Roughness<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> wi<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> wo<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> N<span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token keyword">float</span> A_wi<span class="token punctuation">,</span> A_wo<span class="token punctuation">;</span>
+                    A_wi <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">+</span> <span class="token function">sqrt</span><span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">+</span> Roughness <span class="token operator">*</span> Roughness <span class="token operator">*</span> <span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">tan</span><span class="token punctuation">(</span><span class="token function">acos</span><span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token number">2</span><span class="token punctuation">;</span>
+                    A_wo <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">+</span> <span class="token function">sqrt</span><span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">+</span> Roughness <span class="token operator">*</span> Roughness <span class="token operator">*</span> <span class="token function">pow</span><span class="token punctuation">(</span><span class="token function">tan</span><span class="token punctuation">(</span><span class="token function">acos</span><span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token number">2</span><span class="token punctuation">;</span>
+                    <span class="token keyword">float</span> divisor <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token number">1</span> <span class="token operator">+</span> A_wi <span class="token operator">+</span> A_wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span>
+                        <span class="token keyword">return</span> <span class="token number">1.f</span><span class="token punctuation">;</span>
+                    <span class="token keyword">else</span>
+                        <span class="token keyword">return</span> <span class="token number">1.0f</span> <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token punctuation">}</span><span class="token punctuation">;</span>
+                G <span class="token operator">=</span> <span class="token function">G_function</span><span class="token punctuation">(</span>Roughness<span class="token punctuation">,</span> <span class="token operator">-</span>wi<span class="token punctuation">,</span> wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token keyword">auto</span> D_function <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token operator">&amp;</span><span class="token punctuation">]</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">float</span><span class="token operator">&amp;</span> Roughness<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> h<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f<span class="token operator">&amp;</span> N<span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token keyword">float</span> cos_sita <span class="token operator">=</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>h<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">float</span> divisor <span class="token operator">=</span> <span class="token punctuation">(</span>M_PI <span class="token operator">*</span> <span class="token function">pow</span><span class="token punctuation">(</span><span class="token number">1.0</span> <span class="token operator">+</span> cos_sita <span class="token operator">*</span> cos_sita <span class="token operator">*</span> <span class="token punctuation">(</span>Roughness <span class="token operator">*</span> Roughness <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span>
+                        <span class="token keyword">return</span> <span class="token number">1.f</span><span class="token punctuation">;</span>
+                    <span class="token keyword">else</span> 
+                        <span class="token keyword">return</span> <span class="token punctuation">(</span>Roughness <span class="token operator">*</span> Roughness<span class="token punctuation">)</span> <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token punctuation">}</span><span class="token punctuation">;</span>
+                Vector3f h <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span><span class="token operator">-</span>wi <span class="token operator">+</span> wo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                D <span class="token operator">=</span> <span class="token function">D_function</span><span class="token punctuation">(</span>Roughness<span class="token punctuation">,</span> h<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">// energy balance</span>
+                Vector3f diffuse <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">1.0f</span><span class="token punctuation">)</span> <span class="token operator">-</span> F<span class="token punctuation">)</span> <span class="token operator">*</span> Kd <span class="token operator">/</span> M_PI<span class="token punctuation">;</span>
+                Vector3f specular<span class="token punctuation">;</span>
+                <span class="token keyword">float</span> divisor<span class="token operator">=</span> <span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token number">4</span> <span class="token operator">*</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> <span class="token operator">-</span>wi<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>N<span class="token punctuation">,</span> wo<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>divisor <span class="token operator">&lt;</span> <span class="token number">0.001</span><span class="token punctuation">)</span>
+                    specular<span class="token operator">=</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">else</span>
+                    specular <span class="token operator">=</span> F <span class="token operator">*</span>G <span class="token operator">*</span> D <span class="token operator">/</span> divisor<span class="token punctuation">;</span>
+                <span class="token comment">//std::cout &lt;&lt; "F:"&lt;&lt;F &lt;&lt; "\n";</span>
+                <span class="token comment">//std::cout &lt;&lt; "diffuse:"&lt;&lt;diffuse&lt;&lt;"\n";</span>
+                <span class="token comment">//std::cout &lt;&lt; "specular:" &lt;&lt; specular &lt;&lt; "\n";</span>
+                <span class="token keyword">return</span> diffuse<span class="token operator">+</span>specular<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token function">Vector3f</span><span class="token punctuation">(</span><span class="token number">0.0f</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>哦对，<strong>由于要重要性采样（采样方向只需要采完美反射的方向即可），所以采样的那两个函数也需要改变</strong>，不能像Microfacet一样不变。如下：</p> 
+<pre><code class="prism language-cpp">Vector3f <span class="token class-name">Material</span><span class="token double-colon punctuation">::</span><span class="token function">sample</span><span class="token punctuation">(</span><span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wi<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>N<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">switch</span><span class="token punctuation">(</span>m_type<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> DIFFUSE<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// uniform sample on the hemisphere</span>
+            <span class="token keyword">float</span> x_1 <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> x_2 <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">float</span> z <span class="token operator">=</span> std<span class="token double-colon punctuation">::</span><span class="token function">fabs</span><span class="token punctuation">(</span><span class="token number">1.0f</span> <span class="token operator">-</span> <span class="token number">2.0f</span> <span class="token operator">*</span> x_1<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">float</span> r <span class="token operator">=</span> std<span class="token double-colon punctuation">::</span><span class="token function">sqrt</span><span class="token punctuation">(</span><span class="token number">1.0f</span> <span class="token operator">-</span> z <span class="token operator">*</span> z<span class="token punctuation">)</span><span class="token punctuation">,</span> phi <span class="token operator">=</span> <span class="token number">2</span> <span class="token operator">*</span> M_PI <span class="token operator">*</span> x_2<span class="token punctuation">;</span>
+            Vector3f <span class="token function">localRay</span><span class="token punctuation">(</span>r<span class="token operator">*</span>std<span class="token double-colon punctuation">::</span><span class="token function">cos</span><span class="token punctuation">(</span>phi<span class="token punctuation">)</span><span class="token punctuation">,</span> r<span class="token operator">*</span>std<span class="token double-colon punctuation">::</span><span class="token function">sin</span><span class="token punctuation">(</span>phi<span class="token punctuation">)</span><span class="token punctuation">,</span> z<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> <span class="token function">toWorld</span><span class="token punctuation">(</span>localRay<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MIRROR<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            Vector3f localRay <span class="token operator">=</span> <span class="token function">reflect</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> localRay<span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MICROFACET<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// uniform sample on the hemisphere</span>
+            <span class="token keyword">float</span> x_1 <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> x_2 <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">float</span> z <span class="token operator">=</span> std<span class="token double-colon punctuation">::</span><span class="token function">fabs</span><span class="token punctuation">(</span><span class="token number">1.0f</span> <span class="token operator">-</span> <span class="token number">2.0f</span> <span class="token operator">*</span> x_1<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">float</span> r <span class="token operator">=</span> std<span class="token double-colon punctuation">::</span><span class="token function">sqrt</span><span class="token punctuation">(</span><span class="token number">1.0f</span> <span class="token operator">-</span> z <span class="token operator">*</span> z<span class="token punctuation">)</span><span class="token punctuation">,</span> phi <span class="token operator">=</span> <span class="token number">2</span> <span class="token operator">*</span> M_PI <span class="token operator">*</span> x_2<span class="token punctuation">;</span>
+            Vector3f <span class="token function">localRay</span><span class="token punctuation">(</span>r <span class="token operator">*</span> std<span class="token double-colon punctuation">::</span><span class="token function">cos</span><span class="token punctuation">(</span>phi<span class="token punctuation">)</span><span class="token punctuation">,</span> r <span class="token operator">*</span> std<span class="token double-colon punctuation">::</span><span class="token function">sin</span><span class="token punctuation">(</span>phi<span class="token punctuation">)</span><span class="token punctuation">,</span> z<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> <span class="token function">toWorld</span><span class="token punctuation">(</span>localRay<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword">float</span> <span class="token class-name">Material</span><span class="token double-colon punctuation">::</span><span class="token function">pdf</span><span class="token punctuation">(</span><span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wi<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>wo<span class="token punctuation">,</span> <span class="token keyword">const</span> Vector3f <span class="token operator">&amp;</span>N<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">switch</span><span class="token punctuation">(</span>m_type<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> DIFFUSE<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// uniform sample probability 1 / (2 * PI)</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span>
+                <span class="token keyword">return</span> <span class="token number">0.5f</span> <span class="token operator">/</span> M_PI<span class="token punctuation">;</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token number">0.0f</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MIRROR<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span>
+                <span class="token keyword">return</span> <span class="token number">1.0f</span><span class="token punctuation">;</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token number">0.0f</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">case</span> MICROFACET<span class="token operator">:</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// uniform sample probability 1 / (2 * PI)</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">0.0f</span><span class="token punctuation">)</span>
+                <span class="token keyword">return</span> <span class="token number">0.5f</span> <span class="token operator">/</span> M_PI<span class="token punctuation">;</span>
+            <span class="token keyword">else</span>
+                <span class="token keyword">return</span> <span class="token number">0.0f</span><span class="token punctuation">;</span>
+            <span class="token keyword">break</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>哦对了，<strong>最后的最后，因为要做重要性采样，castRay函数也要进行修改</strong>，否则会有过曝现象，mirror材质不再需要直接光L_dir采样了，就直接算L_indir就行，而且在算L_indir的时候记得那个把里面的避免光源采样的判断条件去了。如下：</p> 
+<pre><code class="prism language-cpp">Vector3f <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">castRay</span><span class="token punctuation">(</span><span class="token keyword">const</span> Ray<span class="token operator">&amp;</span> ray<span class="token punctuation">,</span> <span class="token keyword">int</span> depth<span class="token punctuation">)</span> <span class="token keyword">const</span>
+<span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// TO DO Implement Path Tracing Algorithm here</span>
+    Vector3f hitColor <span class="token operator">=</span> <span class="token keyword">this</span><span class="token operator">-&gt;</span>backgroundColor<span class="token punctuation">;</span>
+    Intersection shade_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>shade_point_inter<span class="token punctuation">.</span>happened<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        Vector3f p <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>coords<span class="token punctuation">;</span>
+        Vector3f wo <span class="token operator">=</span> ray<span class="token punctuation">.</span>direction<span class="token punctuation">;</span>
+        Vector3f N <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>normal<span class="token punctuation">;</span>
+        Vector3f <span class="token function">L_dir</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">L_indir</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Vector3f p_deviation <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">dotProduct</span><span class="token punctuation">(</span>ray<span class="token punctuation">.</span>direction<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">?</span>
+            p <span class="token operator">+</span> N <span class="token operator">*</span> EPSILON <span class="token operator">:</span>
+            p <span class="token operator">-</span> N <span class="token operator">*</span> EPSILON<span class="token punctuation">;</span>
+
+        <span class="token keyword">switch</span> <span class="token punctuation">(</span>shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">getType</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">case</span> MIRROR<span class="token operator">:</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">//Test Russian Roulette with probability RussianRouolette</span>
+                <span class="token keyword">float</span> ksi <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>ksi <span class="token operator">&lt;</span> RussianRoulette<span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">//wi=sample(wo,N)</span>
+                    Vector3f wi <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span>shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">sample</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token comment">//Trace a ray r(p,wi)</span>
+                    Ray <span class="token function">ray_pTowi</span><span class="token punctuation">(</span>p_deviation<span class="token punctuation">,</span> wi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token comment">//If ray r hit a object at q</span>
+                    Intersection bounce_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>bounce_point_inter<span class="token punctuation">.</span>happened<span class="token punctuation">)</span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token keyword">float</span> pdf <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">pdf</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span>pdf <span class="token operator">&gt;</span> EPSILON<span class="token punctuation">)</span>
+                            L_indir <span class="token operator">=</span> <span class="token function">castRay</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">,</span> depth <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">eval</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span>pdf <span class="token operator">*</span> RussianRoulette<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">default</span><span class="token operator">:</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">//sampleLight(inter,pdf_light)</span>
+                Intersection light_point_inter<span class="token punctuation">;</span>
+                <span class="token keyword">float</span> pdf_light<span class="token punctuation">;</span>
+                <span class="token function">sampleLight</span><span class="token punctuation">(</span>light_point_inter<span class="token punctuation">,</span> pdf_light<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">//Get x,ws,NN,emit from inter</span>
+                Vector3f x <span class="token operator">=</span> light_point_inter<span class="token punctuation">.</span>coords<span class="token punctuation">;</span>
+                Vector3f ws <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span>x <span class="token operator">-</span> p<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                Vector3f NN <span class="token operator">=</span> light_point_inter<span class="token punctuation">.</span>normal<span class="token punctuation">;</span>
+                Vector3f emit <span class="token operator">=</span> light_point_inter<span class="token punctuation">.</span>emit<span class="token punctuation">;</span>
+                <span class="token keyword">float</span> distance_pTox <span class="token operator">=</span> <span class="token punctuation">(</span>x <span class="token operator">-</span> p<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">norm</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">//Shoot a ray from p to x</span>
+                Ray <span class="token function">ray_pTox</span><span class="token punctuation">(</span>p_deviation<span class="token punctuation">,</span> ws<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">//If the ray is not blocked in the middleff</span>
+                Intersection blocked_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray_pTox<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">abs</span><span class="token punctuation">(</span>distance_pTox <span class="token operator">-</span> blocked_point_inter<span class="token punctuation">.</span>distance <span class="token operator">&lt;</span> <span class="token number">0.01</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    L_dir <span class="token operator">=</span> emit <span class="token operator">*</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">eval</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> ws<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>ws<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span><span class="token operator">-</span>ws<span class="token punctuation">,</span> NN<span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span>distance_pTox <span class="token operator">*</span> distance_pTox <span class="token operator">*</span> pdf_light<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token comment">//Test Russian Roulette with probability RussianRouolette</span>
+                <span class="token keyword">float</span> ksi <span class="token operator">=</span> <span class="token function">get_random_float</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>ksi <span class="token operator">&lt;</span> RussianRoulette<span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">//wi=sample(wo,N)</span>
+                    Vector3f wi <span class="token operator">=</span> <span class="token function">normalize</span><span class="token punctuation">(</span>shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">sample</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token comment">//Trace a ray r(p,wi)</span>
+                    Ray <span class="token function">ray_pTowi</span><span class="token punctuation">(</span>p_deviation<span class="token punctuation">,</span> wi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token comment">//If ray r hit a non-emitting object at q</span>
+                    Intersection bounce_point_inter <span class="token operator">=</span> <span class="token class-name">Scene</span><span class="token double-colon punctuation">::</span><span class="token function">intersect</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>bounce_point_inter<span class="token punctuation">.</span>happened <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span>bounce_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">hasEmission</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token keyword">float</span> pdf <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">pdf</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span>pdf <span class="token operator">&gt;</span> EPSILON<span class="token punctuation">)</span>
+                            L_indir <span class="token operator">=</span> <span class="token function">castRay</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">,</span> depth <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">eval</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span>pdf <span class="token operator">*</span> RussianRoulette<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        hitColor <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">getEmission</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token operator">+</span>L_dir <span class="token operator">+</span> L_indir<span class="token punctuation">;</span>
+        hitColor<span class="token punctuation">.</span>x <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> hitColor<span class="token punctuation">.</span>x<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        hitColor<span class="token punctuation">.</span>y <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> hitColor<span class="token punctuation">.</span>y<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        hitColor<span class="token punctuation">.</span>z <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token function">clamp</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> hitColor<span class="token punctuation">.</span>z<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> hitColor<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><strong>最终结果（均为1024×1024×512）</strong><br> <img src="https://images2.imgbox.com/da/cb/mRvSL99u_o.png" alt="在这里插入图片描述"><br> <strong>这时候有人会问了，tmd，重要性采样怎么这么麻烦，那我不用，把ssp调高点不就行了？emmm，如果头铁，不做重要性采样，我也实验了一下，就是下图的结果</strong>，ssp已经是2048了，但是噪点还是非常多，就是采样效率太低了，做了重要性采样后，ssp为512的结果可以完美爆杀这张图。</p> 
+<p><img src="https://images2.imgbox.com/7f/2e/XzsQYHj5_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="_717"></a>代码实现可能遇到的问题</h2> 
+<h3><a id="1_718"></a>1.光源融入到整个天花板，没有出现黑色</h3> 
+<p>光源融入到整个天花板了，==tmd，感觉网上没有人和我这个情况是一样的。。。</p> 
+<p>光源尼玛的，就是融入整个天花板了，==tmd，感觉网上没有人和我这个情况是一样的。。。</p> 
+<p>测试的时候发现，<strong>其实这个光源是能被检测出来的</strong>，只是着色的时候变成这样了，然后分析了好几个小时的源码，艹，一直找不到原因，最后debug了半天，总算知道为什么了。</p> 
+<p><strong>就是当对光源着色时，目前是分为两个部分，一个是直接光，一个是间接光。</strong></p> 
+<p><strong>直接光的话应该是不会提供颜色的，因为直接光同样是在光源上采样，相当于ws和N是几乎垂直的，cos(ws,N)项就会使得整个直接光的值接近0。代码中点偏移的处理只会让两者夹角大于90，此时cos算出来甚至还是小于0的。综上，直接光不会给其提供颜色。</strong></p> 
+<p><strong>间接光会对其提供颜色，并且也是导致光源颜色和天花板颜色接近的直接原因，因为计算间接光时，光源本身是 漫反射材质，所以这边代码会让光源应该会有light-&gt;Kd差不多的颜色，而这个值又和天花板的颜色其实差不多，所以看上去才只能看到天花板。</strong></p> 
+<p><strong>这个地方我看其他博主的解决方法都很简单粗暴，检测出是光源就直接返回光源本身颜色</strong>，但实际上光源也是会吸收反射其他光的，如果场景中有其他光源，那这种处理有可能就会出问题。**因此就需要保证光源是可以正常接收直接光和间接光的，不能直接返回光源本身颜色。**此时观察之前的公式，<strong>少了一个自身发光项</strong>（下面第二张图，之前一直不知道这个有啥用，此时起作用了，醍醐灌顶），最后把这个加上去就可以正常显示了。</p> 
+<p><strong>emm，之前好几个小时一直纠结在直接光上面，想方设法要避免直接光，其实并不是这个原因导致的，害==</strong>，也是尼玛的运气好，多实验了一下，结果和想的不一样，就再思考分析了下，就想出来原因了。。。</p> 
+<p><strong>也明白了个道理，发现问题并打算编写代码去解决的时候，先看看能不能设计实验用代码验证一下这个问题的提出是不是正确的，如果这个问题本身就是错误的，那就没有必要花很多时间去写代码解决。我这次就花了很多时间去思考怎么避免直接光，实际上这个问题本身就是不成立的==我应该试一下没有直接光的话，光源区域会不会变黑，如果变黑了，就说明我之前提出的问题是成立的。</strong><br> <img src="https://images2.imgbox.com/f2/cb/6aBI7adt_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/e6/54/h5TViEtq_o.png" alt="在这里插入图片描述"><br> 我草，事后去games论坛上，居然真的找到了个一样的了==<br> https://games-cn.org/forums/topic/zuoye7wenti/</p> 
+<h3><a id="2_741"></a>2.箱子背阴处有很多黑色噪点</h3> 
+<p>没对好伪代码中的那些向量方向定义，说白了就是没完全按照伪代码来，改了之后就好了。<br> <img src="https://images2.imgbox.com/a9/92/UFRZt8ar_o.png" alt="在这里插入图片描述"><br> 修改后的结果<br> <img src="https://images2.imgbox.com/f1/e6/BDiNpwJE_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="3ssp_747"></a>3.有白色噪点（ssp调高仍然有）</h3> 
+<p>画面上有<strong>少部分白色噪点</strong>。<br> <img src="https://images2.imgbox.com/6b/a9/Lgim70mx_o.png" alt="在这里插入图片描述"><br> 用ps工具放大，发现是某个像素为白色，<strong>此时SPP已经是512，所以应该不是采样不够的问题</strong>。而且如果是采样不够，应该是会在其周围同时出现大量噪点，而不是只出现这么一个这么突出的，<strong>例如下面第三张图。</strong><br> <img src="https://images2.imgbox.com/f6/f2/pufbETCx_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/1a/f4/cnBvDc7i_o.png" alt="在这里插入图片描述"><br> 这意味着计算光照时，<strong>出现了一个非常大的值</strong>。排查代码发现原因很可能在于除数过小（无限接近于0，<strong>或等于0</strong>，这里就是等于0），结果接近无穷大。使这个像素的全部采样都收到这个无限大值的影响，直接变成白色。这显然是我们不想要的。<strong>这就对应作业里的提示：pdf接近0</strong>。解决方案就是pdf低于某个指定阈值时，L_indir为0，代码如下：</p> 
+<pre><code class="prism language-cpp"><span class="token keyword">float</span> pdf <span class="token operator">=</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">pdf</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">if</span><span class="token punctuation">(</span>pdf<span class="token operator">&gt;</span> EPSILON<span class="token punctuation">)</span>
+	L_indir <span class="token operator">=</span> <span class="token function">castRay</span><span class="token punctuation">(</span>ray_pTowi<span class="token punctuation">,</span> depth <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">*</span> shade_point_inter<span class="token punctuation">.</span>m<span class="token operator">-&gt;</span><span class="token function">eval</span><span class="token punctuation">(</span>wo<span class="token punctuation">,</span> wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">dotProduct</span><span class="token punctuation">(</span>wi<span class="token punctuation">,</span> N<span class="token punctuation">)</span> <span class="token operator">/</span> <span class="token punctuation">(</span>pdf <span class="token operator">*</span>RussianRoulette<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>修改后的结果<br> <img src="https://images2.imgbox.com/99/8e/PauDoTh2_o.png" alt="在这里插入图片描述"><br> 通过这个案例，分析一下为什么要考虑数值精度，emmm，如果不考虑数值精度，很有可能一次数值的不正确就会产生难以想象的结果，<strong>例如上述除数为0导致无限大inf的出现</strong>，会使得当次像素颜色计算的其他采样结果无效，相当于一个极偏值对整体结果产生了巨大影响，而我们想要的是能够避免极偏值的影响，类似机器学习里面的回归分类问题。<strong>所以这个时候就要对其特殊处理，降低他对其他结果的影响。</strong></p> 
+<h2><a id="_764"></a>理论思考</h2> 
+<h3><a id="1_765"></a>1.偏移为什么要分两种情况这么偏移？</h3> 
+<p>考虑了<strong>背光情况</strong>（因为世间万物都有厚度，如果光在前面，从背面看就是会被挡住），如下面第二张图。<br> <img src="https://images2.imgbox.com/ec/a3/9N1j6GWM_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="2path_tracing_768"></a>2.为什么path tracing有软阴影？</h3> 
+<p>阴影部分应该都是没有直接光的，<strong>那么导致软阴影的原因就是环境光</strong>，接受的间接光是不一样的，离得近的会被挡住更多的间接光，离得远的间接光挡住的比较少，所以就会有软阴影。</p> 
+<p><strong>而witted style就没有软阴影</strong>，这是因为<strong>没有考虑全局光</strong>，就是只考虑了那一个方向。</p> 
+<h3><a id="3witted_stylepath_tracing_772"></a>3.把witted style和path tracing的结果对比一下，两者的实现的不同点有哪些？</h3> 
+<p>区别很大，<strong>path tracing是基于witted style的改进</strong>，很容易看到这两者共同的地方。明显，path tracing是合理的，并且可以基于物理，还能考虑全局光照，能量守恒保证结果更加精确。<strong>具体的可以看 Ray Tracing笔记那一章。</strong></p> 
+<p>反正我觉得两者<strong>最大的区别</strong>，就是path tracing<strong>通过渲染方程考虑了全局光照</strong>，<strong>而witted style无法考虑全局光照（没有全局积分，一个点的颜色就由那么几根光线决定，实现那种完美镜面效果倒是好的很。。。）</strong>，它因此很难实现很多的细节，大部分材质表现也没有path tracing好。</p> 
+<h3><a id="4radianceemit_776"></a>4.为什么程序中，渲染方程的入射radiance是光源的emit，是一个常量？</h3> 
+<p>emmm，如果要深究，非常复杂，后面的光学理论看得我头痛，<strong>大致就下面这么理解就够了。</strong></p> 
+<p><strong>反正radiance在程序中就是一根光线。</strong><br> <img src="https://images2.imgbox.com/54/e7/zLGugnrT_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="5_781"></a>5.为什么说光栅化比光追快？</h3> 
+<p>光栅化没有大量的采样，<strong>光追里面因为要求解积分，需要大量的采样</strong>。</p> 
+<h2><a id="_784"></a>个人感悟</h2> 
+<p>emmm，<strong>可以说这是我从小到大，除一些项目以外，做某门课作业花的最长的时间了</strong>，很感谢闫老师的101课程，提供了优质的作业，通过作业7对光线追踪技术有了一个基础的基本认识，也在做的过程中不断发现问题，解决问题，提高自己的coding和思考能力，<strong>真的很感谢闫老师，我有一种预感，这门课将会为中国图形学持续输送数以万计的人才</strong>。这次作业做完后差不多打好了离线渲染的一些基本的底子，打算明天开始正式做本科的毕设了（之前10月到12月一直在摆烂，1月到2月在补渲染的基础知识，所以说本科毕设正式开始时间就差不多是现在2月，希望来得及==害），加油加油！</p> 
+<p><strong>也希望这个博客可以对做这个作业的人有一定帮助！</strong></p> 
+<h2><a id="_789"></a>参考资料</h2> 
+<p>1.https://blog.csdn.net/u011942101/article/details/123656944（代码性能分析器）</p> 
+<p>2.https://blog.csdn.net/ycrsw/article/details/124408789</p> 
+<p>3.https://blog.csdn.net/qq_41765657/article/details/121942469</p> 
+<p>4.https://blog.csdn.net/ycrsw/article/details/124565054</p> 
+<p>5.https://blog.csdn.net/weixin_44491423/article/details/127552276</p> 
+<p>6.https://games-cn.org/forums/topic/guanyuguangxianzhuizong3zhongradiancedeshizi/</p> 
+<p>7.https://www.zhihu.com/question/28476602/answer/41003204</p> 
+<p>8.https://games-cn.org/forums/topic/guanyuxuanranfangchengdiguidingyideyiwen/</p> 
+<p>9.https://www.jianshu.com/p/0cfc3204af77</p> 
+<p>10.https://zhuanlan.zhihu.com/p/434964126</p> 
+<p>11.https://zhuanlan.zhihu.com/p/152226698</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/393fbe8ed8a1ee264049ef5ed7e16afb/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">MySQL FlinkCDC 通过Kafka实时同步到ClickHouse(自定义Debezium格式支持增加删除修改)</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/7d6812f6641501210da363b9d71e493b/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">5.3.1_原补码的乘法运算</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

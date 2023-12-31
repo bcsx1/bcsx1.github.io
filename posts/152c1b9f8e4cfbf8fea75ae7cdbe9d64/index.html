@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Hbase 深度使用分析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Hbase 深度使用分析" />
+<meta property="og:description" content="版本描述：Hbase 2.X 版本 CRUD场景描述： 批量新增数据 循环put...那是不可能的..可以使用put(List&lt;Put&gt; puts) 需要注意的是当一部分数据插入成功后，此时某个RegionServer出现异常，之前的数据是不会回滚的，对于插入失败的数据hbase默认会进行重试直到到达最大重试次数还是失败即会结束重试（失败数据在写缓冲区），不过如果列族错误了，那么不会进行重试，直接抛出异常
+批量查询数据 get(List&lt;Get&gt; gets) 返回一个Result数组，如果一部分数据失败，一部分数据查询成功，最终hbase还是会返回异常，如果你希望不要抛出异常而是返回成功部分的数据，那么可以使用batch接口进行查询
+Scan 扫描查询 常见的OLTP数据库，最常用的就是各种join语法，不过在hbase可不支持这种语法，那么当我们需要通过部分条件查询批量数据的时候就会用到scan命令，不过考虑到性能那么我们一般使用scan(byte[] startRow,Filter filter) 这里的filter是用来翻页的，这个时候hbase会返回一个ResultScanner对象（这个时候hbase还没有真正的去scan数据，只是返回了你这个构建器对象而已）
+Hbase 数据结构： Namespace（表命名空间），可以直接使用默认值，不过一般你的表特别多并且可以分不同场景管理的时候才需要考虑设置，方便对一种纬度的批量表进行统一管理Table（表），一个表由一个或者多个列族组成，很多表的属性都可以在列族中指定，列入TTL、压缩算法等Row（行），一个行包含了许多列，这些列通过列族来分类Column Family（列族），列族是多个列的集合，列族最大的最用是为了将一个场景/纬度下的列放在一个节点进行维护，这样可以提高性能和降低hbase架构复杂度列，多个列组成一个行，列可以随意定义，一个行中的列不限名字、不限制数量，只限定列族Cell（单元格），一个列中可以存储多个版本的数据，每个版本就是一个单元格，相比传统数据库，hbase数据库的数据颗粒度更加细小，同一个数据还存在多个版本Timestamp（时间戳/版本号），可以定义自己的版本号 当然hbase也和常见数据库一样有一个行数据主键（Rowkey），每一个行都有一个rowkey，这个是按照字典排序的
+Hbase必知概念： WAL（预写日志），当写操作到达Region的时候，hbase会先将数据WAL，这个也是hbase用来故障恢复的依赖，因为hbase的写缓冲区是在内存中的，需要积累一定量的数据后才会刷写，那么这段时间如果Down机了，那么数据就会没了，所以才有了WAL
+Region 这个相当于数据库的分区表或者mongo的分片概念，每一个Region都有起始rowkey和结束rowkey，代表了当前分区存储的范围，这个就和很多MQ的commitlog存储形式一样，每一条消息的头部字节都存储了当前消息的长度和结束位置
+一个region包含多个store，一个store对应一个列族的数据，如果一个表有2个列族，那么在一个region里面就有2个storestore内部有menstore和hfile组成 很多MQ架构中都提供了异步刷盘/同步刷盘机制，其实hbase的WAL也和这个是一样的逻辑，WAL同样提供了异步/同步方式，同步方式对性能损耗较大但是数据100%安全，根据自己业务场景的实际需要改变
+我刚开始的时候也有一个疑问，这种架构总觉得怪怪的，后来我发现是我肤浅了，我的疑问是：数据先写到WAL中，然后内存store汇聚数据，在写道hfile中，但是WAL和HFile的存储介质都是HDFS，那么不是有点多此一举么，其实这么设计的问题在于数据的顺序性，因为HDFS上的文件不能编辑，而数据库数据存放的顺序性是很重要的，如果我们数据一到就写到HDFS中，那么你很难保障数据的是顺序的，那么Menstore的价值就是在于内存整理顺序批量一次性的写到硬盘，那么这批数据的顺序性就是有保障的
+HFile，hbase数据存储的实际载体 HFile是由一个个块组成的，默认每个块64KB
+Data块：数据块，表中的数据就在这里Meta：元数据块FileInfo：文件信息，这里面描述了最后一个key等信息DataIndex：存储Data块的索引信息，索引的偏移值 Hbase之疑问？ hbase是一个随机读写数据库，并且上面也说到HDFS时不支持编辑文件内容的，那么hbase怎么完成CRUD的？
+其实hbase基本都一直再做新增操作，刚刚说道CELL是多份的，当你编辑的时候其实hbase新增了一份cell，只是内部的版本号信息比之前的大，当你删除一条数据的时候，hbase还是做了新增操作，只是这条数据没有value，并且类型是DELETE，常用术语墓碑标记
+那么疑问又来了，一直在做insert操作，第一个是垃圾数据会非常的庞大，第二个是数据的顺序性肯定不对了，其实hbase每隔一段时间会进行一次合并（这个操作和CK很类似）合并分为两种类型（minor和major）major合并过程中如果发现墓碑标记，那么就会忽略这条数据，这个时候这条数据才是真正的被物理删除了
+Hbase数据的读取 Hbase实际的读取顺序是先从BlockCache中找数据，找不到了再去Memstore和HFile中查询数据。
+由于HDFS的文件不可变特性，你不可能在一个KeyValue被新建之后删除它，HBase所能做的也就是帮你加上一个墓碑标记。但是你别忘了HDFS是不能修改的，所以墓碑标记和数据不在一个存储地，所以当我们再用Scan进行数据扫描读取的时候，就算已经查到了用户分页指定数据，hbase还是会继续往后扩大的读取，因为只有这样才能知道是否存在墓碑标记，所以性能最高的scan方式是加上起始-结束标记，这样可以限定hbase扩展读取的范围
+在Scan扫描的时候store会创建StoreScanner实例。StoreScanner会把MemStore和HFile结合起来扫描，所以具体从MemStore还是HFile中读取数据，外部的调用者都不需要知道具体的细节。当StoreScanner打开的时候，会先定位到起始行键
+Client - Region
+最早期的hbase采用了三层查询方式，现在已经废弃了因为代码复杂还没啥实际意义
+现在已经变成了两层查询方式，
+客户端先通过ZooKeeper的/hbase/meta-region-server节点查询到哪台RegionServer上有hbase:meta表。客户端连接含有hbase:meta表的RegionServer。hbase:meta表存储了所有Region的行键范围信息，通过这个表就可以查询出你要存取的rowkey属于哪个Region的范围里面，以及这个Region又是属于哪个RegionServer。获取这些信息后，客户端就可以直连其中一台拥有你要存取的rowkey的RegionServer，并直接对其操作。客户端会把meta信息缓存起来，下次操作就不需要进行以上加载hbase:meta的步骤了。 Hbase 进阶 过滤器，在scan查询的时候经常用到，可以看成SQL语句中的where条件，在遍历过程中，不满足filter条件的数据就会被过滤
+过滤器的模糊值匹配 //这段代码等同于SQL中like &#39;%boluo%&#39; Filter filter = new ValueFilter( CompareOperator.EQUAL, new SubstringComparator( &#34;boluo&#34; ) ); 上面那段代码会有个小问题就是一个列族下其他列也满足这个条件的话数据也会被捞出，那么指定列进行值匹配的话需要看下面的代码
+//这段代码等同于SQL中name like &#39;%boluo%&#39; Filter filter = new SingleColumnValueFilter( Bytes." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/152c1b9f8e4cfbf8fea75ae7cdbe9d64/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-06-22T13:35:14+08:00" />
+<meta property="article:modified_time" content="2022-06-22T13:35:14+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Hbase 深度使用分析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h4>版本描述：Hbase 2.X 版本</h4> 
+<h4>CRUD场景描述：</h4> 
+<ul><li>批量新增数据</li></ul> 
+<p>循环put...那是不可能的..可以使用put(List&lt;Put&gt; puts) 需要注意的是当一部分数据插入成功后，此时某个RegionServer出现异常，之前的数据是不会回滚的，对于插入失败的数据hbase默认会进行重试直到到达最大重试次数还是失败即会结束重试（失败数据在写缓冲区），不过如果列族错误了，那么不会进行重试，直接抛出异常</p> 
+<ul><li>批量查询数据</li></ul> 
+<p>get(List&lt;Get&gt; gets) 返回一个Result数组，如果一部分数据失败，一部分数据查询成功，最终hbase还是会返回异常，如果你希望不要抛出异常而是返回成功部分的数据，那么可以使用batch接口进行查询</p> 
+<ul><li>Scan 扫描查询</li></ul> 
+<p>常见的OLTP数据库，最常用的就是各种join语法，不过在hbase可不支持这种语法，那么当我们需要通过部分条件查询批量数据的时候就会用到scan命令，不过考虑到性能那么我们一般使用scan(byte[] startRow,Filter filter) 这里的filter是用来翻页的，这个时候hbase会返回一个ResultScanner对象（这个时候hbase还没有真正的去scan数据，只是返回了你这个构建器对象而已）</p> 
+<p><img alt="" height="756" src="https://images2.imgbox.com/fd/f3/khrmR69v_o.png" width="558"></p> 
+<p></p> 
+<h4>Hbase 数据结构：</h4> 
+<ul><li>Namespace（表命名空间），可以直接使用默认值，不过一般你的表特别多并且可以分不同场景管理的时候才需要考虑设置，方便对一种纬度的批量表进行统一管理</li><li>Table（表），一个表由一个或者多个列族组成，很多表的属性都可以在列族中指定，列入TTL、压缩算法等</li><li>Row（行），一个行包含了许多列，这些列通过列族来分类</li><li>Column Family（列族），列族是多个列的集合，列族最大的最用是为了将一个场景/纬度下的列放在一个节点进行维护，这样可以提高性能和降低hbase架构复杂度</li><li>列，多个列组成一个行，列可以随意定义，一个行中的列不限名字、不限制数量，只限定列族</li><li>Cell（单元格），一个列中可以存储多个版本的数据，每个版本就是一个单元格，相比传统数据库，hbase数据库的数据颗粒度更加细小，同一个数据还存在多个版本</li><li>Timestamp（时间戳/版本号），可以定义自己的版本号</li></ul> 
+<p><img alt="" height="358" src="https://images2.imgbox.com/43/0a/P2t1mnmo_o.png" width="887"></p> 
+<p>当然hbase也和常见数据库一样有一个行数据主键（Rowkey），每一个行都有一个rowkey，这个是按照字典排序的</p> 
+<p></p> 
+<h4>Hbase必知概念：</h4> 
+<ul><li> <p> WAL（预写日志），当写操作到达Region的时候，hbase会先将数据WAL，这个也是hbase用来故障恢复的依赖，因为hbase的写缓冲区是在内存中的，需要积累一定量的数据后才会刷写，那么这段时间如果Down机了，那么数据就会没了，所以才有了WAL</p> </li><li> <p>Region 这个相当于数据库的分区表或者mongo的分片概念，每一个Region都有起始rowkey和结束rowkey，代表了当前分区存储的范围，这个就和很多MQ的commitlog存储形式一样，每一条消息的头部字节都存储了当前消息的长度和结束位置</p> </li></ul> 
+<p><img alt="" height="502" src="https://images2.imgbox.com/96/98/4ULJn4Ph_o.png" width="830"></p> 
+<ol><li>一个region包含多个store，一个store对应一个列族的数据，如果一个表有2个列族，那么在一个region里面就有2个store</li><li>store内部有menstore和hfile组成 </li></ol> 
+<p>很多MQ架构中都提供了异步刷盘/同步刷盘机制，其实hbase的WAL也和这个是一样的逻辑，WAL同样提供了异步/同步方式，同步方式对性能损耗较大但是数据100%安全，根据自己业务场景的实际需要改变</p> 
+<p><span style="color:#4da8ee;">我刚开始的时候也有一个疑问，这种架构总觉得怪怪的，后来我发现是我肤浅了，我的疑问是：数据先写到WAL中，然后内存store汇聚数据，在写道hfile中，但是WAL和HFile的存储介质都是HDFS，那么不是有点多此一举么，其实这么设计的问题在于数据的顺序性，因为HDFS上的文件不能编辑，而数据库数据存放的顺序性是很重要的，如果我们数据一到就写到HDFS中，那么你很难保障数据的是顺序的，那么Menstore的价值就是在于内存整理顺序批量一次性的写到硬盘，那么这批数据的顺序性就是有保障的</span></p> 
+<ul><li>HFile，hbase数据存储的实际载体</li></ul> 
+<p><img alt="" height="177" src="https://images2.imgbox.com/4a/66/krZYWTtN_o.png" width="826"></p> 
+<p>HFile是由一个个块组成的，默认每个块64KB</p> 
+<ul><li> Data块：数据块，表中的数据就在这里</li><li>Meta：元数据块</li><li>FileInfo：文件信息，这里面描述了最后一个key等信息</li><li>DataIndex：存储Data块的索引信息，索引的偏移值</li></ul> 
+<p></p> 
+<h4>Hbase之疑问？</h4> 
+<p>hbase是一个随机读写数据库，并且上面也说到HDFS时不支持编辑文件内容的，那么hbase怎么完成CRUD的？</p> 
+<p>其实hbase基本都一直再做新增操作，刚刚说道CELL是多份的，当你编辑的时候其实hbase新增了一份cell，只是内部的版本号信息比之前的大，当你删除一条数据的时候，hbase还是做了新增操作，只是这条数据没有value，并且类型是DELETE，<span style="color:#fe2c24;">常用术语墓碑标记</span></p> 
+<p><span style="color:#333333;">那么疑问又来了，一直在做insert操作，第一个是垃圾数据会非常的庞大，第二个是数据的顺序性肯定不对了</span><span style="color:#0d0016;">，</span><span style="color:#fe2c24;">其实hbase每隔一段时间会进行一次合并（这个操作和CK很类似）合并分为两种类型（minor和major）major合并过程中如果发现墓碑标记，那么就会忽略这条数据，这个时候这条数据才是真正的被物理删除了</span></p> 
+<p></p> 
+<h4><span style="color:#333333;">Hbase数据的读取</span></h4> 
+<p><span style="color:#333333;">Hbase实际的读取顺序是先从BlockCache中找数据，找不到了再去Memstore和HFile中查询数据。<br> 由于HDFS的文件不可变特性，你不可能在一个KeyValue被新建之后删除它，HBase所能做的也就是帮你加上一个墓碑标记。但是你别忘了HDFS是不能修改的，所以墓碑标记和数据不在一个存储地，所以当我们再用Scan进行数据扫描读取的时候，就算已经查到了用户分页指定数据，hbase还是会继续往后扩大的读取，因为只有这样才能知道是否存在墓碑标记，所以性能最高的scan方式是加上起始-结束标记，这样可以限定hbase扩展读取的范围</span></p> 
+<p><span style="color:#333333;">在Scan扫描的时候store会创建StoreScanner实例。StoreScanner会把MemStore和HFile结合起来扫描，所以具体从MemStore还是HFile中读取数据，外部的调用者都不需要知道具体的细节。当StoreScanner打开的时候，会先定位到起始行键</span></p> 
+<p><img alt="" height="404" src="https://images2.imgbox.com/7a/2b/Dvfyh8ms_o.png" width="820"></p> 
+<p></p> 
+<p><strong>Client  -  Region</strong></p> 
+<p>最早期的hbase采用了三层查询方式，现在已经废弃了因为代码复杂还没啥实际意义</p> 
+<p>现在已经变成了两层查询方式，</p> 
+<p><img alt="" height="382" src="https://images2.imgbox.com/96/6c/UuLKbwFr_o.png" width="687"></p> 
+<ol><li> 客户端先通过ZooKeeper的/hbase/meta-region-server节点查询到哪台RegionServer上有hbase:meta表。</li><li>客户端连接含有hbase:meta表的RegionServer。hbase:meta表存储了所有Region的行键范围信息，通过这个表就可以查询出你要存取的rowkey属于哪个Region的范围里面，以及这个Region又是属于哪个RegionServer。</li><li>获取这些信息后，客户端就可以直连其中一台拥有你要存取的rowkey的RegionServer，并直接对其操作。</li><li>客户端会把meta信息缓存起来，下次操作就不需要进行以上加载hbase:meta的步骤了。</li></ol> 
+<p></p> 
+<h4>Hbase 进阶</h4> 
+<p>过滤器，在scan查询的时候经常用到，可以看成SQL语句中的where条件，在遍历过程中，不满足filter条件的数据就会被过滤</p> 
+<p><img alt="" height="396" src="https://images2.imgbox.com/26/32/MMRkpYqV_o.png" width="536"></p> 
+<p><span style="color:#ff9900;"><strong>过滤器的模糊值匹配 </strong></span></p> 
+<pre><code class="language-java">//这段代码等同于SQL中like '%boluo%'
+Filter filter = new ValueFilter( CompareOperator.EQUAL,
+new SubstringComparator( "boluo" ) );</code></pre> 
+<p>上面那段代码会有个小问题就是一个列族下其他列也满足这个条件的话数据也会被捞出，那么指定列进行值匹配的话需要看下面的代码</p> 
+<pre><code class="language-java">//这段代码等同于SQL中name like '%boluo%'
+Filter filter = new SingleColumnValueFilter( Bytes.toBytes( "列族" ),Bytes.toBytes( "列名") ,CompareOperator.EQUAL,new SubstringComparator( "boluo" ) );</code></pre> 
+<p></p> 
+<p><span style="color:#ff9900;"><strong>过滤器的精确值匹配</strong></span></p> 
+<pre><code class="language-java">Filter filter = new SingleColumnValueFilter( Bytes.toBytes( "列族" ),Bytes.toBytes( "列名") ,CompareOperator.EQUAL,new BinaryComparator( Bytes.toBytes( "boluo" ) ) );</code></pre> 
+<p></p> 
+<p><span style="color:#ff9900;"><strong>过滤器的值预算匹配</strong></span></p> 
+<pre><code class="language-java">Filter filter = new SingleColumnValueFilter( Bytes.toBytes( "列族" ),Bytes.toBytes( "列名") ,CompareOperator.GREATER,new BinaryComparator( Bytes.toBytes( "boluo" ) ) );</code></pre> 
+<p></p> 
+<p><span style="color:#ff9900;"><strong>Hbase的分页</strong></span></p> 
+<p><span style="color:#494949;">hbase 并没有SQL的limit现成功能，需要传入PageFilter并且当第一页数据取完，想获取第二页数据的时候需要将前一页最后条数据的rowkey记录下来，变成第二页的startRowkey来使用。</span></p> 
+<p><span style="color:#494949;">不过Hbase的分页有个坑，一般初次使用很容易被坑进去，它并不能精确的按照你的分页条数返回数据，可能会比你定义的分页条数多，主要原因是因为你的Filter会到各个Region中执行，所以如果想要精确的条数，还需要自己在内存中排序处理下</span></p> 
+<p></p> 
+<p><span style="color:#ff9900;"><strong>结果集返回指定列族</strong></span></p> 
+<p>列族过滤器，FamilyFilter</p> 
+<pre><code class="language-java">Filter filter = new FamilyFilter( CompareOperator.EQUAL,new BinaryComparator( Bytes.toBytes( "boluo" ) ) );</code></pre> 
+<p></p> 
+<p><span style="color:#ff9900;"><strong>结果集返回指定列</strong></span></p> 
+<pre><code class="language-java">Filter filter = new QualifierFilter( CompareOperator.EQUAL,new BinaryComparator( Bytes.toBytes( "boluo" ) ) );</code></pre> 
+<p></p> 
+<h4>Hbase 调优</h4> 
+<p>作者刚进得物的时候就接手了一个hbase调优的任务项，当时的场景是hbase的get缓存命中率在92%以上，但是P99 在8~10MS之间，期望调优后可以将P99稳定在4~5MS之间，要知道Hbase是java开发的，那么避免不了就是GC的问题</p> 
+<p>本文从几个角度考虑hbase的调优</p> 
+<ul><li><span style="color:#494949;">默认的RegionServer的内存才1GB，而Memstore默认是占40%，所以分配给Memstore的才400MB，在实际场景下，很容易就写阻塞了。可以通过指定HBASE_HEAPSIZE参数来调整所有HBase实例（不管是Master还是RegionServer）占用的内存大小。</span></li><li><span style="color:#494949;">随着内存的加大，有一个不容忽视的问题也出现了，那就是JVM的堆内存越大，Full GC的时间越久。Full GC有时候可以达到好几分钟，这个时候会有一个更加致命的风险，那就是ZK发送心跳请求的时候，由于节点在FC导致没有响应，ZK会认为这个节点失联了....所以GC调优很关键，如果你的机器内存 &gt; 4G 那么推荐你直接使用G1GC，因为就算CMSGC在特定场景下还是会发生FULLGC</span></li><li><span style="color:#494949;">Region的拆分，传统OLTP数据库单表数据量过大的时候一般我们会采用分库分表解决，那么在hbase中其实也一样，一个region就是rowkey数据的集合，当单个region数据量过大的时候，hbase会采用拆分策略，可以使用文件大小拆分或者自定义拆分策略</span> 
+  <ul><li><span style="color:#494949;">按文件大小拆分的劣势就是可能相似场景的rowkey数据被拆分到不同region中，那么查询的性能势必会被降低</span></li><li><span style="color:#494949;">自定义拆分策略可以使用相似前缀的拆分点进行考虑,不过如果你的rowkey业务场景的前缀都差不多那么就不要使用这种策略了</span></li></ul></li></ul> 
+<p><img alt="" height="466" src="https://images2.imgbox.com/fa/ad/WL1fjpMM_o.png" width="918"></p> 
+<ul><li><span style="color:#494949;"> WAL优化</span> 
+  <ul><li><span style="color:#494949;">调整WAL在region的文件数量，因为WAL是滚动生成的，一旦到达最大文件数量就会对之前的WAL进行清理</span></li></ul></li><li><span style="color:#494949;">BlockCache优化，一个regionServer只有一个BlockCache，所有读取请求都会先经过BlockCache如果没有找到数据才会去MS或者HDFS中查找</span> 
+  <ul><li><span style="color:#494949;">开启BlockCache</span></li><li><span style="color:#ad720d;">LRU策略</span><span style="color:#494949;">，常用的一种计算策略，最近最少使用算法，不过缺点是利用JVM的堆内内存，那么势必避免不了GC的影响</span></li><li><span style="color:#ad720d;">BucketCache策略</span><span style="color:#494949;">，一种对外内存的计算策略，其实内部是使用了NIO的DirectByteBuffers进行堆外字节的操作，堆外内存足够的情况下我们可以考虑使用不需要担心内存泄露，并且不限于堆外存储介质，这个策略还能配置堆内，SSD作为存储介质，灵活性很高，性能也很高</span></li><li><span style="color:#ad720d;">组合模式</span><span style="color:#494949;">，虽然BucketCache很优秀，但是在不考虑FULLGC的前提下堆外的性能还是无法直接和堆内比，所以就出现了组合模式,可以简单理解为三级存储，一级是堆内，二级是对外，三级是SSD，但是并不是简单的复制存储，而是数据量从小到大的一种模式，堆内存储索引和文件信息，对外存储热点数据，SSD存储全量数据</span></li></ul></li></ul> 
+<p><img alt="" height="855" src="https://images2.imgbox.com/ed/1b/4QKc5Fg0_o.png" width="923"></p> 
+<ul><li> <span style="color:#494949;">Menstore优化，因为数据会先去WAL，然后再Menstore中汇聚等待刷写，大部分性能问题可能和Menstore阻塞有关系</span> 
+  <ul><li><span style="color:#494949;">如果你的Menstore刷写策略是按照指定时间+指定大小，那么在高并发场景中，还未到达指定时间前，突然一大波写入请求导致Menstore数据瞬间达到指定大小，这个时候你后续所有的写都会被阻塞，直到Menstore完成当前刷写空出内存空间为止，调整阻塞阈值是一个暂时可以解决问题的思路，不过并不能解决所有场景</span></li><li><span style="color:#494949;">有一些场景可能采用手动刷写的思路更加合适，在明确知道本次处理的数据量很大的场景下，手动先刷写Menstore数据，给本次请求腾出空间，当然更好的是设置HFile的合并</span></li><li><span style="color:#494949;">HFile合并（minor/major）</span> 
+    <ul><li><span style="color:#494949;">Minor 合并策略，TTL到期的数据会被移除但是手动删除的数据不会被真正删除，合并触发时间较短</span></li><li><span style="color:#494949;">Major 合并策略，会真正删除手动删除的数据，这个策略频率较低，可以控制触发时机</span></li></ul></li></ul></li></ul>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/ffad562494e77a65c1fb5a820b265514/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Unity基础——List的用法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b15a6a3908f52910758f1860765db186/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">CSP漫画工作室clipstudiopaint最新版本2022功能介绍</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

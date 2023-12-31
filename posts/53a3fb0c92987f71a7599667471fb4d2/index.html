@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>kubernetes如何实现自定义HAP之QPS - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="kubernetes如何实现自定义HAP之QPS" />
+<meta property="og:description" content="1 背景 公司本来用的是普通的基于CPU和内存的HPA扩容策略，但是运维发现效果并不是太好，所以开发这边花点时间去研究一下自定义HPA，希望达到的目的大概是这样：比如一个service下当前只有一个pod，这个pod能抗的并发是100，那么假如当前的并发变成了300，那么此时HPA就应该要能监测到这个变化，将pod扩容为3个。
+2 理论基础 1 普罗米修斯 第一种 Metrics，是宿主机的监控数据。这部分数据的提供，需要借助一个由 Prometheus 维护的Node Exporter 工具。一般来说，Node Exporter 会以 DaemonSet 的方式运行在宿主机上。其实，所谓的 Exporter，就是代替被监控对象来对 Prometheus 暴露出可以被“抓取”的 Metrics 信息的一个辅助进程。
+第二种 Metrics，是来自于 Kubernetes 的 API Server、kubelet 等组件的 /metrics API。除了常规的 CPU、内存的信息外，这部分信息还主要包括了各个组件的核心监控指标。比如，对于 API Server 来说，它就会在 /metrics API 里，暴露出各个 Controller 的工作队列（Work Queue）的长度、请求的 QPS 和延迟数据等等。这些信息，是检查 Kubernetes 本身工作情况的主要依据。
+第三种 Metrics，是 Kubernetes 相关的监控数据。这部分数据，一般叫作 Kubernetes 核心监控数据（core metrics）。这其中包括了 Pod、Node、容器、Service 等主要 Kubernetes 核心概念的 Metrics。
+其实我们要做的事情，就是让我们的Pod暴露一个接口，然后用普罗米修斯等服务去将这个接口中的指标拿到，拿到以后再汇总。此时我们的HPA去拿到这个汇总的数据然后做对比，根据对比的结果来做扩缩容。
+2 流程图示 这张图网上随便找的，但是含义基本上就是这样，根据下面的部署流程去部署一遍后，你才会知道其中的含义。
+3 部署 1 部署 Prometheus 1、将如下代码保存到prometheus-oprator.yaml文件中，然后apply一下。
+apiVersion: rbac.authorization.k8s.io/v1 kind: ClusterRole metadata: name: prometheus-operator rules: - apiGroups: - extensions resources: - thirdpartyresources verbs: - create - apiGroups: - apiextensions." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/53a3fb0c92987f71a7599667471fb4d2/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-05-10T18:24:21+08:00" />
+<meta property="article:modified_time" content="2022-05-10T18:24:21+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">kubernetes如何实现自定义HAP之QPS</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="1__0"></a>1 背景</h2> 
+<p>公司本来用的是普通的基于CPU和内存的HPA扩容策略，但是运维发现效果并不是太好，所以开发这边花点时间去研究一下自定义HPA，希望达到的目的大概是这样：比如一个service下当前只有一个pod，这个pod能抗的并发是100，那么假如当前的并发变成了300，那么此时HPA就应该要能监测到这个变化，将pod扩容为3个。</p> 
+<h2><a id="2__3"></a>2 理论基础</h2> 
+<h3><a id="1__4"></a>1 普罗米修斯</h3> 
+<p><img src="https://images2.imgbox.com/8e/5a/rynhn5wA_o.png" alt="在这里插入图片描述"><br> 第一种 Metrics，是宿主机的监控数据。这部分数据的提供，需要借助一个由 Prometheus 维护的Node Exporter 工具。一般来说，Node Exporter 会以 DaemonSet 的方式运行在宿主机上。其实，所谓的 Exporter，就是代替被监控对象来对 Prometheus 暴露出可以被“抓取”的 Metrics 信息的一个辅助进程。</p> 
+<p>第二种 Metrics，是来自于 Kubernetes 的 API Server、kubelet 等组件的 /metrics API。除了常规的 CPU、内存的信息外，这部分信息还主要包括了各个组件的核心监控指标。比如，对于 API Server 来说，它就会在 /metrics API 里，暴露出各个 Controller 的工作队列（Work Queue）的长度、请求的 QPS 和延迟数据等等。这些信息，是检查 Kubernetes 本身工作情况的主要依据。</p> 
+<p>第三种 Metrics，是 Kubernetes 相关的监控数据。这部分数据，一般叫作 Kubernetes 核心监控数据（core metrics）。这其中包括了 Pod、Node、容器、Service 等主要 Kubernetes 核心概念的 Metrics。</p> 
+<p>其实我们要做的事情，就是让我们的Pod暴露一个接口，然后用普罗米修斯等服务去将这个接口中的指标拿到，拿到以后再汇总。此时我们的HPA去拿到这个汇总的数据然后做对比，根据对比的结果来做扩缩容。</p> 
+<h3><a id="2_httpsimgblogcsdnimgcn816350cb82a44e6793919936d5242a96png_14"></a>2 流程图示<img src="https://images2.imgbox.com/02/92/k9WkO652_o.png" alt="在这里插入图片描述"></h3> 
+<p>这张图网上随便找的，但是含义基本上就是这样，根据下面的部署流程去部署一遍后，你才会知道其中的含义。</p> 
+<h2><a id="3__17"></a>3 部署</h2> 
+<h3><a id="1__Prometheus_18"></a>1 部署 Prometheus</h3> 
+<p>1、将如下代码保存到prometheus-oprator.yaml文件中，然后apply一下。</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+<span class="token key atrule">rules</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> extensions
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> thirdpartyresources
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> create
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> apiextensions.k8s.io
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> customresourcedefinitions
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token string">"*"</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> monitoring.coreos.com
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> alertmanagers
+  <span class="token punctuation">-</span> prometheuses
+  <span class="token punctuation">-</span> servicemonitors
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token string">"*"</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> apps
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> statefulsets
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"*"</span><span class="token punctuation">]</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">""</span><span class="token punctuation">]</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> configmaps
+  <span class="token punctuation">-</span> secrets
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"*"</span><span class="token punctuation">]</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">""</span><span class="token punctuation">]</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> pods
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"list"</span><span class="token punctuation">,</span> <span class="token string">"delete"</span><span class="token punctuation">]</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">""</span><span class="token punctuation">]</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> services
+  <span class="token punctuation">-</span> endpoints
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"get"</span><span class="token punctuation">,</span> <span class="token string">"create"</span><span class="token punctuation">,</span> <span class="token string">"update"</span><span class="token punctuation">]</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">""</span><span class="token punctuation">]</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> nodes
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"list"</span><span class="token punctuation">,</span> <span class="token string">"watch"</span><span class="token punctuation">]</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">""</span><span class="token punctuation">]</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> namespaces
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"list"</span><span class="token punctuation">]</span>
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> default
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">operator</span><span class="token punctuation">:</span> prometheus
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">1</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">operator</span><span class="token punctuation">:</span> prometheus
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">operator</span><span class="token punctuation">:</span> prometheus
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">serviceAccountName</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+       <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus<span class="token punctuation">-</span>operator
+         <span class="token key atrule">image</span><span class="token punctuation">:</span> luxas/prometheus<span class="token punctuation">-</span>operator<span class="token punctuation">:</span>v0.17.0
+         <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+           <span class="token key atrule">requests</span><span class="token punctuation">:</span>
+             <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 100m
+             <span class="token key atrule">memory</span><span class="token punctuation">:</span> 50Mi
+           <span class="token key atrule">limits</span><span class="token punctuation">:</span>
+             <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 200m
+             <span class="token key atrule">memory</span><span class="token punctuation">:</span> 100Mi
+</code></pre> 
+<p>2、将如下代码保存到sample-prometheus-instance.yaml文件中，然后apply一下。<strong>特别需要注意的是，sample-prometheus-instance.yaml这个文件里面在启动普罗米修斯的时候需要创建PVC，所以我本地环境用的是test-promethous-sc这个storageclass，请根据实际情况修改哈。不然这个服务启动不了的。</strong></p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus
+<span class="token key atrule">rules</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token string">""</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> nodes
+  <span class="token punctuation">-</span> services
+  <span class="token punctuation">-</span> endpoints
+  <span class="token punctuation">-</span> pods
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> get
+  <span class="token punctuation">-</span> list
+  <span class="token punctuation">-</span> watch
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> prometheus
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> default
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> monitoring.coreos.com/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Prometheus
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+    <span class="token key atrule">prometheus</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">1</span>
+  <span class="token key atrule">baseImage</span><span class="token punctuation">:</span> luxas/prometheus
+  <span class="token key atrule">version</span><span class="token punctuation">:</span> v2.2.1
+  <span class="token key atrule">serviceAccountName</span><span class="token punctuation">:</span> prometheus
+  <span class="token key atrule">serviceMonitorSelector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">service-monitor</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+    <span class="token key atrule">requests</span><span class="token punctuation">:</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 300Mi
+  <span class="token key atrule">retention</span><span class="token punctuation">:</span> 7d
+  <span class="token key atrule">storage</span><span class="token punctuation">:</span>
+    <span class="token key atrule">class</span><span class="token punctuation">:</span> <span class="token string">"test-promethous-sc"</span>
+    <span class="token key atrule">selector</span><span class="token punctuation">:</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span>
+    <span class="token key atrule">resources</span><span class="token punctuation">:</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span>
+    <span class="token key atrule">volumeClaimTemplate</span><span class="token punctuation">:</span>
+      <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+        <span class="token key atrule">storageClassName</span><span class="token punctuation">:</span> <span class="token string">"test-promethous-sc"</span>
+        <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+          <span class="token key atrule">requests</span><span class="token punctuation">:</span>
+            <span class="token key atrule">storage</span><span class="token punctuation">:</span> 1Gi
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Service
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+    <span class="token key atrule">prometheus</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">type</span><span class="token punctuation">:</span> NodePort
+  <span class="token key atrule">ports</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> web
+    <span class="token key atrule">nodePort</span><span class="token punctuation">:</span> <span class="token number">30999</span>
+    <span class="token key atrule">port</span><span class="token punctuation">:</span> <span class="token number">9090</span>
+    <span class="token key atrule">targetPort</span><span class="token punctuation">:</span> web
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">prometheus</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom
+</code></pre> 
+<p>这两步都执行完以后，来验证一下服务是否启动正常。注意，我这里都是部署到了default命名空间，可以查看：（当然，我这里只是查看了pod资源，其他资源肯定也是有的）<br> kubectl get pod |grep prometheus-operator<br> kubectl get pod |grep sample-metrics-prom</p> 
+<p><img src="https://images2.imgbox.com/02/fc/P4jqN8C4_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="2__Custom_Metrics_APIServer_213"></a>2 部署Custom Metrics APIServer</h3> 
+<p>1、将如下代码保存到custom-metrics.yaml文件中，然后apply一下。</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">kind</span><span class="token punctuation">:</span> Namespace
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+<span class="token punctuation">---</span>
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">:</span>system<span class="token punctuation">:</span>auth<span class="token punctuation">-</span>delegator
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> system<span class="token punctuation">:</span>auth<span class="token punctuation">-</span>delegator
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> RoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>auth<span class="token punctuation">-</span>reader
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> kube<span class="token punctuation">-</span>system
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> Role
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> extension<span class="token punctuation">-</span>apiserver<span class="token punctuation">-</span>authentication<span class="token punctuation">-</span>reader
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>resource<span class="token punctuation">-</span>reader
+<span class="token key atrule">rules</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token string">""</span>
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> namespaces
+  <span class="token punctuation">-</span> pods
+  <span class="token punctuation">-</span> services
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> get
+  <span class="token punctuation">-</span> list
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver<span class="token punctuation">-</span>resource<span class="token punctuation">-</span>reader
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>resource<span class="token punctuation">-</span>reader
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>getter
+<span class="token key atrule">rules</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> custom.metrics.k8s.io
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token string">"*"</span>
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token string">"*"</span>
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> hpa<span class="token punctuation">-</span>custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>getter
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>getter
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> horizontal<span class="token punctuation">-</span>pod<span class="token punctuation">-</span>autoscaler
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> kube<span class="token punctuation">-</span>system
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">1</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">tolerations</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">key</span><span class="token punctuation">:</span> beta.kubernetes.io/arch
+        <span class="token key atrule">value</span><span class="token punctuation">:</span> arm
+        <span class="token key atrule">effect</span><span class="token punctuation">:</span> NoSchedule
+      <span class="token punctuation">-</span> <span class="token key atrule">key</span><span class="token punctuation">:</span> beta.kubernetes.io/arch
+        <span class="token key atrule">value</span><span class="token punctuation">:</span> arm64
+        <span class="token key atrule">effect</span><span class="token punctuation">:</span> NoSchedule
+      <span class="token key atrule">serviceAccountName</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>server
+        <span class="token key atrule">image</span><span class="token punctuation">:</span> luxas/k8s<span class="token punctuation">-</span>prometheus<span class="token punctuation">-</span>adapter<span class="token punctuation">:</span>v0.2.0<span class="token punctuation">-</span>beta.0
+        <span class="token key atrule">args</span><span class="token punctuation">:</span>
+        <span class="token punctuation">-</span> <span class="token punctuation">-</span><span class="token punctuation">-</span>prometheus<span class="token punctuation">-</span>url=http<span class="token punctuation">:</span>//sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>prom.default.svc<span class="token punctuation">:</span><span class="token number">9090</span>
+        <span class="token punctuation">-</span> <span class="token punctuation">-</span><span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>relist<span class="token punctuation">-</span>interval=80s
+        <span class="token punctuation">-</span> <span class="token punctuation">-</span><span class="token punctuation">-</span>rate<span class="token punctuation">-</span>interval=60s
+        <span class="token punctuation">-</span> <span class="token punctuation">-</span><span class="token punctuation">-</span>v=10
+        <span class="token punctuation">-</span> <span class="token punctuation">-</span><span class="token punctuation">-</span>logtostderr=true
+        <span class="token key atrule">ports</span><span class="token punctuation">:</span>
+        <span class="token punctuation">-</span> <span class="token key atrule">containerPort</span><span class="token punctuation">:</span> <span class="token number">443</span>
+        <span class="token key atrule">securityContext</span><span class="token punctuation">:</span>
+          <span class="token key atrule">runAsUser</span><span class="token punctuation">:</span> <span class="token number">0</span>
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Service
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> api
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">ports</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">port</span><span class="token punctuation">:</span> <span class="token number">443</span>
+    <span class="token key atrule">targetPort</span><span class="token punctuation">:</span> <span class="token number">443</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>apiserver
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apiregistration.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> APIService
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> v1beta1.custom.metrics.k8s.io
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">insecureSkipTLSVerify</span><span class="token punctuation">:</span> <span class="token boolean important">true</span>
+  <span class="token key atrule">group</span><span class="token punctuation">:</span> custom.metrics.k8s.io
+  <span class="token key atrule">groupPriorityMinimum</span><span class="token punctuation">:</span> <span class="token number">1000</span>
+  <span class="token key atrule">versionPriority</span><span class="token punctuation">:</span> <span class="token number">5</span>
+  <span class="token key atrule">service</span><span class="token punctuation">:</span>
+    <span class="token key atrule">name</span><span class="token punctuation">:</span> api
+    <span class="token key atrule">namespace</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics
+  <span class="token key atrule">version</span><span class="token punctuation">:</span> v1beta1
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>server<span class="token punctuation">-</span>resources
+<span class="token key atrule">rules</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">apiGroups</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> custom<span class="token punctuation">-</span>metrics.metrics.k8s.io
+  <span class="token key atrule">resources</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"*"</span><span class="token punctuation">]</span>
+  <span class="token key atrule">verbs</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"*"</span><span class="token punctuation">]</span>
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> rbac.authorization.k8s.io/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRoleBinding
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> hpa<span class="token punctuation">-</span>controller<span class="token punctuation">-</span>custom<span class="token punctuation">-</span>metrics
+<span class="token key atrule">roleRef</span><span class="token punctuation">:</span>
+  <span class="token key atrule">apiGroup</span><span class="token punctuation">:</span> rbac.authorization.k8s.io
+  <span class="token key atrule">kind</span><span class="token punctuation">:</span> ClusterRole
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> custom<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>server<span class="token punctuation">-</span>resources
+<span class="token key atrule">subjects</span><span class="token punctuation">:</span>
+<span class="token punctuation">-</span> <span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceAccount
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> horizontal<span class="token punctuation">-</span>pod<span class="token punctuation">-</span>autoscaler
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> kube<span class="token punctuation">-</span>system
+</code></pre> 
+<p>这个执行完以后，我这边的结果是这个：<br> kubectl get all -n custom-metrics<br> <img src="https://images2.imgbox.com/5b/98/KrsK1f3r_o.png" alt="在这里插入图片描述"><br> 其实这个服务的本质就是k8s-prometheus-adapter，从镜像即可以看出来。而且这里配置了地址<br> prometheus-url=http://sample-metrics-prom.default.svc:9090 表示访问普罗米修斯的地址。当然，按照这个教程的话，都不需要修改！</p> 
+<p><strong>注意：这两个时间特别是下面rate-interval的时间，必须能转换为完整的分钟，比如60正好可以换成1分钟。因为adapter会去查普罗米修斯，经过我的测试，这个版本下，如配置为30s这种，查出来的结果会一直为空，这就会导致你在请求的时候发现自定义指标一直看不到。 另一个就是上面这个时间，先配置为80s吧， 因为我刚开始部署的时候，一直刷不出来数据，后来改大以后数据就有了，原因未知。</strong><br> <img src="https://images2.imgbox.com/82/ac/jXqnvMOF_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="3__404"></a>3 添加权限</h3> 
+<p>执行如下命令即可。</p> 
+<pre><code class="prism language-bash">kubectl create clusterrolebinding allowall-cm --clusterrole custom-metrics-server-resources --user system:anonymous
+</code></pre> 
+<h3><a id="4__411"></a>4 部署测试应用</h3> 
+<p>将如下文件保存到sample-metrics-app.yaml文件中，然后apply一下</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">2</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">tolerations</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">key</span><span class="token punctuation">:</span> beta.kubernetes.io/arch
+        <span class="token key atrule">value</span><span class="token punctuation">:</span> arm
+        <span class="token key atrule">effect</span><span class="token punctuation">:</span> NoSchedule
+      <span class="token punctuation">-</span> <span class="token key atrule">key</span><span class="token punctuation">:</span> beta.kubernetes.io/arch
+        <span class="token key atrule">value</span><span class="token punctuation">:</span> arm64
+        <span class="token key atrule">effect</span><span class="token punctuation">:</span> NoSchedule
+      <span class="token punctuation">-</span> <span class="token key atrule">key</span><span class="token punctuation">:</span> node.alpha.kubernetes.io/unreachable
+        <span class="token key atrule">operator</span><span class="token punctuation">:</span> Exists
+        <span class="token key atrule">effect</span><span class="token punctuation">:</span> NoExecute
+        <span class="token key atrule">tolerationSeconds</span><span class="token punctuation">:</span> <span class="token number">0</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">key</span><span class="token punctuation">:</span> node.alpha.kubernetes.io/notReady
+        <span class="token key atrule">operator</span><span class="token punctuation">:</span> Exists
+        <span class="token key atrule">effect</span><span class="token punctuation">:</span> NoExecute
+        <span class="token key atrule">tolerationSeconds</span><span class="token punctuation">:</span> <span class="token number">0</span>
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">image</span><span class="token punctuation">:</span> luxas/autoscale<span class="token punctuation">-</span>demo<span class="token punctuation">:</span>v0.1.2
+        <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+        <span class="token key atrule">ports</span><span class="token punctuation">:</span>
+        <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> web
+          <span class="token key atrule">containerPort</span><span class="token punctuation">:</span> <span class="token number">8080</span>
+        <span class="token key atrule">readinessProbe</span><span class="token punctuation">:</span>
+          <span class="token key atrule">httpGet</span><span class="token punctuation">:</span>
+            <span class="token key atrule">path</span><span class="token punctuation">:</span> /
+            <span class="token key atrule">port</span><span class="token punctuation">:</span> <span class="token number">8080</span>
+          <span class="token key atrule">initialDelaySeconds</span><span class="token punctuation">:</span> <span class="token number">3</span>
+          <span class="token key atrule">periodSeconds</span><span class="token punctuation">:</span> <span class="token number">5</span>
+        <span class="token key atrule">livenessProbe</span><span class="token punctuation">:</span>
+          <span class="token key atrule">httpGet</span><span class="token punctuation">:</span>
+            <span class="token key atrule">path</span><span class="token punctuation">:</span> /
+            <span class="token key atrule">port</span><span class="token punctuation">:</span> <span class="token number">8080</span>
+          <span class="token key atrule">initialDelaySeconds</span><span class="token punctuation">:</span> <span class="token number">3</span>
+          <span class="token key atrule">periodSeconds</span><span class="token punctuation">:</span> <span class="token number">5</span>
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Service
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">ports</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> web
+    <span class="token key atrule">port</span><span class="token punctuation">:</span> <span class="token number">80</span>
+    <span class="token key atrule">targetPort</span><span class="token punctuation">:</span> <span class="token number">8080</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> monitoring.coreos.com/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ServiceMonitor
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+    <span class="token key atrule">service-monitor</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">endpoints</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">port</span><span class="token punctuation">:</span> web
+<span class="token punctuation">---</span>
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> HorizontalPodAutoscaler
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> autoscaling/v2beta2
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app<span class="token punctuation">-</span>hpa
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">scaleTargetRef</span><span class="token punctuation">:</span>
+    <span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+    <span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+    <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">minReplicas</span><span class="token punctuation">:</span> <span class="token number">2</span>
+  <span class="token key atrule">maxReplicas</span><span class="token punctuation">:</span> <span class="token number">10</span>
+<span class="token comment">#  metrics:</span>
+<span class="token comment">#  - type: Object</span>
+<span class="token comment">#    object:</span>
+<span class="token comment">#      target:</span>
+<span class="token comment">#        kind: Service</span>
+<span class="token comment">#        name: sample-metrics-app</span>
+<span class="token comment">#      metricName: http_requests</span>
+<span class="token comment">#      targetValue: 200000000m</span>
+
+  <span class="token key atrule">metrics</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">type</span><span class="token punctuation">:</span> Pods
+    <span class="token key atrule">pods</span><span class="token punctuation">:</span>
+      <span class="token key atrule">metric</span><span class="token punctuation">:</span>
+        <span class="token key atrule">name</span><span class="token punctuation">:</span> http_requests
+      <span class="token key atrule">target</span><span class="token punctuation">:</span>
+        <span class="token key atrule">type</span><span class="token punctuation">:</span> AverageValue
+        <span class="token key atrule">averageValue</span><span class="token punctuation">:</span> <span class="token number">200</span>
+
+<span class="token punctuation">---</span>
+<span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> extensions/v1beta1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Ingress
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> default
+  <span class="token key atrule">annotations</span><span class="token punctuation">:</span>
+    <span class="token key atrule">traefik.frontend.rule.type</span><span class="token punctuation">:</span> PathPrefixStrip
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">rules</span><span class="token punctuation">:</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">http</span><span class="token punctuation">:</span>
+      <span class="token key atrule">paths</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">path</span><span class="token punctuation">:</span> /sample<span class="token punctuation">-</span>app
+        <span class="token key atrule">backend</span><span class="token punctuation">:</span>
+          <span class="token key atrule">serviceName</span><span class="token punctuation">:</span> sample<span class="token punctuation">-</span>metrics<span class="token punctuation">-</span>app
+          <span class="token key atrule">servicePort</span><span class="token punctuation">:</span> <span class="token number">80</span>
+</code></pre> 
+<p>上面的配置已经是我修改过的，没有什么问题的话不要乱动哈。这个部署完了以后，理论上你就能看到这个pod了。kubectl get pod |grep sample-metrics-ap<br> <img src="https://images2.imgbox.com/61/f4/FjViCWLN_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="4__541"></a>4 验证</h2> 
+<h3><a id="1__542"></a>1 验证部署是否正常</h3> 
+<p>这个时候一定不要急，先来验证一下，否则后续你就晕了。<br> 首先找到kubectl get svc -n custom-metrics，这个svc的ip地址，然后手动访问一下。<br> <img src="https://images2.imgbox.com/ba/d7/q308pS8l_o.png" alt="在这里插入图片描述"><br> 我这边是这个ip：（<strong>注意：一定要保证能拿到如下图所示的数据格式，因为HPA能扩容，本质上就是去请求这个地址拿你自定义的指标值的。所以如果为空，一定要去查日志排查问题！！！原因有很多，要具体分析</strong>）<br> curl -sSLk https://10.104.67.2/apis/custom.metrics.k8s.io/v1beta1<br> <img src="https://images2.imgbox.com/94/83/ngV67TtG_o.png" alt="在这里插入图片描述"></p> 
+<p>如果这里有数据，说明服务已经通了，即已经可以通过adpter去普罗米修斯拿到数据了。</p> 
+<p>接着你访问一下这个地址（这个表示的是sample-metrics-app这个svc中的http_requests指标）：<br> curl -sSLk https://10.104.67.2/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/services/sample-metrics-app/http_requests<br> <img src="https://images2.imgbox.com/dd/34/U1cj9jTm_o.png" alt="在这里插入图片描述"><br> 你可能难以理解为什么就有自定义指标了，这是因为我们上面的示例pod中，写了一个/metrics的接口，这个接口会返回一个http_requests_total的数据来统计当前pod收到的所有请求数！ 所以当你查询http_requests指标的时候，服务做了转换。具体后面会讲到。</p> 
+<p>如果service也能拿到数据，那么可以说马上就要成功了。</p> 
+<h3><a id="2_HPA_561"></a>2 检查HPA</h3> 
+<p>此时你查看HPA，kubectl get hpa ，会发现有下面这个一个<br> <img src="https://images2.imgbox.com/7b/94/R1cjqHaf_o.png" alt="在这里插入图片描述"><br> 还记得上面在部署这个HPA的时候吗？看看配置文件：<br> 这里指定了说要去拿pod的http_requests指标。<br> <img src="https://images2.imgbox.com/75/4a/W0gQBucR_o.png" alt="在这里插入图片描述"><br> 所以你访问<br> curl -sSLk https://10.104.67.2/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/http_requests<br> 这个能拿到指标，自然HPA也能通过这个方式拿到指标了。<br> <img src="https://images2.imgbox.com/51/4d/4hdgKumt_o.png" alt="在这里插入图片描述"><br> 这个指标是怎么来的？其实你可以去查看下面这个pod的日志。<br> <img src="https://images2.imgbox.com/0b/79/7j78ETAP_o.png" alt="在这里插入图片描述"><br> 里面会有去请求普罗米修斯的接口（如果你遇到什么问题，也一定要来这里查，如果为空，那么你上面的验证肯定是不通过的！）<br> <img src="https://images2.imgbox.com/22/fa/ceGBI0zM_o.png" alt="在这里插入图片描述"></p> 
+<p>说明：<br> 前面的 Custom Metircs URL 进行访问时，会看到值是 501484m（类似），这里的格式，其实就是 milli-requests，相当于是在过去两分钟内，每秒有 501 个请求</p> 
+<h2><a id="5__583"></a>5 压测</h2> 
+<p>校验的时候到了，先看下这个HPA的含义：<br> <img src="https://images2.imgbox.com/d7/66/wv8uG3UX_o.png" alt="在这里插入图片描述"><br> 443m其实就是0.443/s，表示现在这个平均每个pod的请求量。而当每个pod的请求量达到200的时候才扩容。<br> 通过下面这个命令压测我们的测试APP:(ab如果没有的话安装下吧，或者jmeter也行)，这里表示的是600个并发，发80000个请求，<br> ab -n 80000 -c 600 -k -p “token.txt” -T ‘application/json’ http://192.168.1.137/sample-app</p> 
+<p><img src="https://images2.imgbox.com/42/c3/vdhjfFmB_o.png" alt="在这里插入图片描述"><br> 开始发送请求了。接下来看HPA的变化：只看这个HPA的哈：sample-metrics-app-hpa<br> <img src="https://images2.imgbox.com/5e/1c/NbZDJMjN_o.png" alt="在这里插入图片描述"><br> 发现没，先是每个POD的请求变成了400多，发现需要扩容了，先从2变为4，然后变为5，pod数量增加的同时，每个pod的请求也下去了。<br> <img src="https://images2.imgbox.com/be/0c/OfatYzWd_o.png" alt="在这里插入图片描述"></p> 
+<p>大概就是这么个意思。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/eb6404630ca71538a653c13113aec430/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Ubuntu20.04 安装opencv</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/94bc78c9c0e3198fe6dfe1d230208977/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">python语言下使用opencv接口cv2.VideoCapture()接口调用海康机器人工业相机</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

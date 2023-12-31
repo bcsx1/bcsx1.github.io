@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>redis源码阅读-持久化之aof与aof重写详解 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="redis源码阅读-持久化之aof与aof重写详解" />
+<meta property="og:description" content="aof相关配置 aof-rewrite-incremental-fsync yes # aof 开关，默认是关闭的，改为yes表示开启 appendonly no # aof的文件名，默认 appendfilename &#34;appendonly.aof&#34; # aof刷数据的策略,有no/everysec/aways appendfsync everysec no-appendfsync-on-rewrite no # aof超出配置大小的比例，模式是100%，可以理解为阈值 auto-aof-rewrite-percentage 100 # aof 配置的文件的大小，默认64mb auto-aof-rewrite-min-size 64mb aof-load-truncated yes # rewrite 进行时候，rewrite 文件分两种格式，1. 先 用 rdb 序列化，序列化结果写入aof文件，然后期间积累的差异用追加aof命令格式 ，2 整个文件都是aof的命令追加格式 aof-use-rdb-preamble yes appendfsync 一共有3种策略
+alays 主要有数据改动就把数据刷入磁盘，性能相对最差，但最安全everysec 每隔1秒刷一次数据，redis默认的，也是redis推荐的no 不主动刷，什么时候刷数据，取决于操作系统，大多数linux 30秒提交一次 aof写入： 在之前分析redis的流程的时候《redis源码阅读三-终于把主线任务执行搞明白了》里读取客户端信息的时候
+在processCommand 函数里，解析出来执行命令，放入了client中
+int processCommand(client *c) { //解析出来命令 c-&gt;cmd = c-&gt;lastcmd = lookupCommand(c-&gt;argv[0]-&gt;ptr); //CMD_CALL_FULL 包含着CMD_CALL_SLOWLOG | CMD_CALL_STATS | CMD_CALL_PROPAGATE //CMD_CALL_PROPAGATE 包含着CMD_CALL_PROPAGATE_AOF|CMD_CALL_PROPAGATE_REPL call(c,CMD_CALL_FULL); } //命令执行 void call(client *c, int flags) { /** * dirty 记录修改次数 * start记录命令开始执行时间us * duration记录命令执行花费时间 */ long long dirty; ustime_t start, duration; int client_old_flags = c-&gt;flags; struct redisCommand *real_cmd = c-&gt;cmd; //从server." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/9ccce18621cc23ce9ebc35b20e791c30/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-03-23T16:51:42+08:00" />
+<meta property="article:modified_time" content="2022-03-23T16:51:42+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">redis源码阅读-持久化之aof与aof重写详解</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h4><a id="aof_0"></a>aof相关配置</h4> 
+<hr> 
+<pre><code class="prism language-properties">aof-rewrite-incremental-fsync yes
+# aof 开关，默认是关闭的，改为yes表示开启
+appendonly no
+# aof的文件名，默认
+appendfilename "appendonly.aof"
+# aof刷数据的策略,有no/everysec/aways
+appendfsync everysec
+no-appendfsync-on-rewrite no
+# aof超出配置大小的比例，模式是100%，可以理解为阈值 
+auto-aof-rewrite-percentage 100
+# aof 配置的文件的大小，默认64mb
+auto-aof-rewrite-min-size 64mb
+aof-load-truncated yes
+# rewrite 进行时候，rewrite 文件分两种格式，1. 先 用 rdb 序列化，序列化结果写入aof文件，然后期间积累的差异用追加aof命令格式 ，2 整个文件都是aof的命令追加格式
+aof-use-rdb-preamble yes 
+</code></pre> 
+<p>appendfsync 一共有3种策略</p> 
+<ul><li>alays 主要有数据改动就把数据刷入磁盘，性能相对最差，但最安全</li><li>everysec 每隔1秒刷一次数据，redis默认的，也是redis推荐的</li><li>no 不主动刷，什么时候刷数据，取决于操作系统，大多数linux 30秒提交一次</li></ul> 
+<h4><a id="aof_29"></a>aof写入：</h4> 
+<hr> 
+<p>在之前分析redis的流程的时候《redis源码阅读三-终于把主线任务执行搞明白了》里读取客户端信息的时候</p> 
+<p><img src="https://images2.imgbox.com/b9/de/wZ6M7JIS_o.png" alt="image"></p> 
+<p>在processCommand 函数里，解析出来执行命令，放入了client中</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">processCommand</span><span class="token punctuation">(</span>client <span class="token operator">*</span>c<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//解析出来命令</span>
+	c<span class="token operator">-&gt;</span>cmd <span class="token operator">=</span> c<span class="token operator">-&gt;</span>lastcmd <span class="token operator">=</span> <span class="token function">lookupCommand</span><span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>argv<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token operator">-&gt;</span>ptr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//CMD_CALL_FULL 包含着CMD_CALL_SLOWLOG | CMD_CALL_STATS | CMD_CALL_PROPAGATE</span>
+    <span class="token comment">//CMD_CALL_PROPAGATE 包含着CMD_CALL_PROPAGATE_AOF|CMD_CALL_PROPAGATE_REPL</span>
+    <span class="token function">call</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span>CMD_CALL_FULL<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+<span class="token comment">//命令执行</span>
+<span class="token keyword">void</span> <span class="token function">call</span><span class="token punctuation">(</span>client <span class="token operator">*</span>c<span class="token punctuation">,</span> <span class="token keyword">int</span> flags<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">/**
+     * dirty 记录修改次数
+     * start记录命令开始执行时间us
+     * duration记录命令执行花费时间
+     */</span>
+    <span class="token keyword">long</span> <span class="token keyword">long</span> dirty<span class="token punctuation">;</span>
+    <span class="token class-name">ustime_t</span> start<span class="token punctuation">,</span> duration<span class="token punctuation">;</span>
+    <span class="token keyword">int</span> client_old_flags <span class="token operator">=</span> c<span class="token operator">-&gt;</span>flags<span class="token punctuation">;</span>
+    <span class="token keyword">struct</span> <span class="token class-name">redisCommand</span> <span class="token operator">*</span>real_cmd <span class="token operator">=</span> c<span class="token operator">-&gt;</span>cmd<span class="token punctuation">;</span>
+    <span class="token comment">//从server.dirty中获取</span>
+    dirty <span class="token operator">=</span> server<span class="token punctuation">.</span>dirty<span class="token punctuation">;</span>
+    <span class="token comment">//命令执行，会执行对应的redisCommand</span>
+    c<span class="token operator">-&gt;</span>cmd<span class="token operator">-&gt;</span><span class="token function">proc</span><span class="token punctuation">(</span>c<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//计算执行时间</span>
+    duration <span class="token operator">=</span> <span class="token function">ustime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token operator">-</span>start<span class="token punctuation">;</span>
+    <span class="token comment">//在对应的命令里执行一次，dirty+1</span>
+    <span class="token comment">//这里表示本次命令有多少次修改</span>
+    dirty <span class="token operator">=</span> server<span class="token punctuation">.</span>dirty<span class="token operator">-</span>dirty<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>flags <span class="token operator">&amp;</span> CMD_CALL_PROPAGATE <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>flags <span class="token operator">&amp;</span> CLIENT_PREVENT_PROP<span class="token punctuation">)</span> <span class="token operator">!=</span> CLIENT_PREVENT_PROP<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>propagate_flags <span class="token operator">!=</span> PROPAGATE_NONE <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span><span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>cmd<span class="token operator">-&gt;</span>flags <span class="token operator">&amp;</span> CMD_MODULE<span class="token punctuation">)</span><span class="token punctuation">)</span>
+            <span class="token function">propagate</span><span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>cmd<span class="token punctuation">,</span>c<span class="token operator">-&gt;</span>db<span class="token operator">-&gt;</span>id<span class="token punctuation">,</span>c<span class="token operator">-&gt;</span>argv<span class="token punctuation">,</span>c<span class="token operator">-&gt;</span>argc<span class="token punctuation">,</span>propagate_flags<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>    
+<span class="token punctuation">}</span>
+<span class="token comment">/**
+ * 传播执行的命令到aof或从节点
+ * @param cmd
+ * @param dbid
+ * @param argv
+ * @param argc
+ * @param flags
+ */</span>
+<span class="token keyword">void</span> <span class="token function">propagate</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">redisCommand</span> <span class="token operator">*</span>cmd<span class="token punctuation">,</span> <span class="token keyword">int</span> dbid<span class="token punctuation">,</span> robj <span class="token operator">*</span><span class="token operator">*</span>argv<span class="token punctuation">,</span> <span class="token keyword">int</span> argc<span class="token punctuation">,</span>
+               <span class="token keyword">int</span> flags<span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_state <span class="token operator">!=</span> AOF_OFF <span class="token operator">&amp;&amp;</span> flags <span class="token operator">&amp;</span> PROPAGATE_AOF<span class="token punctuation">)</span>
+        <span class="token comment">//aof追加（主要是生成aof内容，并追加到.aof_buf）</span>
+        <span class="token function">feedAppendOnlyFile</span><span class="token punctuation">(</span>cmd<span class="token punctuation">,</span>dbid<span class="token punctuation">,</span>argv<span class="token punctuation">,</span>argc<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>flags <span class="token operator">&amp;</span> PROPAGATE_REPL<span class="token punctuation">)</span>
+        <span class="token comment">//主从复制处理</span>
+        <span class="token function">replicationFeedSlaves</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>slaves<span class="token punctuation">,</span>dbid<span class="token punctuation">,</span>argv<span class="token punctuation">,</span>argc<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>在feedAppendOnlyFile方法里主要是aof内容生成，方法就不具体列了，主要做了三件事</p> 
+<ul><li><strong>组装刚执行命令的aof内容buf，将过期时间由相对转成绝对（重点）</strong></li><li>如果AOF开启的情况，将刚组装的buf放入到server.aof_buf 后</li><li>如果正在重写aof，将buf写到 server.aof_rewrite_buf_blocks中（在aofRewriteBufferAppend里）</li></ul> 
+<pre><code class="prism language-c"><span class="token comment">/**
+ * aof重写的情况下调用，将buf写到一个链表里
+ * @param s  aof信息
+ * @param len
+ */</span>
+<span class="token keyword">void</span> <span class="token function">aofRewriteBufferAppend</span><span class="token punctuation">(</span><span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span>s<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">long</span> len<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    listNode <span class="token operator">*</span>ln <span class="token operator">=</span> <span class="token function">listLast</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_rewrite_buf_blocks<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    aofrwblock <span class="token operator">*</span>block <span class="token operator">=</span> ln <span class="token operator">?</span> ln<span class="token operator">-&gt;</span>value <span class="token operator">:</span> <span class="token constant">NULL</span><span class="token punctuation">;</span>
+    <span class="token keyword">while</span><span class="token punctuation">(</span>len<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//将传递过来的s写入到aof_rewrite_buf_blocks</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//现在是主进程，如果有管道，通过管道server.aof_pipe_write_data_to_child 给子进程</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">aeGetFileEvents</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>el<span class="token punctuation">,</span>server<span class="token punctuation">.</span>aof_pipe_write_data_to_child<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">aeCreateFileEvent</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>el<span class="token punctuation">,</span> server<span class="token punctuation">.</span>aof_pipe_write_data_to_child<span class="token punctuation">,</span>AE_WRITABLE<span class="token punctuation">,</span> aofChildWriteDiffData<span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+<span class="token comment">/**
+ * 将server.aof_rewrite_buf_blocks 中的数据写入server.aof_pipe_write_data_to_child子进程的管道里
+ * 此处增量更新的数据，会由子进程在将虚拟空间里的数据落地后再次读取
+ * @param el
+ * @param fd
+ * @param privdata
+ * @param mask
+ */</span>
+<span class="token keyword">void</span> <span class="token function">aofChildWriteDiffData</span><span class="token punctuation">(</span>aeEventLoop <span class="token operator">*</span>el<span class="token punctuation">,</span> <span class="token keyword">int</span> fd<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>privdata<span class="token punctuation">,</span> <span class="token keyword">int</span> mask<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+     <span class="token keyword">while</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+          ln <span class="token operator">=</span> <span class="token function">listFirst</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_rewrite_buf_blocks<span class="token punctuation">)</span><span class="token punctuation">;</span>
+          block <span class="token operator">=</span> ln <span class="token operator">?</span> ln<span class="token operator">-&gt;</span>value <span class="token operator">:</span> <span class="token constant">NULL</span><span class="token punctuation">;</span>
+          <span class="token keyword">if</span> <span class="token punctuation">(</span>block<span class="token operator">-&gt;</span>used <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+              <span class="token comment">//通过管道把block-&gt;buf里的数据写给子进程</span>
+              nwritten <span class="token operator">=</span> <span class="token function">write</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_pipe_write_data_to_child<span class="token punctuation">,</span> block<span class="token operator">-&gt;</span>buf<span class="token punctuation">,</span>block<span class="token operator">-&gt;</span>used<span class="token punctuation">)</span><span class="token punctuation">;</span>
+              <span class="token keyword">if</span> <span class="token punctuation">(</span>nwritten <span class="token operator">&lt;=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token keyword">return</span><span class="token punctuation">;</span>
+              <span class="token function">memmove</span><span class="token punctuation">(</span>block<span class="token operator">-&gt;</span>buf<span class="token punctuation">,</span>block<span class="token operator">-&gt;</span>buf<span class="token operator">+</span>nwritten<span class="token punctuation">,</span>block<span class="token operator">-&gt;</span>used<span class="token operator">-</span>nwritten<span class="token punctuation">)</span><span class="token punctuation">;</span>
+              block<span class="token operator">-&gt;</span>used <span class="token operator">-=</span> nwritten<span class="token punctuation">;</span>
+              block<span class="token operator">-&gt;</span>free <span class="token operator">+=</span> nwritten<span class="token punctuation">;</span>
+          <span class="token punctuation">}</span>
+          <span class="token keyword">if</span> <span class="token punctuation">(</span>block<span class="token operator">-&gt;</span>used <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token function">listDelNode</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_rewrite_buf_blocks<span class="token punctuation">,</span>ln<span class="token punctuation">)</span><span class="token punctuation">;</span>
+     <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>    
+</code></pre> 
+<p>这里有几个变量</p> 
+<ul><li>server.aof_buf aof缓冲区，用于存放每次执行命令后的aof信息</li><li>server.aof_rewrite_buf_blocks 只要是有aof的子进程，就把新产生的命令添加上去</li><li>server.aof_pipe_write_data_to_child aof 子进程的管道，用于将server.aof_rewrite_buf_blocks信息给子进程</li></ul> 
+<p>在主进程执行命令后，并没有写aof文件，只是将命令拼装成了字符串，放入到了aof缓冲区server.aof_buf 中，如果有aof的子进程，将aof信息放入到server.aof_rewrite_buf_blocks 然后通过管道将该信息给到子进程。</p> 
+<p>那aof是什么时候写入到文件里呢？，别急，看下图</p> 
+<p><img src="https://images2.imgbox.com/d4/2c/4Aqn1el7_o.png" alt="image-20220317143329825"></p> 
+<p>aof有几个场景的写入：</p> 
+<ul><li>在主流程的循环体里 
+  <ul><li>在循环执行前的beforesleep里</li><li>在serverCron里</li></ul> </li><li>准备停止之前调用一次</li><li>通过configSetCommand设置</li><li>主从复制</li></ul> 
+<p>最终都是调用的flushAppendOnlyFile</p> 
+<pre><code class="prism language-c"><span class="token comment">//在beforeSleep里，没有任何的逻辑判断，直接调用</span>
+<span class="token keyword">void</span> <span class="token function">beforeSleep</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">aeEventLoop</span> <span class="token operator">*</span>eventLoop<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//将aof缓冲区写入磁盘</span>
+    <span class="token function">flushAppendOnlyFile</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>    
+<span class="token punctuation">}</span>
+<span class="token comment">//在serverCron中</span>
+<span class="token keyword">int</span> <span class="token function">serverCron</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">aeEventLoop</span> <span class="token operator">*</span>eventLoop<span class="token punctuation">,</span> <span class="token keyword">long</span> <span class="token keyword">long</span> id<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>clientData<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//设置了刷入延期开始时间，直接调用</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_flush_postponed_start<span class="token punctuation">)</span> <span class="token function">flushAppendOnlyFile</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//每秒再判断一次，如果上一次执行异常，再刷入一次</span>
+    <span class="token function">run_with_period</span><span class="token punctuation">(</span><span class="token number">1000</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_last_write_status <span class="token operator">==</span> C_ERR<span class="token punctuation">)</span>
+            <span class="token function">flushAppendOnlyFile</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">/**
+  * 刷入文件
+  * @param force 1 强制，0不强制
+  */</span>
+<span class="token keyword">void</span> <span class="token function">flushAppendOnlyFile</span><span class="token punctuation">(</span><span class="token keyword">int</span> force<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//每秒刷入的时候，判断一下aof的fsync是否在bio线程里执行了，是sync_in_progress 为true</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_fsync <span class="token operator">==</span> AOF_FSYNC_EVERYSEC<span class="token punctuation">)</span>
+        sync_in_progress <span class="token operator">=</span> <span class="token function">aofFsyncInProgress</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//每秒并且非强制刷入</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_fsync <span class="token operator">==</span> AOF_FSYNC_EVERYSEC <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span>force<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>sync_in_progress<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//刷入延期开始时间为0，表示没有任何的执行</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_flush_postponed_start <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">//先将刷入延期开始时间置为当前时间</span>
+                server<span class="token punctuation">.</span>aof_flush_postponed_start <span class="token operator">=</span> server<span class="token punctuation">.</span>unixtime<span class="token punctuation">;</span>
+                <span class="token keyword">return</span><span class="token punctuation">;</span>
+                <span class="token comment">//以后再来，只要当前时间-开始时间&lt;2直接返回（所以对redis的aof来说，并不是每秒执行，而是至少2秒以上，如果阻塞了，时间更久）</span>
+            <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>unixtime <span class="token operator">-</span> server<span class="token punctuation">.</span>aof_flush_postponed_start <span class="token operator">&lt;</span> <span class="token number">2</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">return</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            server<span class="token punctuation">.</span>aof_delayed_fsync<span class="token operator">++</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//这里用了卫语句的方式,将不能触发的在前面拦截</span>
+    <span class="token comment">//写入到aof文件里</span>
+    nwritten <span class="token operator">=</span> <span class="token function">aofWrite</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_fd<span class="token punctuation">,</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">,</span><span class="token function">sdslen</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//写完aof后，将刷入延期开始时间置为0</span>
+    server<span class="token punctuation">.</span>aof_flush_postponed_start <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token comment">//省略异常的处理</span>
+    <span class="token comment">//记录aof当前的大小</span>
+    server<span class="token punctuation">.</span>aof_current_size <span class="token operator">+=</span> nwritten<span class="token punctuation">;</span>
+     <span class="token comment">/**
+     * aof的可用buf比较小了，就清空buf
+     */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token function">sdslen</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">)</span><span class="token operator">+</span><span class="token function">sdsavail</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">4000</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">sdsclear</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">sdsfree</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>aof_buf <span class="token operator">=</span> <span class="token function">sdsempty</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+    
+    
+<span class="token comment">//aof写入方式的枚举</span>
+configEnum aof_fsync_enum<span class="token punctuation">[</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token punctuation">{<!-- --></span><span class="token string">"everysec"</span><span class="token punctuation">,</span> AOF_FSYNC_EVERYSEC<span class="token punctuation">}</span><span class="token punctuation">,</span>
+    <span class="token punctuation">{<!-- --></span><span class="token string">"always"</span><span class="token punctuation">,</span> AOF_FSYNC_ALWAYS<span class="token punctuation">}</span><span class="token punctuation">,</span>
+    <span class="token punctuation">{<!-- --></span><span class="token string">"no"</span><span class="token punctuation">,</span> AOF_FSYNC_NO<span class="token punctuation">}</span><span class="token punctuation">,</span>
+    <span class="token punctuation">{<!-- --></span><span class="token constant">NULL</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">}</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>    
+</code></pre> 
+<ul><li>aof的写入是在beforeSleep 里，在serverCron 主要是处理延期写入或者处理写入异常</li><li>aof通过server.aof_flush_postponed_start来延期写入，第一次将此值赋值为当前时间，写完以后置为0</li><li>aof通过write写入文件（获取的是文件fd对应的偏移指针，顺序写）</li></ul> 
+<h4><a id="aof_235"></a>aof重写</h4> 
+<hr> 
+<p>在上一篇《redis源码阅读-持久化之RDB》中</p> 
+<p><img src="https://images2.imgbox.com/61/4c/uqZSaCuf_o.png" alt="rdb"></p> 
+<p>serverCron在执行的时候，有一个backgroundRewriteDoneHandler方法，当时就有疑问，这个重写是干啥的？</p> 
+<p>然后搜索了下，发现了这个函数rewriteAppendOnlyFileBackground</p> 
+<p>我们看下这个函数的触发的时机</p> 
+<p><img src="https://images2.imgbox.com/64/19/2ZxgwjhK_o.png" alt="image-20220317222918220"></p> 
+<p>先说下触发时机：</p> 
+<ul><li>在周期性循环里进行</li><li>通过命令调用执行aof重写 
+  <ul><li>一个是bgrewriteaofCommand</li><li>一个是configSetCommand</li></ul> </li><li>主从复制时触发</li></ul> 
+<p>在serverCron里有两次调用</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">serverCron</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">aeEventLoop</span> <span class="token operator">*</span>eventLoop<span class="token punctuation">,</span> <span class="token keyword">long</span> <span class="token keyword">long</span> id<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>clientData<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">/**调用①，这次调用是之前有rdb进程的时候，设置为了aof重写等待任务（本该执行的逻辑之前因为rdb没有执行，所以直接触发）*/</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> server<span class="token punctuation">.</span>aof_child_pid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> server<span class="token punctuation">.</span>aof_rewrite_scheduled<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        <span class="token function">rewriteAppendOnlyFileBackground</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">||</span> server<span class="token punctuation">.</span>aof_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">||</span><span class="token function">ldbPendingChildren</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        
+    <span class="token punctuation">}</span><span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+       
+        <span class="token comment">/** 调用②
+         *  在没有rdb和aof子进程的时候，
+         *  先判断rdb是否达到了执行条件
+         *     save 900 1  配置的判断
+         *  再判断aof是否达到了执行条件
+         *    1，先判断aof是否打开
+         *    2，如果有rdb或aof子进程了也不再执行（互斥）
+         *    3，有触发阈值，
+         *    4，aof当前的文件的大小大于设置的最小大小
+         */</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_state <span class="token operator">==</span> AOF_ON <span class="token operator">&amp;&amp;</span> server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> server<span class="token punctuation">.</span>aof_child_pid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> server<span class="token punctuation">.</span>aof_rewrite_perc <span class="token operator">&amp;&amp;</span>
+            server<span class="token punctuation">.</span>aof_current_size <span class="token operator">&gt;</span> server<span class="token punctuation">.</span>aof_rewrite_min_size<span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/**
+             * aof_rewrite_base_size 启动默认为0，第一次达到min_size以后设置为1，这时候触发
+             * 等待aof重写完以后，会把aof_rewrite_base_size设置为重写后的大小，这个值一致随着aof文件大小自增
+             */</span>
+            <span class="token keyword">long</span> <span class="token keyword">long</span> base <span class="token operator">=</span> server<span class="token punctuation">.</span>aof_rewrite_base_size <span class="token operator">?</span>server<span class="token punctuation">.</span>aof_rewrite_base_size <span class="token operator">:</span> <span class="token number">1</span><span class="token punctuation">;</span>
+            <span class="token comment">/**
+              * 这个公式也很有意思，aof的重写会随着文件的变大而逐步变大，而不是64mb
+              */</span>
+            <span class="token keyword">long</span> <span class="token keyword">long</span> growth <span class="token operator">=</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_current_size<span class="token operator">*</span><span class="token number">100</span><span class="token operator">/</span>base<span class="token punctuation">)</span> <span class="token operator">-</span> <span class="token number">100</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>growth <span class="token operator">&gt;=</span> server<span class="token punctuation">.</span>aof_rewrite_perc<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">//触发aof重写</span>
+                <span class="token function">rewriteAppendOnlyFileBackground</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ul><li>① 位置标注的调用是为了延迟补偿</li><li>②位置标注的每次在没有rdb和aof子进程的情况下都会进来</li><li>redis通过server.aof_rewrite_scheduled来控制aof的延迟执行</li></ul> 
+<pre><code class="prism language-c"><span class="token comment">/**
+ * 后台的方式重写aof，通过fork进程处理
+ *
+ * @return
+ */</span>
+<span class="token keyword">int</span> <span class="token function">rewriteAppendOnlyFileBackground</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token class-name">pid_t</span> childpid<span class="token punctuation">;</span>
+    <span class="token keyword">long</span> <span class="token keyword">long</span> start<span class="token punctuation">;</span>
+    <span class="token comment">//双重校验，只要有aof或rdb的子进程就不再执行，</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">||</span> server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token comment">//创建6个管道，分别用来数据传输，父子进程之间的ack响应</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">aofCreatePipes</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">!=</span> C_OK<span class="token punctuation">)</span> <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token comment">//创建执行aof完以后回写的管道</span>
+    <span class="token function">openChildInfoPipe</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    start <span class="token operator">=</span> <span class="token function">ustime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//fork子进程进行重写</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>childpid <span class="token operator">=</span> <span class="token function">fork</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">char</span> tmpfile<span class="token punctuation">[</span><span class="token number">256</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* Child */</span>
+        <span class="token comment">//关闭自己不需要关注的</span>
+        <span class="token function">closeClildUnusedResourceAfterFork</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//设置进程名称</span>
+        <span class="token function">redisSetProcTitle</span><span class="token punctuation">(</span><span class="token string">"redis-aof-rewrite"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//格式化重写aof的文件名</span>
+        <span class="token function">snprintf</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span><span class="token number">256</span><span class="token punctuation">,</span><span class="token string">"temp-rewriteaof-bg-%d.aof"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span> <span class="token function">getpid</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//重写aof文件</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rewriteAppendOnlyFile</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">)</span> <span class="token operator">==</span> C_OK<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token class-name">size_t</span> private_dirty <span class="token operator">=</span> <span class="token function">zmalloc_get_private_dirty</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            server<span class="token punctuation">.</span>child_info_data<span class="token punctuation">.</span>cow_size <span class="token operator">=</span> private_dirty<span class="token punctuation">;</span>
+            <span class="token function">sendChildInfo</span><span class="token punctuation">(</span>CHILD_INFO_TYPE_AOF<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token function">exitFromChild</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">exitFromChild</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* Parent */</span>
+        server<span class="token punctuation">.</span>stat_fork_time <span class="token operator">=</span> <span class="token function">ustime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token operator">-</span>start<span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>stat_fork_rate <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">double</span><span class="token punctuation">)</span> <span class="token function">zmalloc_used_memory</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token number">1000000</span> <span class="token operator">/</span> server<span class="token punctuation">.</span>stat_fork_time <span class="token operator">/</span> <span class="token punctuation">(</span><span class="token number">1024</span><span class="token operator">*</span><span class="token number">1024</span><span class="token operator">*</span><span class="token number">1024</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">/* GB per second. */</span>
+        <span class="token function">latencyAddSampleIfNeeded</span><span class="token punctuation">(</span><span class="token string">"fork"</span><span class="token punctuation">,</span>server<span class="token punctuation">.</span>stat_fork_time<span class="token operator">/</span><span class="token number">1000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>childpid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">closeChildInfoPipe</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token function">aofClosePipes</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">//已经开始处理了，就把等待任务表示写回0</span>
+        server<span class="token punctuation">.</span>aof_rewrite_scheduled <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+        <span class="token comment">//标记aof重写开始的时间</span>
+        server<span class="token punctuation">.</span>aof_rewrite_time_start <span class="token operator">=</span> <span class="token function">time</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//标记aof的的子进程</span>
+        server<span class="token punctuation">.</span>aof_child_pid <span class="token operator">=</span> childpid<span class="token punctuation">;</span>
+        <span class="token comment">//禁用hash resize</span>
+        <span class="token function">updateDictResizePolicy</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>aof_selected_db <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token function">replicationScriptCacheFlush</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span> <span class="token comment">/* unreached */</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">/**
+ * 创建aof管道
+ * @return
+ */</span>
+<span class="token keyword">int</span> <span class="token function">aofCreatePipes</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">int</span> fds<span class="token punctuation">[</span><span class="token number">6</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+    <span class="token keyword">int</span> j<span class="token punctuation">;</span>
+
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">pipe</span><span class="token punctuation">(</span>fds<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> error<span class="token punctuation">;</span> <span class="token comment">/* parent -&gt; children data. */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">pipe</span><span class="token punctuation">(</span>fds<span class="token operator">+</span><span class="token number">2</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> error<span class="token punctuation">;</span> <span class="token comment">/* children -&gt; parent ack. */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">pipe</span><span class="token punctuation">(</span>fds<span class="token operator">+</span><span class="token number">4</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> error<span class="token punctuation">;</span> <span class="token comment">/* parent -&gt; children ack. */</span>
+    <span class="token comment">/* 设置数据管道为非阻塞 */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">anetNonBlock</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">,</span>fds<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">!=</span> ANET_OK<span class="token punctuation">)</span> <span class="token keyword">goto</span> error<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">anetNonBlock</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">,</span>fds<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">!=</span> ANET_OK<span class="token punctuation">)</span> <span class="token keyword">goto</span> error<span class="token punctuation">;</span>
+    <span class="token comment">/**
+     * 注册时间处理，监听 server.aof_pipe_read_ack_from_child 传递过来的ack信息，如果有就 server.aof_stop_sending_diff = 1;
+     * 同时删除server.aof_pipe_read_ack_from_child的事件处理器
+     */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">aeCreateFileEvent</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>el<span class="token punctuation">,</span> fds<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">,</span> AE_READABLE<span class="token punctuation">,</span> aofChildPipeReadable<span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">)</span> <span class="token operator">==</span> AE_ERR<span class="token punctuation">)</span> <span class="token keyword">goto</span> error<span class="token punctuation">;</span>
+    <span class="token comment">//父进程往子进程写数据的管道</span>
+    server<span class="token punctuation">.</span>aof_pipe_write_data_to_child <span class="token operator">=</span> fds<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token comment">//子进程从父进程读数据的管道</span>
+    server<span class="token punctuation">.</span>aof_pipe_read_data_from_parent <span class="token operator">=</span> fds<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token comment">//子进程发送ack给父进程的管道</span>
+    server<span class="token punctuation">.</span>aof_pipe_write_ack_to_parent <span class="token operator">=</span> fds<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token comment">//父进程读子进程发送的ack信息的管道</span>
+    server<span class="token punctuation">.</span>aof_pipe_read_ack_from_child <span class="token operator">=</span> fds<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token comment">//父进程发送ack信息给子进程的管道</span>
+    server<span class="token punctuation">.</span>aof_pipe_write_ack_to_child <span class="token operator">=</span> fds<span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token comment">//子进程读取父进程发送的ack信息的管道</span>
+    server<span class="token punctuation">.</span>aof_pipe_read_ack_from_parent <span class="token operator">=</span> fds<span class="token punctuation">[</span><span class="token number">4</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    server<span class="token punctuation">.</span>aof_stop_sending_diff <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span>
+
+error<span class="token operator">:</span>
+    <span class="token keyword">for</span> <span class="token punctuation">(</span>j <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> j <span class="token operator">&lt;</span> <span class="token number">6</span><span class="token punctuation">;</span> j<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token keyword">if</span><span class="token punctuation">(</span>fds<span class="token punctuation">[</span>j<span class="token punctuation">]</span> <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token function">close</span><span class="token punctuation">(</span>fds<span class="token punctuation">[</span>j<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>rof重写</p> 
+<pre><code class="prism language-c"><span class="token comment">/**
+ * 同步重写aof
+ * @param filename
+ * @return
+ */</span>
+<span class="token keyword">int</span> <span class="token function">rewriteAppendOnlyFile</span><span class="token punctuation">(</span><span class="token keyword">char</span> <span class="token operator">*</span>filename<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    rio aof<span class="token punctuation">;</span>
+    FILE <span class="token operator">*</span>fp<span class="token punctuation">;</span>
+    <span class="token keyword">char</span> tmpfile<span class="token punctuation">[</span><span class="token number">256</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token keyword">char</span> byte<span class="token punctuation">;</span>
+
+    <span class="token comment">//又创建了一个临时文件</span>
+    <span class="token function">snprintf</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span><span class="token number">256</span><span class="token punctuation">,</span><span class="token string">"temp-rewriteaof-%d.aof"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span> <span class="token function">getpid</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    fp <span class="token operator">=</span> <span class="token function">fopen</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span><span class="token string">"w"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>fp<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    server<span class="token punctuation">.</span>aof_child_diff <span class="token operator">=</span> <span class="token function">sdsempty</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//初始化一个文件io对象</span>
+    <span class="token function">rioInitWithFile</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>aof<span class="token punctuation">,</span>fp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_rewrite_incremental_fsync<span class="token punctuation">)</span>
+        <span class="token function">rioSetAutoSync</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>aof<span class="token punctuation">,</span>REDIS_AUTOSYNC_BYTES<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">/**
+     * aof_use_rdb_preamble = yes 表示开启了混合模式，先将rdb信息刷入aof文件
+     * rdb是比较节省空间
+     */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_use_rdb_preamble<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">int</span> error<span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveRio</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>aof<span class="token punctuation">,</span><span class="token operator">&amp;</span>error<span class="token punctuation">,</span>RDB_SAVE_AOF_PREAMBLE<span class="token punctuation">,</span><span class="token constant">NULL</span><span class="token punctuation">)</span> <span class="token operator">==</span> C_ERR<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            errno <span class="token operator">=</span> error<span class="token punctuation">;</span>
+            <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//直接以redis的协议从所有db的全局hash表中读取数据写入aof文件</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rewriteAppendOnlyFileRio</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>aof<span class="token punctuation">)</span> <span class="token operator">==</span> C_ERR<span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//清空缓冲区</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fflush</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">EOF</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//刷入磁盘，正常都是在操作系统的页缓存里，fsync可以刷入磁盘</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fsync</span><span class="token punctuation">(</span><span class="token function">fileno</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token keyword">int</span> nodata <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token class-name">mstime_t</span> start <span class="token operator">=</span> <span class="token function">mstime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">/**
+     * 在1秒内，每次等待1毫秒，从管道里获取数据
+     */</span>
+    <span class="token keyword">while</span><span class="token punctuation">(</span><span class="token function">mstime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token operator">-</span>start <span class="token operator">&lt;</span> <span class="token number">1000</span> <span class="token operator">&amp;&amp;</span> nodata <span class="token operator">&lt;</span> <span class="token number">20</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//等待管道数据，没有数据，下一次轮训</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">aeWait</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_pipe_read_data_from_parent<span class="token punctuation">,</span> AE_READABLE<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">&lt;=</span> <span class="token number">0</span><span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+            nodata<span class="token operator">++</span><span class="token punctuation">;</span>
+            <span class="token keyword">continue</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        nodata <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> <span class="token comment">/* Start counting from zero, we stop on N *contiguous*
+                       timeouts. */</span>
+        <span class="token comment">//从父进程读取追加的数据</span>
+        <span class="token function">aofReadDiffFromParent</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/* Ask the master to stop sending diffs. */</span>
+    <span class="token comment">//向父进程发送ack信息!,让父进程停止追加</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">write</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_pipe_write_ack_to_parent<span class="token punctuation">,</span><span class="token string">"!"</span><span class="token punctuation">,</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//读取master的ack信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">anetNonBlock</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">,</span>server<span class="token punctuation">.</span>aof_pipe_read_ack_from_parent<span class="token punctuation">)</span> <span class="token operator">!=</span> ANET_OK<span class="token punctuation">)</span>
+        <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//同步读取父进程的ack消息，5秒超时</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">syncRead</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_pipe_read_ack_from_parent<span class="token punctuation">,</span><span class="token operator">&amp;</span>byte<span class="token punctuation">,</span><span class="token number">1</span><span class="token punctuation">,</span><span class="token number">5000</span><span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token number">1</span> <span class="token operator">||</span>
+        byte <span class="token operator">!=</span> <span class="token string">'!'</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token comment">/* Read the final diff if any. */</span>
+    <span class="token comment">//再次读一下，补救ack期间传过来的数据</span>
+    <span class="token function">aofReadDiffFromParent</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">//将aof开始执行之后，追加的数据写入到aof文件中</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rioWrite</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>aof<span class="token punctuation">,</span>server<span class="token punctuation">.</span>aof_child_diff<span class="token punctuation">,</span><span class="token function">sdslen</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_child_diff<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+        <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token comment">//清空缓冲区</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fflush</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">EOF</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//刷入磁盘，正常都是在操作系统的页缓存里，fsync可以刷入磁盘</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fsync</span><span class="token punctuation">(</span><span class="token function">fileno</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fclose</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">EOF</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token comment">//将rof的临时文件改名为temp-rewriteaof-bg-%d.aof</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rename</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span>filename<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">unlink</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span>
+
+werr<span class="token operator">:</span>
+    <span class="token function">fclose</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">unlink</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>通过以上的代码我们可以看到：</p> 
+<ul><li>aof的重写过程和bgsave方式的rdb差不多的过程差不多</li><li>aof 重写有两种模式，一种是先写rdb，再追加aof（混合模式），一种是一路aof格式</li><li>aof在将虚拟内存空间里的数据写完以后，会通过wait轮训从管道server.aof_pipe_read_data_from_parent里获取增量更新的数据，增量更新在第一小节的时候，有个aofChildWriteDiffData处理器（通过FileEvent机制写入）</li><li>然后aof 子父进程发送ack确认消息</li><li>最后再次通过rioWrite 将ack期间追加的数据补救回来</li><li>最后将rof的临时文件重命名为temp-rewriteaof-bg-进程id.aof</li></ul> 
+<h4><a id="aof_520"></a>aof后续处理</h4> 
+<hr> 
+<p>其实到这里，aof是写到文件里了，但是并没有再改到配置的文件上?</p> 
+<p>别急，我们上一篇，或者本篇aof小结那张图。</p> 
+<p>在serverCron有一个分支处理backgroundSaveDoneHandler 和backgroundRewriteDoneHandler。上一篇，我们讲过了backgroundSaveDoneHandler，另一个方法backgroundRewriteDoneHandler没有讲，翻看代码看下</p> 
+<pre><code class="prism language-c"><span class="token comment">/**
+ * 后台aof重写后的处理
+ * @param exitcode 获取子进程的结束代码，exitcode=0 表示rdb成功，1表示失败
+ * @param bysignal 子进程信号中断代码，如果有值，表示被信号中断
+ */</span>
+<span class="token keyword">void</span> <span class="token function">backgroundRewriteDoneHandler</span><span class="token punctuation">(</span><span class="token keyword">int</span> exitcode<span class="token punctuation">,</span> <span class="token keyword">int</span> bysignal<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//格式化子进程的文件名</span>
+        <span class="token function">snprintf</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span><span class="token number">256</span><span class="token punctuation">,</span><span class="token string">"temp-rewriteaof-bg-%d.aof"</span><span class="token punctuation">,</span>
+            <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span>server<span class="token punctuation">.</span>aof_child_pid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//以写模式打开</span>
+        newfd <span class="token operator">=</span> <span class="token function">open</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span>O_WRONLY<span class="token operator">|</span>O_APPEND<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//将写入缓冲区aof_rewrite_buf_blocks的数据追加到aof文件数上</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">aofRewriteBufferWrite</span><span class="token punctuation">(</span>newfd<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            
+        <span class="token punctuation">}</span>
+         <span class="token comment">//将临时文件改为真正的aof文件</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rename</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span>server<span class="token punctuation">.</span>aof_filename<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_fd <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">close</span><span class="token punctuation">(</span>newfd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//把新的aof文件的fd赋值过去，redis可以实时写入，这些操作都是线性的</span>
+            oldfd <span class="token operator">=</span> server<span class="token punctuation">.</span>aof_fd<span class="token punctuation">;</span>
+            server<span class="token punctuation">.</span>aof_fd <span class="token operator">=</span> newfd<span class="token punctuation">;</span>
+            <span class="token comment">//根据类型是否直接刷盘</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_fsync <span class="token operator">==</span> AOF_FSYNC_ALWAYS<span class="token punctuation">)</span>
+                <span class="token function">redis_fsync</span><span class="token punctuation">(</span>newfd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_fsync <span class="token operator">==</span> AOF_FSYNC_EVERYSEC<span class="token punctuation">)</span>
+                <span class="token function">aof_background_fsync</span><span class="token punctuation">(</span>newfd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            server<span class="token punctuation">.</span>aof_selected_db <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span> <span class="token comment">/* Make sure SELECT is re-issued */</span>
+            <span class="token function">aofUpdateCurrentSize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//重置aof的base_size</span>
+            server<span class="token punctuation">.</span>aof_rewrite_base_size <span class="token operator">=</span> server<span class="token punctuation">.</span>aof_current_size<span class="token punctuation">;</span>
+            <span class="token comment">//aof的偏移指针</span>
+            server<span class="token punctuation">.</span>aof_fsync_offset <span class="token operator">=</span> server<span class="token punctuation">.</span>aof_current_size<span class="token punctuation">;</span>
+
+            <span class="token comment">/* Clear regular AOF buffer since its contents was just written to
+             * the new AOF from the background rewrite buffer. */</span>
+            <span class="token function">sdsfree</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>aof_buf<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            server<span class="token punctuation">.</span>aof_buf <span class="token operator">=</span> <span class="token function">sdsempty</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">//修改aof最近重写的状态</span>
+        server<span class="token punctuation">.</span>aof_lastbgrewrite_status <span class="token operator">=</span> C_OK<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        server<span class="token punctuation">.</span>aof_lastbgrewrite_status <span class="token operator">=</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>在最后</p> 
+<ul><li>将临时文件改成了真正配置的的aof文件</li><li>然后又将缓冲区aof_rewrite_buf_blocks里的数据写入到了aof文件里。</li></ul> 
+<p>redis为什么要进行aof重写呢？</p> 
+<ul><li>aof记录的是所有的修改操作，随着运行越来越大；</li><li>redis作为一个缓存数据库，很多的数据是有有效期的，可能30秒后之前的键值就无效；</li><li>这些失效的数据，对于aof后续的恢复来说是大部分都是执行无效的数据，会导致效能过低；</li><li>磁盘的的占用也是一个问题，其实rdb也是这个理；</li></ul> 
+<p>为什么aof和rdb要后台子进程运行？</p> 
+<ul><li> <p>子进程通过页映射表来读取主进程的物理数据，使用子进程，一是防止阻塞主进程，二是省去了数据的拷贝；</p> </li><li> <p>对于redis来说，对外提供高性能的服务是核心，aof和rdb是辅助性的维护手段；</p> </li><li> <p>简单来说非核心业务不要影响核心业务；</p> </li></ul> 
+<p>redis系列文章</p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484533&amp;idx=1&amp;sn=4eb2d930cd421f71e62c26830c79e24f&amp;chksm=a6db25c991acacdf3df39578e26e5aba77a1a279b3baaae780fd6885f2d17a01aee8547091cd&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读-入门篇</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484538&amp;idx=1&amp;sn=b4f3140d6e3cb0c8d38c2e8340fc1032&amp;chksm=a6db25c691acacd0bb3a89b1483c1637a2c211b4d57ba4ce9c1852c19c2165dc57c0891dae09&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读二-终于把redis的启动流程搞明白了</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484563&amp;idx=1&amp;sn=9ded6f5301d025b37730e51a6fc65fbb&amp;chksm=a6db252f91acac39d6f5c61c23de031c15bc621cba59414397aab3ff035745a724d67debff5b&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读三-终于把主线任务执行搞明白了</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484578&amp;idx=1&amp;sn=7c3bb1d28ce02e04d47a0be951964764&amp;chksm=a6db251e91acac084bf5b7e5a3e40fd18249e6502793d0755ed3fdf5c2f4dec875916a3876f7&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读四-我把redis6里的io多线程执行流程梳理明白了</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484581&amp;idx=1&amp;sn=9db93d0a341b554caf229f8d66a34799&amp;chksm=a6db251991acac0f4ab51a969a998981c842a0a58f7153f21868ec2ed7ece5e225226ff9f367&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读五-为什么大量过期key会阻塞redis？</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484591&amp;idx=1&amp;sn=1c6e6b404dc99e653c2690a2fff65d23&amp;chksm=a6db251391acac0554ce1a494408f8c3639298d780ee7a77314a621a7803f787add0bd67017b&amp;scene=21#wechat_redirect" rel="nofollow">redis源码六-redis中的缓存淘汰策略处理分析</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484681&amp;idx=1&amp;sn=cad5bcf7b8edd6d296d58468bda3fac9&amp;chksm=a6db24b591acada3bf90974b24fbe0161a60cc22a7b2638a3cbe0d7fb74abbb0dd97c9267820&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读-之哨兵流程</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484729&amp;idx=1&amp;sn=692d16b3e91943411c9848c775f46cc4&amp;chksm=a6db248591acad933646cfacf0f5004630090fd4a64996c47037ad6c7ba98f65f21c0eb306ab&amp;scene=21#wechat_redirect" rel="nofollow">redis源码阅读-持久化之RDB</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484630&amp;idx=1&amp;sn=15b5873adaa6bd423e3e4de1f84e87b8&amp;chksm=a6db256a91acac7c9f831674aec8128571f22d92f93fc2199d636c93877442b45ac733c96121&amp;scene=21#wechat_redirect" rel="nofollow">阅读redis源码的时候一些c知识</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484722&amp;idx=1&amp;sn=ce6012e63e102f90b80bbec45e8a98a5&amp;chksm=a6db248e91acad984a19944ef28f31bb35760c0ce33659f97c9e79a7f808e97d218c661251a8&amp;scene=21#wechat_redirect" rel="nofollow">阅读redis持久化RDB源码的时候一些c知识</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484637&amp;idx=1&amp;sn=1e55e0908c3414346baced78c0a1a37e&amp;chksm=a6db256191acac7772f2ee5cdc647c5619e968f8ba2a05f734c9f0318d627e95092cc141817b&amp;scene=21#wechat_redirect" rel="nofollow">linux中的文件描述符与套接字socket</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484643&amp;idx=1&amp;sn=6ac1955eeda52e925f0f265ebbde53ab&amp;chksm=a6db255f91acac49256d37d252a591291286ca6efa69e5078247d6d337702082d5d252e59183&amp;scene=21#wechat_redirect" rel="nofollow">redis中的IO多路复用select和epoll</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484652&amp;idx=1&amp;sn=54207abbace0b18badf81b0593d6bada&amp;chksm=a6db255091acac46993429b49d748362ba373bb832912ac71595afe02ac0927ef373293945f2&amp;scene=21#wechat_redirect" rel="nofollow">Reactor模式详解及redis如何使用</a></p> 
+<p><a href="http://mp.weixin.qq.com/s?__biz=MjM5NzQxMTAyNw==&amp;mid=2247484517&amp;idx=1&amp;sn=a297c436c062d30c473e59566f1039e0&amp;chksm=a6db25d991acaccf2aa3f5d8ef21c95de0805512146be412b28153486a9b48e840801e26b0e1&amp;scene=21#wechat_redirect" rel="nofollow">redis的key过期了还能取出来？</a></p> 
+<blockquote> 
+ <p>本文是Redis源码剖析系列博文，有想深入学习Redis的同学，欢迎star和关注；<br> Redis中文注解版：https://github.com/yxkong/redis/tree/5.0<br> 如果觉得本文对你有用，欢迎一键三连；<br> 同时可以关注微信公众号5ycode获取第一时间的更新哦；</p> 
+</blockquote>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/7524c1ab871fb573a565c786e8d0ce69/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Echarts柱状图配置</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/48493c360bfd56afa5a08a1db27cf453/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Games101作业补全--所有作业含提高项</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

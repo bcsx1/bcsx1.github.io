@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>FreeRTOS-信号量详解 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="FreeRTOS-信号量详解" />
+<meta property="og:description" content="✅作者简介：嵌入式入坑者，与大家一起加油，希望文章能够帮助各位！！！！
+📃个人主页：@rivencode的个人主页
+🔥系列专栏：玩转FreeRTOS
+💬保持学习、保持热爱、认真分享、一起进步！！！
+目录 前言一、信号量的简介二、FreeRTOS信号量1.二值信号量2.计数信号量3.互斥信号量1.优先级反转2.优先级继承3.互斥信号量解析 4.递归互斥信号量1.互斥信号量的缺陷2.递归互斥信号量解析 三.总结 前言 本文将详细全方位的讲解FreeRTOS的信量量，其实你学完了《FreeRTOS-消息队列详解》信号量的学习就非常简单了，因为所有的信号量的本质的都是特殊的队列(特殊在哪里：信号量只有队列头部，并没有后面的环形存储区，也就是说信号量只负责消息传递，并不传递数据)，当然这么多信号量也是有区别的，不同的信号量对应不同的应用场景，还是以源码分析为主，源码分析透了，这几种信号量的区别，或者特殊机制(互斥量的优先级继承)就一清二楚了。
+在学习信号量之前请将FreeRTOS的队列消息了如指掌：
+《FreeRTOS-消息队列详解》
+一、信号量的简介 信号量（Semaphore）是一种实现任务间通信的机制，可以实现任务之间同步或临界资源的互斥访问，其实信号量主要的功能就是实现任务之间的同步与互斥，实现的方式主要就是依靠队列(信号量是特殊的队列)的任务阻塞机制。
+既然队列也可以实现同步与互斥那为什么还要信号量？
+答：信号量相比队列更节省空间，因为实现同步与互斥不需要传递数据，所以信号量没有队列后面的环形存储区，信号量主要就是依靠计数值uxMessagesWaiting（在队列中表示队列现有消息个数，在信号量中表示有效信号量个数）。
+什么是同步与互斥？
+1.同步 比如说，买包子
+我要去买包子，如果包子店没有包子了，则需要等待卖包子的把包子做出来我才能买到包子，这个等待的过程就叫做同步。(在实际应用中：一个采集数据的传感器任务，一个处理数据的任务，则处理数据的任务需要等待传感器去采用数据，则在FreeRTOS系统中等待不能干等着，在该任务等待的过程中，CPU转而可以去执行其他任务，则就可以提高效率，则就是队列的阻塞机制)
+2.互斥 比如说，抢厕所
+厕所只有一个，一个人进去上了，另一个人也要上，则必须等待前人上完厕所才能上，等待的过程就是同步，而保护厕所的过程叫做互斥，则厕所就是所谓临界资源，同一时间只能一个人使用厕所，当然前人上完厕所应该提醒等待的人，厕所用完了可以上了，其中本质也是阻塞机制。
+uxMessagesWaiting作为复用在信号量中表示资源的数量，所有获取信号量的任务都会将该整数减一，当该整数值为零时，则此时想要获取的任务则会进入阻塞态，释放信号量的任务都会将该整数加一，不过当该整数值为最大值时(最大值要看你是什么信号量)，则此时想要释信号量的任务则并不会进入阻塞态，直接返回释放信号量失败。
+接下来就分别介绍二值信号量、计数信号量、互斥信号量、递归互斥信号量、它们的应用场景、特殊机制、以源码分析的方式，深入理解信号量！！！
+创建信号量就对应创建特殊队列，获取信号量就对应队列出队，释放信号量就对应队列入队，学好了队列就基本学好了信号量，所以这一章主要是针对互斥量(优先级反转、优先级继承、递归互斥信号量)。
+二、FreeRTOS信号量 1.二值信号量 所谓二值信号量其实就是一个队列长度为1，没有数据存储器的队列，而二值则表示计数值uxMessagesWaiting只有0和1两种状态(就是队列空与队列满两种情况)，uxMessagesWaiting在队列中表示队列中现有消息数量，而在信号量中则表示信号量的数量。
+uxMessagesWaiting为0表示：信号量资源被获取了.
+uxMessagesWaiting为1表示：信号量资源被释放了
+把这种只有 0 和 1 两种情况的信号量称之为二值信号量。
+由于二值信号量就是特殊的队列，其实它的运转机制就是利用了队列的阻塞机，从而达到实现任务之间的同步与互斥(有优先级反转的缺陷)。
+二值信号量的应用场景：
+二值信号量用于同步： 在多任务系统中，经常会使用二值信号量来实现任务之间或者任务与中断之间的同步，比如，某个任务需要等待一个标记，那么任务可以在轮询中查询这个标记有没有被置位，则任务在等待的过程也会消耗CPU的资源，如下图所示：
+上面的代码看似没问题，其实存在有两个问题：
+1.使用了全局变量flagCalcEnd，(如果同时读写flagCalcEnd则会出问题)。
+2.任务二在等待任务一计算完sum的值的过程中，任务二也会参与任务调度消耗CPU资源(假设只有这两个任务,优先级相同，且支持时间片轮转，则在任务一在计算sum值的过程中，任务一与任务二轮流执行相同时间片，只不过任务二就一直判断flagCalcEnd的值是否为1，相当于就是浪费CPU的资源)
+所以二值信号量就可以解决这个问题，在任务一计算sum的值的过程中，任务二应该进入阻塞态让出CPU的使用权，在任务二阻塞期间任务一就可以独占CPU全速计算sum的值，代码如下图所示：
+当任务一计算完sum值，然后才释放信号量(通知任务二有数据来了)，任务二则刚开始sum值未计算完成时，获取信号量会失败，任务进入阻塞态，等待大任务一计算sum完成释放信号量则任务被唤醒，则就可以出来后面的事情。
+使用信号量的方式就可以完美实现同步，即保证了正确性，有保证了效率(让任务进入阻塞态)。
+二值信号量在任务与中断同步的应用场景：
+我们在串口接收中，我们并不知道什么时候有数据发送过来(等数据过来标记一次)，还有一个处理串口接收到的数据，在任务系统中不可能时时刻刻去判断是否有串口有数据过来(判断标志位)，所以在这种情况下使用二值信号量是很好的办法，当没有数据到来的时候，任务就进入阻塞态，不参与任务的调度，等到数据到来了，释放一个二值信号量，任务就立即从阻塞态中解除，进入就绪态，然后运行的时候处理数据，这样子系统的资源就会很好的被利用起来。
+其实所谓的操作系统就是为了榨干CPU的性能，不能让CPU闲着，干等着。
+二值信号量用于互斥： 二值信号量一般不用于任务之间的互斥(任务之间互斥的访问一个临界资源，同一时间只能一个任务可以使用)，因为它有优先级反转的缺点，解决互斥的方式就是使用互斥信号量(具有优先级继承的机制能减少优先级反转的影响)，关于优先级反转，优先级继承等下面讲互斥量的时候在讲。
+FreeRTOS 二值信号量相关 API 函数
+关于中断中获取或释放信号量的函数就不在讲解了，在讲解队列的时候已经详细阐述，在任务与在中断中使用的API函数的区别，其实函数的主体代码是一模一样的，就是在中断中：
+1.不能允许阻塞
+2.不能立马发送任务调度
+1.二值信号量的创建
+函数 xSemaphoreCreateBinary()
+此函数用于使用动态方式创建二值信号量，关于动态与静态创建的区别之前的文章详细阐述过，我们这里只讲动态创建就完了，其实xSemaphoreCreateBinary()只是一个宏正在调用的函数为通用队列创建函数xQueueGenericCreate，只不过传入的参数为：创建一个，队列长度为1(队列不是空就是满)，队列项(消息)大小为0(没有后面的数据存储区)，队列类型就为二值信号量。
+uxItemSize为零，则在xQueueGenericCreate()函数内部则不会分配环形存储区，只需要队列头(队列结构体)。
+既然没有环形存储器了，那信号量的个数(资源的数量)用什么表示？ 队列结构体中的uxMessagesWaiting来表示信号量数量如下图所示。
+2.获取信号量函数 xSemaphoreTake()
+从上图可以看出xSemaphoreTake其实是一个宏，真正调用的函数为 xQueueSemaphoreTake()来获取信号量，xQueueSemaphoreTake()看函数名带有一个Queue就知道其实信号量还是队列操作。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/885ab7067331d90040880a5ae06eb774/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-01-27T20:57:20+08:00" />
+<meta property="article:modified_time" content="2023-01-27T20:57:20+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">FreeRTOS-信号量详解</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <blockquote> 
+ <p><strong>✅作者简介：嵌入式入坑者，与大家一起加油，希望文章能够帮助各位！！！！</strong><br> <strong>📃个人主页：</strong><a href="https://blog.csdn.net/k666499436?spm=1011.2421.3001.5343">@rivencode的个人主页</a><br> <strong>🔥系列专栏：</strong><a href="https://blog.csdn.net/k666499436/category_12006244.html">玩转FreeRTOS</a><br> <strong>💬保持学习、保持热爱、认真分享、一起进步！！！</strong></p> 
+</blockquote> 
+<p></p> 
+<div class="toc"> 
+ <h4>目录</h4> 
+ <ul><li><a href="#_8" rel="nofollow">前言</a></li><li><a href="#_15" rel="nofollow">一、信号量的简介</a></li><li><a href="#FreeRTOS_40" rel="nofollow">二、FreeRTOS信号量</a></li><li><ul><li><a href="#1_41" rel="nofollow">1.二值信号量</a></li><li><a href="#2_514" rel="nofollow">2.计数信号量</a></li><li><a href="#3_555" rel="nofollow">3.互斥信号量</a></li><li><ul><li><a href="#1_558" rel="nofollow">1.优先级反转</a></li><li><a href="#2_588" rel="nofollow">2.优先级继承</a></li><li><a href="#3_610" rel="nofollow">3.互斥信号量解析</a></li></ul> 
+   </li><li><a href="#4_706" rel="nofollow">4.递归互斥信号量</a></li><li><ul><li><a href="#1_707" rel="nofollow">1.互斥信号量的缺陷</a></li><li><a href="#2_715" rel="nofollow">2.递归互斥信号量解析</a></li></ul> 
+  </li></ul> 
+  </li><li><a href="#_745" rel="nofollow">三.总结</a></li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_8"></a>前言</h2> 
+<p><strong>本文将详细全方位的讲解FreeRTOS的信量量，其实你学完了<a href="https://blog.csdn.net/k666499436/article/details/128530538?csdn_share_tail=%7B%22type%22:%22blog%22,%22rType%22:%22article%22,%22rId%22:%22128530538%22,%22source%22:%22k666499436%22%7D">《FreeRTOS-消息队列详解》</a>信号量的学习就非常简单了，因为所有的信号量的本质的都是特殊的队列(特殊在哪里：信号量只有队列头部，并没有后面的环形存储区，也就是说信号量只负责消息传递，并不传递数据)，当然这么多信号量也是有区别的，不同的信号量对应不同的应用场景，还是以源码分析为主，源码分析透了，这几种信号量的区别，或者特殊机制(互斥量的优先级继承)就一清二楚了。</strong></p> 
+<p>在学习信号量之前请将FreeRTOS的队列消息了如指掌：<br> <a href="https://blog.csdn.net/k666499436/article/details/128530538?csdn_share_tail=%7B%22type%22:%22blog%22,%22rType%22:%22article%22,%22rId%22:%22128530538%22,%22source%22:%22k666499436%22%7D">《FreeRTOS-消息队列详解》</a></p> 
+<h2><a id="_15"></a>一、信号量的简介</h2> 
+<p><strong><mark>信号量（Semaphore）是一种实现任务间通信的机制，可以实现任务之间同步或临界资源的互斥访问</mark>，其实信号量主要的功能就是实现任务之间的同步与互斥，实现的方式主要就是依靠队列(信号量是特殊的队列)的任务阻塞机制。</strong></p> 
+<p><strong>既然队列也可以实现同步与互斥那为什么还要信号量？<br> 答：信号量相比队列更节省空间，因为实现同步与互斥不需要传递数据，所以信号量没有队列后面的环形存储区，信号量主要就是依靠计数值uxMessagesWaiting（在队列中表示队列现有消息个数，在信号量中表示有效信号量个数）。</strong></p> 
+<p><strong>什么是同步与互斥？</strong></p> 
+<ul><li><strong>1.同步</strong></li></ul> 
+<p><strong>比如说，买包子<br> 我要去买包子，如果包子店没有包子了，则需要等待卖包子的把包子做出来我才能买到包子，这个等待的过程就叫做同步。(在实际应用中：一个采集数据的传感器任务，一个处理数据的任务，则处理数据的任务需要等待传感器去采用数据，则在FreeRTOS系统中等待不能干等着，在该任务等待的过程中，CPU转而可以去执行其他任务，则就可以提高效率，则就是队列的阻塞机制)</strong></p> 
+<ul><li><strong>2.互斥</strong></li></ul> 
+<p><strong>比如说，抢厕所<br> 厕所只有一个，一个人进去上了，另一个人也要上，则必须等待前人上完厕所才能上，等待的过程就是同步，而保护厕所的过程叫做互斥，则厕所就是所谓临界资源，同一时间只能一个人使用厕所，当然前人上完厕所应该提醒等待的人，厕所用完了可以上了，其中本质也是阻塞机制。</strong></p> 
+<p><strong>uxMessagesWaiting作为复用在信号量中表示资源的数量，所有获取信号量的任务都会将该整数减一，当该整数值为零时，则此时想要获取的任务则会进入阻塞态，释放信号量的任务都会将该整数加一，不过当该整数值为最大值时(最大值要看你是什么信号量)，则此时想要释信号量的任务则并不会进入阻塞态，直接返回释放信号量失败。</strong></p> 
+<p><strong><mark>接下来就分别介绍二值信号量、计数信号量、互斥信号量、递归互斥信号量、它们的应用场景、特殊机制、以源码分析的方式，深入理解信号量！！！</mark></strong></p> 
+<p><strong>创建信号量就对应创建特殊队列，获取信号量就对应队列出队，释放信号量就对应队列入队，学好了队列就基本学好了信号量，所以这一章主要是针对互斥量(优先级反转、优先级继承、递归互斥信号量)。</strong></p> 
+<h2><a id="FreeRTOS_40"></a>二、FreeRTOS信号量</h2> 
+<h3><a id="1_41"></a>1.二值信号量</h3> 
+<p><strong>所谓二值信号量其实就是一个队列长度为1，没有数据存储器的队列，而二值则表示计数值uxMessagesWaiting只有0和1两种状态(就是队列空与队列满两种情况)，uxMessagesWaiting在队列中表示队列中现有消息数量，而在信号量中则表示信号量的数量。</strong></p> 
+<p><strong>uxMessagesWaiting为0表示：信号量资源被获取了.<br> uxMessagesWaiting为1表示：信号量资源被释放了<br> 把这种只有 0 和 1 两种情况的信号量称之为二值信号量。</strong></p> 
+<p><strong>由于二值信号量就是特殊的队列，其实它的运转机制就是利用了队列的阻塞机，从而达到实现任务之间的同步与互斥(有优先级反转的缺陷)。</strong></p> 
+<p><strong>二值信号量的应用场景：</strong></p> 
+<ul><li><strong>二值信号量用于同步：</strong></li></ul> 
+<p><strong>在多任务系统中，经常会使用二值信号量来实现任务之间或者任务与中断之间的同步，比如，某个任务需要等待一个标记，那么任务可以在轮询中查询这个标记有没有被置位，则任务在等待的过程也会消耗CPU的资源，如下图所示：</strong></p> 
+<p><img src="https://images2.imgbox.com/b9/97/Me0bCssB_o.png" alt="在这里插入图片描述"><br> <strong>上面的代码看似没问题，其实存在有两个问题：<br> 1.使用了全局变量flagCalcEnd，(如果同时读写flagCalcEnd则会出问题)。<br> 2.任务二在等待任务一计算完sum的值的过程中，任务二也会参与任务调度消耗CPU资源(假设只有这两个任务,优先级相同，且支持时间片轮转，则在任务一在计算sum值的过程中，任务一与任务二轮流执行相同时间片，只不过任务二就一直判断flagCalcEnd的值是否为1，相当于就是浪费CPU的资源)</strong></p> 
+<p><strong>所以二值信号量就可以解决这个问题，在任务一计算sum的值的过程中，任务二应该进入阻塞态让出CPU的使用权，在任务二阻塞期间任务一就可以独占CPU全速计算sum的值，代码如下图所示：</strong><br> <img src="https://images2.imgbox.com/cb/e4/Fsv9zVM7_o.png" alt="在这里插入图片描述"><br> <strong>当任务一计算完sum值，然后才释放信号量(通知任务二有数据来了)，任务二则刚开始sum值未计算完成时，获取信号量会失败，任务进入阻塞态，等待大任务一计算sum完成释放信号量则任务被唤醒，则就可以出来后面的事情。</strong></p> 
+<p><strong>使用信号量的方式就可以完美实现同步，即保证了正确性，有保证了效率(让任务进入阻塞态)。</strong></p> 
+<p><strong>二值信号量在任务与中断同步的应用场景：<br> 我们在串口接收中，我们并不知道什么时候有数据发送过来(等数据过来标记一次)，还有一个处理串口接收到的数据，在任务系统中不可能时时刻刻去判断是否有串口有数据过来(判断标志位)，所以在这种情况下使用二值信号量是很好的办法，当没有数据到来的时候，任务就进入阻塞态，不参与任务的调度，等到数据到来了，释放一个二值信号量，任务就立即从阻塞态中解除，进入就绪态，然后运行的时候处理数据，这样子系统的资源就会很好的被利用起来。</strong><br> <strong>其实所谓的操作系统就是为了榨干CPU的性能，不能让CPU闲着，干等着。</strong></p> 
+<ul><li><strong>二值信号量用于互斥：</strong></li></ul> 
+<p><strong>二值信号量一般不用于任务之间的互斥(任务之间互斥的访问一个临界资源，同一时间只能一个任务可以使用)，因为它有优先级反转的缺点，解决互斥的方式就是使用互斥信号量(具有优先级继承的机制能减少优先级反转的影响)，关于优先级反转，优先级继承等下面讲互斥量的时候在讲。</strong></p> 
+<p><mark>FreeRTOS 二值信号量相关 API 函数</mark></p> 
+<p><img src="https://images2.imgbox.com/c0/a9/ilXrFk8b_o.png" alt="在这里插入图片描述"><br> <strong>关于中断中获取或释放信号量的函数就不在讲解了，在讲解队列的时候已经详细阐述，在任务与在中断中使用的API函数的区别，其实函数的主体代码是一模一样的，就是在中断中：<br> 1.不能允许阻塞<br> 2.不能立马发送任务调度</strong></p> 
+<p><strong><mark>1.二值信号量的创建</mark></strong></p> 
+<p><strong>函数 xSemaphoreCreateBinary()<br> 此函数用于使用动态方式创建二值信号量，关于动态与静态创建的区别之前的文章详细阐述过，我们这里只讲动态创建就完了，其实xSemaphoreCreateBinary()只是一个宏正在调用的函数为通用队列创建函数xQueueGenericCreate，只不过传入的参数为：创建一个，队列长度为1(队列不是空就是满)，队列项(消息)大小为0(没有后面的数据存储区)，队列类型就为二值信号量。</strong><br> <img src="https://images2.imgbox.com/9e/c1/DwRpxldx_o.png" alt="在这里插入图片描述"><br> <strong>uxItemSize为零，则在xQueueGenericCreate()函数内部则不会分配环形存储区，只需要队列头(队列结构体)。</strong></p> 
+<ul><li><strong>既然没有环形存储器了，那信号量的个数(资源的数量)用什么表示？</strong></li></ul> 
+<p><strong>队列结构体中的uxMessagesWaiting来表示信号量数量如下图所示。</strong><br> <img src="https://images2.imgbox.com/70/49/yLYGRdmT_o.png" alt="在这里插入图片描述"></p> 
+<p><strong><mark>2.获取信号量函数 xSemaphoreTake()</mark></strong><br> <img src="https://images2.imgbox.com/ca/2a/jhRX6VlP_o.png" alt="在这里插入图片描述"><br> <strong>从上图可以看出xSemaphoreTake其实是一个宏，真正调用的函数为 xQueueSemaphoreTake()来获取信号量，xQueueSemaphoreTake()看函数名带有一个Queue就知道其实信号量还是队列操作。</strong></p> 
+<p><mark>xQueueSemaphoreTake()的源码分析：</mark></p> 
+<pre><code class="prism language-c">
+
+BaseType_t <span class="token function">xQueueSemaphoreTake</span><span class="token punctuation">(</span> QueueHandle_t xQueue<span class="token punctuation">,</span>
+                                TickType_t xTicksToWait <span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+    BaseType_t xEntryTimeSet <span class="token operator">=</span> pdFALSE<span class="token punctuation">;</span>
+    TimeOut_t xTimeOut<span class="token punctuation">;</span>
+    Queue_t <span class="token operator">*</span> <span class="token keyword">const</span> pxQueue <span class="token operator">=</span> xQueue<span class="token punctuation">;</span>
+
+    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_MUTEXES <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+        BaseType_t xInheritanceOccurred <span class="token operator">=</span> pdFALSE<span class="token punctuation">;</span>
+    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span></span>
+
+    <span class="token comment">/* Check the queue pointer is not NULL. */</span>
+    <span class="token function">configASSERT</span><span class="token punctuation">(</span> <span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/* 检查这是否真的是信号量，在这种情况下，项目大小将为0 */</span>
+    <span class="token function">configASSERT</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>uxItemSize <span class="token operator">==</span> <span class="token number">0</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/*如果调度程序已挂起，则无法阻塞。 */</span>
+    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> <span class="token punctuation">(</span> INCLUDE_xTaskGetSchedulerState <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">(</span> configUSE_TIMERS <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span></span></span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token function">configASSERT</span><span class="token punctuation">(</span> <span class="token operator">!</span><span class="token punctuation">(</span> <span class="token punctuation">(</span> <span class="token function">xTaskGetSchedulerState</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> taskSCHEDULER_SUSPENDED <span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span> xTicksToWait <span class="token operator">!=</span> <span class="token number">0</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span></span>
+
+    <span class="token keyword">for</span><span class="token punctuation">(</span> <span class="token punctuation">;</span> <span class="token punctuation">;</span> <span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* 关中断 */</span>
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/* 信号量是消息大小为0的特殊队列
+		     uxMessagesWaiting在信号量中表示资源数 */</span>
+            <span class="token keyword">const</span> UBaseType_t uxSemaphoreCount <span class="token operator">=</span> pxQueue<span class="token operator">-&gt;</span>uxMessagesWaiting<span class="token punctuation">;</span>
+
+			<span class="token comment">/* 判断信号量是否有资源 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> uxSemaphoreCount <span class="token operator">&gt;</span> <span class="token punctuation">(</span> UBaseType_t <span class="token punctuation">)</span> <span class="token number">0</span> <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">traceQUEUE_RECEIVE</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">/* 信号量资源数减一 */</span>
+                pxQueue<span class="token operator">-&gt;</span>uxMessagesWaiting <span class="token operator">=</span> uxSemaphoreCount <span class="token operator">-</span> <span class="token punctuation">(</span> UBaseType_t <span class="token punctuation">)</span> <span class="token number">1</span><span class="token punctuation">;</span>
+            
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_MUTEXES <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+                    <span class="token punctuation">{<!-- --></span> 
+                        <span class="token comment">/* 判断队列的类型是否为互斥信号量 */</span>
+                        <span class="token keyword">if</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>uxQueueType <span class="token operator">==</span> queueQUEUE_IS_MUTEX <span class="token punctuation">)</span>
+                        <span class="token punctuation">{<!-- --></span>
+					     <span class="token comment">/* 设置互斥信号量的持有者，并更新该任务拥有互斥信号量的数量                 */</span>
+                            pxQueue<span class="token operator">-&gt;</span>u<span class="token punctuation">.</span>xSemaphore<span class="token punctuation">.</span>xMutexHolder <span class="token operator">=</span> <span class="token function">pvTaskIncrementMutexHeldCount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                        <span class="token keyword">else</span>
+                        <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                    <span class="token punctuation">}</span>
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_MUTEXES */</span></span>
+				
+				<span class="token comment">/* 判断信号量的获取阻塞任务列表中是否有任务 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">listLIST_IS_EMPTY</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>xTasksWaitingToSend <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">/* 将阻塞任务从信号量获取阻塞任务列表中移除 */</span>
+                    <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">xTaskRemoveFromEventList</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>xTasksWaitingToSend <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token function">queueYIELD_IF_USING_PREEMPTION</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                    <span class="token keyword">else</span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token comment">/* 开中断 */</span>
+                <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">return</span> pdPASS<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 若信号量无资源不能获取信号量，则需要判断任务是否需要阻塞 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> xTicksToWait <span class="token operator">==</span> <span class="token punctuation">(</span> TickType_t <span class="token punctuation">)</span> <span class="token number">0</span> <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">/* 要发生继承，必须存在初始超时，并且调整后的超时不能变为 0，因为如果为 0，函数就会退出。*/</span>
+                    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_MUTEXES <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+                        <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">configASSERT</span><span class="token punctuation">(</span> xInheritanceOccurred <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_MUTEXES */</span></span>
+
+                    <span class="token comment">/* 信号灯计数为 0，未指定阻止时间（或阻止时间已过期），因此立即退出。 */</span>
+                    <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token function">traceQUEUE_RECEIVE_FAILED</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token keyword">return</span> errQUEUE_EMPTY<span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span> xEntryTimeSet <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">/* 信号量无资源，并指定了阻塞时间(则任务需要阻塞)，
+					所以需要记录下此时系统节拍计数器的值和溢出次数
+					用于下面对阻塞时间进行补偿 */</span>
+                    <span class="token function">vTaskInternalSetTimeOutState</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span>xTimeOut <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    xEntryTimeSet <span class="token operator">=</span> pdTRUE<span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">/* Entry time was already set. */</span>
+                    <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+		<span class="token comment">/* 开中断 */</span>
+        <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* 开中断：此时中断和其他任务可以向信号量获取和获取信号量。 */</span>
+
+		<span class="token comment">/* 挂起任务调度器 */</span>
+        <span class="token function">vTaskSuspendAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">/* 队列上锁 */</span>
+        <span class="token function">prvLockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* 判断阻塞时间补偿后，是否还需要阻塞 */</span>
+        <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">xTaskCheckForTimeOut</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span>xTimeOut<span class="token punctuation">,</span> <span class="token operator">&amp;</span>xTicksToWait <span class="token punctuation">)</span> <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">/* 阻塞时间补偿后，还需要进行阻塞(未超时)
+              再次确认信号量是否为空(无资源) */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">prvIsQueueEmpty</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span> <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">traceBLOCKING_ON_QUEUE_RECEIVE</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_MUTEXES <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token comment">/* 判断队列类型是否为互斥信号量 */</span>
+                        <span class="token keyword">if</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>uxQueueType <span class="token operator">==</span> queueQUEUE_IS_MUTEX <span class="token punctuation">)</span>
+                        <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                            <span class="token punctuation">{<!-- --></span>
+                                <span class="token comment">/* 进行优先级继承，互斥信号量用于解决优先级翻转的问题*/</span>
+                                xInheritanceOccurred <span class="token operator">=</span> <span class="token function">xTaskPriorityInherit</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>u<span class="token punctuation">.</span>xSemaphore<span class="token punctuation">.</span>xMutexHolder <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                            <span class="token punctuation">}</span>
+                            <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                        <span class="token keyword">else</span>
+                        <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                    <span class="token punctuation">}</span>
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* if ( configUSE_MUTEXES == 1 ) */</span></span>
+			    <span class="token comment">/* 将任务添加到队列读取阻塞任务列表中进行阻塞 */</span>
+                <span class="token function">vTaskPlaceOnEventList</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>xTasksWaitingToReceive <span class="token punctuation">)</span><span class="token punctuation">,</span> xTicksToWait <span class="token punctuation">)</span><span class="token punctuation">;</span>
+			    <span class="token comment">/* 解锁队列 */</span>
+                <span class="token function">prvUnlockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token comment">/* 恢复任务调度器，判断是否需要的进行任务切换 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">xTaskResumeAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">portYIELD_WITHIN_API</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">/* 解锁队列 	*/</span>
+                <span class="token function">prvUnlockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token comment">/* 恢复任务调度器 */</span>
+                <span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token punctuation">)</span> <span class="token function">xTaskResumeAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">else</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/* 已超时，解锁队列 */</span>
+            <span class="token function">prvUnlockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">/* 恢复任务调度器 */</span>
+            <span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token punctuation">)</span> <span class="token function">xTaskResumeAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+			<span class="token comment">/* 判断信号量是否为空 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">prvIsQueueEmpty</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span> <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_MUTEXES <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token comment">/* 判断任务是否发生优先级继承 */</span>
+                        <span class="token keyword">if</span><span class="token punctuation">(</span> xInheritanceOccurred <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+                        <span class="token punctuation">{<!-- --></span>
+                            <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                            <span class="token punctuation">{<!-- --></span>
+                                UBaseType_t uxHighestWaitingPriority<span class="token punctuation">;</span>
+
+                                <span class="token comment">/* 互斥锁上的此任务阻塞导致另一个任务继承此任务的优先级。 现在此任务已超时，
+                                优先级应再次取消继承，但只能低至等待相同互斥锁的下一个最高优先级任务。 */</span>
+                                uxHighestWaitingPriority <span class="token operator">=</span> <span class="token function">prvGetDisinheritPriorityAfterTimeout</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                                <span class="token function">vTaskPriorityDisinheritAfterTimeout</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>u<span class="token punctuation">.</span>xSemaphore<span class="token punctuation">.</span>xMutexHolder<span class="token punctuation">,</span> uxHighestWaitingPriority <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                            <span class="token punctuation">}</span>
+                            <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                    <span class="token punctuation">}</span>
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_MUTEXES */</span></span>
+
+                <span class="token function">traceQUEUE_RECEIVE_FAILED</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">return</span> errQUEUE_EMPTY<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> <span class="token comment">/*lint -restore */</span>
+<span class="token punctuation">}</span>
+<span class="token comment">/*-----------------------------------------------------------*/</span>			
+</code></pre> 
+<p><img src="https://images2.imgbox.com/0d/22/UuiVAahu_o.png" alt="在这里插入图片描述"><br> <mark>总结：</mark><br> <strong>获取信号量其实与队列的出队基本差不多的<br> 1.获取信号量资源数uxMessagesWaiting(在二值信号量中只能是0/1，代表信号量为空或满）<br> 2.判断信号量是否有资源uxSemaphoreCount &gt;0 (有资源才能被获取)<br> 3.如果信号量有资源，uxSemaphoreCount 计数值减一<br> 4.如果信号量无资源<br> (1).如果设置的不等待，等待时间为0，则即可返回获取信号量失败的错误<br> (2).如果设置的等待时间为0-portMAX_DELAY，则判断任务是否超时，若未超时，即刻阻塞。<br> (3).如果设置的等待时间portMAX_DELAY，则任务一直阻塞，直到信号量有资源才会被唤醒。</strong></p> 
+<p><strong>其实信号量与队列操作基本是一模一样，只不过信号量不需要去拷贝消息到队列，信号量不会去关注数据，而只在乎资源数。</strong><br> <strong>若xQueueSemaphoreTake()函数中有看不懂的地方请查看</strong><a href="https://blog.csdn.net/k666499436/article/details/128530538?csdn_share_tail=%7B%22type%22:%22blog%22,%22rType%22:%22article%22,%22rId%22:%22128530538%22,%22source%22:%22k666499436%22%7D">《FreeRTOS-消息队列详解》</a></p> 
+<p><strong>3.释放信号量函数 xSemaphoreGive()</strong><br> <img src="https://images2.imgbox.com/21/16/bmQgeN8M_o.png" alt="在这里插入图片描述"><br> <strong>根据上图xSemaphoreGive()其实是一个宏，真正调用的函数为xQueueGenericSend()为队列通用入队函数：</strong><br> <img src="https://images2.imgbox.com/5a/88/SdT1MyhB_o.png" alt="在这里插入图片描述"><br> <strong>相当于xSemaphoreGive()向xQueueGenericSend()函数出传入的参数为<br> 1.xSemaphore：要释放的信号量<br> 2.NULL：信号量不需要传递数据<br> 3.semGIVE_BLOCK_TIME：释放信号量不能阻塞，(信号量计数值达最大值，在释放则直接返回错误)</strong><br> <img src="https://images2.imgbox.com/c2/2a/qOaca7Mt_o.png" alt="在这里插入图片描述"><br> <strong>4.queueSEND_TO_BACK：向队尾入队(这个不重要，因为信号量操作并不会拷贝数据)</strong></p> 
+<p><strong>xQueueGenericSend()函数在讲解队列的文章已经讲解过，这里直接将源码贴出：</strong></p> 
+<p><strong><mark>xQueueGenericSend()函数源码分析：</mark></strong></p> 
+<pre><code class="prism language-c">
+BaseType_t <span class="token function">xQueueGenericSend</span><span class="token punctuation">(</span> QueueHandle_t xQueue<span class="token punctuation">,</span>
+                              <span class="token keyword">const</span> <span class="token keyword">void</span> <span class="token operator">*</span> <span class="token keyword">const</span> pvItemToQueue<span class="token punctuation">,</span>
+                                       TickType_t xTicksToWait<span class="token punctuation">,</span>
+                              <span class="token keyword">const</span> BaseType_t xCopyPosition <span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+    BaseType_t xEntryTimeSet <span class="token operator">=</span> pdFALSE<span class="token punctuation">,</span> xYieldRequired<span class="token punctuation">;</span>
+    TimeOut_t xTimeOut<span class="token punctuation">;</span>
+    Queue_t <span class="token operator">*</span> <span class="token keyword">const</span> pxQueue <span class="token operator">=</span> xQueue<span class="token punctuation">;</span>
+
+    <span class="token function">configASSERT</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">/* 检查参数的合法性：要写入数据地址不为NULL，消息的大小uxItemSize不为0 */</span>
+    <span class="token function">configASSERT</span><span class="token punctuation">(</span> <span class="token operator">!</span><span class="token punctuation">(</span> <span class="token punctuation">(</span> pvItemToQueue <span class="token operator">==</span> <span class="token constant">NULL</span> <span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>uxItemSize <span class="token operator">!=</span> <span class="token punctuation">(</span> UBaseType_t <span class="token punctuation">)</span> <span class="token number">0U</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">/* 限制：当队列写入方式是覆写入队，队列的长度必须为1  */</span>
+    <span class="token function">configASSERT</span><span class="token punctuation">(</span> <span class="token operator">!</span><span class="token punctuation">(</span> <span class="token punctuation">(</span> xCopyPosition <span class="token operator">==</span> queueOVERWRITE <span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>uxLength <span class="token operator">!=</span> <span class="token number">1</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> <span class="token punctuation">(</span> INCLUDE_xTaskGetSchedulerState <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">(</span> configUSE_TIMERS <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span></span></span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token function">configASSERT</span><span class="token punctuation">(</span> <span class="token operator">!</span><span class="token punctuation">(</span> <span class="token punctuation">(</span> <span class="token function">xTaskGetSchedulerState</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> taskSCHEDULER_SUSPENDED <span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span> xTicksToWait <span class="token operator">!=</span> <span class="token number">0</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span></span>
+
+    <span class="token keyword">for</span><span class="token punctuation">(</span> <span class="token punctuation">;</span> <span class="token punctuation">;</span> <span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* 关中断 */</span>
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/* 只有队列有空闲位置或者为覆写入队，队列才能被写入消息 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>uxMessagesWaiting <span class="token operator">&lt;</span> pxQueue<span class="token operator">-&gt;</span>uxLength <span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">(</span> xCopyPosition <span class="token operator">==</span> queueOVERWRITE <span class="token punctuation">)</span> <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">traceQUEUE_SEND</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+				
+				<span class="token comment">/* 此宏用于使能启用队列集 */</span>
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_QUEUE_SETS <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+                	<span class="token punctuation">{<!-- --></span>
+                	  <span class="token comment">/* 关于队列集的代码省略 */</span>
+                	<span class="token punctuation">}</span>
+				
+			    <span class="token keyword">else</span> <span class="token comment">/* configUSE_QUEUE_SETS */</span>
+				   <span class="token punctuation">{<!-- --></span>
+						<span class="token comment">/* 将消息拷贝到队列的环形存储区的指定位置(即消息入队) */</span>
+						xYieldRequired <span class="token operator">=</span> <span class="token function">prvCopyDataToQueue</span><span class="token punctuation">(</span> pxQueue<span class="token punctuation">,</span> pvItemToQueue<span class="token punctuation">,</span> xCopyPosition <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+						<span class="token comment">/* 如果队列有阻塞的读取任务，请立马唤醒它 */</span>
+						<span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">listLIST_IS_EMPTY</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>xTasksWaitingToReceive <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+						<span class="token punctuation">{<!-- --></span>
+							<span class="token comment">/* 将读取阻塞任务从队列读取任务阻塞列表中移除，
+							   因为此时，队列中已经有消息可读取了(可出队) */</span>
+							<span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">xTaskRemoveFromEventList</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>xTasksWaitingToReceive <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+							<span class="token punctuation">{<!-- --></span>
+								<span class="token comment">/* 如果被唤醒的任务比当前任务的优先级高，应立即切换任务 */</span>
+								<span class="token function">queueYIELD_IF_USING_PREEMPTION</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+							<span class="token punctuation">}</span>
+							<span class="token keyword">else</span>
+							<span class="token punctuation">{<!-- --></span>
+								<span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+							<span class="token punctuation">}</span>
+						<span class="token punctuation">}</span>
+						<span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span> xYieldRequired <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+						<span class="token punctuation">{<!-- --></span>
+							<span class="token comment">/* 在互斥信号量释放完且任务优先级恢复后，
+							需要进行任务切换 (这是关于信号量的暂且不要管) */</span>
+							<span class="token function">queueYIELD_IF_USING_PREEMPTION</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+						<span class="token punctuation">}</span>
+						<span class="token keyword">else</span>
+						<span class="token punctuation">{<!-- --></span>
+						     <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+						<span class="token punctuation">}</span>
+			       <span class="token punctuation">}</span>
+		       <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_QUEUE_SETS */</span></span>
+						
+						<span class="token comment">/* 开中断(退出临界区) */</span>
+						<span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+						<span class="token keyword">return</span> pdPASS<span class="token punctuation">;</span>
+		   <span class="token punctuation">}</span>
+		   <span class="token keyword">else</span>
+		   <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">/* 此时不能写入消息，则需要判断是否设置的阻塞时间 */</span>
+				<span class="token keyword">if</span><span class="token punctuation">(</span> xTicksToWait <span class="token operator">==</span> <span class="token punctuation">(</span> TickType_t <span class="token punctuation">)</span> <span class="token number">0</span> <span class="token punctuation">)</span>
+				<span class="token punctuation">{<!-- --></span>
+					<span class="token comment">/* 队列已满，未指定阻止时间（或阻止时间已过期），立即返回入队失败。 */</span>
+					<span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		
+					<span class="token comment">/* 用于调试，不用理会 */</span>
+					<span class="token function">traceQUEUE_SEND_FAILED</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token comment">/* 入队失败，返回队列满错误 */</span>
+					<span class="token keyword">return</span> errQUEUE_FULL<span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+				<span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span> xEntryTimeSet <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+				<span class="token punctuation">{<!-- --></span>
+					<span class="token comment">/* 队列满，并指定了阻塞时间(则任务需要阻塞)，
+					所以需要记录下此时系统节拍计数器的值和溢出次数
+					用于下面对阻塞时间进行补偿 */</span>
+					<span class="token function">vTaskInternalSetTimeOutState</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span>xTimeOut <span class="token punctuation">)</span><span class="token punctuation">;</span>
+					xEntryTimeSet <span class="token operator">=</span> pdTRUE<span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+				<span class="token keyword">else</span>
+				<span class="token punctuation">{<!-- --></span>
+					<span class="token comment">/* Entry time was already set. */</span>
+					<span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token punctuation">}</span>
+		   <span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">/* 开中断(退出临界区) */</span>
+		<span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* 中断和其他任务现在可以向队列发送和接收 */</span>
+		
+		<span class="token comment">/* 挂起任务调度器 */</span>
+        <span class="token function">vTaskSuspendAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">/* 队列上锁 */</span>
+        <span class="token function">prvLockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* 判断阻塞时间补偿后，是否还需要阻塞 */</span>
+        <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">xTaskCheckForTimeOut</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span>xTimeOut<span class="token punctuation">,</span> <span class="token operator">&amp;</span>xTicksToWait <span class="token punctuation">)</span> <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+        <span class="token punctuation">{<!-- --></span>          
+		    <span class="token comment">/* 阻塞时间补偿后，还需要进行阻塞
+		    再次确认队列是否为满 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">prvIsQueueFull</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span> <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 用于调试，不用理会 */</span>
+                <span class="token function">traceBLOCKING_ON_QUEUE_SEND</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token comment">/* 将任务添加到队列写入阻塞任务列表中进行阻塞 */</span>
+                <span class="token function">vTaskPlaceOnEventList</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxQueue<span class="token operator">-&gt;</span>xTasksWaitingToSend <span class="token punctuation">)</span><span class="token punctuation">,</span> xTicksToWait <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">/* 解锁队列 */</span>
+                <span class="token function">prvUnlockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">/* 恢复任务调度器，判断是否需要的进行任务切换 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> <span class="token function">xTaskResumeAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> pdFALSE <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">portYIELD_WITHIN_API</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 解锁队列     */</span>
+                <span class="token function">prvUnlockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token comment">/* 恢复任务调度器 */</span>
+                <span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token punctuation">)</span> <span class="token function">xTaskResumeAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">else</span>
+        <span class="token punctuation">{<!-- --></span>
+            
+		    <span class="token comment">/* 已超时，解锁队列 */</span>
+            <span class="token function">prvUnlockQueue</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">/* 恢复任务调度器 */</span>
+            <span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token punctuation">)</span> <span class="token function">xTaskResumeAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">/* 用于调试，不用理会 */</span>
+            <span class="token function">traceQUEUE_SEND_FAILED</span><span class="token punctuation">(</span> pxQueue <span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">/* 返回队列满错误 */</span>
+            <span class="token keyword">return</span> errQUEUE_FULL<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> <span class="token comment">/*lint -restore */</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/bf/5b/QCd8o6w2_o.png" alt="在这里插入图片描述"><br> <strong>总结：</strong><br> <strong>1.判断信号量计数值是否达最大值， pxQueue-&gt;uxMessagesWaiting &lt; pxQueue-&gt;uxLength ，(在创建二值信号量中，uxLength 赋值为1，则信号量计数值的最大值就为1，也就是说计数值要等于0才能释放信号)</strong><br> <strong>2.若满足信号量释放条件，则计数值(uxMessagesWaiting )加1，并不会拷贝数据，此时计数值为1表示信号量有资源，如果有因为获取信号量而阻塞的任务，则需要将其唤醒(从xTasksWaitingToReceive列表中移除，将任务挂入就绪列表)。</strong><img src="https://images2.imgbox.com/0b/f9/vulXzYNh_o.png" alt="在这里插入图片描述"></p> 
+<p><strong><mark>prvCopyDataToQueue()函数源码分析：</mark></strong><br> <img src="https://images2.imgbox.com/90/83/PEylGoQU_o.png" alt="在这里插入图片描述"><br> <strong>prvCopyDataToQueue()中会走第一个分支，pxQueue-&gt;uxItemSize == ( UBaseType_t ) 0，不会去拷贝数据，到最后，会将uxMessagesWaiting (信号量的计数值加1)。</strong></p> 
+<p><strong>3.若不满足信号量释放条件(计数值达最大值，二值信号量就是1)，因为xSemaphoreGive()带入的参数为阻塞时间为0，则释放信号量不会阻塞，直接返回释放信号量失败。</strong></p> 
+<h3><a id="2_514"></a>2.计数信号量</h3> 
+<p><strong>计数值信号量也与二值信号量一样也是特殊的队列，二值信号量是长度为1的队列，而计数值信号量是长度大于0的队列，他们本质的区别就是应用场景不同二值信号量常用于同步，计数值信号量常用于 事件计数、资源管理，其实如果限定计数值信号量计数值最大值只能为1则就等同于二值信号量。</strong></p> 
+<p><mark><strong>计数值信号量的应用场景：</strong></mark></p> 
+<ul><li><strong>1.事件计数</strong><br> <strong>在这种场合下，每次事件发生后，在事件处理函数中释放计数型信号量（计数型信号量的资源数加 1），其他等待事件发生的任务获取计数型信号量（计数型信号量的资源数减 1），这种场景下，计数型信号量的资源数一般在创建时设置为 0。</strong></li></ul> 
+<p><strong>例如买包子<br> 最开始包子还没做，包子这个资源的数量为0，等做好一个包子，包子的资源数就加1，而卖掉一个包子，包子的资源数就要减一，当包子没有的时候，买包子的人就需要等待包子做好，这个过程就是阻塞。</strong></p> 
+<ul><li><strong>2.资源管理</strong><br> <strong>在这种场合下，计数型信号量的资源数代表着共享资源的可用数量，一个任务想要访问共享资源，就必须先获取这个共享资源的计数型信号量，之后在成功获取了计数型信号量之后，才可以对这个共享资源进行访问操作，当然，在使用完共享资源后也要释放这个共享资源的计数型信号量。在这种场合下，计数型信号量的资源数一般在创建时设置为受其管理的共享资源的最大可用数量</strong></li></ul> 
+<p><strong>例如停车场的空车位<br> 最开始空车位为最大值，停一辆车则空车位资源数就减一，出去一辆空车位就加一，当全部停满时，在有车来停则停车失败可以选择等待(等待有空车位)，当空车位为最大值时则不能再继续出车(因为停车场已经没有车了)。</strong></p> 
+<p><mark>FreeRTOS 计数值信号量相关 API 函数</mark><br> <img src="https://images2.imgbox.com/83/48/pSQ8o0PP_o.png" alt="在这里插入图片描述"><br> <strong>由上图可知，计数值信号量与二值信号量相比，除了创建函数不同其他函数都相同，所以主要将计数值信号量的创建函数。</strong></p> 
+<p><strong><mark>1.计数值信号量的创建</mark></strong><br> <strong>动态创建计数值信号量函数 xSemaphoreCreateCounting()</strong><br> <img src="https://images2.imgbox.com/d4/00/dQue3MEG_o.png" alt="在这里插入图片描述"><br> <strong>由上图可知xSemaphoreCreateCounting其实只是一个宏定义，真正调用的是xQueueCreateCountingSemaphore()函数。</strong></p> 
+<p><img src="https://images2.imgbox.com/c7/16/2Ndm7EBK_o.png" alt="在这里插入图片描述"><strong>xQueueCreateCountingSemaphore()函数原型：</strong></p> 
+<p><strong>1.函数参数<br> (1).uxMaxCount：信号量计数值的最大值<br> (2).uxInitialCount：信号量计数值的初始值</strong><br> <strong>2.函数返回值</strong><br> <strong>(1).创建成功，返回信号量句柄<br> (2).创建失败</strong></p> 
+<p><mark><strong>xQueueCreateCountingSemaphore()函数源码分析</strong></mark><br> <img src="https://images2.imgbox.com/2f/a3/yapX6POD_o.png" alt="在这里插入图片描述"><br> <strong>其实创建计数值信号量函数很简单，里面还是调用了队列创建函数xQueueGenericCreate()，创建一个长度为uxMaxCount，消息大小为0的特殊队列即计数值信号量，当然创建成功后，将计数值初值赋值成uxInitialCount，就是这么简单，然后其他获取、释放信号量等操作与二值信号量一模一样。</strong></p> 
+<h3><a id="3_555"></a>3.互斥信号量</h3> 
+<p><strong>前面的二值信号量/计数值信号量其实也可以实现互斥，那还要互斥信号量干嘛，前面也说过二值信号量存在优先级反转的缺点，而解决方法就是优先级继承，优先级继承就是互斥信号量的特性，则互斥信号量的本质就是具有优先级继承的二值信号量，所以我们只要搞明白什么是优先级反转和优先级继承，然后再分析互斥信号量的函数源码搞明白优先级继承在代码上如何体现。</strong></p> 
+<h4><a id="1_558"></a>1.优先级反转</h4> 
+<p><strong>什么叫做优先级反转，简单来说就是低优先级的任务霸占CPU资源，导致高优先级任务无法运行的情况：低优先级的任务持有一个被高优先级任务所需要的共享资源(低优先级给共享资源上锁，高优先级需要等待低优先级解锁共享资源，而在这期间正好一个中等优先级的任务打断低优先级任务去执行，则低优先级任务迟迟不能运行则不能给共享资源解锁，导致高优先级要一直等待(阻塞)，而中等优先级的任务正在运行(逍遥法外))。</strong></p> 
+<p><strong>优先级反转示意：</strong></p> 
+<p><strong>假设有三个任务A,B,C，优先级分别为低、中、高优先级，假设任务A先运行(中、高优先级的任务在阻塞)调用上锁函数(获取二值信号量，使用某个共享资源)，然后任务B解除阻塞抢占任务A，任务B运行，最后任务C解除阻塞抢占任务B，任务C运行，任务C想要去获取锁(获取二值信号量，使用某个共享资源)，问题是任务A还没有释放这个锁(释放二值信号量)，则任务C想要获取这个锁就会失败进入阻塞状态，任务C进入阻塞态后，任务B中等优先级的任务一直执行，这样一来任务A就无法运行（无法去解锁），则任务C(优先级最高的任务会一直阻塞)，则最终导致明明任务C的优先级最高反而得不到执行，而中等优先级的任务B一直执行，则就是所谓的优先级反转，这种情况在实时操作系统中是绝对不允许的。</strong></p> 
+<p><img src="https://images2.imgbox.com/9c/b2/8NCU0qeN_o.png" alt="在这里插入图片描述"><br> <strong>优先级反转实验演示：</strong><br> <img src="https://images2.imgbox.com/02/22/yAyhHeH2_o.png" alt="在这里插入图片描述"><br> <strong>创建三个优先级为低、中、高的任务，然后再创建一个二值信号量(锁)</strong></p> 
+<p><strong>低优先级任务：</strong></p> 
+<p><strong>低优先级任务很简单，获取二值信号量(上锁)，然后耗时很久再解锁。</strong><br> <img src="https://images2.imgbox.com/ba/ed/nh5mjGfC_o.png" alt="在这里插入图片描述"><br> <strong>中等优先级任务：</strong><br> <strong>中等优先级任务，就开头先进入阻塞，阻塞20ms(先让低优先级任务先执行)，后面就啥事不干。</strong><br> <img src="https://images2.imgbox.com/e3/a5/KKfH0v5V_o.png" alt="在这里插入图片描述"><br> <strong>高优先级任务：</strong><br> <strong>高优先级任务，就开头先进入阻塞，阻塞10ms(先让低优先级任务先执行)，然后去获取锁(获取二值信号量)，然后释放二值信号量。</strong><br> <img src="https://images2.imgbox.com/8e/ad/ai1OG8hq_o.png" alt="在这里插入图片描述"><br> <strong>实验结果分析：</strong><br> <strong>我就不废话了，解析全在图中。</strong><br> <img src="https://images2.imgbox.com/d3/9e/9zZpJliw_o.png" alt="在这里插入图片描述"><br> <strong>导致这种严重优先级反转的问题的根本原因在于持有锁的低优先级任务因为优先级低，而得不到执行，得不到执行的话，就无法解锁，无法解锁就导致高优先级的任务获取锁会失败，从而导致高优先级任务一直在阻塞状态。</strong></p> 
+<p><strong>所以解决方式就是优先级继承，不是说低优先级任务无法执行嘛，那我就在高优先级任务进入阻塞之前将低优先级任务的优先级提升至与高优先级一致，这样等高优先级任务进入阻塞之后，低优先级任务就能继承高优先级任务的优先级，这样低优先级任务就能尽快执行(从而解锁，让高优先级能够获取锁)。</strong></p> 
+<h4><a id="2_588"></a>2.优先级继承</h4> 
+<p><strong>优先级继承：暂时提高某个占有某种资源的低优先级任务的优先级，使之与在所有等待该资源的任务中优先级最高那个任务的优先级相等，而当这个低优先级任务执行完毕释放该资源时，<mark>优先级重新回到初始设定值</mark>。</strong></p> 
+<p><strong>优先级继承示意图：</strong></p> 
+<p><img src="https://images2.imgbox.com/42/f0/hVQVdkai_o.png" alt="在这里插入图片描述"><br> <strong>当高优先级任务获取锁进入阻塞之前，会将低优先级任务的优先级提升至与高优先级任务一样，则等高优先级任务C进入阻塞之后，则低优先级任务A继承任务C的优先级，则任务A立马执行(任务B没机会执行)，则任务A继续执行就能尽快开锁(释放信号量)，这样就能极大的减少优先级反转带来的影响。</strong></p> 
+<p><mark>这里为什么说是减少优先级反转带来的影响，而不是消除优先级反转？</mark></p> 
+<p><strong>因为优先级反转概念是指一个低优先级的任务持有一个被高优先级任务所需要的共享资源，也就是说当因为任务A上锁之后，然后任务C来获取锁失败而进入阻塞态，在高优先级任务进入阻塞态的时候已经是优先级反转了，而优先级继承只是让任务A尽快执行(尽快解锁)，让高优先级任务C尽快解除阻塞态，<mark>所以优先级继承只能是缩短优先级反转的时间</mark>。</strong></p> 
+<p><strong>优先级继承实验演示：</strong></p> 
+<p><img src="https://images2.imgbox.com/c4/12/QeQ1vcVT_o.png" alt="在这里插入图片描述"><br> <strong>其中就是改变了信号量的种类，从二值信号量变成互斥信号量，其他都不变，因为互斥信号量有优先级继承的机制。</strong></p> 
+<p><strong>实验结果分析：</strong><br> <img src="https://images2.imgbox.com/f5/7e/3xxcj3P6_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="3_610"></a>3.互斥信号量解析</h4> 
+<p><strong>互斥信号量相当于是一个具有优先级继承机制的二值信号量，所以互斥信号量就是为了降低优先级反转所带来的影响。</strong></p> 
+<p><strong>互斥信号量的应用场景</strong><br> <strong>一般用于保护共享临界资源，从而实现独占式访问，而可以降低优先级反转带来的影响。</strong></p> 
+<p><strong>实际应用场景：<br> 比如独占使用串口，不可能两个任务同时向串口发送、接收数据，此时就可以使用互斥量来互斥的使用串口(另一个任务必须等待当前正在使用传递任务使用完串口才能使用)</strong></p> 
+<p><strong>注意：<br> 1.优先级继承并不是完全能避免优先级反转只能是减低其影响(前面已经解释过)<br> 2.互斥信号量不能用于中断服务函数中，原因如下：<br> (1) 互斥信号量有任务优先级继承的机制，但是中断不是任务，没有任务优先级，所以互斥信号量只能用与任务中，不能用于中断服务函数。<br> (2) 中断服务函数中不能因为要等待互斥信号量而设置阻塞时间进入阻塞态</strong></p> 
+<p><strong>所以分析互斥信号量就是搞明白优先级继承机制，还有一些与二值信号量的区别。</strong></p> 
+<p><mark>FreeRTOS 互斥信号量相关 API 函数</mark><br> <img src="https://images2.imgbox.com/49/e8/hmFxulc0_o.png" alt="在这里插入图片描述"><br> <strong>由图可知获取、释放信号量的函数与二值信号量是一样的但是函数里面有关于互斥信号量的条件编译。</strong></p> 
+<p><strong><mark>1.互斥信号量的创建</mark></strong><br> <strong>函数 xSemaphoreCreateMutex()原型：</strong><br> <img src="https://images2.imgbox.com/45/a0/ETjWxzn5_o.png" alt="在这里插入图片描述"><br> <strong>xSemaphoreCreateMutex其实是一个宏，真正执行的是xQueueCreateMutex()函数：</strong><br> <img src="https://images2.imgbox.com/e8/0c/e62dV1AS_o.png" alt="在这里插入图片描述"><br> <strong>其实xQueueCreateMutex()函数里面最终调用的还是队列创建函数xQueueGenericCreate()，且传入的参数与二值信号量一样，同样为队列长度为1的特殊队列，与二值信号量不同是里面还调用了prvInitialiseMutex函数。</strong><br> <img src="https://images2.imgbox.com/e9/59/CYfrrBd9_o.png" alt="在这里插入图片描述"><br> <strong><mark>在创建互斥信号量时候会释放一次信号量，表示一开始就有资源，而二值信号量则不会释放。</mark></strong></p> 
+<p><strong>接下来就是看在什么时候进行优先级继承，什么时候解除优先级继承？</strong></p> 
+<p><strong>进行优先级继承的时候肯定是高优先级任务去获取信号量失败然后让低优先级任务继承它的优先级。<br> 进行解除优先级继承的时候肯定是低优先级释放信号量，此时它的任务完成需要恢复成之前的优先级。</strong></p> 
+<p><strong>所以优先级继承发生在获取信号量，解除优先级继承发生在释放信号量。</strong></p> 
+<ul><li><strong>1.优先级继承</strong></li></ul> 
+<p><strong><mark>2.获取信号量函数 xSemaphoreTake()</mark></strong></p> 
+<p><strong>xSemaphoreTake真正执行的是xQueueSemaphoreTake()函数。</strong><br> <mark>xQueueSemaphoreTake()的源码分析：</mark><br> <img src="https://images2.imgbox.com/26/16/R1rjmoYJ_o.png" alt="在这里插入图片描述"><br> <strong>优先级继承肯定发生正在高优先级任务进入阻塞之前，调用了xTaskPriorityInherit()函数进行优先级继承。</strong><br> <img src="https://images2.imgbox.com/a9/f0/Hl7R9qkG_o.png" alt="在这里插入图片描述"><br> <strong>xTaskPriorityInherit()函数源码分析：</strong><br> <img src="https://images2.imgbox.com/2d/39/8jCGSyi5_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>xTaskPriorityInherit()函数主要内容：</strong></p> 
+<p><strong>1.判断互斥信号量是否被持有，然后就是判断如果互斥锁持有者的优先级低于尝试获取互斥锁的任务的优先级(高优先级任务)，才要发送优先级继承，因为互斥锁持有者已经是高优先级任务了，它还需要继承优先级嘛？<br> 因为我们优先级继承的目的就是为了提高持有互斥锁的任务的优先级，能更快解锁</strong>。<br> <img src="https://images2.imgbox.com/17/4b/g8LH5b70_o.png" alt="在这里插入图片描述"><br> <strong>xQueueSemaphoreTake函数中会记录谁持有互斥信号量，并记录该任务拥有互斥信号量的数目uxMutexesHeld，(因为一个任务不止可以拥有一个互斥信号量)</strong><br> <img src="https://images2.imgbox.com/da/97/OjJ7xndx_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>2.所谓继承优先级，就是该任务的优先级修改成与高优先级任务一样，然后将任务添加到优先级对应的就绪列表中(这样任务就可以以新的优先级参与调度)</strong><br> <img src="https://images2.imgbox.com/75/51/brs9AyE5_o.png" alt="在这里插入图片描述"></p> 
+<ul><li><strong>2.解除优先级继承</strong></li></ul> 
+<p><strong>释放信号量函数 xSemaphoreGive()</strong><br> <img src="https://images2.imgbox.com/b0/65/V74iND8p_o.png" alt="在这里插入图片描述"><br> <strong>根据上图xSemaphoreGive()其实是一个宏，真正调用的函数为xQueueGenericSend()为队列通用入队函数：</strong><br> <img src="https://images2.imgbox.com/b4/31/KT50jGIn_o.png" alt="在这里插入图片描述"><br> <strong>解除优先级继承藏在prvCopyDataToQueue()函数中，调用xTaskPriorityDisinherit()函数解除优先级继承。</strong></p> 
+<p><img src="https://images2.imgbox.com/c7/16/5ory44Zh_o.png" alt="在这里插入图片描述"><br> <strong>xTaskPriorityDisinherit()函数源码分析:</strong><br> <img src="https://images2.imgbox.com/7f/01/C3fFtnLP_o.png" alt="在这里插入图片描述"><br> <strong>1.判断任务是否已经继承了优先级，判断依据就是uxBasePriority(最初优先级)，与当前优先级不一致</strong><br> <strong>2.只能是任务只持有一个互斥量的情况下才能取消优先级继承(因为当你持有信号量就有可能发生优先级反转)</strong><br> <img src="https://images2.imgbox.com/c1/79/5W0tmb9w_o.png" alt="在这里插入图片描述"></p> 
+<p><img src="https://images2.imgbox.com/b0/5f/IXoYA1kM_o.png" alt="在这里插入图片描述"><br> <strong>3.恢复任务优先级到最初值(将任务添加到优先级对应的就绪列表中)，更新任务事件列表项的辅助排序值(因为优先级改变了)。</strong><br> <img src="https://images2.imgbox.com/a5/91/ZE0r7AXv_o.png" alt="在这里插入图片描述"><br> <strong>关于事件列表请参考：</strong><a href="https://blog.csdn.net/k666499436/article/details/128530538?spm=1001.2014.3001.5501">FreeRTOS-消息队列详解</a></p> 
+<p><strong>总结：</strong><br> <strong>所谓优先级继承，其实就是低优先级任务继承高优先级任务的优先级，<br> 发生优先级继承：在高优先级任务获取信号量失败(低优先级任务已经持有信号量)，进入阻塞态之前，将持有信号量的低优先级任务的优先级提升</strong></p> 
+<p><strong>解除优先级继承：在持有信号量的低优先级任务释放信号量的时候，将自己的优先级恢复到初始值(因为已经释放了信号量，完成了任务)</strong></p> 
+<p><strong>而改变任务优先级的本质就是任务改变任务所挂入的优先级对应的就绪链表。</strong></p> 
+<p><strong>所以互斥信号量与二值信号量的区别在于：<br> 1.互斥信号量创建时就有资源(因为是专门针对互斥的)，不需要手动释放一次信号量，而二值信号量则没有。<br> 2.互斥信号量具有优先级继承的机制，能减少优先级反转带来的影响。</strong></p> 
+<h3><a id="4_706"></a>4.递归互斥信号量</h3> 
+<h4><a id="1_707"></a>1.互斥信号量的缺陷</h4> 
+<p><strong>1.并没有实现谁持有锁就由谁释放</strong><br> <strong>也就是说，比如任务A想要去独占的使用串口资源(上锁)，但是有一个任务不讲武德直接还没等任务A解锁(释放信号量)，就偷偷去解锁，则串口资源就被失去保护，则任何任务都可以去使用串口(则就会打印的乱七八糟)。</strong><br> <img src="https://images2.imgbox.com/60/27/yPA8zJp7_o.png" alt="在这里插入图片描述"><br> <strong>2.不能递归上锁，会导致死锁</strong><br> <img src="https://images2.imgbox.com/71/f4/Minbavz3_o.png" alt="在这里插入图片描述"><br> <strong>而递归互斥信号量则完美实现了这两点，而且递归互斥信号量也是基于互斥信号量的，所以一样具有优先级继承的机制。</strong></p> 
+<h4><a id="2_715"></a>2.递归互斥信号量解析</h4> 
+<p><mark>FreeRTOS 递归互斥信号量相关 API 函数</mark><br> <img src="https://images2.imgbox.com/fe/6a/YAI7gvXV_o.png" alt="在这里插入图片描述"><br> <strong>有上图可知，递归互斥信号量相关函数具有Recursive(递归)字样</strong></p> 
+<p><strong>1.递归互斥信号量的创建</strong></p> 
+<p><strong>函数 xSemaphoreCreateRecursiveMutex()</strong><br> <img src="https://images2.imgbox.com/fe/09/dumS7OmQ_o.png" alt="在这里插入图片描述"><strong>真正调用的是xQueueCreateMutex()函数：</strong><br> <img src="https://images2.imgbox.com/e9/26/xTyNkbm9_o.png" alt="在这里插入图片描述"><br> <strong>创建递归互斥信号量与互斥信号量是一模一样的</strong><br> <strong>2.释放递归互斥信号量</strong></p> 
+<p><strong>xSemaphoreGiveRecursive()函数原型：</strong><br> <img src="https://images2.imgbox.com/c5/ce/T1YFJ91S_o.png" alt="在这里插入图片描述"><strong>真正调用的是xQueueGiveMutexRecursive()函数：</strong><img src="https://images2.imgbox.com/5d/96/WjDnPaTO_o.png" alt="在这里插入图片描述"><br> <strong>源码分析：</strong><br> <strong>1.想要释放递归互斥信号量必须是信号量的持有者(这样就实现了谁上锁就由谁来解锁)</strong><br> <img src="https://images2.imgbox.com/34/f1/r8uxI8ig_o.png" alt="在这里插入图片描述"><br> <strong>2.让uxRecursiveCallCount减一，因为uxRecursiveCallCount表示该信号量上锁了多少次，当uxRecursiveCallCount等于0就说明递归互斥信号量释放了最后一次信号量，则就要真正去执行一次释放。</strong><br> <img src="https://images2.imgbox.com/ed/8d/VKGtMxCI_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>3.获取递归互斥信号量</strong></p> 
+<p><strong>xSemaphoreTakeRecursive()函数原型：</strong><br> <img src="https://images2.imgbox.com/a4/08/4GzFV4w3_o.png" alt="在这里插入图片描述"><br> <strong>xQueueTakeMutexRecursive源码分析</strong>：<br> <img src="https://images2.imgbox.com/a4/ca/9MHKdNqE_o.png" alt="在这里插入图片描述"><br> <strong>源码分析看代码就行<br> 反正实现由谁上锁就由谁解锁，递归上锁功能是依靠xMutexHolder、uxRecursiveCallCount两个变量实现的。</strong></p> 
+<h2><a id="_745"></a>三.总结</h2> 
+<p><strong>学习FreeRTOS就是要刨根问底，深入底层底层底层！！！</strong></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/8c70f0120f9063257b67dc75b046ee7f/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">MySQL插入数据</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f32bdd04cee35f010f09d019895bbe11/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">最详细蓝桥杯嵌入式完整教程（一）：工程模块建立</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

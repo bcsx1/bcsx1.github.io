@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>flink源码分析之功能组件(六)-心跳组件 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="flink源码分析之功能组件(六)-心跳组件" />
+<meta property="og:description" content="简介 本系列是flink源码分析的第二个系列，上一个《flink源码分析之集群与资源》分析集群与资源，本系列分析功能组件，kubeclient，rpc，心跳，高可用，slotpool，rest，metrics，future。
+本文解释心跳组件，心跳组件监听组件间连接活性，超时触发重连，保证连接有效性；断连后通知并释放资源，心跳可以带荷载，作为组件间数据交换的方式
+心跳组件依赖rpc组件实现通讯，rpc的解释可参考本系列flink源码分析之功能组件(三)-rpc组件
+心跳组件 心跳组件通过定时心跳，监视组件被管理组件的存活，心跳可携带载荷信息，实现轻量级实时/准实时的信息交换
+心跳组件依赖rpc组件实现通讯服务，关于rpc组件参考相关的分析章节
+心跳组件有两个角色：sender和receiver。检测动作是Sender主动发起请求，Reciver给Sender回一个心跳，在这一个来回sender和receiver相互检测。
+设计类图 上图是心跳设计类图
+HeartbeatServices 与其他模块一样，flink的代码习惯， ***Services是构建工厂，负责抓取配置，构建服务
+HeartbeatTarget 监控目标接口，requestHeartbeat/receiveHeartbeat两个方法，分别是发送心跳请求，接收心跳请求
+HeartbeatSender HeartbeatTarget发送(Sender)实现基类，屏蔽receiveHeartbeat方法
+HeartbeatReceiver HeartbeatTarget接收(Receive)实现基类，屏蔽senderHeartbeat方法
+HeartbeatMonitor 心跳监测器，管理HeartbeatTarget，设置心跳监听器，超时通知
+DefaultHeartbeatMonitor 心跳检测器实现，内置定时执行器，定时检查超时，通知客户
+HeartbeatManager HeartbeatTarget管理器，负责启停HeartbeatTarget，自身是HeartbeatTarget实现，形成合成模式，操作HeartbeatTarget集合与操作单个HeartbeatTarget一致的接口，有两个实现：
+HearbeatManagerImpl 实现为心跳Receiver器管理器
+HeartbeatManagerSenderImpl 实现为心跳Sender管理器，继承自HearbeatManagerImpl，自身实现了Runnable接口，并内置ScheduledExecutor，定时发送心跳请求
+管理器主要方法是monitorTarget，增加心跳目标
+HeartbeatListener 用户实现 心跳监听，载荷通知；负责构建载荷
+心跳 心跳是心跳组件的主要职责，sender和receive通过心跳，相互检测监控状态，可搭载负载，实时交换信息。
+心跳的过程解释在下面示例章节结合作业管理器-任务管理器心跳解释
+超时检测 超时是Sender在设定时间未收到目标返回心跳，认为目标组件已不可用，通知上级调用者心跳超时
+超时检测是DefaultHeartbeatMonitor负责，
+重置超时检查 前面解释了，DefaultHeartbeatMonitor实现了Runable接口，内置ScheduledExecutor
+下面方法resetHeartbeatTimeout，重置延时执行方法，延时也是超时的时间，方法有两重意思，停止前面的延时；设置新的延时
+DefaultHeartbeatMonitor构造函数调用了该方法初始设置
+run方法 延时时间到了，也即心跳超时，State的4个状态，其中
+UNREACHABLE rpc异常
+CANCELED 认为停止
+TIMEOUT 只有run方法设置
+因此，不执行超时的唯一方法就是不执行run方法，即延时到达前叫停ScheduledExecutor
+重设超时 reportHeartbeat报告收到心跳，调用重置超时检查，重新设置延时，实际就是叫停并重置ScheduledExecutor
+reportHeartbeat是HearbeatManagerImpl接收到心跳返回时调用receiveHeartbeat，调用reportHearbeat，就是说，在心跳检查延时前收到心跳回应，心跳超时检查就会被重置
+示例 本节以作业管理器与任务管理器心跳为例，解释心跳组件原理和使用。作业管理器是心跳管理者，管理多个任务管理器
+构建 作业管理器和任务管理器构建心跳管理器，并设置心跳目标
+作业管理器 作业管理器对任务管理器的心跳管理是Sender，即心跳发起者
+作业管理器的心跳管理器设置任务管理器心跳目标，指向任务管理器
+心跳目标继承自HeartbeatSender，并带载荷AllocatedSlotReport，任务管理器的资源slot分配报告
+任务管理器 与作业管理器对应，任务管理器对作业管理器的心跳管理器是Reciver，接收者；心跳管理器设置作业管理器心跳目标，继承自HeartbeatReceiver
+心跳 心跳的流程，定时请求--&gt;rpc发送请--&gt;接收方处理心跳请求，返回--&gt;发送方处理接收方的返回
+请求 发送管理器自身实现Runable接口，使用Executor延时发送心跳请求" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/80a8c5760a29105d6796a7f4ed00728a/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-12T14:16:39+08:00" />
+<meta property="article:modified_time" content="2023-12-12T14:16:39+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">flink源码分析之功能组件(六)-心跳组件</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2><a name="_Toc146701500">简介</a></h2> 
+<p>     本系列是flink源码分析的第二个系列，上一个《flink源码分析之集群与资源》分析集群与资源，本系列分析功能组件，kubeclient，rpc，心跳，高可用，slotpool，rest，metrics，future。</p> 
+<p>     本文解释心跳组件，心跳组件监听组件间连接活性，<strong>超时</strong>触发重连，保证连接有效性；断连后通知并释放资源，心跳可以带荷载，作为组件间数据交换的方式</p> 
+<p style="margin-left:0;text-align:justify;">     心跳组件依赖rpc组件实现通讯，rpc的解释可参考<a href="https://mp.csdn.net/mp_blog/creation/editor/134627770" title="本系列flink源码分析之功能组件(三)-rpc组件">本系列flink源码分析之功能组件(三)-rpc组件</a></p> 
+<h2>心跳组件</h2> 
+<p style="margin-left:0;text-align:justify;">    心跳组件通过定时心跳，监视组件被管理组件的存活，心跳可携带载荷信息，实现轻量级实时/准实时的信息交换</p> 
+<p style="margin-left:0;text-align:justify;">    心跳组件依赖rpc组件实现通讯服务，关于rpc组件参考相关的分析章节</p> 
+<p style="margin-left:0;text-align:justify;">    心跳组件有两个角色：sender和receiver。检测动作是Sender主动发起请求，Reciver给Sender回一个心跳，在这一个来回sender和receiver相互检测。</p> 
+<h3>设计类图</h3> 
+<p class="img-center"><img alt="" height="471" src="https://images2.imgbox.com/84/9e/T6DreAH9_o.png" width="700"></p> 
+<p style="margin-left:0;text-align:justify;">上图是心跳设计类图</p> 
+<p style="margin-left:0;text-align:justify;"><strong>HeartbeatServices</strong>  与其他模块一样，flink的代码习惯， ***Services是构建工厂，负责抓取配置，构建服务</p> 
+<p style="margin-left:0;text-align:justify;"><strong>HeartbeatTarget</strong>  监控目标接口，requestHeartbeat/receiveHeartbeat两个方法，分别是发送心跳请求，接收心跳请求</p> 
+<p style="margin-left:0;text-align:justify;"><strong>     HeartbeatSender</strong>  HeartbeatTarget发送(Sender)实现基类，屏蔽receiveHeartbeat方法</p> 
+<p style="margin-left:0;text-align:justify;"><strong>     HeartbeatReceiver</strong> HeartbeatTarget接收(Receive)实现基类，屏蔽senderHeartbeat方法</p> 
+<p style="margin-left:0;text-align:justify;"><strong>HeartbeatMonitor</strong>  心跳监测器，管理HeartbeatTarget，设置心跳监听器，超时通知</p> 
+<p style="margin-left:0;text-align:justify;">    <strong>DefaultHeartbeatMonitor</strong> 心跳检测器实现，内置定时执行器，定时检查超时，通知客户</p> 
+<p style="margin-left:0;text-align:justify;"><strong>HeartbeatManager</strong>  HeartbeatTarget管理器，负责启停HeartbeatTarget，自身是HeartbeatTarget实现，形成合成模式，操作HeartbeatTarget集合与操作单个HeartbeatTarget一致的接口，有两个实现：</p> 
+<p style="margin-left:0;text-align:justify;"><strong>    HearbeatManagerImpl</strong> 实现为心跳Receiver器管理器</p> 
+<p style="margin-left:0;text-align:justify;"><strong>    HeartbeatManagerSenderImpl</strong> 实现为心跳Sender管理器，继承自<strong>HearbeatManagerImpl</strong><strong>，</strong>自身实现了Runnable接口，并内置ScheduledExecutor，定时发送心跳请求</p> 
+<p style="margin-left:0;text-align:justify;">管理器主要方法是monitorTarget，增加心跳目标</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="48" src="https://images2.imgbox.com/c2/a2/1pyq24Z0_o.png" width="915"></p> 
+<p style="margin-left:0;text-align:justify;"><strong>HeartbeatListener</strong>  用户实现 心跳监听，载荷通知；负责构建载荷</p> 
+<h3>心跳</h3> 
+<p style="margin-left:0;text-align:justify;">      心跳是心跳组件的主要职责，sender和receive通过心跳，相互检测监控状态，可搭载负载，实时交换信息。</p> 
+<p style="margin-left:0;text-align:justify;">心跳的过程解释在下面示例章节结合作业管理器-任务管理器心跳解释</p> 
+<h3>超时检测</h3> 
+<p style="margin-left:0;text-align:justify;">      超时是Sender在设定时间未收到目标返回心跳，认为目标组件已不可用，通知上级调用者心跳超时</p> 
+<p style="margin-left:0;text-align:justify;">     超时检测是DefaultHeartbeatMonitor负责，</p> 
+<h4 style="text-align:justify;">重置超时检查</h4> 
+<p style="margin-left:0;text-align:justify;">前面解释了，DefaultHeartbeatMonitor实现了Runable接口，内置ScheduledExecutor</p> 
+<p style="margin-left:0;text-align:justify;">下面方法resetHeartbeatTimeout，重置延时执行方法，延时也是超时的时间，方法有两重意思，停止前面的延时；设置新的延时</p> 
+<p class="img-center"><img alt="" height="221" src="https://images2.imgbox.com/d7/19/MHAlqCiU_o.png" width="698"></p> 
+<p style="margin-left:0;text-align:justify;">DefaultHeartbeatMonitor构造函数调用了该方法初始设置</p> 
+<h4 style="text-align:justify;">run方法</h4> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="133" src="https://images2.imgbox.com/b2/8d/IkIMAPdd_o.png" width="492">  </p> 
+<p style="margin-left:0;text-align:justify;">延时时间到了，也即心跳超时，State的4个状态，其中</p> 
+<p style="margin-left:0;text-align:justify;">        UNREACHABLE rpc异常</p> 
+<p style="margin-left:0;text-align:justify;">        CANCELED 认为停止</p> 
+<p style="margin-left:0;text-align:justify;">        TIMEOUT 只有run方法设置</p> 
+<p style="margin-left:0;text-align:justify;">因此，不执行超时的唯一方法就是不执行run方法，即延时到达前叫停ScheduledExecutor</p> 
+<h4 style="text-align:justify;">重设超时</h4> 
+<p style="margin-left:0;text-align:justify;">reportHeartbeat报告收到心跳，调用重置超时检查，重新设置延时，实际就是叫停并重置ScheduledExecutor</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="137" src="https://images2.imgbox.com/90/a1/tNIHnWYy_o.png" width="550">reportHeartbeat是<strong>HearbeatManagerImpl</strong>接收到心跳返回时调用receiveHeartbeat，调用reportHearbeat，就是说，在心跳检查延时前收到心跳回应，心跳超时检查就会被重置</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="241" src="https://images2.imgbox.com/73/b5/E1k2aqMR_o.png" width="610"></p> 
+<h3>示例</h3> 
+<p style="margin-left:0;text-align:justify;">      本节以<strong><u>作业管理器</u></strong>与<strong><u>任务管理器</u></strong>心跳为例，解释心跳组件原理和使用。<strong><u>作业管理器</u></strong>是心跳管理者，管理多个<strong><u>任务管理器</u></strong></p> 
+<h4><span style="color:#000000;">构建</span></h4> 
+<p style="margin-left:0;text-align:justify;">作业管理器和任务管理器构建心跳管理器，并设置心跳目标</p> 
+<ul><li style="text-align:justify;">作业管理器</li></ul> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="115" src="https://images2.imgbox.com/06/af/JSf5Lcdy_o.png" width="673"></p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="85" src="https://images2.imgbox.com/52/bc/t0yqOgi2_o.png" width="678"></p> 
+<p style="margin-left:0;text-align:justify;">作业管理器对任务管理器的心跳管理是Sender，即心跳发起者</p> 
+<p style="margin-left:0;text-align:justify;"><strong><u>作业管理器</u></strong>的心跳管理器设置任务管理器心跳目标，指向<strong><u>任务管理器</u></strong></p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="95" src="https://images2.imgbox.com/cc/bc/k9CG0U3p_o.png" width="532"></p> 
+<p style="margin-left:0;text-align:justify;">心跳目标继承自HeartbeatSender，并带载荷AllocatedSlotReport，<strong><u>任务管理器</u></strong>的资源slot分配报告</p> 
+<ul><li style="text-align:justify;">任务管理器</li></ul> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="89" src="https://images2.imgbox.com/ae/d3/xlxklls4_o.png" width="644"></p> 
+<p style="margin-left:0;text-align:justify;">与作业管理器对应，任务管理器对作业管理器的心跳管理器是Reciver，接收者；心跳管理器设置作业管理器心跳目标，继承自HeartbeatReceiver</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="99" src="https://images2.imgbox.com/c3/6a/eIGW8LzQ_o.png" width="734"></p> 
+<h4><span style="color:#000000;">心跳</span></h4> 
+<p style="margin-left:0;text-align:justify;">心跳的流程，定时请求--&gt;rpc发送请--&gt;接收方处理心跳请求，返回--&gt;发送方处理接收方的返回</p> 
+<h5 style="text-align:justify;">请求</h5> 
+<p style="margin-left:0;text-align:justify;">发送管理器自身实现Runable接口，使用Executor延时发送心跳请求</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="200" src="https://images2.imgbox.com/56/55/BaFKGSTP_o.png" width="718"></p> 
+<p style="margin-left:0;text-align:justify;">下图管理器发送心跳方法，发送者(Sender)也带了载荷，当然监听器可以返回null</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="167" src="https://images2.imgbox.com/c0/9e/BkpbTgUj_o.png" width="699"></p> 
+<p style="margin-left:0;text-align:justify;">请求返回处理handleHeartbeatRpc后面监听章节解释</p> 
+<h4 style="text-align:justify;">发送心跳请求</h4> 
+<p style="margin-left:0;text-align:justify;">发送器(Sender)调用目标的rpc gateway方法</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="231" src="https://images2.imgbox.com/46/40/ALGIZNCE_o.png" width="694"></p> 
+<h4 style="text-align:justify;">接收方</h4> 
+<p style="margin-left:0;text-align:justify;">另一边，任务管理器rpc gateway  taskExecutorGateway处理请求</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="145" src="https://images2.imgbox.com/8c/7e/qXjFy52M_o.png" width="700"></p> 
+<p style="margin-left:0;text-align:justify;">作为Receiver的心跳管理器requestHeartbeat方法，上面的Sender重写了该方法，这里也是让人觉得混乱的地方，读者要注意的点，对比Sender的该方法，Receiver调用心跳目标的receivieHeartbeat方法</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="355" src="https://images2.imgbox.com/a4/77/MFqu2tRD_o.png" width="671"></p> 
+<p style="margin-left:0;text-align:justify;">作为接收方，心跳管理器目标实现为Reciever，即实现了receivieHeartbeat方法，对应上面的requestHeartbeat方法</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="80" src="https://images2.imgbox.com/c4/34/siF6TPMN_o.png" width="697"></p> 
+<p style="margin-left:0;text-align:justify;">心跳回应方法receiveHeatbeat调用作业管理器gateway方法，带上荷载</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="248" src="https://images2.imgbox.com/0e/f4/DvN3jPSg_o.png" width="690"></p> 
+<h4 style="text-align:justify;">发送方</h4> 
+<p style="margin-left:0;text-align:justify;">最后回到发送方作业管理器的rpc gateway的heartbeatFromTaskManager方法</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="100" src="https://images2.imgbox.com/cf/a1/8KSyle3o_o.png" width="730"></p> 
+<p style="margin-left:0;text-align:justify;">心跳管理器的receiveHeartbeat方法，报告心跳(reportHeartbeat)，重置超时；报告荷载</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="282" src="https://images2.imgbox.com/3c/98/NhkTbUFo_o.png" width="717"></p> 
+<h4><span style="color:#000000;">处理心跳返回</span></h4> 
+<p style="margin-left:0;text-align:justify;">上一节，请求时提过，请求完成的异步处理handleHeartbeatRpc</p> 
+<p style="margin-left:0;text-align:justify;"><img alt="" height="167" src="https://images2.imgbox.com/98/d2/jrsEhIBd_o.png" width="699"></p> 
+<p style="margin-left:0;text-align:justify;">这里不详细介绍，根据是否有异常分别处理</p> 
+<h2 style="margin-left:0px;text-align:justify;"><span style="color:#000000;">总结</span></h2> 
+<p style="margin-left:0;text-align:justify;">发送心跳-接收和返回-处理返回，一个完整心跳来回过程，相互检测，相互传递载荷</p> 
+<p></p> 
+<p style="margin-left:0;text-align:justify;"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/828b70be3688697a662755f0fdefa8a8/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">华为OD机考机试 真题目录（C卷 &#43; D卷 &#43; B卷 &#43; A卷） &#43; 考点说明</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/ef2f6fe877461ac6ca0ea4613c63e6b0/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Android蓝牙</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

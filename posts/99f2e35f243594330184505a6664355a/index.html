@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>关于PCM音频重采样思路及注意事项(频率变换和通道数变换(单通道转双通道)) - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="关于PCM音频重采样思路及注意事项(频率变换和通道数变换(单通道转双通道))" />
+<meta property="og:description" content="最近在做一个语音广播的项目，实现语音广播的过程主要是:音频采集、音频编码、音频发送、音频解码和音频播放，这个过程在这里不展开说明，本文主要讲述其中的音频重采样和音频降噪的问题和记录如何解决的思路。本文主要讲述重采样部分，降噪部分在下一篇文章讲述
+一、重采样和降噪的关系 之所以降噪过程中需要借助重采样的力量来实现，原因是一般情况下我们从电脑端采集到的音频数据是44.1Khz或者48Khz的16位或者8位双通道的PCM数据，而对于目前一些通用开源的降噪库例如speex或者webrtc来说一般都是有对送入降噪音频频率特定的要求的，其中speex开源库的降噪模块可以对44.1Khz和48Khz等音频PCM数据进行降噪；webrtc则对输入的音频数据要求在32Khz及以下：8Khz、16Khz和32Khz。
+对比降噪效果的话，就我在网络中找到的demo而言：
+(1)speex虽然可以直接对44.1khz和48khz的PCM数据进行降噪，同时能够比较好的对麦克风的底噪进行了滤除，但是同时也在正常的声音部分引入了不可容忍的电流声，这种电流声噪点有点类似直接使用设定最低阈值和最高阈值一刀切得到的效果。
+(2)webrtc虽然仅仅支持32Khz以下频率的音频数据进行降噪,即需要对正常采集到的PCM数据(44.1Khz或者48Khz)进行重采样为32Khz、16Khz或者8Khz的数据来进行降噪，然后再通过重采样为44.1Khz或者48Khz的音频数据才能正常播放。虽然对比speex的降噪步骤webrtc的降噪比较繁琐，但是webrtc的降噪效果对比speex的降噪效果是更好的，不仅底噪被滤除了，而且没有引入电流噪声。
+二、重采样知识记录 参考链接:
+理解重采样，需要真正的实现如下几个功能:
+(1)实现重采样通道数、音频格式相同，但采样频率不同的音频；
+(2)实现重采样音频格式相同、采样频率相同但通道数不同的音频；（目前一些usb转耳机就是单通道的）
+1、重采样基础知识 (1)采样频率 采样频率在流媒体中是指每秒钟对音频的采样点数，单位为Hz(赫兹)。例如采样频率为44100hz是指每秒钟采集44100个样本点，其中每个样本点根据实际情况具有不同的内存空间，在下面将会讲述到。
+(2)声道数 是指该段音频能够通过一个设备的多个发声位置进行发声，常见的声道数有:
+单声道:mono
+双声道:stereo,包含左右两声道
+2.1声道:在双声道基础上增加了一个低音声道
+5.1声道:包含一个正面声道、左前方声道、右前方声道、左环绕声道、右环绕声道、一个低音声道，最早应用于早期的电影院
+7.1声道:在5.1声道的基础上，把左右的环绕声道拆分为左右环绕声道以及左右后置声道，主要应用于BD以及现代的电影院
+(3)重采样样本数和空间大小 每重采样样本数:这个就是说在重采样时需要多少个样本数据，这个样本数会根据不同的声道数和音频格式会有所区别，例如对于1024个16位单声道PCM样本而言，它的大小为1024*2*1=2048字节；而对于1024个16位单声道PCM样本而言，它的样本大小为1024*2*2=4096字节，这两个数字也是在使用ffmpeg进行重采样时常常看到的，因为一般情况下ffmpeg进行重采样时一般采用输入1024个样本来进行重采样，而根据音频格式不同，所输入的音频具体空间大小不同。理解好这一点也是对于重采样知识理解的核心。
+补充一点:
+我们平时所看到的1024个样本点其实并不是绝对的，因为也可以是1152个样本点等，其中1024是对应一帧AAC音频的样本点数，而1152则一般对应MP3音频的样本点数。
+(4)PCM音频格式 a)常见的PCM格式有8位和16位两种，8位每一个PCM数据的值由一个字节即8位来表示(0~255);而16位是指每一个PCM数据的值由两个字节即16位来表示，分为高8位和第8位(-32767~32767);
+b)同时由于PCM音频格式还具有单声道和双声道等的区分，就衍生出如下4种自由组合的情况。
+(5)重采样的目的 在了解完上述关于音频的基础知识之后，再来探讨一个问题就是为何需要进行重采样呢？其实重采样的真正原因是这样的，在我们进行音视频开发中，遇到的很多设备的对于音频的格式要求是不一样的，例如在我的一个项目中遇到过这么一个情形：正常的电脑播放声音的音频是2声道16位44.1khz或者48khz的PCM音频格式才能够播放，但是此时我的项目中需要使用的一款usb耳机它的格式如下图所示:单声道16位44.1khz或者48khz。
+通常情况下在双声道16位的音频设备需要输入的肯定是对应双声道16位的音频数据才能够正确播放，这个时候来了个单声道16位的数据，播放时声音肯定不是我们想要的了。这个时候想要解决这个问题就是需要对这个麦克风的音频数据进行重采样由原来的单声道进行重采样为双声道的数据，以此能够在正常的扬声器中播放音频。
+一般情况下重采样能够满足如下需求:
+1.采样频率转换:例如44.1khz变为48khz等。
+2.声道数变换:例如单双声道的数据转换等。
+3.音频格式变换:例如16位转8位等。
+(6)重采样流程: 在使用ffmpeg或者其他的重采样方式时，无外乎都是需要注意上面所介绍过的采样频率、声道数以及音频格式的变化等，同时还有一个特别需要注意的是送入样本点和输出样本点的所占的字节数以及保存方式，这些都是需要考虑的，因此每次进行重采样时对输入和输出的样本字节数的计算是特别需要注意的，否则会导致重采样得到的结果不是我们所期望的。
+由于网络中很多帖子都仅仅是讲述如何使用字符串操作的方式来进行声道的转换，同时对双声道采样为单声道的讲述尤为多，而对于单声道转为双声道的讲述特别是通过ffmpeg进行的声道转换的重采样尤为的少，在接下来将给出一个demo是关于如何使用ffmpeg来进行对一段44.1khz16位单声道的pcm进行重采样为双声道的16位44.1khz的音频数据。
+对于下面的代码有几个需要注意的地方:
+（1）在函数pcm_resample_init()中“pcm-&gt;nb_samples = 1024;”，选择1024个音频样本数是因为我有一个项目是在重采样完后需要进行编码为aac格式的，因此选择1024个样本数比较方便后面的操作，如果是后面编码为mp3的话建议可以选择1152个样本数。
+（2）&#34;max_dst_nb_samples = dst_nb_samples =
+av_rescale_rnd(src_nb_samples, outSamplerate, inSamplerate, AV_ROUND_UP);&#34;这一段是为了能够计算出根据采样频率不同时，根据输入样本点数计算出输出的样本点数，其中: max_dst_nb_samples = src_nb_samples*outSamplerate/inSamplerate。
+（3）&#34;dst_bufsize = av_samples_get_buffer_size(&amp;dst_linesize, dst_nb_channels,
+len_swr, outSamplefmt, 1);&#34;这一个函数是用于计算重采样完成之后实际得到的数据的字节大小，算法是dst_bufsize = len_swr*2*2 = 1024*2*2 = 4096 字节
+其中len_swr是根据实际调用swr_convert()后返回1024。
+（4）输入数据字节大小的计算" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/99f2e35f243594330184505a6664355a/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-01-13T15:43:53+08:00" />
+<meta property="article:modified_time" content="2021-01-13T15:43:53+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">关于PCM音频重采样思路及注意事项(频率变换和通道数变换(单通道转双通道))</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p style="margin-left:0in;">最近在做一个语音广播的项目，实现语音广播的过程主要是:音频采集、音频编码、音频发送、音频解码和音频播放，这个过程在这里不展开说明，本文主要讲述其中的音频重采样和音频降噪的问题和记录如何解决的思路。本文主要讲述重采样部分，降噪部分在下一篇文章讲述</p> 
+<hr> 
+<h2 style="margin-left:0in;">一、重采样和降噪的关系</h2> 
+<p style="margin-left:0in;">之所以降噪过程中需要借助重采样的力量来实现，原因是一般情况下我们从电脑端采集到的音频数据是44.1Khz或者48Khz的16位或者8位双通道的PCM数据，而对于目前一些通用开源的降噪库例如speex或者webrtc来说一般都是有对送入降噪音频频率特定的要求的，其中speex开源库的降噪模块可以对44.1Khz和48Khz等音频PCM数据进行降噪；webrtc则对输入的音频数据要求在32Khz及以下：8Khz、16Khz和32Khz。</p> 
+<p style="margin-left:0in;">对比降噪效果的话，就我在网络中找到的demo而言：</p> 
+<p style="margin-left:0in;">(1)speex虽然可以直接对44.1khz和48khz的PCM数据进行降噪，同时能够比较好的对麦克风的底噪进行了滤除，但是同时也在正常的声音部分引入了不可容忍的电流声，这种电流声噪点有点类似直接使用设定最低阈值和最高阈值一刀切得到的效果。</p> 
+<p style="margin-left:0in;">(2)webrtc虽然仅仅支持32Khz以下频率的音频数据进行降噪,即需要对正常采集到的PCM数据(44.1Khz或者48Khz)进行重采样为32Khz、16Khz或者8Khz的数据来进行降噪，然后再通过重采样为44.1Khz或者48Khz的音频数据才能正常播放。虽然对比speex的降噪步骤webrtc的降噪比较繁琐，但是webrtc的降噪效果对比speex的降噪效果是更好的，不仅底噪被滤除了，而且没有引入电流噪声。</p> 
+<h2 style="margin-left:0in;">二、重采样知识记录</h2> 
+<p style="margin-left:0in;"><a href="https://blog.csdn.net/huihunxu1307/article/details/85114559?ops_request_misc=%257B%2522request%255Fid%2522%253A%2522161003111116780266254745%2522%252C%2522scm%2522%253A%252220140713.130102334.pc%255Fall.%2522%257D&amp;request_id=161003111116780266254745&amp;biz_id=0&amp;utm_medium=distribute.pc_search_result.none-task-blog-2~all~first_rank_v2~rank_v29-1-85114559.first_rank_v2_pc_rank_v29&amp;utm_term=ffmpeg%E9%87%8D%E9%87%87%E6%A0%B7%E5%BA%93%2044100&amp;spm=1018.2226.3001.4187">参考链接</a>:</p> 
+<p style="margin-left:0in;">理解重采样，需要真正的实现如下几个功能:</p> 
+<p style="margin-left:0in;">(1)实现重采样通道数、音频格式相同，但采样频率不同的音频；</p> 
+<p style="margin-left:0in;">(2)实现重采样音频格式相同、采样频率相同但通道数不同的音频；（目前一些usb转耳机就是单通道的）</p> 
+<h3 style="margin-left:0in;">1、重采样基础知识</h3> 
+<h4 style="margin-left:0in;">(1)采样频率</h4> 
+<p style="margin-left:0in;">采样频率在流媒体中是指每秒钟对音频的采样点数，单位为Hz(赫兹)。例如采样频率为44100hz是指每秒钟采集44100个样本点，其中每个样本点根据实际情况具有不同的内存空间，在下面将会讲述到。</p> 
+<h4 style="margin-left:0in;">(2)声道数</h4> 
+<p style="margin-left:0in;">是指该段音频能够通过一个设备的多个发声位置进行发声，常见的声道数有:</p> 
+<p style="margin-left:0in;">单声道:mono</p> 
+<p style="margin-left:0in;">双声道:stereo,包含左右两声道</p> 
+<p style="margin-left:0in;">2.1声道:在双声道基础上增加了一个低音声道</p> 
+<p style="margin-left:0in;">5.1声道:包含一个正面声道、左前方声道、右前方声道、左环绕声道、右环绕声道、一个低音声道，最早应用于早期的电影院</p> 
+<p style="margin-left:0in;">7.1声道:在5.1声道的基础上，把左右的环绕声道拆分为左右环绕声道以及左右后置声道，主要应用于BD以及现代的电影院</p> 
+<h4 style="margin-left:0in;">(3)重采样样本数和空间大小</h4> 
+<p style="margin-left:0in;">每重采样样本数:这个就是说在重采样时需要多少个样本数据，这个样本数会根据不同的声道数和音频格式会有所区别，例如对于1024个16位单声道PCM样本而言，它的大小为1024*2*1=2048字节；而对于1024个16位单声道PCM样本而言，它的样本大小为1024*2*2=4096字节，这两个数字也是在使用ffmpeg进行重采样时常常看到的，因为一般情况下ffmpeg进行重采样时一般采用输入1024个样本来进行重采样，而根据音频格式不同，所输入的音频具体空间大小不同。理解好这一点也是对于重采样知识理解的核心。</p> 
+<p style="margin-left:0in;">补充一点:</p> 
+<p style="margin-left:0in;">我们平时所看到的1024个样本点其实并不是绝对的，因为也可以是1152个样本点等，其中1024是对应一帧AAC音频的样本点数，而1152则一般对应MP3音频的样本点数。</p> 
+<h4 style="margin-left:0in;">(4)PCM音频格式</h4> 
+<p style="margin-left:0in;">a)常见的PCM格式有8位和16位两种，8位每一个PCM数据的值由一个字节即8位来表示(0~255);而16位是指每一个PCM数据的值由两个字节即16位来表示，分为高8位和第8位(-32767~32767);</p> 
+<p style="margin-left:0in;">b)同时由于PCM音频格式还具有单声道和双声道等的区分，就衍生出如下4种自由组合的情况。</p> 
+<p style="margin-left:0in;"><img alt="" height="238" src="https://images2.imgbox.com/90/9a/ZQ7d8xYZ_o.png" width="574"></p> 
+<h4 style="margin-left:0in;">(5)重采样的目的</h4> 
+<p style="margin-left:0in;">在了解完上述关于音频的基础知识之后，再来探讨一个问题就是为何需要进行重采样呢？其实重采样的真正原因是这样的，在我们进行音视频开发中，遇到的很多设备的对于音频的格式要求是不一样的，例如在我的一个项目中遇到过这么一个情形：正常的电脑播放声音的音频是2声道16位44.1khz或者48khz的PCM音频格式才能够播放，但是此时我的项目中需要使用的一款usb耳机它的格式如下图所示:单声道16位44.1khz或者48khz。</p> 
+<p style="margin-left:0in;">通常情况下在双声道16位的音频设备需要输入的肯定是对应双声道16位的音频数据才能够正确播放，这个时候来了个单声道16位的数据，播放时声音肯定不是我们想要的了。这个时候想要解决这个问题就是需要对这个麦克风的音频数据进行重采样由原来的单声道进行重采样为双声道的数据，以此能够在正常的扬声器中播放音频。</p> 
+<p style="margin-left:0in;"><img alt="" height="338" src="https://images2.imgbox.com/50/5d/IcXfiP0U_o.png" width="392"></p> 
+<p style="margin-left:0in;">一般情况下重采样能够满足如下需求:</p> 
+<p style="margin-left:0in;">1.采样频率转换:例如44.1khz变为48khz等。</p> 
+<p style="margin-left:0in;">2.声道数变换:例如单双声道的数据转换等。</p> 
+<p style="margin-left:0in;">3.音频格式变换:例如16位转8位等。</p> 
+<h4 style="margin-left:0in;">(6)重采样流程:</h4> 
+<p style="margin-left:0in;">在使用ffmpeg或者其他的重采样方式时，无外乎都是需要注意上面所介绍过的采样频率、声道数以及音频格式的变化等，同时还有一个特别需要注意的是送入样本点和输出样本点的所占的字节数以及保存方式，这些都是需要考虑的，因此每次进行重采样时对输入和输出的样本字节数的计算是特别需要注意的，否则会导致重采样得到的结果不是我们所期望的。</p> 
+<p style="margin-left:0in;">由于网络中很多帖子都仅仅是讲述如何使用字符串操作的方式来进行声道的转换，同时对双声道采样为单声道的讲述尤为多，而对于单声道转为双声道的讲述特别是通过ffmpeg进行的声道转换的重采样尤为的少，在接下来将给出一个demo是关于如何使用ffmpeg来进行对一段44.1khz16位单声道的pcm进行重采样为双声道的16位44.1khz的音频数据。</p> 
+<p style="margin-left:0in;">对于下面的代码有几个需要注意的地方:</p> 
+<p><code style="margin-left:.375in;">（1）在函数pcm_resample_init()中“pcm-&gt;nb_samples = 1024;”，选择1024个音频样本数是因为我有一个项目是在重采样完后需要进行编码为aac格式的，因此选择1024个样本数比较方便后面的操作，如果是后面编码为mp3的话建议可以选择1152个样本数。</code></p> 
+<p><code style="margin-left:.375in;">（2）"max_dst_nb_samples = dst_nb_samples =</code></p> 
+<p><code style="margin-left:.75in;">av_rescale_rnd(src_nb_samples, outSamplerate, inSamplerate, AV_ROUND_UP);"这一段是为了能够计算出根据采样频率不同时，根据输入样本点数计算出输出的样本点数，其中: </code><code>max_dst_nb_samples = src_nb_samples*outSamplerate/inSamplerate。</code></p> 
+<p><code style="margin-left:.375in;">（3）</code>"dst_bufsize = av_samples_get_buffer_size(&amp;dst_linesize, dst_nb_channels,</p> 
+<p><code style="margin-left:.75in;">len_swr, outSamplefmt, 1);"这一个函数是用于计算重采样完成之后实际得到的数据的字节大小，算法是dst_bufsize = len_swr*2*2 = 1024*2*2 = 4096 字节</code></p> 
+<p><code style="margin-left:.75in;">其中len_swr是根据实际调用swr_convert()后返回1024。</code></p> 
+<p><code style="margin-left:.375in;">（4）输入数据字节大小的计算</code></p> 
+<pre><code class="language-cpp">src_bufsize = av_samples_get_buffer_size(NULL, 1, 1024, inSamplefmt, 1);
+
+if (dst_bufsize &lt; 0) {
+
+printf("av_samples_get_buffer_size error\n");
+
+return -1;
+
+}</code></pre> 
+<p><code style="margin-left:.375in;">其中src_bufsie = 1024 * 1 * 2 = 2048(字节)，1为单声道，2为16位的意思，因此也说明了为什么在main()函数中需要传入的是2048字节的样本数而不是4096，如果还是传4096字节的样本的话，最后得到的仍然是4096而不是8192字节的数据，因此需要输入2048字节数据才能够正确的重采样。</code></p> 
+<p><code style="margin-left:.375in;">(5)重采样参数设置方式有两种:</code></p> 
+<p><code style="margin-left:.75in;">1.参数设置方式一:swr_alloc_set_opts()</code></p> 
+<p><code style="margin-left:.75in;">2.参数设置方式二:av_opt_set_int()</code></p> 
+<p><code style="margin-left:.75in;">这两种方式设置效果是一致的，可以自由选用，本文的demo是为了给大家作为参考都写进去了，读者可以自由选用。</code></p> 
+<h3>2、重采样demo(单通道转双通道)</h3> 
+<h3>a)初始化函数</h3> 
+<pre><code class="language-cpp">	/*函数名称:pcm_resample_init
+	*函数功能：初始化pcm重采样参数
+	*传入参数：int insample:输入数据采样频率, int outsample:输出采样频率
+	*函数返回值：成功返回0，失败返回-1
+	*函数作者:吴豪乐
+	*日期：2021年1月5日
+	*/
+	int pcm_resample::pcm_resample_init(int insample, int outsample)
+	{
+	        //音频重采样 上下文初始化
+	        inSamplerate = insample;
+	        outSamplerate = outsample;
+	        int ret = 0;
+	        inSamplefmt = AV_SAMPLE_FMT_S16;
+	        outSamplefmt = AV_SAMPLE_FMT_S16;
+	        //channels = 2;
+	        in_channels = 1;
+	        out_channels = 2;
+	        dst_nb_channels = av_get_channel_layout_nb_channels(AV_CH_LAYOUT_STEREO);
+	        printf("dst_nb_channels:%d\n", dst_nb_channels);
+	        //outs_new[0] = (uint8_t *)malloc(4096);//len 为4096
+	        //outs_new[1] = (uint8_t *)malloc(4096);
+	
+	        //设置参数方式一
+	        asc = swr_alloc_set_opts(asc, av_get_default_channel_layout(out_channels), outSamplefmt, outSamplerate,
+	                av_get_default_channel_layout(in_channels), inSamplefmt, inSamplerate, 0, 0);
+	        if (!asc)
+	        {
+	                printf("swr_alloc_set_opts failed\n");
+	                return -1;
+	        }
+	
+	        //设置参数方式二:
+	        /* set options */
+	        int64_t src_ch_layout = AV_CH_LAYOUT_MONO, dst_ch_layout = AV_CH_LAYOUT_STEREO;//AV_CH_LAYOUT_SURROUND;
+	        av_opt_set_int(asc, "in_channel_layout", src_ch_layout, 0);
+	        av_opt_set_int(asc, "in_sample_rate", inSamplerate, 0);
+	        av_opt_set_sample_fmt(asc, "in_sample_fmt", inSamplefmt, 0);
+	        av_opt_set_int(asc, "in_channel_count", in_channels, 0);
+	
+	        av_opt_set_int(asc, "out_channel_layout", dst_ch_layout, 0);
+	        av_opt_set_int(asc, "out_sample_rate", outSamplerate, 0);
+	        av_opt_set_sample_fmt(asc, "out_sample_fmt", outSamplefmt, 0);
+	        av_opt_set_int(asc, "out_channel_count", out_channels, 0);
+	
+	        ret = swr_init(asc);
+	        if (ret != 0)
+	        {
+	                printf("swr_init failed\n");
+	                return -1;
+	        }
+	
+	        indata[0] = (const uint8_t*)indata1;
+	
+	        //重采样输出分配空间
+	        pcm = av_frame_alloc();
+	        pcm-&gt;format = outSamplefmt;
+	        pcm-&gt;channels = out_channels;
+	        pcm-&gt;channel_layout = av_get_default_channel_layout(out_channels);
+	        pcm-&gt;nb_samples = 1024;	//一帧音频一通道的采样数量
+	        ret = av_frame_get_buffer(pcm, 0);//给pcm分配存储空间
+	        if (ret != 0)
+	        {
+	                printf("重采样分配输出空间失败\n");
+	                return -1;
+	        }
+	
+	        printf("pcm_resample_init 重采样初始化成功, inSamplerate:%d, outSamplerate:%d\n", inSamplerate, outSamplerate);
+	        
+	        src_nb_samples = 1024;
+	        //计算理论重采样后的数据量
+	        /* compute the number of converted samples: buffering is avoided
+	        * ensuring that the output buffer will contain at least all the
+	        * converted input samples */
+	        //e=av_rescale_rnd(a,b,c,d) =&gt; e=a*b/c
+	        max_dst_nb_samples = dst_nb_samples =
+	                av_rescale_rnd(src_nb_samples, outSamplerate, inSamplerate, AV_ROUND_UP);//这是按比例来求取的目标通道的采样数据:src_num/src_rate = dst_num/dst_rate =&gt; dst_num = src_num * dst_rate/src_rate
+	
+	        printf("111max_dst_nb_samples:%d, dst_nb_samples:%d\n", max_dst_nb_samples, dst_nb_samples);
+	
+	        //为重采样后的接收数据申请缓存
+	        ret = av_samples_alloc_array_and_samples(&amp;dst_data, &amp;dst_linesize, 2,
+	                dst_nb_samples, outSamplefmt, 0);
+	        if (ret &lt; 0) {
+	                printf("Could not allocate destination samples\n");
+	                return -1;
+	        }
+	
+	        return 0;
+	}
+</code></pre> 
+<h3>b)开始重采样函数</h3> 
+<pre><code class="language-cpp">	/*函数名称:pcm_resample_run
+	*函数功能：开始进行重采样,每次重采样数据大小为2048字节
+	*传入参数：char *in_data：输入数据, int len_in：输入数据的大小(字节), char *out_data：输出数据, int len_out：输出数据的大小(字节)
+	*函数返回值：成功返回0，失败返回-1
+	*函数作者:吴豪乐
+	*日期：2021年1月5日
+	*/
+	int pcm_resample::pcm_resample_run(char *in_data, int len_in, char *out_data, int *len_out)
+	{
+	        if (in_data == NULL || out_data == NULL || len_out == NULL)
+	        {
+	                printf("pcm_resample_run in_data or out_data error\n");
+	                getchar();
+	                return -1;
+	        }
+	
+	        if (len_in &lt; 2048)
+	        {
+	                printf("pcm_resample_run len_in or len_out error\n");
+	                getchar();
+	                return -1;
+	        }
+	
+	        int ret = 0;
+	        //拷贝输入数据
+	        memcpy(indata1, in_data, 2048);
+	
+	        //计算实际重采样后得到的数据大小以及重新分配缓存
+	        /* compute destination number of samples */
+	        dst_nb_samples = av_rescale_rnd(swr_get_delay(asc, inSamplerate) +
+	                src_nb_samples, outSamplerate, inSamplerate, AV_ROUND_UP);//这里将重采样时间也计算进去的意思
+	        if (dst_nb_samples &gt; max_dst_nb_samples) {
+	                av_freep(&amp;dst_data[0]);
+	                ret = av_samples_alloc(dst_data, &amp;dst_linesize, 2,
+	                        dst_nb_samples, outSamplefmt, 1);
+	                if (ret &lt; 0)
+	                {
+	                        printf("av_samples_alloc error\n");
+	                        return -1;
+	                }
+	                max_dst_nb_samples = dst_nb_samples;
+	        }
+	        printf("222max_dst_nb_samples:%d, dst_nb_samples:%d\n", max_dst_nb_samples, dst_nb_samples);
+	
+	
+	        int len_swr = 0;
+	        len_swr = swr_convert(asc, dst_data, dst_nb_samples, (const uint8_t**)(&amp;indata), pcm-&gt;nb_samples);
+	        if (len_swr &lt; 0)
+	        {
+	                printf("swr_convert error\n");
+	                return -1;
+	        }
+	
+	        src_bufsize = av_samples_get_buffer_size(NULL, 1, 1024, inSamplefmt, 1);
+	        if (dst_bufsize &lt; 0) {
+	                printf("av_samples_get_buffer_size error\n");
+	                return -1;
+	        }
+	        printf("src_bufsize:%d\n", src_bufsize);
+	        
+	        dst_bufsize = av_samples_get_buffer_size(&amp;dst_linesize, dst_nb_channels,
+	                len_swr, outSamplefmt, 1);
+	        if (dst_bufsize &lt; 0) {
+	                printf("av_samples_get_buffer_size error\n");
+	                return -1;
+	        }
+	
+	        printf("dst_bufsize:%d, dst_nb_samples:%d, pcm-&gt;nb_samples：%d\n", dst_bufsize, dst_nb_samples, pcm-&gt;nb_samples);
+	        printf("outSamplerate:%d, inSamplerate:%d\n", outSamplerate, inSamplerate);
+	        //getchar();
+	        *len_out = dst_bufsize;
+	        memcpy(out_data, dst_data[0], dst_bufsize);
+	        return 0;
+	}
+</code></pre> 
+<h4>c)重采样相关资源释放函数</h4> 
+<pre><code class="language-cpp">	/*函数名称:pcm_resample_release
+	*函数功能：释放资源
+	*传入参数：无
+	*函数返回值：无
+	*函数作者:吴豪乐
+	*日期：2021年1月5日
+	*/
+	void pcm_resample::pcm_resample_release(void)
+	{
+	        if (pcm != NULL)
+	        {
+	                av_frame_free(&amp;pcm);
+	                pcm = NULL;
+	        }
+	
+	        if (asc != NULL)
+	        {
+	                swr_free(&amp;asc);
+	                asc = NULL;
+	        }
+	
+	        if (dst_data != NULL)
+	        {
+	                av_freep(&amp;dst_data[0]);
+	                dst_data = NULL;
+	        }
+	
+	        return;
+	}
+</code></pre> 
+<h4>d)main函数运行</h4> 
+<pre><code class="language-cpp">	int main()
+	{
+	        FILE *fb_in = fopen("in_datamono.pcm", "rb");
+	        FILE *fb_out = fopen("out_datastereo.pcm", "wb");
+	        int nRead = 0, len_swr = 0;
+	
+	        //初始化重采样
+	        pcm_resample obj_pcm_resample;
+	        obj_pcm_resample.pcm_resample_init(44100, 44100);
+	
+	        //进行重采样数据
+	        char data_read[8192] = {0};
+	
+	        while (1)
+	        {
+	                nRead = fread(data_read, 1, 2048, fb_in);
+	                if (nRead == 0)
+	                        break;
+	                //printf("1nRead:%d\n", nRead);
+	                obj_pcm_resample.pcm_resample_run(data_read, 2048, data_read, &amp;len_swr);
+	                //printf("len_swr:%d\n", len_swr);
+	                //len_swr = single2Double(data_read, 4096);
+	                printf("lenswr:%d\n", len_swr);
+	                fwrite(data_read, 1, len_swr, fb_out);
+	        }
+	
+	        obj_pcm_resample.pcm_resample_release();
+	        getchar();
+	        return 0;
+	}
+</code></pre> 
+<p>下面将提供本文重采样(通道转换的demo)和频率变换的demo链接:</p> 
+<p>1、<a href="https://download.csdn.net/download/weixin_41353840/14141733">单通道转双通道demo</a></p> 
+<p>2、<a href="https://download.csdn.net/download/weixin_41353840/14141720">频率转换demo</a></p> 
+<hr> 
+<p><strong>每写一篇文章都不容易，尊重别人的知识产权才是对自己和技术的尊重。为了避免发生知识产权被侵权的情况，我决定做出以下声明：</strong></p> 
+<p><strong>1.博客中标注原创的文章，版权归原作者 吴豪乐工作室 所有；</strong></p> 
+<p><strong>2.未经原作者允许不得转载本文内容，否则将视为侵权；</strong></p> 
+<p><strong>3.转载或者引用本文内容请注明来源及原作者；</strong></p> 
+<p><strong>4.对于不遵守此声明或者其他违法使用本文内容者，本人依法保留追究权等。</strong></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/0e4e62e5a931f5532b68adaebb3a973d/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">联想开机启动项按哪个_联想电脑怎么在BIOS中设置从U盘或光盘启动</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/a2013c8f8e1928a8772fe82752e5505e/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">行上下移动_只会用Ctrl&#43;C和Ctrl&#43;V怎么行？真正的Excel高手都是快捷键达人！</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

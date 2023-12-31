@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>如何用GO语言编写缓存服务？ - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="如何用GO语言编写缓存服务？" />
+<meta property="og:description" content="随着互联网的飞速发展，各行各业对互联网服务的要求也越来越高，服务架构能撑起多大的业务数据？服务响应的速度能不能达到要求？我们的架构师每天都在思考这些问题。
+对于数据库或者对象存储等服务来说，它们受限于自己先天的设计目标，往往不能具有很好的性能，响应时间通常是秒级。此时就需要高性能的缓存来为我们的服务提速了，缓存服务的响应时间通常是毫秒级，甚至小于1ms。
+缓存服务需要被设置在其他服务的前端，客户端首先访问缓存，查询自己的数据，仅当客户端需要的数据不存在于缓存中时，才去访问实际的服务。从实际的服务中获取到的数据会被放在缓存中，以备下次使用。
+缓存的设计目标就是尽可能地快，但它引起了其他的问题。比如目前业界使用较多的缓存服务有Memcached和Redis等，它们都是内存内缓存，单节点最大的容量不能超过整个系统的内存。
+且一旦服务器重启，对于Memcached来说就是内容彻底丢失；Redis稍好一点，但也要花费不少时间从磁盘上的数据文件中重新读入内存。
+当我们决定要用Go语言编写一个缓存服务的时候，首先想到的就是HTTP服务。因为用Go语言写基于HTTP的缓存服务真的是太方便了，我们只需要一个map来保存数据，写一个handler负责处理请求，然后调用http.ListenAndServe，最后用go run运行。一切就是这么简单，你不需要去考虑复杂的并发问题，也不需要自己设计一套网络协议，Go语言的HTTP服务框架会帮你处理好底层的一切。
+我们在本文将要实现的是一个简单的内存缓存服务，所有的缓存数据都存储在服务器的内存中。一旦服务器重启，所有的数据都将被清零。
+缓存服务的接口
+1.1.1　REST接口
+本章的接口支持缓存的设置（Set）、获取（Get）和删除（Del）这3个基本操作，同时还支持对缓存服务状态的查询。Set操作用于将一对键值对（key value pair）设置进缓存服务器，它通过HTTP的PUT方法进行；Get操作用于查询某个键并获取其值，它通过HTTP的GET方法进行；Del操作用于从缓存中删除某个键，它通过HTTP的DELETE方法进行。我们可以查询的缓存服务状态包括当前缓存了多少对键值对，所有的键一共占据了多少字节，所有的值一共占据了多少字节。​
+客户端通过HTTP的PUT方法将一对键值对设置进缓存服务器，服务器将该键值对保存在内存堆上创建的map里。
+​这里/cache/是一个URL，它标识了缓存的值（value）所在的位置。URL是Uniform Resource Locator的缩写，它是一个网络地址，用于引用某个网络资源在网络上的位置。HTTP的请求正文（request body）里包含了该key对应的value的内容。​
+客户端通过HTTP的GET方法从缓存服务器上获取key对应的value，服务器在map中查找该key，如果key不存在，服务器返回HTTP错误代码404 NOT FOUND；如果key存在，则服务器在HTTP响应正文（response body）中返回相应的value。
+​客户端通过HTTP的GET方法从缓存服务器上获取key对应的value，服务器在map中查找该key，如果key不存在，服务器返回HTTP错误代码404 NOT FOUND；如果key存在，则服务器在HTTP响应正文（response body）中返回相应的value。
+客户端通过HTTP的DELETE方法将key从缓存中删除。无论之前该key是否存在，之后它都将不存在，服务器始终返回HTTP错误代码200 OK。
+​客户端通过这个接口获取缓存服务的状态，在HTTP响应正文中返回的状态是以JSON格式编码的一个cache.Stat结构体（见例1-3）。
+1.1.2　缓存Set流程
+我们可以用一张简单的图来概括Set流程，见图1-1。
+图1-1　in memory缓存的Set流程
+客户端的PUT请求提供了key和value。cacheHandler实现了http.Handler接口，其ServeHTTP方法对HTTP请求进行解析，并调用cache.Cache接口的Set方法。
+在cache模块中，inMemoryCache结构体实现Cache接口，其Set方法最终将键值对保存在内存的map中。cacheHandler最后会返回客户端一个HTTP错误号来表示结果，如果成功则返回的是200 OK，否则返回500 Internal Server Error。
+Go语言中的map的含义和用法跟大多数现代编程语言中的map一样，map是一种用于保存键值对的散列表数据结构，可以通过中括号 [ ] 进行key的查询和设置。
+由于程序会对key进行散列和掩码运算以直接获取存储key的偏移量，所以能获得近乎O(1)的查询和设置复杂度。之所以说近乎O(1)是因为两个key在经过散列和掩码运算后有可能会具有相同的偏移量，此时将不得不继续进行线性搜索，不过发生这种不幸情况的概率很小。
+1.1.3　缓存Get流程
+缓存Get流程见图1-2。
+图1-2　in memory缓存的Get流程
+客户端的Get请求提供了key。cacheHandler的ServeHTTP方法对HTTP请求进行解析，并调用cache.Cache接口的Get方法。inMemoryCache结构体的Get方法在map中查询key对应的value并返回。cacheHandler会将value写入HTTP响应正文并返回200 OK，如果cache.Cache.Get方法返回错误，cacheHandler会返回500 Internal Server Error。如果value长度为0，说明该key不存在，cacheHandler会返回404 Not Found。
+1.1.4　缓存Del流程
+缓存Del流程见图1-3。
+图1-3　in memory缓存的Del流程
+客户端的DELETE请求提供了key。cacheHandler的ServeHTTP方法对HTTP请求进行解析，并调用cache.Cache接口的Del方法。inMemoryCache结构体的Del方法在map中查询key是否存在，如果存在则调用delete函数删除该key。如果cache.Cache.Del方法返回错误，cacheHandler会返回500 Internal Server Error，否则返回200 OK。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/22179cf86a7d4c407cb0de0336054013/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2018-12-03T05:29:41+08:00" />
+<meta property="article:modified_time" content="2018-12-03T05:29:41+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">如何用GO语言编写缓存服务？</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div class="article-content"> 
+ <p>随着互联网的飞速发展，各行各业对互联网服务的要求也越来越高，服务架构能撑起多大的业务数据？服务响应的速度能不能达到要求？我们的架构师每天都在思考这些问题。<br></p> 
+ <p>对于数据库或者对象存储等服务来说，它们受限于自己先天的设计目标，往往不能具有很好的性能，响应时间通常是秒级。<b>此时就需要高性能的缓存来为我们的服务提速了，缓存服务的响应时间通常是毫秒级，甚至小于1ms。</b></p> 
+ <p>缓存服务需要被设置在其他服务的前端，客户端首先访问缓存，查询自己的数据，仅当客户端需要的数据不存在于缓存中时，才去访问实际的服务。从实际的服务中获取到的数据会被放在缓存中，以备下次使用。</p> 
+ <p>缓存的设计目标就是尽可能地快，但它引起了其他的问题。比如目前业界使用较多的缓存服务有Memcached和Redis等，它们都是内存内缓存，单节点最大的容量不能超过整个系统的内存。</p> 
+ <p></p> 
+ <p>且一旦服务器重启，对于Memcached来说就是内容彻底丢失；Redis稍好一点，但也要花费不少时间从磁盘上的数据文件中重新读入内存。<br></p> 
+ <p>当我们决定要用Go语言编写一个缓存服务的时候，首先想到的就是HTTP服务。因为用Go语言写基于HTTP的缓存服务真的是太方便了，我们只需要一个map来保存数据，写一个handler负责处理请求，然后调用http.ListenAndServe，最后用go run运行。一切就是这么简单，你不需要去考虑复杂的并发问题，也不需要自己设计一套网络协议，Go语言的HTTP服务框架会帮你处理好底层的一切。</p> 
+ <p>我们在本文将要实现的是一个简单的内存缓存服务，所有的缓存数据都存储在服务器的内存中。一旦服务器重启，所有的数据都将被清零。</p> 
+ <p><b>缓存服务的接口</b></p> 
+ <p><b>1.1.1　REST接口</b></p> 
+ <p>本章的接口支持缓存的设置（Set）、获取（Get）和删除（Del）这3个基本操作，同时还支持对缓存服务状态的查询。Set操作用于将一对键值对（key value pair）设置进缓存服务器，它通过HTTP的PUT方法进行；Get操作用于查询某个键并获取其值，它通过HTTP的GET方法进行；Del操作用于从缓存中删除某个键，它通过HTTP的DELETE方法进行。我们可以查询的缓存服务状态包括当前缓存了多少对键值对，所有的键一共占据了多少字节，所有的值一共占据了多少字节<b>。</b><b>​</b></p> 
+ <p>客户端通过HTTP的PUT方法将一对键值对设置进缓存服务器，服务器将该键值对保存在内存堆上创建的map里。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>​这里/cache/是一个URL，它标识了缓存的值（value）所在的位置。URL是Uniform Resource Locator的缩写，它是一个网络地址，用于引用某个网络资源在网络上的位置。HTTP的请求正文（request body）里包含了该key对应的value的内容。<b>​</b></p> 
+ <p>客户端通过HTTP的GET方法从缓存服务器上获取key对应的value，服务器在map中查找该key，如果key不存在，服务器返回HTTP错误代码404 NOT FOUND；如果key存在，则服务器在HTTP响应正文（response body）中返回相应的value。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p><b>​</b>客户端通过HTTP的GET方法从缓存服务器上获取key对应的value，服务器在map中查找该key，如果key不存在，服务器返回HTTP错误代码404 NOT FOUND；如果key存在，则服务器在HTTP响应正文（response body）中返回相应的value。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>客户端通过HTTP的DELETE方法将key从缓存中删除。无论之前该key是否存在，之后它都将不存在，服务器始终返回HTTP错误代码200 OK。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>​客户端通过这个接口获取缓存服务的状态，在HTTP响应正文中返回的状态是以JSON格式编码的一个cache.Stat结构体（见例1-3）。</p> 
+ <p><b>1.1.2　缓存Set流程</b></p> 
+ <p>我们可以用一张简单的图来概括Set流程，见图1-1。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>图1-1　in memory缓存的Set流程</p> 
+ <p>客户端的PUT请求提供了key和value。cacheHandler实现了http.Handler接口，其ServeHTTP方法对HTTP请求进行解析，并调用cache.Cache接口的Set方法。</p> 
+ <p>在cache模块中，inMemoryCache结构体实现Cache接口，其Set方法最终将键值对保存在内存的map中。cacheHandler最后会返回客户端一个HTTP错误号来表示结果，如果成功则返回的是200 OK，否则返回500 Internal Server Error。</p> 
+ <p>Go语言中的map的含义和用法跟大多数现代编程语言中的map一样，map是一种用于保存键值对的散列表数据结构，可以通过中括号 [ ] 进行key的查询和设置。</p> 
+ <p>由于程序会对key进行散列和掩码运算以直接获取存储key的偏移量，所以能获得近乎O(1)的查询和设置复杂度。之所以说近乎O(1)是因为两个key在经过散列和掩码运算后有可能会具有相同的偏移量，此时将不得不继续进行线性搜索，不过发生这种不幸情况的概率很小。</p> 
+ <p><b>1.1.3　缓存Get流程</b></p> 
+ <p>缓存Get流程见图1-2。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>图1-2　in memory缓存的Get流程</p> 
+ <p>客户端的Get请求提供了key。cacheHandler的ServeHTTP方法对HTTP请求进行解析，并调用cache.Cache接口的Get方法。inMemoryCache结构体的Get方法在map中查询key对应的value并返回。cacheHandler会将value写入HTTP响应正文并返回200 OK，如果cache.Cache.Get方法返回错误，cacheHandler会返回500 Internal Server Error。如果value长度为0，说明该key不存在，cacheHandler会返回404 Not Found。</p> 
+ <p><b>1.1.4　缓存Del流程</b></p> 
+ <p>缓存Del流程见图1-3。</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>图1-3　in memory缓存的Del流程</p> 
+ <p>客户端的DELETE请求提供了key。cacheHandler的ServeHTTP方法对HTTP请求进行解析，并调用cache.Cache接口的Del方法。inMemoryCache结构体的Del方法在map中查询key是否存在，如果存在则调用delete函数删除该key。如果cache.Cache.Del方法返回错误，cacheHandler会返回500 Internal Server Error，否则返回200 OK。</p> 
+ <p>REST接口和处理流程介绍完了，接下来我们来看看如何实现。</p> 
+ <p><b>Go语言实现</b></p> 
+ <p><b>1.2.1　main包的实现</b></p> 
+ <p>缓存服务的main包只有一个函数，就是main函数。在Go语言中，如果某个项目需要被编译为可执行程序，那么它的源码需要有一个main包，其中需要有一个main函数，它用来作为可执行程序的入口函数。如果某个项目不需要被编译为可执行程序，只是实现一个库，则可以没有main包和main函数。我们的缓存服务需要被编译成一个可执行程序，所以需要提供main包和main函数。main函数的实现见例1-1：</p> 
+ <p>例1-1　main函数</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p><b>​</b>我们的main函数非常简单，它需要做的只是调用cache.New函数创建一个新的cache.Cache接口的实例c，然后以c为参数调用http.New函数创建一个指向http.Server结构体的指针并调用其Listen方法。</p> 
+ <p>cache.New这样的写法则是指定我们调用的New函数属于cache包。Go语言调用同一个包内的函数不需要在函数前面带上包名，Go编译器会默认在当前包内查找。调用另一个包中的函数则需要指定包名，让Go编译器知道去哪里查找这个函数。这里我们是在main包中调用cache包的New函数，所以需要指定包名。</p> 
+ <p><b>1.2.2　cache包的实现</b></p> 
+ <p>我们在cache包中实现服务的缓存功能。在cache包内，我们首先声明了一个Cache接口，见例1-2。</p> 
+ <p>例1-2　Cache接口</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>​在Go语言中，接口和实现是完全分开的。接口甚至拥有它自己的类型（type interface）。开发者可以自由声明一个接口，然后以一种或多种方式去实现这个接口。在例1-2中，我们看到的就是一个名为Cache的接口声明。</p> 
+ <p>在接口内，我们会声明一些方法，一个接口就是该接口内所有方法的集合。任何结构体只要实现了某个接口声明的所有方法，我们就认为该结构体实现了该接口。实现某个接口的结构体可以不止一个，这意味着同样的接口实现的方式可以有很多种，Go语言就是用这种方式来实现多态。</p> 
+ <p><b>我们的Cache接口一共声明了4个方法，分别是Set、Get、Del和GetStat。</b></p> 
+ <p>Set方法用于将键值对设置进缓存，它接收两个参数，类型分别是string和[ ]byte，其中string是key的类型，而[ ]byte则是value的类型，byte前面的中括号意味着它的类型是字节（byte）的切片（slice）。Go语言中切片的内部实现可以被认为是一个指向切片第一个元素的地址和该切片的长度。切片和数组（Array）的区别在于数组的长度是固定的，而切片则是底层数组的一个视图，其长度可以动态调整。Set方法的返回值只有一个。若返回值的类型是error，则用于返回Set操作的错误，当Set操作成功时，返回nil。</p> 
+ <p>Get方法根据key从缓存中获取value，所以它接收一个string类型的参数，返回值则是两个，分别是 [ ]byte和error。在Go语言中，当函数具有多个返回值时，需要用小括号()将它们括在一起。</p> 
+ <p>Del方法从缓存中删除key，所以它只有一个string类型的参数和一个error类型的返回值。</p> 
+ <p>GetStat方法用于获取缓存的状态，它没有参数，只有一个Stat类型的返回值。Stat是一种结构体，见例1-3。</p> 
+ <p>例1-3　Stat结构体相关实现</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>Go语言编程仅仅声明接口类型（type interface）是没用的，还必须实现接口。而接口的实现需要依附于某个结构体类型（type struct）。Stat就是一个结构体，它的内部有3个字段，Count用于表示缓存目前保存的键值对数量，KeySize和ValueSize分别表示key和value占据的总字节数。</p> 
+ <p>结构体也可以包含方法，和接口不同的地方在于结构体必须实现这些方法，而接口只需要声明。Stat结构体实现了add和del两个方法，这两个方法分别用于新加键值对和删除键值对时改变缓存的状态。</p> 
+ <p>在了解完整个Cache接口之后，我们就可以去看看New函数的实现了，见例1-4。</p> 
+ <p>例1-4　New函数实现</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>cache包的New函数用来创建并返回一个Cache接口，它接收一个string类型的参数typ，typ用于指定需要创建的Cache接口的具体结构体类型。</p> 
+ <p>我们在函数体的第一行声明了一个类型为Cache接口的变量c，当typ字符串等于“inmemory”时，我们将newInMemoryCache函数的返回值赋值给c。如果c为nil，我们调用panic报错并退出整个程序，否则我们打印一条日志通知缓存开始服务并将c返回。</p> 
+ <p>本文实现的缓存服务是一种内存缓存（in memory），实现Cache接口的结构体名为inMemoryCache，见例1-5。</p> 
+ <p>例1-5　inMemoryCache相关代码</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>inMemoryCache结构体包含一个成员c，类型是以string为key、以 [ ]byte为value的map，用来保存键值对；一个mutex，类型是sync.RWMutex，用来对map的并发访问提供读写锁保护；一个Stat，用来记录缓存状态。</p> 
+ <p>Go语言的map可以支持多个goroutine同时读，但不能支持多个goroutine同时写或同时既读又写，所以我们必须用一个读写锁保护map的并发读写，当多个goroutine同时读时，它们会调用mutex.RLock()，互不影响。</p> 
+ <p>当有至少一个goroutine需要写时，它会调用mutex.Lock()，此时它会等待所有其他读写锁释放，然后自己加锁，在它加锁后其他goroutine需要加锁则必须等待它先解锁。读写锁mutex的类型是sync.RWMutex，sync是Go语言自带的一个标准包，它提供了包括Mutex、RWMutex在内的多种互斥锁的实现。</p> 
+ <p><b>需要特别注意的是Stat，它的类型是Stat结构体，但是它没有提供成员名字，</b><b>这种写法在Go语言中被称为内嵌。</b>结构体可以内嵌多个结构体和接口，接则只能内嵌多个接口。</p> 
+ <p>Go语言通过内嵌来实现继承，内嵌结构体/接口可以被认为是外层结构体/接口的父类。一个内嵌结构体/接口的所有成员/方法都可以通过外层结构体/接口直接访问，那些成员/方法的首字母不需要大写。（通常我们从一个结构体外部只能访问其首字母大写的成员/方法，访问自己的内嵌成员的成员/方法不受此限制。）当我们需要访问某个内嵌成员本身时，我们可以直接用它的类型指代它，就如同我们在inMemoryCache.GetStat函数中做的那样。</p> 
+ <p><b>1.2.3　HTTP包的实现</b></p> 
+ <p>HTTP包用来实现我们的HTTP服务功能。由于不需要使用多态，我们在HTTP包里并没有声明接口，而是直接声明了一个Server结构体，见例1-6。</p> 
+ <p>例1-6　Server相关实现</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>Server结构体中内嵌了cache.Cache，cache.Cache就是之前介绍的cache包的Cache接口。HTTP包的Server结构体内嵌该接口意味着http.Server也实现了cache.Cache接口，而实现的方式则由实际的内嵌结构体决定。</p> 
+ <p>接下来我们看到Server的Listen方法会调用http.Handle函数，它会注册两个Handler分别用来处理/cache/和/status这两个HTTP协议的端点。</p> 
+ <p>这里需要注意的是http.Handle函数并不属于我们的HTTP包，而是Go语言自己的net/http标准包。还记得吗？Server结构体自身就处于我们的HTTP包里，引用自己包内的名字无需指定包名，所以当我们指定HTTP包名时，Go语言编译器会知道去net/http包中查找名字。</p> 
+ <p>Server.cacheHandler方法返回的是一个http.Handler接口，它用来处理HTTP端点/cache/的请求，也就是缓存的Set、Get、Del这3个基本操作，见例1-7。</p> 
+ <p>例1-7　cacheHandler相关实现</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>cacheHandler结构体内嵌了一个Server结构体的指针，并实现了ServeHTTP方法，实现该方法就意味着实现了http.Handler接口。例1-8展示了Go语言标准包net/http对Handler接口的定义。</p> 
+ <p>例1-8　Go标准包net/http中Handler接口的定义</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>​cacheHandler的ServeHTTP方法解析URL以获取key，并根据HTTP请求的3种方式PUT/GET/DELETE决定调用cache.Cache的Set/Get/Del方法。</p> 
+ <p>这里我们看到了Go语言内嵌的高阶使用方式——多重内嵌：cacheHandler内嵌了Server结构体指针，而Server内嵌了cache.Cache接口。于是cacheHandler就可以直接访问cache.Cache的方法了。</p> 
+ <p>Server.statusHandler方法同样返回一个http.Handler接口，其实现见例1-9。</p> 
+ <p>例1-9　statusHandler相关实现</p> 
+ <div> 
+  <br> 
+  <div></div> 
+ </div> 
+ <p>和cacheHandler一样，statusHandler内嵌Server结构体指针并实现ServeHTTP方法。该方法调用cache.Cache的GetStat方法并将返回的cache.Stat结构体用JSON格式编码成字节切片b，写入HTTP的响应正文。</p> 
+ <p>如果你是一位程序员，看到这里你的心里可能会有一个疑问。我们这样实现会不会太复杂了？为了处理两个HTTP端点的请求，我们需要实现两个Handler结构体并分别实现它们的ServeHTTP方法，能不能直接在Server结构体上实现ServeHTTP方法并根据URL区分不同的HTTP请求？</p> 
+ <p>从实现上来说是可行的，但是那意味着Server的ServeHTTP需要承担两个不同的职责，处理两类HTTP请求。将这两类请求分开到不同的结构体内实现符合SOLID的单一职责原则。</p> 
+ <p>Go语言的实现介绍完了，接下来我们需要把程序运行起来，并进行功能测试来验证我们的实现。</p> 
+ <div> 
+  <p><br></p> 
+  <div></div> 
+ </div> 
+ <p><b>《</b><b>分布式缓存——原理、架构及Go语言实现</b><b>》</b></p> 
+ <p>胡世杰 著</p> 
+ <p><a href="https://link.juejin.im?target=https%3A%2F%2Fwww.epubit.com%2Fbook%2Fdetail%2F39324" rel="nofollow">点击此处购买纸书</a></p> 
+ <p>本书共分3个部分，每个部分都有3章。第1部分为基本功能的实现,主要介绍基于HTTP的in memory缓存服务、HTTP/REST协议、TCP等。第2部分介绍性能相关的内容，我们将集中全力讲解从各方面提升缓存服务性能的方法，主要包括pipeline的原理、RocksDB批量写入等。最后一个部分则HE 分布式缓存服务集群有关，主要介绍分布式缓存集群、节点的再平衡功能等。</p> 
+ <p><br></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/4f3d707f8020d9958f24f28e2f3894d1/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">WPS光标消失，无法打字</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/c42cbb0c8fb5b49a2d40d9dfa9692dcd/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">shiro 异常处理</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

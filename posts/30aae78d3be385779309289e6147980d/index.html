@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>分布式事务常见解决方案整理：二阶段、三阶段、TCC、MQ&#43;本地事务&#43;消息校对 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="分布式事务常见解决方案整理：二阶段、三阶段、TCC、MQ&#43;本地事务&#43;消息校对" />
+<meta property="og:description" content="分布式事务常见解决方案整理：二阶段、三阶段、TCC、MQ&#43;本地事务&#43;消息校对 1、两阶段提交2、三阶段提交2.1 二阶段提交的缺点2.2 三阶段提交 3、TCC提交3.1 TCC提交的优点3.2 TCC提交的缺点3.3 TCC提交的注意事项 4、MQ消息&#43;本地事务&#43;消息校对4.1 首先为什么要加消息队列？4.2 需要注意的问题4.2.1 服务A先扣款100成功了，怎么保证一定能把消息发送到mq呢？4.2.2 既然已经保证了消息一定能发送出去，那服务B加钱100怎么保证幂等性呢？ 4.3 引入消息校验保证最终一致性 分布式事务是要保证多个服务下的多个数据库操作的一致性。
+本文以银行转账为例，来说明下分布式事务的常见解决方案。比如服务A需要对用户A扣款100元，服务B需要对用户B新增100元。
+1、两阶段提交 两阶段提交的典型应用是spring cloud alibaba的seata。其解决分布式事务的方案如下：
+1）阶段一：事务管理器TM（服务A）发起全局事务请求，事务协调器TC生产全局唯一事务XID。XID通过微服务调用链传播。因此各微服务（服务A&#43;服务B）到TC上注册为XID中的一个分支。
+2）各微服务进行事务操作，然后将事务结果返回给事务协调器TC，TC根据所有服务的结果判断是全局commit还是全局rollback。
+参考文章：
+1：SpringBoot 整合 Seata
+2、三阶段提交 2.1 二阶段提交的缺点 既然已经有二阶段提交了，那为什么还需要三阶段提交呢？因此接下来需要重点理解下，二阶段提交的优点和缺点。
+二阶段提交的缺点：
+1）同步阻塞问题：所有参与者的数据库事务都处于阻塞状态。如果某个参与者占用了某个公共资源，会导致其他服务请求该资源时也处于阻塞状态。因此不适用于高并发的情况。
+2）事务协调者单点故障问题：二阶段中，事务协调者是非常重要的环节。如果在第2阶段，协调者宕机了，那么会导致相关数据库事务不能commit或rollback，会一致阻塞下去。
+3）数据不一致的问题：在二阶段提交过程中，由于二阶段可能存在局部网络问题。可能存在协调者TC发出了commit或rollback请求，但是参与者未接收到。或者发出消息后，参与者宕机了等。那么也会导致相关事务未成功提交，导致存在数据不一致的问题。参与者在第二阶段超时未收到请求后，建议最好是rollback，当然这样也会存在数据不一致的情况，即本来应该是commit的情况。
+2.2 三阶段提交 三阶段包含：CanCommit 准备阶段、PreCommit 预提交阶段、DoCommit 提交阶段。思想基本和二阶段基本是一致的。
+1、引入了CanCommit阶段：该阶段会先进行服务的预检查工作（比如下订单，会先判断库存是否足够），因此该步骤不会锁资源。
+我理解引入该阶段的优点是：
+1）可以提前做校验，减少了资源的锁定时间。因此可以提升并发量。可以一定程度上解决二阶段中的同步阻塞问题。
+2）如果超时未收到第二阶段PreCommit的通知的话，会自动取消。可以一定程度解决二阶段的事务协调者单点故障问题。
+2、PreCommit预提交阶段后，参与者引入了超时机制。如果未收到协调者发布的DoCommit信息，会超时执行commit阶段。
+该阶段的优点是可以一定程度上解决事务协调者单点故障的问题。
+可以看到三阶段提交和二阶段提交一样，依然都存在数据不一致的问题。针对这种事务异常的情况，可以在监测到事务异常时，通过脚本或者异步任务来补偿差异的信息，并进行告警。
+3、针对二阶段中的数据不一致问题，可以使用超时重试机制。
+参考文章：
+1、分布式两阶段提交和三阶段提交
+2、分布式事务 - 两阶段提交和三阶段提交
+3、七种常见分布式事务详解
+3、TCC提交 TCC也可以理解为二阶段提交，不过它是基于应用层面的提交：Try Confirm Cancer。
+1）准备阶段：Try，业务系统做检测并预留资源 (加锁，锁住资源)，比如常见的下单，在try阶段，我们不是真正的减库存，也就是并没有进行数据库的事务操作。而是把下单的库存给锁定住，比如通过redis锁住对应资源。
+2）根据第一阶段的结果决定是执行confirm还是cancel。Confirm：执行真正的业务（执行业务，进行数据库的事务操作，释放锁）。Cancel：是对Try阶段预留资源的释放（出问题，不进行数据库的事务操作，释放锁）。
+3.1 TCC提交的优点 1、并发性能提升：TCC的本质原理是把数据库的二阶段提交上升到微服务来实现，从而避免了数据库在二阶段提交中，由于锁冲突、长事务而导致的阻塞低性能问题。可以一定程度上解决二阶段的同步阻塞问题。
+即将数据库阶段中的事务的阻塞等待，转化为了微服务间调用的阻塞。以转账为例，比如二阶段提交中服务A进行了数据库事务操作扣款了100元，接着就要等待服务B进行数据库事务操作增加100元，此时服务A的数据库事务就处于阻塞状态。而TCC提交的话，服务A执行了Confirm中的数据库的事务后，服务A的数据库事务就可以commit了，不用处于阻塞状态，如果服务B超时未成功返回的话，服务A可以再调用Cancer再进行回滚。
+当然TCC的前提是默认Confirm阶段和Cancer阶段是一定可以执行成功的。
+2、数据最终一致性：基于 Confirm 和 Cancel 的幂等性，保证事务最终完成确认或者取消，保证数据的一致性。可以解决二阶段提交中的数据不一致的问题。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/30aae78d3be385779309289e6147980d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-10-08T21:43:03+08:00" />
+<meta property="article:modified_time" content="2022-10-08T21:43:03+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">分布式事务常见解决方案整理：二阶段、三阶段、TCC、MQ&#43;本地事务&#43;消息校对</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>分布式事务常见解决方案整理：二阶段、三阶段、TCC、MQ+本地事务+消息校对</h4> 
+ <ul><li><a href="#1_6" rel="nofollow">1、两阶段提交</a></li><li><a href="#2_17" rel="nofollow">2、三阶段提交</a></li><li><ul><li><a href="#21__18" rel="nofollow">2.1 二阶段提交的缺点</a></li><li><a href="#22__27" rel="nofollow">2.2 三阶段提交</a></li></ul> 
+  </li><li><a href="#3TCC_52" rel="nofollow">3、TCC提交</a></li><li><ul><li><a href="#31_TCC_58" rel="nofollow">3.1 TCC提交的优点</a></li><li><a href="#32_TCC_68" rel="nofollow">3.2 TCC提交的缺点</a></li><li><a href="#33_TCC_71" rel="nofollow">3.3 TCC提交的注意事项</a></li></ul> 
+  </li><li><a href="#4MQ_77" rel="nofollow">4、MQ消息+本地事务+消息校对</a></li><li><ul><li><a href="#41__82" rel="nofollow">4.1 首先为什么要加消息队列？</a></li><li><a href="#42__87" rel="nofollow">4.2 需要注意的问题</a></li><li><ul><li><a href="#421_A100mq_90" rel="nofollow">4.2.1 服务A先扣款100成功了，怎么保证一定能把消息发送到mq呢？</a></li><li><a href="#422_B100_96" rel="nofollow">4.2.2 既然已经保证了消息一定能发送出去，那服务B加钱100怎么保证幂等性呢？</a></li></ul> 
+   </li><li><a href="#43__103" rel="nofollow">4.3 引入消息校验保证最终一致性</a></li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<p>分布式事务是要保证多个服务下的多个数据库操作的一致性。</p> 
+<p>本文以银行转账为例，来说明下分布式事务的常见解决方案。比如服务A需要对用户A扣款100元，服务B需要对用户B新增100元。</p> 
+<h2><a id="1_6"></a>1、两阶段提交</h2> 
+<p>两阶段提交的典型应用是spring cloud alibaba的seata。其解决分布式事务的方案如下：<br> 1）阶段一：事务管理器TM（服务A）发起全局事务请求，事务协调器TC生产全局唯一事务XID。XID通过微服务调用链传播。因此各微服务（服务A+服务B）到TC上注册为XID中的一个分支。<br> 2）各微服务进行事务操作，然后将事务结果返回给事务协调器TC，TC根据所有服务的结果判断是全局commit还是全局rollback。</p> 
+<p><img src="https://images2.imgbox.com/ac/87/1cMT6m9B_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/dc/ca/qldFt6dd_o.png" alt="在这里插入图片描述"></p> 
+<p>参考文章：<br> 1：<a href="https://blog.csdn.net/qq_32691791/article/details/112727500">SpringBoot 整合 Seata</a></p> 
+<h2><a id="2_17"></a>2、三阶段提交</h2> 
+<h3><a id="21__18"></a>2.1 二阶段提交的缺点</h3> 
+<p>既然已经有二阶段提交了，那为什么还需要三阶段提交呢？因此接下来需要重点理解下，二阶段提交的优点和缺点。</p> 
+<p><strong>二阶段提交的缺点</strong>：<br> 1）<code>同步阻塞问题</code>：所有参与者的数据库事务都处于阻塞状态。如果某个参与者占用了某个公共资源，会导致其他服务请求该资源时也处于阻塞状态。因此不适用于高并发的情况。<br> 2）<code>事务协调者单点故障问题</code>：二阶段中，事务协调者是非常重要的环节。如果在第2阶段，协调者宕机了，那么会导致相关数据库事务不能commit或rollback，会一致阻塞下去。<br> 3）<code>数据不一致的问题</code>：在二阶段提交过程中，由于二阶段可能存在局部网络问题。可能存在协调者TC发出了commit或rollback请求，但是参与者未接收到。或者发出消息后，参与者宕机了等。那么也会导致相关事务未成功提交，导致存在数据不一致的问题。参与者在第二阶段超时未收到请求后，建议最好是rollback，当然这样也会存在数据不一致的情况，即本来应该是commit的情况。</p> 
+<h3><a id="22__27"></a>2.2 三阶段提交</h3> 
+<p>三阶段包含：CanCommit 准备阶段、PreCommit 预提交阶段、DoCommit 提交阶段。思想基本和二阶段基本是一致的。</p> 
+<p>1、引入了CanCommit阶段：该阶段会先进行服务的预检查工作（比如下订单，会先判断库存是否足够），因此该步骤不会锁资源。</p> 
+<p>我理解引入该阶段的<strong>优点</strong>是：<br> 1）可以<strong>提前做校验，减少了资源的锁定时间。因此可以提升并发量</strong>。<code>可以一定程度上解决二阶段中的同步阻塞问题</code>。<br> 2）如果<strong>超时未收到第二阶段PreCommit的通知的话，会自动取消</strong>。<code>可以一定程度解决二阶段的事务协调者单点故障问题</code>。</p> 
+<p>2、PreCommit预提交阶段后，<strong>参与者引入了超时机制。如果未收到协调者发布的DoCommit信息，会超时执行commit阶段</strong>。</p> 
+<p>该阶段的优点是<code>可以一定程度上解决事务协调者单点故障的问题</code>。</p> 
+<p>可以看到三阶段提交和二阶段提交一样，<code>依然都存在数据不一致的问题</code>。针对这种事务异常的情况，可以在<strong>监测到事务异常时，通过脚本或者异步任务来补偿差异的信息，并进行告警</strong>。</p> 
+<p>3、针对二阶段中的数据不一致问题，可以使用超时重试机制。<br> <img src="https://images2.imgbox.com/3f/2f/NWkpfocb_o.png" alt="在这里插入图片描述"></p> 
+<p>参考文章：<br> 1、<a href="https://blog.csdn.net/u010191243/article/details/52081891?spm=1001.2101.3001.6650.6&amp;utm_medium=distribute.pc_relevant.none-task-blog-2~default~BlogCommendFromBaidu~Rate-6-52081891-blog-124152586.pc_relevant_3mothn_strategy_recovery&amp;depth_1-utm_source=distribute.pc_relevant.none-task-blog-2~default~BlogCommendFromBaidu~Rate-6-52081891-blog-124152586.pc_relevant_3mothn_strategy_recovery&amp;utm_relevant_index=12">分布式两阶段提交和三阶段提交</a><br> 2、<a href="https://zhuanlan.zhihu.com/p/375248168" rel="nofollow">分布式事务 - 两阶段提交和三阶段提交</a><br> 3、<a href="https://blog.csdn.net/a745233700/article/details/122402303?spm=1001.2101.3001.6661.1&amp;utm_medium=distribute.pc_relevant_t0.none-task-blog-2~default~CTRLIST~Rate-1-122402303-blog-52067011.pc_relevant_multi_platform_whitelistv4&amp;depth_1-utm_source=distribute.pc_relevant_t0.none-task-blog-2~default~CTRLIST~Rate-1-122402303-blog-52067011.pc_relevant_multi_platform_whitelistv4&amp;utm_relevant_index=1">七种常见分布式事务详解</a></p> 
+<h2><a id="3TCC_52"></a>3、TCC提交</h2> 
+<p>TCC也可以理解为二阶段提交，不过它是基于应用层面的提交：Try Confirm Cancer。<br> 1）准备阶段：Try，业务系统做检测并预留资源 (加锁，锁住资源)，比如常见的下单，在try阶段，我们不是真正的减库存，也就是并没有进行数据库的事务操作。而是把下单的库存给锁定住，比如通过redis锁住对应资源。<br> 2）根据第一阶段的结果决定是执行confirm还是cancel。Confirm：执行真正的业务（执行业务，进行数据库的事务操作，释放锁）。Cancel：是对Try阶段预留资源的释放（出问题，不进行数据库的事务操作，释放锁）。<br> <img src="https://images2.imgbox.com/f6/bc/10RL1vRJ_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="31_TCC_58"></a>3.1 TCC提交的优点</h3> 
+<p>1、<strong>并发性能提升</strong>：<code>TCC的本质原理是把数据库的二阶段提交上升到微服务来实现</code>，从而避免了数据库在二阶段提交中，<strong>由于锁冲突、长事务而导致的阻塞低性能问题</strong>。<code>可以一定程度上解决二阶段的同步阻塞问题</code>。</p> 
+<p><strong>即将数据库阶段中的事务的阻塞等待，转化为了微服务间调用的阻塞</strong>。以转账为例，比如二阶段提交中服务A进行了数据库事务操作扣款了100元，接着就要等待服务B进行数据库事务操作增加100元，此时<strong>服务A的数据库事务就处于阻塞状态</strong>。而TCC提交的话，服务A执行了Confirm中的数据库的事务后，<strong>服务A的数据库事务就可以commit了，不用处于阻塞状态</strong>，如果服务B超时未成功返回的话，服务A可以再调用Cancer再进行回滚。</p> 
+<p>当然TCC的前提是默认Confirm阶段和Cancer阶段是一定可以执行成功的。</p> 
+<p>2、<strong>数据最终一致性</strong>：基于 Confirm 和 Cancel 的幂等性，保证事务最终完成确认或者取消，保证数据的一致性。<code>可以解决二阶段提交中的数据不一致的问题</code>。<br> 3、<strong>可靠性</strong>：解决了 XA 协议的协调者单点故障问题。由于主业务方的微服务一般是集群部署，由微服务发起并控制整个业务活动，<code>可以解决二阶段提交中的事务协调者单点故障问题</code>。</p> 
+<h3><a id="32_TCC_68"></a>3.2 TCC提交的缺点</h3> 
+<p>1、<code>对微服务的侵入性强</code>：微服务的每个事务都必须实现try，confirm，cancel等3个方法，业务耦合度较高，提高了开发成本，今后维护改造的成本也高。</p> 
+<h3><a id="33_TCC_71"></a>3.3 TCC提交的注意事项</h3> 
+<p>1）<code>允许空回滚</code>：由于try的步骤可能会失败，因此允许执行空回滚；<br> 2）<code>防悬挂控制</code>：针对try一致未成功执行，导致协调者发布cancel。导致参与者先收到cancel，再收到try请求。针对这种情况，需要在本地事务中记录该id已cancel了，所以再try的时候，就不能成功。<br> 3）幂等问题：一定要考虑幂等情况。</p> 
+<h2><a id="4MQ_77"></a>4、MQ消息+本地事务+消息校对</h2> 
+<p>MQ消息+本地事务的核心是对于调用方需要保证本地事务一致性，然后保证消息一定成功发送。其次被调用方需要保证一定能接收到消息，并且也要能保证本地事务的一致性。<br> <img src="https://images2.imgbox.com/49/86/SWnA8QLS_o.png" alt="在这里插入图片描述"><br> 以下以转账为例。</p> 
+<h3><a id="41__82"></a>4.1 首先为什么要加消息队列？</h3> 
+<p><strong>加消息队列主要是考虑到以下2个问题</strong>：<br> 1、服务A调用服务B，可能时间较长，服务A一直处于阻塞状态；<br> 2、流量不是很好控制，服务A如果是高流量的话，可能会压垮服务B；</p> 
+<h3><a id="42__87"></a>4.2 需要注意的问题</h3> 
+<p>大致步骤是：服务A先扣款100成功，然后发送消息到mq，然后服务B收到消息并加钱100，最后服务A完成调用。</p> 
+<h4><a id="421_A100mq_90"></a>4.2.1 服务A先扣款100成功了，怎么保证一定能把消息发送到mq呢？</h4> 
+<p>可以考虑在服务A中加一张表：<strong>转账流水表</strong>。把扣款和写入转账流水表作为1个本地事务，扣款成功的话，就将该条转账记录的状态改为<code>待处理</code>。</p> 
+<p>然后<strong>后台加一个定时任务，定期地查看转账流水表中是否有记录地状态时待处理</strong>，同时更新时间-当前时间大于阈值，说明这条数据一直没有收到结果，需要将其重新投入到消息队列中。<code>这样就可以保证服务A只要扣款成功，就一定能将消息成功发送给服务B</code>。</p> 
+<p>当然如果服务B那边成功返回ACK了的话，可以将状态改为<code>处理成功</code>；ACK返回失败的话，可以将状态改为<code>处理失败</code>。</p> 
+<h4><a id="422_B100_96"></a>4.2.2 既然已经保证了消息一定能发送出去，那服务B加钱100怎么保证幂等性呢？</h4> 
+<p>可以在服务B这里也建一个转账日志表，让<strong>服务B加钱和写入转账记录为一个本地事</strong>务，保证加钱成功，就一定能成功写入。这样每次有消息来了之后，可以先看下这条流水id是否已经存在，存在的话，就不用重复消费了。</p> 
+<p>当然这里还存在一个问题，假设2个重复消息同时到了，那么还涉及到一个加锁的步骤了。比如2条流水号为202209200000001的消息都来了，那么可以先去redis里面看一下是否已存在202209200000001的锁，有的话，说明前面一个线程已经获取锁了，正在加钱并且写入转账日志表。</p> 
+<p>比如线程1先抢占到锁，那么先加好钱并写入转账日志表，然后释放锁。此时线程2再抢到锁，先判断转账日志表中是否已有这条记录，有的话，那就不要再重复操作了。如果没有的话，线程2就加钱并写入转账日志表。</p> 
+<h3><a id="43__103"></a>4.3 引入消息校验保证最终一致性</h3> 
+<p>可以使用定时任务进行消息校验/消息对账，来保证最终一致性。</p> 
+<p>参考文章：<br> 1、<a href="https://blog.csdn.net/ZrZrZr666666/article/details/113388852">转账引发数据一致性思考</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/c8e013b89d13ed9645f4b92048b9d605/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">mysql主从复制概述</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/a6fa6f759f49a9b1d8424c0c6498131f/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">python网络编程—UDP协议</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

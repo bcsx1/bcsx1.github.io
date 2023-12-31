@@ -1,0 +1,1787 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>RabbitMQ集群原理 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="RabbitMQ集群原理" />
+<meta property="og:description" content="RabbitMQ是Erlang语言和平台实现的，其充分利用Erlang分布特性，实现集群功能非常容易。RabbitMQ集群分为普通模式和镜像模式，普通模式下存在单点故障，当队列创建时绑定的节点故障时，服务整体不可用。镜像队列（Mirrored queue）机制解决了RabbitMQ单点问题，保证了高可用（Highly Available）。
+重点讨论镜像模式RabbitMQ集群。
+通过镜像机制，RabbitMQ将队列放置于集群中的多个节点上，消息的生产和消费都会在节点间同步。镜像队列包含一个master和多个slave，当master退出时，最老的slave被提升为新的master。
+镜像队列中各节点的进程是独立的，进程间通过消息传递来通信。各节点之间通过GM协议保证消息原子性传递。
+可靠多播 (Guaranteed Multicast) 广播通常的实现方法是发送者将消息发给集群中的每个节点，这要求集群节点是全联通的（fully connected）。当发送节点挂掉时，消息可能没有发到集群中的每个节点，这就引入了集群中哪些节点要为已挂掉节点负责、继续发送消息的问题。
+为简化网络拓扑和实现复杂度，GM组将集群中的节点组成一个环。环中节点挂掉时，很容易知道哪些节点已收到消息、哪些节点没有收到：如果一个节点挂掉，其左右邻居节点将获悉其退出信息，然后最近的上游节点（upstream）负责将挂掉节点未转发的消息（in-flight messages）继续发给最近的下游节点（downstream）。
+参考RabbitMQ源文件gm.erl
+%% The contents of this file are subject to the Mozilla Public License %% Version 1.1 (the &#34;License&#34;); you may not use this file except in %% compliance with the License. You may obtain a copy of the License at %% https://www.mozilla.org/MPL/ %% %% Software distributed under the License is distributed on an &#34;AS IS&#34; %% basis, WITHOUT WARRANTY OF ANY KIND, either express or implied." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/41d7f389a7fd0ac2567d46ac1f4fe27b/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-06-23T11:55:15+08:00" />
+<meta property="article:modified_time" content="2020-06-23T11:55:15+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">RabbitMQ集群原理</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>RabbitMQ是Erlang语言和平台实现的，其充分利用Erlang分布特性，实现集群功能非常容易。RabbitMQ集群分为普通模式和镜像模式，普通模式下存在单点故障，当队列创建时绑定的节点故障时，服务整体不可用。镜像队列（Mirrored queue）机制解决了RabbitMQ单点问题，保证了高可用（Highly Available）。</p> 
+<p>重点讨论镜像模式RabbitMQ集群。</p> 
+<p>通过镜像机制，RabbitMQ将队列放置于集群中的多个节点上，消息的生产和消费都会在节点间同步。镜像队列包含一个master和多个slave，当master退出时，最老的slave被提升为新的master。<br> 镜像队列中各节点的进程是独立的，进程间通过消息传递来通信。各节点之间通过GM协议保证消息原子性传递。</p> 
+<p><img src="https://images2.imgbox.com/fe/f6/kOSXtako_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="_Guaranteed_Multicast_9"></a>可靠多播 (Guaranteed Multicast)</h3> 
+<p>广播通常的实现方法是发送者将消息发给集群中的每个节点，这要求集群节点是全联通的（fully connected）。当发送节点挂掉时，消息可能没有发到集群中的每个节点，这就引入了集群中哪些节点要为已挂掉节点负责、继续发送消息的问题。</p> 
+<p>为简化网络拓扑和实现复杂度，GM组将集群中的节点组成一个环。环中节点挂掉时，很容易知道哪些节点已收到消息、哪些节点没有收到：如果一个节点挂掉，其左右邻居节点将获悉其退出信息，然后最近的上游节点（upstream）负责将挂掉节点未转发的消息（in-flight messages）继续发给最近的下游节点（downstream）。<br> 　　<br> <img src="https://images2.imgbox.com/8b/e4/HAWemhii_o.png" alt="在这里插入图片描述"></p> 
+<p>参考RabbitMQ源文件gm.erl</p> 
+<pre><code class="prism language-bash">%% The contents of this <span class="token function">file</span> are subject to the Mozilla Public License
+%% Version 1.1 <span class="token punctuation">(</span>the <span class="token string">"License"</span><span class="token punctuation">)</span><span class="token punctuation">;</span> you may not use this <span class="token function">file</span> except <span class="token keyword">in</span>
+%% compliance with the License. You may obtain a copy of the License at
+%% https://www.mozilla.org/MPL/
+%%
+%% Software distributed under the License is distributed on an <span class="token string">"AS IS"</span>
+%% basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
+%% License <span class="token keyword">for</span> the specific language governing rights and limitations
+%% under the License.
+%%
+%% The Original Code is RabbitMQ.
+%%
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright <span class="token punctuation">(</span>c<span class="token punctuation">)</span> 2007-2020 VMware, Inc. or its affiliates.  All rights reserved.
+%%
+
+-module<span class="token punctuation">(</span>gm<span class="token punctuation">)</span>.
+
+%% Guaranteed Multicast
+%% <span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span>
+%%
+%% This module provides the ability to create named <span class="token function">groups</span> of
+%% processes to <span class="token function">which</span> members can be dynamically added and removed,
+%% and <span class="token keyword">for</span> messages to be broadcast within the group that are
+%% guaranteed to reach all members of the group during the lifetime of
+%% the message. The lifetime of a message is defined as being, at a
+%% minimum, the <span class="token function">time</span> from <span class="token function">which</span> the message is first sent to any
+%% member of the group, up <span class="token keyword">until</span> the <span class="token function">time</span> at <span class="token function">which</span> it is known by the
+%% member <span class="token function">who</span> published the message that the message has reached all
+%% group members.
+%%
+%% The guarantee given is that provided a message, once sent, makes it
+%% to members <span class="token function">who</span> <span class="token keyword">do</span> not all leave the group, the message will
+%% <span class="token keyword">continue</span> to propagate to all group members.
+%%
+%% Another way of stating the guarantee is that <span class="token keyword">if</span> member P publishes
+%% messages m and m<span class="token string">', then for all members P'</span>, <span class="token keyword">if</span> P<span class="token string">' is a member of
+%% the group prior to the publication of m, and P'</span> receives m<span class="token string">', then
+%% P'</span> will receive m.
+%%
+%% Note that only local-ordering is enforced: i.e. <span class="token keyword">if</span> member P sends
+%% message m and <span class="token keyword">then</span> message m<span class="token string">', then for-all members P'</span>, <span class="token keyword">if</span> P<span class="token string">'
+%% receives m and m'</span>, <span class="token keyword">then</span> they will receive m<span class="token string">' after m. Causality
+%% ordering is _not_ enforced. I.e. if member P receives message m
+%% and as a result publishes message m'</span>, there is no guarantee that
+%% other members P<span class="token string">' will receive m before m'</span><span class="token keyword">.</span>
+%%
+%%
+%% API Use
+%% -------
+%%
+%% Mnesia must be started. Use the idempotent create_tables/0 <span class="token keyword">function</span>
+%% to create the tables required.
+%%
+%% start_link/3
+%% Provide the group name, the callback module name, and any arguments
+%% you wish to be passed into the callback module<span class="token string">'s functions. The
+%% joined/2 function will be called when we have joined the group,
+%% with the arguments passed to start_link and a list of the current
+%% members of the group. See the callbacks specs and the comments
+%% below for further details of the callback functions.
+%%
+%% leave/1
+%% Provide the Pid. Removes the Pid from the group. The callback
+%% handle_terminate/2 function will be called.
+%%
+%% broadcast/2
+%% Provide the Pid and a Message. The message will be sent to all
+%% members of the group as per the guarantees given above. This is a
+%% cast and the function call will return immediately. There is no
+%% guarantee that the message will reach any member of the group.
+%%
+%% confirmed_broadcast/2
+%% Provide the Pid and a Message. As per broadcast/2 except that this
+%% is a call, not a cast, and only returns '</span>ok<span class="token string">' once the Message has
+%% reached every member of the group. Do not call
+%% confirmed_broadcast/2 directly from the callback module otherwise
+%% you will deadlock the entire group.
+%%
+%% info/1
+%% Provide the Pid. Returns a proplist with various facts, including
+%% the group name and the current group members.
+%%
+%% validate_members/2
+%% Check whether a given member list agrees with the chosen member'</span>s
+%% view. Any differences will be communicated via the members_changed
+%% callback. If there are no differences <span class="token keyword">then</span> there will be no reply.
+%% Note that members will not necessarily share the same view.
+%%
+%% forget_group/1
+%% Provide the group name. Removes its mnesia record. Makes no attempt
+%% to ensure the group is empty.
+%%
+%% Implementation Overview
+%% -----------------------
+%%
+%% One possible means of implementation would be a fan-out from the
+%% sender to every member of the group. This would require that the
+%% group is fully connected, and, <span class="token keyword">in</span> the event that the original
+%% sender of the message disappears from the group before the message
+%% has made it to every member of the group, raises questions as to
+%% <span class="token function">who</span> is responsible <span class="token keyword">for</span> sending on the message to new group members.
+%% In particular, the issue is with <span class="token punctuation">[</span> Pid <span class="token operator">!</span> Msg <span class="token operator">||</span> Pid <span class="token operator">&lt;</span>- Members <span class="token punctuation">]</span> -
+%% <span class="token keyword">if</span> the sender dies part way through, <span class="token function">who</span> is responsible <span class="token keyword">for</span>
+%% ensuring that the remaining Members receive the Msg? In the event
+%% that within the group, messages sent are broadcast from a subset of
+%% the members, the fan-out arrangement has the potential to
+%% substantially impact the CPU and network workload of such members,
+%% as such members would have to accommodate the cost of sending each
+%% message to every group member.
+%%
+%% Instead, <span class="token keyword">if</span> the members of the group are arranged <span class="token keyword">in</span> a chain, <span class="token keyword">then</span>
+%% it becomes easier to reason about <span class="token function">who</span> within the group has received
+%% each message and <span class="token function">who</span> has not. It eases issues of responsibility: <span class="token keyword">in</span>
+%% the event of a group member disappearing, the nearest upstream
+%% member of the chain is responsible <span class="token keyword">for</span> ensuring that messages
+%% <span class="token keyword">continue</span> to propagate down the chain. It also results <span class="token keyword">in</span> equal
+%% distribution of sending and receiving workload, even <span class="token keyword">if</span> all
+%% messages are being sent from just a single group member. This
+%% configuration has the further advantage that it is not necessary
+%% <span class="token keyword">for</span> every group member to know of every other group member, and
+%% even that a group member does not have to be accessible from all
+%% other group members.
+%%
+%% Performance is kept high by permitting pipelining and all
+%% communication between joined group members is asynchronous. In the
+%% chain A -<span class="token operator">&gt;</span> B -<span class="token operator">&gt;</span> C -<span class="token operator">&gt;</span> D, <span class="token keyword">if</span> A sends a message to the group, it will
+%% not directly contact C or D. However, it must know that D receives
+%% the message <span class="token punctuation">(</span>in addition to B and C<span class="token punctuation">)</span> before it can consider the
+%% message fully sent. A simplistic implementation would require that
+%% D replies to C, C replies to B and B <span class="token keyword">then</span> replies to A. This would
+%% result <span class="token keyword">in</span> a propagation delay of twice the length of the chain. It
+%% would also require, <span class="token keyword">in</span> the event of the failure of C, that D knows
+%% to directly contact B and issue the necessary replies. Instead, the
+%% chain forms a ring: D sends the message on to A: D does not
+%% distinguish A as the sender, merely as the next member <span class="token punctuation">(</span>downstream<span class="token punctuation">)</span>
+%% within the chain <span class="token punctuation">(</span>which has now become a ring<span class="token punctuation">)</span>. When A receives
+%% from D messages that A sent, it knows that all members have
+%% received the message. However, the message is not dead yet: <span class="token keyword">if</span> C
+%% died as B was sending to C, <span class="token keyword">then</span> B would need to detect the death
+%% of C and forward the message on to D instead: thus every node has
+%% to remember every message published <span class="token keyword">until</span> it is told that it can
+%% forget about the message. This is essential not just <span class="token keyword">for</span> dealing
+%% with failure of members, but also <span class="token keyword">for</span> the addition of new members.
+%%
+%% Thus once A receives the message back again, it <span class="token keyword">then</span> sends to B an
+%% acknowledgement <span class="token keyword">for</span> the message, indicating that B can now forget
+%% about the message. B does so, and forwards the ack to C. C forgets
+%% the message, and forwards the ack to D, <span class="token function">which</span> forgets the message
+%% and finally forwards the ack back to A. At this point, A takes no
+%% further action: the message and its acknowledgement have made it to
+%% every member of the group. The message is now dead, and any new
+%% member joining the group at this point will not receive the
+%% message.
+%%
+%% We therefore have two roles:
+%%
+%% 1. The sender, <span class="token function">who</span> upon receiving their own messages back, must
+%% <span class="token keyword">then</span> send out acknowledgements, and upon receiving their own
+%% acknowledgements back perform no further action.
+%%
+%% 2. The other group members <span class="token function">who</span> upon receiving messages and
+%% acknowledgements must update their own internal state accordingly
+%% <span class="token punctuation">(</span>the sending member must also <span class="token keyword">do</span> this <span class="token keyword">in</span> order to be able to
+%% accommodate failures<span class="token punctuation">)</span>, and forwards messages on to their downstream
+%% neighbours.
+%%
+%%
+%% Implementation: It gets trickier
+%% --------------------------------
+%%
+%% Chain A -<span class="token operator">&gt;</span> B -<span class="token operator">&gt;</span> C -<span class="token operator">&gt;</span> D
+%%
+%% A publishes a message <span class="token function">which</span> B receives. A now dies. B and D will
+%% detect the death of A, and will <span class="token function">link</span> up, thus the chain is now B -<span class="token operator">&gt;</span>
+%% C -<span class="token operator">&gt;</span> D. B forwards A<span class="token string">'s message on to C, who forwards it to D, who
+%% forwards it to B. Thus B is now responsible for A'</span>s messages - both
+%% publications and acknowledgements that were <span class="token keyword">in</span> flight at the point
+%% at <span class="token function">which</span> A died. Even worse is that this is transitive: after B
+%% forwards A<span class="token string">'s message to C, B dies as well. Now C is not only
+%% responsible for B'</span>s in-flight messages, but is also responsible <span class="token keyword">for</span>
+%% A<span class="token string">'s in-flight messages.
+%%
+%% Lemma 1: A member can only determine which dead members they have
+%% inherited responsibility for if there is a total ordering on the
+%% conflicting additions and subtractions of members from the group.
+%%
+%% Consider the simultaneous death of B and addition of B'</span> that
+%% transitions a chain from A -<span class="token operator">&gt;</span> B -<span class="token operator">&gt;</span> C to A -<span class="token operator">&gt;</span> B<span class="token string">' -&gt; C. Either B'</span> or
+%% C is responsible <span class="token keyword">for</span> in-flight messages from B. It is easy to
+%% ensure that at least one of them thinks they have inherited B, but
+%% <span class="token keyword">if</span> we <span class="token keyword">do</span> not ensure that exactly one of them inherits B, <span class="token keyword">then</span> we
+%% could have B<span class="token string">' converting publishes to acks, which then will crash C
+%% as C does not believe it has issued acks for those messages.
+%%
+%% More complex scenarios are easy to concoct: A -&gt; B -&gt; C -&gt; D -&gt; E
+%% becoming A -&gt; C'</span> -<span class="token operator">&gt;</span> E. Who has inherited <span class="token function">which</span> of B, C and D?
+%%
+%% However, <span class="token keyword">for</span> non-conflicting membership changes, only a partial
+%% ordering is required. For example, A -<span class="token operator">&gt;</span> B -<span class="token operator">&gt;</span> C becoming A -<span class="token operator">&gt;</span> A<span class="token string">' -&gt;
+%% B. The addition of A'</span>, between A and B can have no conflicts with
+%% the death of C: it is <span class="token function">clear</span> that A has inherited C<span class="token string">'s messages.
+%%
+%% For ease of implementation, we adopt the simple solution, of
+%% imposing a total order on all membership changes.
+%%
+%% On the death of a member, it is ensured the dead member'</span>s
+%% neighbours become aware of the death, and the upstream neighbour
+%% now sends to its new downstream neighbour its state, including the
+%% messages pending acknowledgement. The downstream neighbour can <span class="token keyword">then</span>
+%% use this to calculate <span class="token function">which</span> publishes and acknowledgements it has
+%% missed out on, due to the death of its old upstream. Thus the
+%% downstream can catch up, and continues the propagation of messages
+%% through the group.
+%%
+%% Lemma 2: When a member is joining, it must synchronously
+%% communicate with its upstream member <span class="token keyword">in</span> order to receive its
+%% starting state atomically with its addition to the group.
+%%
+%% New members must start with the same state as their nearest
+%% upstream neighbour. This ensures that it is not surprised by
+%% acknowledgements they are sent, and that should their downstream
+%% neighbour die, they are able to send the correct state to their new
+%% downstream neighbour to ensure it can catch up. Thus <span class="token keyword">in</span> the
+%% transition A -<span class="token operator">&gt;</span> B -<span class="token operator">&gt;</span> C becomes A -<span class="token operator">&gt;</span> A<span class="token string">' -&gt; B -&gt; C becomes A -&gt; A'</span> -<span class="token operator">&gt;</span>
+%% C, A<span class="token string">' must start with the state of A, so that it can send C the
+%% correct state when B dies, allowing C to detect any missed
+%% messages.
+%%
+%% If A'</span> starts by adding itself to the group membership, A could <span class="token keyword">then</span>
+%% die, without A<span class="token string">' having received the necessary state from A. This
+%% would leave A'</span> responsible <span class="token keyword">for</span> in-flight messages from A, but
+%% having the least knowledge of all, of those messages. Thus A<span class="token string">' must
+%% start by synchronously calling A, which then immediately sends A'</span>
+%% back its state. A <span class="token keyword">then</span> adds A<span class="token string">' to the group. If A dies at this
+%% point then A'</span> will be able to see this <span class="token punctuation">(</span>as A<span class="token string">' will fail to appear
+%% in the group membership), and thus A'</span> will ignore the state it
+%% receives from A, and will simply repeat the process, trying to now
+%% <span class="token function">join</span> downstream from some other member. This ensures that should
+%% the upstream die as soon as the new member has been joined, the new
+%% member is guaranteed to receive the correct state, allowing it to
+%% correctly process messages inherited due to the death of its
+%% upstream neighbour.
+%%
+%% The canonical definition of the group membership is held by a
+%% distributed database. Whilst this allows the total ordering of
+%% changes to be achieved, it is nevertheless undesirable to have to
+%% query this database <span class="token keyword">for</span> the current view, upon receiving each
+%% message. Instead, we wish <span class="token keyword">for</span> members to be able to cache a view of
+%% the group membership, <span class="token function">which</span> <span class="token keyword">then</span> requires a cache invalidation
+%% mechanism. Each member maintains its own view of the group
+%% membership. Thus when the group<span class="token string">'s membership changes, members may
+%% need to become aware of such changes in order to be able to
+%% accurately process messages they receive. Because of the
+%% requirement of a total ordering of conflicting membership changes,
+%% it is not possible to use the guaranteed broadcast mechanism to
+%% communicate these changes: to achieve the necessary ordering, it
+%% would be necessary for such messages to be published by exactly one
+%% member, which can not be guaranteed given that such a member could
+%% die.
+%%
+%% The total ordering we enforce on membership changes gives rise to a
+%% view version number: every change to the membership creates a
+%% different view, and the total ordering permits a simple
+%% monotonically increasing view version number.
+%%
+%% Lemma 3: If a message is sent from a member that holds view version
+%% N, it can be correctly processed by any member receiving the
+%% message with a view version &gt;= N.
+%%
+%% Initially, let us suppose that each view contains the ordering of
+%% every member that was ever part of the group. Dead members are
+%% marked as such. Thus we have a ring of members, some of which are
+%% dead, and are thus inherited by the nearest alive downstream
+%% member.
+%%
+%% In the chain A -&gt; B -&gt; C, all three members initially have view
+%% version 1, which reflects reality. B publishes a message, which is
+%% forward by C to A. B now dies, which A notices very quickly. Thus A
+%% updates the view, creating version 2. It now forwards B'</span>s
+%% publication, sending that message to its new downstream neighbour,
+%% C. This happens before C is aware of the death of B. C must become
+%% aware of the view change before it interprets the message its
+%% received, otherwise it will fail to learn of the death of B, and
+%% thus will not realise it has inherited B<span class="token string">'s messages (and will
+%% likely crash).
+%%
+%% Thus very simply, we have that each subsequent view contains more
+%% information than the preceding view.
+%%
+%% However, to avoid the views growing indefinitely, we need to be
+%% able to delete members which have died _and_ for which no messages
+%% are in-flight. This requires that upon inheriting a dead member, we
+%% know the last publication sent by the dead member (this is easy: we
+%% inherit a member because we are the nearest downstream member which
+%% implies that we know at least as much than everyone else about the
+%% publications of the dead member), and we know the earliest message
+%% for which the acknowledgement is still in flight.
+%%
+%% In the chain A -&gt; B -&gt; C, when B dies, A will send to C its state
+%% (as C is the new downstream from A), allowing C to calculate which
+%% messages it has missed out on (described above). At this point, C
+%% also inherits B'</span>s messages. If that state from A also includes the
+%% last message published by B <span class="token keyword">for</span> <span class="token function">which</span> an acknowledgement has been
+%% seen, <span class="token keyword">then</span> C knows exactly <span class="token function">which</span> further acknowledgements it must
+%% receive <span class="token punctuation">(</span>also including issuing acknowledgements <span class="token keyword">for</span> publications
+%% still in-flight that it receives<span class="token punctuation">)</span>, after <span class="token function">which</span> it is known there
+%% are no <span class="token function">more</span> messages <span class="token keyword">in</span> flight <span class="token keyword">for</span> B, thus all evidence that B was
+%% ever part of the group can be safely removed from the canonical
+%% group membership.
+%%
+%% Thus, <span class="token keyword">for</span> every message that a member sends, it includes with that
+%% message its view version. When a member receives a message it will
+%% update its view from the canonical copy, should its view be older
+%% than the view version included <span class="token keyword">in</span> the message it has received.
+%%
+%% The state held by each member therefore includes the messages from
+%% each publisher pending acknowledgement, the last publication seen
+%% from that publisher, and the last acknowledgement from that
+%% publisher. In the <span class="token keyword">case</span> of the member<span class="token string">'s own publications or
+%% inherited members, this last acknowledgement seen state indicates
+%% the last acknowledgement retired, rather than sent.
+%%
+%%
+%% Proof sketch
+%% ------------
+%%
+%% We need to prove that with the provided operational semantics, we
+%% can never reach a state that is not well formed from a well-formed
+%% starting state.
+%%
+%% Operational semantics (small step): straight-forward message
+%% sending, process monitoring, state updates.
+%%
+%% Well formed state: dead members inherited by exactly one non-dead
+%% member; for every entry in anyone'</span>s pending-acks, either <span class="token punctuation">(</span>the
+%% publication of the message is in-flight downstream from the member
+%% and upstream from the publisher<span class="token punctuation">)</span> or <span class="token punctuation">(</span>the acknowledgement of the
+%% message is in-flight downstream from the publisher and upstream
+%% from the member<span class="token punctuation">)</span>.
+%%
+%% Proof by induction on the applicable operational semantics.
+%%
+%%
+%% Related work
+%% ------------
+%%
+%% The ring configuration and double traversal of messages around the
+%% ring is similar <span class="token punctuation">(</span>though developed independently<span class="token punctuation">)</span> to the LCR
+%% protocol by <span class="token punctuation">[</span>Levy 2008<span class="token punctuation">]</span>. However, LCR differs <span class="token keyword">in</span> several
+%% ways. Firstly, by using vector clocks, it enforces a total order of
+%% message delivery, <span class="token function">which</span> is unnecessary <span class="token keyword">for</span> our purposes. More
+%% significantly, it is built on <span class="token function">top</span> of a <span class="token string">"group communication system"</span>
+%% <span class="token function">which</span> performs the group management functions, taking
+%% responsibility away from the protocol as to how to cope with safely
+%% adding and removing members. When membership changes <span class="token keyword">do</span> occur, the
+%% protocol stipulates that every member must perform communication
+%% with every other member of the group, to ensure all outstanding
+%% deliveries complete, before the entire group transitions to the new
+%% view. This, <span class="token keyword">in</span> total, requires two sets of all-to-all synchronous
+%% communications.
+%%
+%% This is not only rather inefficient, but also does not explain what
+%% happens upon the failure of a member during this process. It does
+%% though entirely avoid the need <span class="token keyword">for</span> inheritance of responsibility of
+%% dead members that our protocol incorporates.
+%%
+%% In <span class="token punctuation">[</span>Marandi et al 2010<span class="token punctuation">]</span>, a Paxos-based protocol is described. This
+%% work explicitly focuses on the efficiency of communication. LCR
+%% <span class="token punctuation">(</span>and our protocol too<span class="token punctuation">)</span> are <span class="token function">more</span> efficient, but at the cost of
+%% higher latency. The Ring-Paxos protocol is itself built on <span class="token function">top</span> of
+%% IP-multicast, <span class="token function">which</span> rules it out <span class="token keyword">for</span> many applications where
+%% point-to-point communication is all that can be required. They also
+%% have an excellent related work section <span class="token function">which</span> I really ought to
+%% read<span class="token punctuation">..</span>.
+%%
+%%
+%% <span class="token punctuation">[</span>Levy 2008<span class="token punctuation">]</span> The Complexity of Reliable Distributed Storage, 2008.
+%% <span class="token punctuation">[</span>Marandi et al 2010<span class="token punctuation">]</span> Ring Paxos: A High-Throughput Atomic Broadcast
+%% Protocol
+
+
+-behaviour<span class="token punctuation">(</span>gen_server2<span class="token punctuation">)</span>.
+
+-export<span class="token punctuation">(</span><span class="token punctuation">[</span>create_tables/0, start_link/4, leave/1, broadcast/2, broadcast/3,
+         confirmed_broadcast/2, info/1, validate_members/2, forget_group/1<span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+-export<span class="token punctuation">(</span><span class="token punctuation">[</span>init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3, prioritise_info/3<span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+%% For INSTR_MOD callbacks
+-export<span class="token punctuation">(</span><span class="token punctuation">[</span>call/3, cast/2, monitor/1, demonitor/1<span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+-export<span class="token punctuation">(</span><span class="token punctuation">[</span>table_definitions/0<span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+-define<span class="token punctuation">(</span>GROUP_TABLE, gm_group<span class="token punctuation">)</span>.
+-define<span class="token punctuation">(</span>MAX_BUFFER_SIZE, 100000000<span class="token punctuation">)</span>. %% 100MB
+-define<span class="token punctuation">(</span>BROADCAST_TIMER, 25<span class="token punctuation">)</span>.
+-define<span class="token punctuation">(</span>FORCE_GC_TIMER, 250<span class="token punctuation">)</span>.
+-define<span class="token punctuation">(</span>VERSION_START, 0<span class="token punctuation">)</span>.
+-define<span class="token punctuation">(</span>SETS, ordsets<span class="token punctuation">)</span>.
+
+-record<span class="token punctuation">(</span>state,
+        <span class="token punctuation">{<!-- --></span> self,
+          left,
+          right,
+          group_name,
+          module,
+          view,
+          pub_count,
+          members_state,
+          callback_args,
+          confirms,
+          broadcast_buffer,
+          broadcast_buffer_sz,
+          broadcast_timer,
+          force_gc_timer,
+          txn_executor,
+          shutting_down
+        <span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+-record<span class="token punctuation">(</span>gm_group, <span class="token punctuation">{<!-- --></span> name, version, members <span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+-record<span class="token punctuation">(</span>view_member, <span class="token punctuation">{<!-- --></span> id, aliases, left, right <span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+-record<span class="token punctuation">(</span>member, <span class="token punctuation">{<!-- --></span> pending_ack, last_pub, last_ack <span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+-define<span class="token punctuation">(</span>TABLE, <span class="token punctuation">{<!-- --></span>?GROUP_TABLE, <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>record_name, gm_group<span class="token punctuation">}</span>,
+                               <span class="token punctuation">{<!-- --></span>attributes, record_info<span class="token punctuation">(</span>fields, gm_group<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">)</span>.
+-define<span class="token punctuation">(</span>TABLE_MATCH, <span class="token punctuation">{<!-- --></span>match, <span class="token comment">#gm_group { _ = '_' }}).</span>
+
+-define<span class="token punctuation">(</span>TAG, <span class="token string">'<span class="token variable">$gm</span>'</span><span class="token punctuation">)</span>.
+
+-export_type<span class="token punctuation">(</span><span class="token punctuation">[</span>group_name/0<span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+-type group_name<span class="token punctuation">(</span><span class="token punctuation">)</span> :: any<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+-type txn_fun<span class="token punctuation">(</span><span class="token punctuation">)</span> :: fun<span class="token variable"><span class="token punctuation">((</span>fun<span class="token punctuation">((</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> any<span class="token punctuation">(</span><span class="token punctuation">))</span></span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> any<span class="token punctuation">(</span><span class="token punctuation">))</span>.
+
+%% The joined, members_changed and handle_msg callbacks can all <span class="token keyword">return</span>
+%% any of the following terms:
+%%
+%% <span class="token string">'ok'</span> - the callback <span class="token keyword">function</span> returns normally
+%%
+%% <span class="token punctuation">{<!-- --></span><span class="token string">'stop'</span>, Reason<span class="token punctuation">}</span> - the callback indicates the member should stop
+%% with reason Reason and should leave the group.
+%%
+%% <span class="token punctuation">{<!-- --></span><span class="token string">'become'</span>, Module, Args<span class="token punctuation">}</span> - the callback indicates that the callback
+%% module should be changed to Module and that the callback functions
+%% should now be passed the arguments Args. This allows the callback
+%% module to be dynamically changed.
+
+%% Called when we<span class="token string">'ve successfully joined the group. Supplied with Args
+%% provided in start_link, plus current group members.
+-callback joined(Args :: term(), Members :: [pid()]) -&gt;
+    ok | {stop, Reason :: term()} | {become, Module :: atom(), Args :: any()}.
+
+%% Supplied with Args provided in start_link, the list of new members
+%% and the list of members previously known to us that have since
+%% died. Note that if a member joins and dies very quickly, it'</span>s
+%% possible that we will never see that member appear <span class="token keyword">in</span> either births
+%% or deaths. However we are guaranteed that <span class="token punctuation">(</span>1<span class="token punctuation">)</span> we will see a member
+%% joining either <span class="token keyword">in</span> the births here, or <span class="token keyword">in</span> the members passed to
+%% joined/2 before receiving any messages from it<span class="token punctuation">;</span> and <span class="token punctuation">(</span>2<span class="token punctuation">)</span> we will not
+%% see members die that we have not seen born <span class="token punctuation">(</span>or supplied <span class="token keyword">in</span> the
+%% members to joined/2<span class="token punctuation">)</span>.
+-callback members_changed<span class="token punctuation">(</span>Args :: term<span class="token punctuation">(</span><span class="token punctuation">)</span>,
+                          Births :: <span class="token punctuation">[</span>pid<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">]</span>, Deaths :: <span class="token punctuation">[</span>pid<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ok <span class="token operator">|</span> <span class="token punctuation">{<!-- --></span>stop, Reason :: term<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span> <span class="token operator">|</span> <span class="token punctuation">{<!-- --></span>become, Module :: atom<span class="token punctuation">(</span><span class="token punctuation">)</span>, Args :: any<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+%% Supplied with Args provided <span class="token keyword">in</span> start_link, the sender, and the
+%% message. This does get called <span class="token keyword">for</span> messages injected by this member,
+%% however, <span class="token keyword">in</span> such cases, there is no special significance of this
+%% invocation: it does not indicate that the message has made it to
+%% any other members, <span class="token keyword">let</span> alone all other members.
+-callback handle_msg<span class="token punctuation">(</span>Args :: term<span class="token punctuation">(</span><span class="token punctuation">)</span>, From :: pid<span class="token punctuation">(</span><span class="token punctuation">)</span>, Message :: term<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span>
+    ok <span class="token operator">|</span> <span class="token punctuation">{<!-- --></span>stop, Reason :: term<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span> <span class="token operator">|</span> <span class="token punctuation">{<!-- --></span>become, Module :: atom<span class="token punctuation">(</span><span class="token punctuation">)</span>, Args :: any<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+%% Called on gm member termination as per rules <span class="token keyword">in</span> gen_server, with
+%% the Args provided <span class="token keyword">in</span> start_link plus the termination Reason.
+-callback handle_terminate<span class="token punctuation">(</span>Args :: term<span class="token punctuation">(</span><span class="token punctuation">)</span>, Reason :: term<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span>
+    ok <span class="token operator">|</span> term<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+
+-spec create_tables<span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token string">'ok'</span> <span class="token operator">|</span> <span class="token punctuation">{<!-- --></span><span class="token string">'aborted'</span>, any<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+create_tables<span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    create_tables<span class="token punctuation">(</span><span class="token punctuation">[</span>?TABLE<span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+create_tables<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ok<span class="token punctuation">;</span>
+create_tables<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>Table, Attributes<span class="token punctuation">}</span> <span class="token operator">|</span> Tables<span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> mnesia:create_table<span class="token punctuation">(</span>Table, Attributes<span class="token punctuation">)</span> of
+        <span class="token punctuation">{<!-- --></span>atomic, ok<span class="token punctuation">}</span>                       -<span class="token operator">&gt;</span> create_tables<span class="token punctuation">(</span>Tables<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>aborted, <span class="token punctuation">{<!-- --></span>already_exists, Table<span class="token punctuation">}</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span> create_tables<span class="token punctuation">(</span>Tables<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Err                                -<span class="token operator">&gt;</span> Err
+    end.
+
+table_definitions<span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Name, Attributes<span class="token punctuation">}</span> <span class="token operator">=</span> ?TABLE,
+    <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>Name, <span class="token punctuation">[</span>?TABLE_MATCH <span class="token operator">|</span> Attributes<span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>.
+
+-spec start_link<span class="token punctuation">(</span>group_name<span class="token punctuation">(</span><span class="token punctuation">)</span>, atom<span class="token punctuation">(</span><span class="token punctuation">)</span>, any<span class="token punctuation">(</span><span class="token punctuation">)</span>, txn_fun<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span>
+          rabbit_types:ok_pid_or_error<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+
+start_link<span class="token punctuation">(</span>GroupName, Module, Args, TxnFun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    gen_server2:start_link<span class="token punctuation">(</span>?MODULE, <span class="token punctuation">[</span>GroupName, Module, Args, TxnFun<span class="token punctuation">]</span>,
+                       <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>spawn_opt, <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>fullsweep_after, 0<span class="token punctuation">}</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span><span class="token punctuation">)</span>.
+
+-spec leave<span class="token punctuation">(</span>pid<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span> <span class="token string">'ok'</span><span class="token keyword">.</span>
+
+leave<span class="token punctuation">(</span>Server<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    gen_server2:cast<span class="token punctuation">(</span>Server, leave<span class="token punctuation">)</span>.
+
+-spec broadcast<span class="token punctuation">(</span>pid<span class="token punctuation">(</span><span class="token punctuation">)</span>, any<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span> <span class="token string">'ok'</span><span class="token keyword">.</span>
+
+broadcast<span class="token punctuation">(</span>Server, Msg<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> broadcast<span class="token punctuation">(</span>Server, Msg, 0<span class="token punctuation">)</span>.
+
+broadcast<span class="token punctuation">(</span>Server, Msg, SizeHint<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    gen_server2:cast<span class="token punctuation">(</span>Server, <span class="token punctuation">{<!-- --></span>broadcast, Msg, SizeHint<span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+-spec confirmed_broadcast<span class="token punctuation">(</span>pid<span class="token punctuation">(</span><span class="token punctuation">)</span>, any<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span> <span class="token string">'ok'</span><span class="token keyword">.</span>
+
+confirmed_broadcast<span class="token punctuation">(</span>Server, Msg<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    gen_server2:call<span class="token punctuation">(</span>Server, <span class="token punctuation">{<!-- --></span>confirmed_broadcast, Msg<span class="token punctuation">}</span>, infinity<span class="token punctuation">)</span>.
+
+-spec info<span class="token punctuation">(</span>pid<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span> rabbit_types:infos<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+
+info<span class="token punctuation">(</span>Server<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    gen_server2:call<span class="token punctuation">(</span>Server, info, infinity<span class="token punctuation">)</span>.
+
+-spec validate_members<span class="token punctuation">(</span>pid<span class="token punctuation">(</span><span class="token punctuation">)</span>, <span class="token punctuation">[</span>pid<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token string">'ok'</span><span class="token keyword">.</span>
+
+validate_members<span class="token punctuation">(</span>Server, Members<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    gen_server2:cast<span class="token punctuation">(</span>Server, <span class="token punctuation">{<!-- --></span>validate_members, Members<span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+-spec forget_group<span class="token punctuation">(</span>group_name<span class="token punctuation">(</span><span class="token punctuation">))</span> -<span class="token operator">&gt;</span> <span class="token string">'ok'</span><span class="token keyword">.</span>
+
+forget_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>atomic, ok<span class="token punctuation">}</span> <span class="token operator">=</span> mnesia:sync_transaction<span class="token punctuation">(</span>
+                     fun <span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                             mnesia:delete<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>?GROUP_TABLE, GroupName<span class="token punctuation">}</span><span class="token punctuation">)</span>
+                     end<span class="token punctuation">)</span>,
+    ok.
+
+init<span class="token punctuation">(</span><span class="token punctuation">[</span>GroupName, Module, Args, TxnFun<span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    put<span class="token punctuation">(</span>process_name, <span class="token punctuation">{<!-- --></span>?MODULE, GroupName<span class="token punctuation">}</span><span class="token punctuation">)</span>,
+    Self <span class="token operator">=</span> make_member<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span>,
+    gen_server2:cast<span class="token punctuation">(</span>self<span class="token punctuation">(</span><span class="token punctuation">)</span>, join<span class="token punctuation">)</span>,
+    <span class="token punctuation">{<!-- --></span>ok, <span class="token comment">#state { self                = Self,</span>
+                  left                <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span>,
+                  right               <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span>,
+                  group_name          <span class="token operator">=</span> GroupName,
+                  module              <span class="token operator">=</span> Module,
+                  view                <span class="token operator">=</span> undefined,
+                  pub_count           <span class="token operator">=</span> -1,
+                  members_state       <span class="token operator">=</span> undefined,
+                  callback_args       <span class="token operator">=</span> Args,
+                  confirms            <span class="token operator">=</span> queue:new<span class="token punctuation">(</span><span class="token punctuation">)</span>,
+                  broadcast_buffer    <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token punctuation">]</span>,
+                  broadcast_buffer_sz <span class="token operator">=</span> 0,
+                  broadcast_timer     <span class="token operator">=</span> undefined,
+                  force_gc_timer      <span class="token operator">=</span> undefined,
+                  txn_executor        <span class="token operator">=</span> TxnFun,
+                  shutting_down       <span class="token operator">=</span> <span class="token boolean">false</span> <span class="token punctuation">}</span><span class="token punctuation">}</span>.
+
+
+handle_call<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>confirmed_broadcast, _Msg<span class="token punctuation">}</span>, _From,
+            State <span class="token operator">=</span> <span class="token comment">#state { shutting_down = {true, _} }) -&gt;</span>
+    reply<span class="token punctuation">(</span>shutting_down, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+handle_call<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>confirmed_broadcast, _Msg<span class="token punctuation">}</span>, _From,
+            State <span class="token operator">=</span> <span class="token comment">#state { members_state = undefined }) -&gt;</span>
+    reply<span class="token punctuation">(</span>not_joined, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+handle_call<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>confirmed_broadcast, Msg<span class="token punctuation">}</span>, _From,
+            State <span class="token operator">=</span> <span class="token comment">#state { self          = Self,</span>
+                             right         <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span>,
+                             module        <span class="token operator">=</span> Module,
+                             callback_args <span class="token operator">=</span> Args <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    handle_callback_result<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Module:handle_msg<span class="token punctuation">(</span>Args, get_pid<span class="token punctuation">(</span>Self<span class="token punctuation">)</span>, Msg<span class="token punctuation">)</span>,
+                           ok, State<span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+handle_call<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>confirmed_broadcast, Msg<span class="token punctuation">}</span>, From, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Result, State1 <span class="token operator">=</span> <span class="token comment">#state { pub_count = PubCount, confirms = Confirms }} =</span>
+        internal_broadcast<span class="token punctuation">(</span>Msg, 0, State<span class="token punctuation">)</span>,
+    Confirms1 <span class="token operator">=</span> queue:in<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>PubCount, From<span class="token punctuation">}</span>, Confirms<span class="token punctuation">)</span>,
+    handle_callback_result<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Result, flush_broadcast_buffer<span class="token punctuation">(</span>
+                                      State1 <span class="token comment">#state { confirms = Confirms1 })});</span>
+
+handle_call<span class="token punctuation">(</span>info, _From,
+            State <span class="token operator">=</span> <span class="token comment">#state { members_state = undefined }) -&gt;</span>
+    reply<span class="token punctuation">(</span>not_joined, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+handle_call<span class="token punctuation">(</span>info, _From, State <span class="token operator">=</span> <span class="token comment">#state { group_name = GroupName,</span>
+                                          module     <span class="token operator">=</span> Module,
+                                          view       <span class="token operator">=</span> View <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    reply<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>group_name,    GroupName<span class="token punctuation">}</span>,
+           <span class="token punctuation">{<!-- --></span>module,        Module<span class="token punctuation">}</span>,
+           <span class="token punctuation">{<!-- --></span>group_members, get_pids<span class="token punctuation">(</span>alive_view_members<span class="token punctuation">(</span>View<span class="token punctuation">))</span><span class="token punctuation">}</span><span class="token punctuation">]</span>, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+handle_call<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>add_on_right, _NewMember<span class="token punctuation">}</span>, _From,
+            State <span class="token operator">=</span> <span class="token comment">#state { members_state = undefined }) -&gt;</span>
+    reply<span class="token punctuation">(</span>not_ready, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+handle_call<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>add_on_right, NewMember<span class="token punctuation">}</span>, _From,
+            State <span class="token operator">=</span> <span class="token comment">#state { self          = Self,</span>
+                             group_name    <span class="token operator">=</span> GroupName,
+                             members_state <span class="token operator">=</span> MembersState,
+                             txn_executor  <span class="token operator">=</span> TxnFun <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    try
+        Group <span class="token operator">=</span> record_new_member_in_group<span class="token punctuation">(</span>
+                  NewMember, Self, GroupName, TxnFun<span class="token punctuation">)</span>,
+        View1 <span class="token operator">=</span> group_to_view<span class="token punctuation">(</span>check_membership<span class="token punctuation">(</span>Self, Group<span class="token punctuation">))</span>,
+        MembersState1 <span class="token operator">=</span> remove_erased_members<span class="token punctuation">(</span>MembersState, View1<span class="token punctuation">)</span>,
+        ok <span class="token operator">=</span> send_right<span class="token punctuation">(</span>NewMember, View1,
+                        <span class="token punctuation">{<!-- --></span>catchup, Self, prepare_members_state<span class="token punctuation">(</span>MembersState1<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">)</span>,
+        <span class="token punctuation">{<!-- --></span>Result, State1<span class="token punctuation">}</span> <span class="token operator">=</span> change_view<span class="token punctuation">(</span>View1, State <span class="token comment">#state {<!-- --></span>
+                                                members_state <span class="token operator">=</span> MembersState1 <span class="token punctuation">}</span><span class="token punctuation">)</span>,
+        handle_callback_result<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Result, <span class="token punctuation">{<!-- --></span>ok, Group<span class="token punctuation">}</span>, State1<span class="token punctuation">}</span><span class="token punctuation">)</span>
+    catch
+        lost_membership -<span class="token operator">&gt;</span>
+            <span class="token punctuation">{<!-- --></span>stop, shutdown, State<span class="token punctuation">}</span>
+    end.
+
+%% add_on_right causes a catchup to be sent immediately from the left,
+%% so we can never see this from the left neighbour. However, it<span class="token string">'s
+%% possible for the right neighbour to send us a check_neighbours
+%% immediately before that. We can'</span>t possibly handle it, but <span class="token keyword">if</span> we<span class="token string">'re
+%% in this state we know a catchup is coming imminently anyway. So
+%% just ignore it.
+handle_cast({?TAG, _ReqVer, check_neighbours},
+            State = #state { members_state = undefined }) -&gt;
+    noreply(State);
+
+handle_cast({?TAG, ReqVer, Msg},
+            State = #state { view          = View,
+                             self          = Self,
+                             members_state = MembersState,
+                             group_name    = GroupName }) -&gt;
+    try
+        {Result, State1} =
+            case needs_view_update(ReqVer, View) of
+                true  -&gt;
+                    View1 = group_to_view(
+                              check_membership(Self,
+                                               dirty_read_group(GroupName))),
+                    MemberState1 = remove_erased_members(MembersState, View1),
+                    change_view(View1, State #state {
+                                         members_state = MemberState1 });
+                false -&gt; {ok, State}
+            end,
+        handle_callback_result(
+          if_callback_success(
+            Result, fun handle_msg_true/3, fun handle_msg_false/3, Msg, State1))
+    catch
+        lost_membership -&gt;
+            {stop, shutdown, State}
+    end;
+
+handle_cast({broadcast, _Msg, _SizeHint},
+            State = #state { shutting_down = {true, _} }) -&gt;
+    noreply(State);
+
+handle_cast({broadcast, _Msg, _SizeHint},
+            State = #state { members_state = undefined }) -&gt;
+    noreply(State);
+
+handle_cast({broadcast, Msg, _SizeHint},
+            State = #state { self          = Self,
+                             right         = {Self, undefined},
+                             module        = Module,
+                             callback_args = Args }) -&gt;
+    handle_callback_result({Module:handle_msg(Args, get_pid(Self), Msg),
+                            State});
+
+handle_cast({broadcast, Msg, SizeHint}, State) -&gt;
+    {Result, State1} = internal_broadcast(Msg, SizeHint, State),
+    handle_callback_result({Result, maybe_flush_broadcast_buffer(State1)});
+
+handle_cast(join, State = #state { self          = Self,
+                                   group_name    = GroupName,
+                                   members_state = undefined,
+                                   module        = Module,
+                                   callback_args = Args,
+                                   txn_executor  = TxnFun }) -&gt;
+    try
+	View = join_group(Self, GroupName, TxnFun),
+	MembersState =
+	    case alive_view_members(View) of
+		[Self] -&gt; blank_member_state();
+		_      -&gt; undefined
+	    end,
+	State1 = check_neighbours(State #state { view          = View,
+						 members_state = MembersState }),
+	handle_callback_result(
+	  {Module:joined(Args, get_pids(all_known_members(View))), State1})
+    catch
+        lost_membership -&gt;
+            {stop, shutdown, State}
+    end;
+
+handle_cast({validate_members, OldMembers},
+            State = #state { view          = View,
+                             module        = Module,
+                             callback_args = Args }) -&gt;
+    NewMembers = get_pids(all_known_members(View)),
+    Births = NewMembers -- OldMembers,
+    Deaths = OldMembers -- NewMembers,
+    case {Births, Deaths} of
+        {[], []}  -&gt; noreply(State);
+        _         -&gt; Result = Module:members_changed(Args, Births, Deaths),
+                     handle_callback_result({Result, State})
+    end;
+
+handle_cast(leave, State) -&gt;
+    {stop, normal, State}.
+
+
+handle_info(force_gc, State) -&gt;
+    garbage_collect(),
+    noreply(State #state { force_gc_timer = undefined });
+
+handle_info(flush, State) -&gt;
+    noreply(
+      flush_broadcast_buffer(State #state { broadcast_timer = undefined }));
+
+handle_info(timeout, State) -&gt;
+    noreply(flush_broadcast_buffer(State));
+
+handle_info({'</span>DOWN<span class="token string">', _MRef, process, _Pid, _Reason},
+            State = #state { shutting_down =
+                                 {true, {shutdown, ring_shutdown}} }) -&gt;
+    noreply(State);
+handle_info({'</span>DOWN<span class="token string">', MRef, process, _Pid, Reason},
+            State = #state { self          = Self,
+                             left          = Left,
+                             right         = Right,
+                             group_name    = GroupName,
+                             confirms      = Confirms,
+                             txn_executor  = TxnFun }) -&gt;
+    try
+        check_membership(GroupName),
+        Member = case {Left, Right} of
+                     {<!-- -->{Member1, MRef}, _} -&gt; Member1;
+                     {_, {Member1, MRef}} -&gt; Member1;
+                     _                    -&gt; undefined
+                 end,
+        case {Member, Reason} of
+            {undefined, _} -&gt;
+                noreply(State);
+            {_, {shutdown, ring_shutdown}} -&gt;
+                noreply(State);
+            _ -&gt;
+                %% In the event of a partial partition we could see another member
+                %% go down and then remove them from Mnesia. While they can
+                %% recover from this they'</span>d have to restart the queue - not
+                %% ideal. So <span class="token keyword">let</span><span class="token string">'s sleep here briefly just in case this was caused
+                %% by a partial partition; in which case by the time we record the
+                %% member death in Mnesia we will probably be in a full
+                %% partition and will not be assassinating another member.
+                timer:sleep(100),
+                View1 = group_to_view(record_dead_member_in_group(Self,
+                                        Member, GroupName, TxnFun, true)),
+                handle_callback_result(
+                  case alive_view_members(View1) of
+                      [Self] -&gt; maybe_erase_aliases(
+                                  State #state {
+                                    members_state = blank_member_state(),
+                                    confirms      = purge_confirms(Confirms) },
+                                  View1);
+                      _      -&gt; change_view(View1, State)
+                  end)
+        end
+    catch
+        lost_membership -&gt;
+            {stop, shutdown, State}
+    end;
+handle_info(_, State) -&gt;
+    %% Discard any unexpected messages, such as late replies from neighbour_call/2
+    %% TODO: For #gm_group{} related info messages, it could be worthwhile to
+    %% change_view/2, as this might reflect an alteration in the gm group, meaning
+    %% we now need to update our state. see rabbitmq-server#914.
+    noreply(State).
+
+terminate(Reason, #state { module = Module, callback_args = Args }) -&gt;
+    Module:handle_terminate(Args, Reason).
+
+code_change(_OldVsn, State, _Extra) -&gt;
+    {ok, State}.
+
+prioritise_info(flush, _Len, _State) -&gt;
+    1;
+%% DOWN messages should not overtake initial catchups; if they do we
+%% will receive a DOWN we do not know what to do with.
+prioritise_info({'</span>DOWN<span class="token string">', _MRef, process, _Pid, _Reason}, _Len,
+                #state { members_state = undefined }) -&gt;
+    0;
+%% We should not prioritise DOWN messages from our left since
+%% otherwise the DOWN can overtake any last activity from the left,
+%% causing that activity to be lost.
+prioritise_info({'</span>DOWN<span class="token string">', _MRef, process, LeftPid, _Reason}, _Len,
+                #state { left = {<!-- -->{_LeftVer, LeftPid}, _MRef2} }) -&gt;
+    0;
+%% But prioritise all other DOWNs - we want to make sure we are not
+%% sending activity into the void for too long because our right is
+%% down but we don'</span>t know it.
+prioritise_info<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span><span class="token string">'DOWN'</span>, _MRef, process, _Pid, _Reason<span class="token punctuation">}</span>, _Len, _State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    1<span class="token punctuation">;</span>
+prioritise_info<span class="token punctuation">(</span>_, _Len, _State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    0.
+
+
+handle_msg<span class="token punctuation">(</span>check_neighbours, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    %% no-op - it<span class="token string">'s already been done by the calling handle_cast
+    {ok, State};
+
+handle_msg({catchup, Left, MembersStateLeft},
+           State = #state { self          = Self,
+                            left          = {Left, _MRefL},
+                            right         = {Right, _MRefR},
+                            view          = View,
+                            members_state = undefined }) -&gt;
+    ok = send_right(Right, View, {catchup, Self, MembersStateLeft}),
+    MembersStateLeft1 = build_members_state(MembersStateLeft),
+    {ok, State #state { members_state = MembersStateLeft1 }};
+
+handle_msg({catchup, Left, MembersStateLeft},
+           State = #state { self = Self,
+                            left = {Left, _MRefL},
+                            view = View,
+                            members_state = MembersState })
+  when MembersState =/= undefined -&gt;
+    MembersStateLeft1 = build_members_state(MembersStateLeft),
+    AllMembers = lists:usort(maps:keys(MembersState) ++
+                                 maps:keys(MembersStateLeft1)),
+    {MembersState1, Activity} =
+        lists:foldl(
+          fun (Id, MembersStateActivity) -&gt;
+                  #member { pending_ack = PALeft, last_ack = LA } =
+                      find_member_or_blank(Id, MembersStateLeft1),
+                  with_member_acc(
+                    fun (#member { pending_ack = PA } = Member, Activity1) -&gt;
+                            case is_member_alias(Id, Self, View) of
+                                true -&gt;
+                                    {_AcksInFlight, Pubs, _PA1} =
+                                        find_prefix_common_suffix(PALeft, PA),
+                                    {Member #member { last_ack = LA },
+                                     activity_cons(Id, pubs_from_queue(Pubs),
+                                                   [], Activity1)};
+                                false -&gt;
+                                    {Acks, _Common, Pubs} =
+                                        find_prefix_common_suffix(PA, PALeft),
+                                    {Member,
+                                     activity_cons(Id, pubs_from_queue(Pubs),
+                                                   acks_from_queue(Acks),
+                                                   Activity1)}
+                            end
+                    end, Id, MembersStateActivity)
+          end, {MembersState, activity_nil()}, AllMembers),
+    handle_msg({activity, Left, activity_finalise(Activity)},
+               State #state { members_state = MembersState1 });
+
+handle_msg({catchup, _NotLeft, _MembersState}, State) -&gt;
+    {ok, State};
+
+handle_msg({activity, Left, Activity},
+           State = #state { self          = Self,
+                            group_name    = GroupName,
+                            left          = {Left, _MRefL},
+                            view          = View,
+                            members_state = MembersState,
+                            confirms      = Confirms })
+  when MembersState =/= undefined -&gt;
+    try
+        %% If we have to stop, do it asap so we avoid any ack confirmation
+        %% Membership must be checked again by erase_members_in_group, as the
+        %% node can be marked as dead on the meanwhile
+        check_membership(GroupName),
+        {MembersState1, {Confirms1, Activity1}} =
+            calculate_activity(MembersState, Confirms, Activity, Self, View),
+        State1 = State #state { members_state = MembersState1,
+                                confirms      = Confirms1 },
+        Activity3 = activity_finalise(Activity1),
+        ok = maybe_send_activity(Activity3, State1),
+        {Result, State2} = maybe_erase_aliases(State1, View),
+        if_callback_success(
+          Result, fun activity_true/3, fun activity_false/3, Activity3, State2)
+    catch
+        lost_membership -&gt;
+            {<!-- -->{stop, shutdown}, State}
+    end;
+
+handle_msg({activity, _NotLeft, _Activity}, State) -&gt;
+    {ok, State}.
+
+
+noreply(State) -&gt;
+    {noreply, ensure_timers(State), flush_timeout(State)}.
+
+reply(Reply, State) -&gt;
+    {reply, Reply, ensure_timers(State), flush_timeout(State)}.
+
+ensure_timers(State) -&gt;
+    ensure_force_gc_timer(ensure_broadcast_timer(State)).
+
+flush_timeout(#state{broadcast_buffer = []}) -&gt; infinity;
+flush_timeout(_)                             -&gt; 0.
+
+ensure_force_gc_timer(State = #state { force_gc_timer = TRef })
+  when is_reference(TRef) -&gt;
+    State;
+ensure_force_gc_timer(State = #state { force_gc_timer = undefined }) -&gt;
+    TRef = erlang:send_after(?FORCE_GC_TIMER, self(), force_gc),
+    State #state { force_gc_timer = TRef }.
+
+ensure_broadcast_timer(State = #state { broadcast_buffer = [],
+                                        broadcast_timer  = undefined }) -&gt;
+    State;
+ensure_broadcast_timer(State = #state { broadcast_buffer = [],
+                                        broadcast_timer  = TRef }) -&gt;
+    _ = erlang:cancel_timer(TRef),
+    State #state { broadcast_timer = undefined };
+ensure_broadcast_timer(State = #state { broadcast_timer = undefined }) -&gt;
+    TRef = erlang:send_after(?BROADCAST_TIMER, self(), flush),
+    State #state { broadcast_timer = TRef };
+ensure_broadcast_timer(State) -&gt;
+    State.
+
+internal_broadcast(Msg, SizeHint,
+                   State = #state { self                = Self,
+                                    pub_count           = PubCount,
+                                    module              = Module,
+                                    callback_args       = Args,
+                                    broadcast_buffer    = Buffer,
+                                    broadcast_buffer_sz = BufferSize }) -&gt;
+    PubCount1 = PubCount + 1,
+    {Module:handle_msg(Args, get_pid(Self), Msg),
+     State #state { pub_count           = PubCount1,
+                    broadcast_buffer    = [{PubCount1, Msg} | Buffer],
+                    broadcast_buffer_sz = BufferSize + SizeHint}}.
+
+%% The Erlang distribution mechanism has an interesting quirk - it
+%% will kill the VM cold with "Absurdly large distribution output data
+%% buffer" if you attempt to send a message which serialises out to
+%% more than 2^31 bytes in size. It'</span>s therefore a very good idea to
+%% <span class="token function">make</span> sure that we don<span class="token string">'t exceed that size!
+%%
+%% Now, we could figure out the size of messages as they come in using
+%% size(term_to_binary(Msg)) or similar. The trouble is, that requires
+%% us to serialise the message only to throw the serialised form
+%% away. Hard to believe that'</span>s a sensible thing to do. So instead we
+%% accept a size hint from the application, via broadcast/3. This size
+%% hint can be the size of anything <span class="token keyword">in</span> the message <span class="token function">which</span> we <span class="token function">expect</span>
+%% could be large, and we just ignore the size of any small bits of
+%% the message term. Therefore MAX_BUFFER_SIZE is <span class="token keyword">set</span> somewhat
+%% conservatively at 100MB - but the buffer is only to allow us to
+%% buffer tiny messages anyway, so 100MB is plenty.
+
+maybe_flush_broadcast_buffer<span class="token punctuation">(</span>State <span class="token operator">=</span> <span class="token comment">#state{broadcast_buffer_sz = Size}) -&gt;</span>
+    <span class="token keyword">case</span> Size <span class="token operator">&gt;</span> ?MAX_BUFFER_SIZE of
+        <span class="token boolean">true</span>  -<span class="token operator">&gt;</span> flush_broadcast_buffer<span class="token punctuation">(</span>State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token boolean">false</span> -<span class="token operator">&gt;</span> State
+    end.
+
+flush_broadcast_buffer<span class="token punctuation">(</span>State <span class="token operator">=</span> <span class="token comment">#state { broadcast_buffer = [] }) -&gt;</span>
+    State<span class="token punctuation">;</span>
+flush_broadcast_buffer<span class="token punctuation">(</span>State <span class="token operator">=</span> <span class="token comment">#state { self             = Self,</span>
+                                        members_state    <span class="token operator">=</span> MembersState,
+                                        broadcast_buffer <span class="token operator">=</span> Buffer,
+                                        pub_count        <span class="token operator">=</span> PubCount <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>PubCount, _Msg<span class="token punctuation">}</span><span class="token operator">|</span>_<span class="token punctuation">]</span> <span class="token operator">=</span> Buffer, %% ASSERTION match on PubCount
+    Pubs <span class="token operator">=</span> lists:reverse<span class="token punctuation">(</span>Buffer<span class="token punctuation">)</span>,
+    Activity <span class="token operator">=</span> activity_cons<span class="token punctuation">(</span>Self, Pubs, <span class="token punctuation">[</span><span class="token punctuation">]</span>, activity_nil<span class="token punctuation">(</span><span class="token punctuation">))</span>,
+    ok <span class="token operator">=</span> maybe_send_activity<span class="token punctuation">(</span>activity_finalise<span class="token punctuation">(</span>Activity<span class="token punctuation">)</span>, State<span class="token punctuation">)</span>,
+    MembersState1 <span class="token operator">=</span> with_member<span class="token punctuation">(</span>
+                      fun <span class="token punctuation">(</span>Member <span class="token operator">=</span> <span class="token comment">#member { pending_ack = PA }) -&gt;</span>
+                              PA1 <span class="token operator">=</span> queue:join<span class="token punctuation">(</span>PA, queue:from_list<span class="token punctuation">(</span>Pubs<span class="token punctuation">))</span>,
+                              Member <span class="token comment">#member { pending_ack = PA1,</span>
+                                               last_pub <span class="token operator">=</span> PubCount <span class="token punctuation">}</span>
+                      end, Self, MembersState<span class="token punctuation">)</span>,
+    State <span class="token comment">#state { members_state       = MembersState1,</span>
+                   broadcast_buffer    <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token punctuation">]</span>,
+                   broadcast_buffer_sz <span class="token operator">=</span> 0 <span class="token punctuation">}</span>.
+
+%% ---------------------------------------------------------------------------
+%% View construction and inspection
+%% ---------------------------------------------------------------------------
+
+needs_view_update<span class="token punctuation">(</span>ReqVer, <span class="token punctuation">{<!-- --></span>Ver, _View<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Ver <span class="token operator">&lt;</span> ReqVer.
+
+view_version<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Ver, _View<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Ver.
+
+is_member_alive<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>dead, _Member<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+is_member_alive<span class="token punctuation">(</span>_<span class="token punctuation">)</span>               -<span class="token operator">&gt;</span> true.
+
+is_member_alias<span class="token punctuation">(</span>Self, Self, _View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token boolean">true</span><span class="token punctuation">;</span>
+is_member_alias<span class="token punctuation">(</span>Member, Self, View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ?SETS:is_element<span class="token punctuation">(</span>Member,
+                     <span class="token variable"><span class="token punctuation">((</span>fetch_view_member<span class="token punctuation">(</span>Self<span class="token punctuation">,</span> View<span class="token punctuation">))</span></span> <span class="token comment">#view_member.aliases)).</span>
+
+dead_member_id<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>dead, Member<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Member.
+
+store_view_member<span class="token punctuation">(</span>VMember <span class="token operator">=</span> <span class="token comment">#view_member { id = Id }, {Ver, View}) -&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Ver, maps:put<span class="token punctuation">(</span>Id, VMember, View<span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+with_view_member<span class="token punctuation">(</span>Fun, View, Id<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    store_view_member<span class="token punctuation">(</span>Fun<span class="token punctuation">(</span>fetch_view_member<span class="token punctuation">(</span>Id, View<span class="token punctuation">))</span>, View<span class="token punctuation">)</span>.
+
+fetch_view_member<span class="token punctuation">(</span>Id, <span class="token punctuation">{<!-- --></span>_Ver, View<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:get<span class="token punctuation">(</span>Id, View<span class="token punctuation">)</span>.
+
+find_view_member<span class="token punctuation">(</span>Id, <span class="token punctuation">{<!-- --></span>_Ver, View<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:find<span class="token punctuation">(</span>Id, View<span class="token punctuation">)</span>.
+
+blank_view<span class="token punctuation">(</span>Ver<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>Ver, maps:new<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+alive_view_members<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>_Ver, View<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:keys<span class="token punctuation">(</span>View<span class="token punctuation">)</span>.
+
+all_known_members<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>_Ver, View<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    maps:fold<span class="token punctuation">(</span>
+       fun <span class="token punctuation">(</span>Member, <span class="token comment">#view_member { aliases = Aliases }, Acc) -&gt;</span>
+               ?SETS:to_list<span class="token punctuation">(</span>Aliases<span class="token punctuation">)</span> ++ <span class="token punctuation">[</span>Member <span class="token operator">|</span> Acc<span class="token punctuation">]</span>
+       end, <span class="token punctuation">[</span><span class="token punctuation">]</span>, View<span class="token punctuation">)</span>.
+
+group_to_view<span class="token punctuation">(</span><span class="token comment">#gm_group { members = Members, version = Ver }) -&gt;</span>
+    Alive <span class="token operator">=</span> lists:filter<span class="token punctuation">(</span>fun is_member_alive/1, Members<span class="token punctuation">)</span>,
+    <span class="token punctuation">[</span>_<span class="token operator">|</span>_<span class="token punctuation">]</span> <span class="token operator">=</span> Alive, %% ASSERTION - can't have all dead members
+    add_aliases<span class="token punctuation">(</span>link_view<span class="token punctuation">(</span>Alive ++ Alive ++ Alive, blank_view<span class="token punctuation">(</span>Ver<span class="token punctuation">))</span>, Members<span class="token punctuation">)</span>.
+
+link_view<span class="token punctuation">(</span><span class="token punctuation">[</span>Left, Middle, Right <span class="token operator">|</span> Rest<span class="token punctuation">]</span>, View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> find_view_member<span class="token punctuation">(</span>Middle, View<span class="token punctuation">)</span> of
+        error -<span class="token operator">&gt;</span>
+            link_view<span class="token punctuation">(</span>
+              <span class="token punctuation">[</span>Middle, Right <span class="token operator">|</span> Rest<span class="token punctuation">]</span>,
+              store_view_member<span class="token punctuation">(</span><span class="token comment">#view_member { id      = Middle,</span>
+                                               aliases <span class="token operator">=</span> ?SETS:new<span class="token punctuation">(</span><span class="token punctuation">)</span>,
+                                               left    <span class="token operator">=</span> Left,
+                                               right   <span class="token operator">=</span> Right <span class="token punctuation">}</span>, View<span class="token punctuation">))</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>ok, _<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            View
+    end<span class="token punctuation">;</span>
+link_view<span class="token punctuation">(</span>_, View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    View.
+
+add_aliases<span class="token punctuation">(</span>View, Members<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Members1 <span class="token operator">=</span> ensure_alive_suffix<span class="token punctuation">(</span>Members<span class="token punctuation">)</span>,
+    <span class="token punctuation">{<!-- --></span>EmptyDeadSet, View1<span class="token punctuation">}</span> <span class="token operator">=</span>
+        lists:foldl<span class="token punctuation">(</span>
+          fun <span class="token punctuation">(</span>Member, <span class="token punctuation">{<!-- --></span>DeadAcc, ViewAcc<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                  <span class="token keyword">case</span> is_member_alive<span class="token punctuation">(</span>Member<span class="token punctuation">)</span> of
+                      <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+                          <span class="token punctuation">{<!-- --></span>?SETS:new<span class="token punctuation">(</span><span class="token punctuation">)</span>,
+                           with_view_member<span class="token punctuation">(</span>
+                             fun <span class="token punctuation">(</span>VMember <span class="token operator">=</span>
+                                      <span class="token comment">#view_member { aliases = Aliases }) -&gt;</span>
+                                     VMember <span class="token comment">#view_member {<!-- --></span>
+                                       aliases <span class="token operator">=</span> ?SETS:union<span class="token punctuation">(</span>Aliases, DeadAcc<span class="token punctuation">)</span> <span class="token punctuation">}</span>
+                             end, ViewAcc, Member<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+                      <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+                          <span class="token punctuation">{<!-- --></span>?SETS:add_element<span class="token punctuation">(</span>dead_member_id<span class="token punctuation">(</span>Member<span class="token punctuation">)</span>, DeadAcc<span class="token punctuation">)</span>,
+                           ViewAcc<span class="token punctuation">}</span>
+                  end
+          end, <span class="token punctuation">{<!-- --></span>?SETS:new<span class="token punctuation">(</span><span class="token punctuation">)</span>, View<span class="token punctuation">}</span>, Members1<span class="token punctuation">)</span>,
+    0 <span class="token operator">=</span> ?SETS:size<span class="token punctuation">(</span>EmptyDeadSet<span class="token punctuation">)</span>, %% ASSERTION
+    View1.
+
+ensure_alive_suffix<span class="token punctuation">(</span>Members<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    queue:to_list<span class="token punctuation">(</span>ensure_alive_suffix1<span class="token punctuation">(</span>queue:from_list<span class="token punctuation">(</span>Members<span class="token punctuation">))</span><span class="token punctuation">)</span>.
+
+ensure_alive_suffix1<span class="token punctuation">(</span>MembersQ<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, Member<span class="token punctuation">}</span>, MembersQ1<span class="token punctuation">}</span> <span class="token operator">=</span> queue:out_r<span class="token punctuation">(</span>MembersQ<span class="token punctuation">)</span>,
+    <span class="token keyword">case</span> is_member_alive<span class="token punctuation">(</span>Member<span class="token punctuation">)</span> of
+        <span class="token boolean">true</span>  -<span class="token operator">&gt;</span> MembersQ<span class="token punctuation">;</span>
+        <span class="token boolean">false</span> -<span class="token operator">&gt;</span> ensure_alive_suffix1<span class="token punctuation">(</span>queue:in_r<span class="token punctuation">(</span>Member, MembersQ1<span class="token punctuation">))</span>
+    end.
+
+
+%% ---------------------------------------------------------------------------
+%% View modification
+%% ---------------------------------------------------------------------------
+
+join_group<span class="token punctuation">(</span>Self, GroupName, TxnFun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    join_group<span class="token punctuation">(</span>Self, GroupName, dirty_read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span>, TxnFun<span class="token punctuation">)</span>.
+
+join_group<span class="token punctuation">(</span>Self, GroupName, <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span>, TxnFun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    join_group<span class="token punctuation">(</span>Self, GroupName,
+               prune_or_create_group<span class="token punctuation">(</span>Self, GroupName, TxnFun<span class="token punctuation">)</span>, TxnFun<span class="token punctuation">)</span><span class="token punctuation">;</span>
+join_group<span class="token punctuation">(</span>Self, _GroupName, <span class="token comment">#gm_group { members = [Self] } = Group, _TxnFun) -&gt;</span>
+    group_to_view<span class="token punctuation">(</span>Group<span class="token punctuation">)</span><span class="token punctuation">;</span>
+join_group<span class="token punctuation">(</span>Self, GroupName, <span class="token comment">#gm_group { members = Members } = Group, TxnFun) -&gt;</span>
+    <span class="token keyword">case</span> lists:member<span class="token punctuation">(</span>Self, Members<span class="token punctuation">)</span> of
+        <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+            group_to_view<span class="token punctuation">(</span>Group<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+            <span class="token keyword">case</span> lists:filter<span class="token punctuation">(</span>fun is_member_alive/1, Members<span class="token punctuation">)</span> of
+                <span class="token punctuation">[</span><span class="token punctuation">]</span> -<span class="token operator">&gt;</span>
+                    join_group<span class="token punctuation">(</span>Self, GroupName,
+                               prune_or_create_group<span class="token punctuation">(</span>Self, GroupName, TxnFun<span class="token punctuation">)</span>,
+                               TxnFun<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                Alive -<span class="token operator">&gt;</span>
+                    Left <span class="token operator">=</span> lists:nth<span class="token punctuation">(</span>rand:uniform<span class="token punctuation">(</span>length<span class="token punctuation">(</span>Alive<span class="token punctuation">))</span>, Alive<span class="token punctuation">)</span>,
+                    Handler <span class="token operator">=</span>
+                        fun <span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                                join_group<span class="token punctuation">(</span>
+                                  Self, GroupName,
+                                  record_dead_member_in_group<span class="token punctuation">(</span>Self,
+                                    Left, GroupName, TxnFun, false<span class="token punctuation">)</span>,
+                                  TxnFun<span class="token punctuation">)</span>
+                        end,
+                    try
+                        <span class="token keyword">case</span> neighbour_call<span class="token punctuation">(</span>Left, <span class="token punctuation">{<!-- --></span>add_on_right, Self<span class="token punctuation">}</span><span class="token punctuation">)</span> of
+                            <span class="token punctuation">{<!-- --></span>ok, Group1<span class="token punctuation">}</span> -<span class="token operator">&gt;</span> group_to_view<span class="token punctuation">(</span>Group1<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                            not_ready    -<span class="token operator">&gt;</span> join_group<span class="token punctuation">(</span>Self, GroupName, TxnFun<span class="token punctuation">)</span>
+                        end
+                    catch
+                        exit:<span class="token punctuation">{<!-- --></span>R, _<span class="token punctuation">}</span>
+                          when R <span class="token operator">=</span>:<span class="token operator">=</span> noproc<span class="token punctuation">;</span> R <span class="token operator">=</span>:<span class="token operator">=</span> normal<span class="token punctuation">;</span> R <span class="token operator">=</span>:<span class="token operator">=</span> <span class="token function">shutdown</span> -<span class="token operator">&gt;</span>
+                            Handler<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        exit:<span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>R, _<span class="token punctuation">}</span>, _<span class="token punctuation">}</span>
+                          when R <span class="token operator">=</span>:<span class="token operator">=</span> nodedown<span class="token punctuation">;</span> R <span class="token operator">=</span>:<span class="token operator">=</span> <span class="token function">shutdown</span> -<span class="token operator">&gt;</span>
+                            Handler<span class="token punctuation">(</span><span class="token punctuation">)</span>
+                    end
+            end
+    end.
+
+dirty_read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> mnesia:dirty_read<span class="token punctuation">(</span>?GROUP_TABLE, GroupName<span class="token punctuation">)</span> of
+        <span class="token punctuation">[</span><span class="token punctuation">]</span>      -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        <span class="token punctuation">[</span>Group<span class="token punctuation">]</span> -<span class="token operator">&gt;</span> Group
+    end.
+
+read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> mnesia:read<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>?GROUP_TABLE, GroupName<span class="token punctuation">}</span><span class="token punctuation">)</span> of
+        <span class="token punctuation">[</span><span class="token punctuation">]</span>      -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        <span class="token punctuation">[</span>Group<span class="token punctuation">]</span> -<span class="token operator">&gt;</span> Group
+    end.
+
+write_group<span class="token punctuation">(</span>Group<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> mnesia:write<span class="token punctuation">(</span>?GROUP_TABLE, Group, write<span class="token punctuation">)</span>, Group.
+
+prune_or_create_group<span class="token punctuation">(</span>Self, GroupName, TxnFun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    TxnFun<span class="token punctuation">(</span>
+      fun <span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+              GroupNew <span class="token operator">=</span> <span class="token comment">#gm_group { name    = GroupName,</span>
+                                     members <span class="token operator">=</span> <span class="token punctuation">[</span>Self<span class="token punctuation">]</span>,
+                                     version <span class="token operator">=</span> get_version<span class="token punctuation">(</span>Self<span class="token punctuation">)</span> <span class="token punctuation">}</span>,
+              <span class="token keyword">case</span> read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> of
+                  <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+                      write_group<span class="token punctuation">(</span>GroupNew<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                  Group <span class="token operator">=</span> <span class="token comment">#gm_group { members = Members } -&gt;</span>
+                      <span class="token keyword">case</span> lists:any<span class="token punctuation">(</span>fun is_member_alive/1, Members<span class="token punctuation">)</span> of
+                          <span class="token boolean">true</span>  -<span class="token operator">&gt;</span> Group<span class="token punctuation">;</span>
+                          <span class="token boolean">false</span> -<span class="token operator">&gt;</span> write_group<span class="token punctuation">(</span>GroupNew<span class="token punctuation">)</span>
+                      end
+              end
+      end<span class="token punctuation">)</span>.
+
+record_dead_member_in_group<span class="token punctuation">(</span>Self, Member, GroupName, TxnFun, Verify<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Fun <span class="token operator">=</span>
+        fun <span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                try
+                    Group <span class="token operator">=</span> <span class="token comment">#gm_group { members = Members, version = Ver } =</span>
+                        <span class="token keyword">case</span> Verify of
+                            <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+                                check_membership<span class="token punctuation">(</span>Self, read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">))</span><span class="token punctuation">;</span>
+                            <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+                                check_group<span class="token punctuation">(</span>read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">))</span>
+                        end,
+                    <span class="token keyword">case</span> lists:splitwith<span class="token punctuation">(</span>
+                           fun <span class="token punctuation">(</span>Member1<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Member1 <span class="token operator">=</span>/<span class="token operator">=</span> Member end, Members<span class="token punctuation">)</span> of
+                        <span class="token punctuation">{<!-- --></span>_Members1, <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span> %% not found - already recorded dead
+                            Group<span class="token punctuation">;</span>
+                        <span class="token punctuation">{<!-- --></span>Members1, <span class="token punctuation">[</span>Member <span class="token operator">|</span> Members2<span class="token punctuation">]</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+                            Members3 <span class="token operator">=</span> Members1 ++ <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>dead, Member<span class="token punctuation">}</span> <span class="token operator">|</span> Members2<span class="token punctuation">]</span>,
+                            write_group<span class="token punctuation">(</span>Group <span class="token comment">#gm_group { members = Members3,</span>
+                                                          version <span class="token operator">=</span> Ver + 1 <span class="token punctuation">}</span><span class="token punctuation">)</span>
+                    end
+                catch
+                    lost_membership -<span class="token operator">&gt;</span>
+                        %% The transaction must not be abruptly crashed, but
+                        %% leave the gen_server to stop normally
+                        <span class="token punctuation">{<!-- --></span>error, lost_membership<span class="token punctuation">}</span>
+                end
+        end,
+    handle_lost_membership_in_txn<span class="token punctuation">(</span>TxnFun, Fun<span class="token punctuation">)</span>.
+
+handle_lost_membership_in_txn<span class="token punctuation">(</span>TxnFun, Fun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> TxnFun<span class="token punctuation">(</span>Fun<span class="token punctuation">)</span>  of
+        <span class="token punctuation">{<!-- --></span>error, lost_membership <span class="token operator">=</span> T<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            throw<span class="token punctuation">(</span>T<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Any -<span class="token operator">&gt;</span>
+            Any
+    end.
+
+record_new_member_in_group<span class="token punctuation">(</span>NewMember, Left, GroupName, TxnFun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Fun <span class="token operator">=</span>
+        fun <span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                try
+                    Group <span class="token operator">=</span> <span class="token comment">#gm_group { members = Members, version = Ver } =</span>
+                        check_membership<span class="token punctuation">(</span>Left, read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">))</span>,
+                    <span class="token keyword">case</span> lists:member<span class="token punctuation">(</span>NewMember, Members<span class="token punctuation">)</span> of
+                        <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+                            %% This avois duplicates during partial partitions,
+                            %% as inconsistent views might happen during them
+                            rabbit_log:warning<span class="token punctuation">(</span><span class="token string">"(~p) GM avoiding duplicate of ~p"</span>,
+                                               <span class="token punctuation">[</span>self<span class="token punctuation">(</span><span class="token punctuation">)</span>, NewMember<span class="token punctuation">]</span><span class="token punctuation">)</span>,
+                            Group<span class="token punctuation">;</span>
+                        <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+                            <span class="token punctuation">{<!-- --></span>Prefix, <span class="token punctuation">[</span>Left <span class="token operator">|</span> Suffix<span class="token punctuation">]</span><span class="token punctuation">}</span> <span class="token operator">=</span>
+                                lists:splitwith<span class="token punctuation">(</span>fun <span class="token punctuation">(</span>M<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> M <span class="token operator">=</span>/<span class="token operator">=</span> Left end, Members<span class="token punctuation">)</span>,
+                            write_group<span class="token punctuation">(</span>Group <span class="token comment">#gm_group {<!-- --></span>
+                                          members <span class="token operator">=</span> Prefix ++ <span class="token punctuation">[</span>Left, NewMember <span class="token operator">|</span> Suffix<span class="token punctuation">]</span>,
+                                          version <span class="token operator">=</span> Ver + 1 <span class="token punctuation">}</span><span class="token punctuation">)</span>
+                    end
+                catch
+                    lost_membership -<span class="token operator">&gt;</span>
+                        %% The transaction must not be abruptly crashed, but
+                        %% leave the gen_server to stop normally
+                        <span class="token punctuation">{<!-- --></span>error, lost_membership<span class="token punctuation">}</span>
+                end
+        end,
+    handle_lost_membership_in_txn<span class="token punctuation">(</span>TxnFun, Fun<span class="token punctuation">)</span>.
+
+erase_members_in_group<span class="token punctuation">(</span>Self, Members, GroupName, TxnFun<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    DeadMembers <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>dead, Id<span class="token punctuation">}</span> <span class="token operator">||</span> Id <span class="token operator">&lt;</span>- Members<span class="token punctuation">]</span>,
+    Fun <span class="token operator">=</span>
+        fun <span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                try
+                    Group <span class="token operator">=</span> <span class="token comment">#gm_group { members = [_|_] = Members1, version = Ver } =</span>
+                        check_membership<span class="token punctuation">(</span>Self, read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">))</span>,
+                    <span class="token keyword">case</span> Members1 -- DeadMembers of
+                        Members1 -<span class="token operator">&gt;</span> Group<span class="token punctuation">;</span>
+                        Members2 -<span class="token operator">&gt;</span> write_group<span class="token punctuation">(</span>
+                                      Group <span class="token comment">#gm_group { members = Members2,</span>
+                                                        version <span class="token operator">=</span> Ver + 1 <span class="token punctuation">}</span><span class="token punctuation">)</span>
+                    end
+              catch
+                  lost_membership -<span class="token operator">&gt;</span>
+                      %% The transaction must not be abruptly crashed, but
+                      %% leave the gen_server to stop normally
+                      <span class="token punctuation">{<!-- --></span>error, lost_membership<span class="token punctuation">}</span>
+              end
+        end,
+    handle_lost_membership_in_txn<span class="token punctuation">(</span>TxnFun, Fun<span class="token punctuation">)</span>.
+
+maybe_erase_aliases<span class="token punctuation">(</span>State <span class="token operator">=</span> <span class="token comment">#state { self          = Self,</span>
+                                     group_name    <span class="token operator">=</span> GroupName,
+                                     members_state <span class="token operator">=</span> MembersState,
+                                     txn_executor  <span class="token operator">=</span> TxnFun <span class="token punctuation">}</span>, View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token comment">#view_member { aliases = Aliases } = fetch_view_member(Self, View),</span>
+    <span class="token punctuation">{<!-- --></span>Erasable, MembersState1<span class="token punctuation">}</span>
+        <span class="token operator">=</span> ?SETS:fold<span class="token punctuation">(</span>
+             fun <span class="token punctuation">(</span>Id, <span class="token punctuation">{<!-- --></span>ErasableAcc, MembersStateAcc<span class="token punctuation">}</span> <span class="token operator">=</span> Acc<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                     <span class="token comment">#member { last_pub = LP, last_ack = LA } =</span>
+                         find_member_or_blank<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span>,
+                     <span class="token keyword">case</span> can_erase_view_member<span class="token punctuation">(</span>Self, Id, LA, LP<span class="token punctuation">)</span> of
+                         <span class="token boolean">true</span>  -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">[</span>Id <span class="token operator">|</span> ErasableAcc<span class="token punctuation">]</span>,
+                                   erase_member<span class="token punctuation">(</span>Id, MembersStateAcc<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+                         <span class="token boolean">false</span> -<span class="token operator">&gt;</span> Acc
+                     end
+             end, <span class="token punctuation">{<!-- --></span><span class="token punctuation">[</span><span class="token punctuation">]</span>, MembersState<span class="token punctuation">}</span>, Aliases<span class="token punctuation">)</span>,
+    View1 <span class="token operator">=</span> <span class="token keyword">case</span> Erasable of
+                <span class="token punctuation">[</span><span class="token punctuation">]</span> -<span class="token operator">&gt;</span> View<span class="token punctuation">;</span>
+                _  -<span class="token operator">&gt;</span> group_to_view<span class="token punctuation">(</span>
+                        erase_members_in_group<span class="token punctuation">(</span>Self, Erasable, GroupName, TxnFun<span class="token punctuation">))</span>
+            end,
+    change_view<span class="token punctuation">(</span>View1, State <span class="token comment">#state { members_state = MembersState1 }).</span>
+
+can_erase_view_member<span class="token punctuation">(</span>Self, Self, _LA, _LP<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+can_erase_view_member<span class="token punctuation">(</span>_Self, _Id,   N,   N<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+can_erase_view_member<span class="token punctuation">(</span>_Self, _Id, _LA, _LP<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> false.
+
+neighbour_cast<span class="token punctuation">(</span>N, Msg<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> ?INSTR_MOD:cast<span class="token punctuation">(</span>get_pid<span class="token punctuation">(</span>N<span class="token punctuation">)</span>, Msg<span class="token punctuation">)</span>.
+neighbour_call<span class="token punctuation">(</span>N, Msg<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> ?INSTR_MOD:call<span class="token punctuation">(</span>get_pid<span class="token punctuation">(</span>N<span class="token punctuation">)</span>, Msg, infinity<span class="token punctuation">)</span>.
+
+%% ---------------------------------------------------------------------------
+%% View monitoring and maintenance
+%% ---------------------------------------------------------------------------
+
+ensure_neighbour<span class="token punctuation">(</span>_Ver, Self, <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span>, Self<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span><span class="token punctuation">;</span>
+ensure_neighbour<span class="token punctuation">(</span>Ver, Self, <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span>, RealNeighbour<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ok <span class="token operator">=</span> neighbour_cast<span class="token punctuation">(</span>RealNeighbour, <span class="token punctuation">{<!-- --></span>?TAG, Ver, check_neighbours<span class="token punctuation">}</span><span class="token punctuation">)</span>,
+    <span class="token punctuation">{<!-- --></span>RealNeighbour, maybe_monitor<span class="token punctuation">(</span>RealNeighbour, Self<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+ensure_neighbour<span class="token punctuation">(</span>_Ver, _Self, <span class="token punctuation">{<!-- --></span>RealNeighbour, MRef<span class="token punctuation">}</span>, RealNeighbour<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>RealNeighbour, MRef<span class="token punctuation">}</span><span class="token punctuation">;</span>
+ensure_neighbour<span class="token punctuation">(</span>Ver, Self, <span class="token punctuation">{<!-- --></span>RealNeighbour, MRef<span class="token punctuation">}</span>, Neighbour<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token boolean">true</span> <span class="token operator">=</span> ?INSTR_MOD:demonitor<span class="token punctuation">(</span>MRef<span class="token punctuation">)</span>,
+    Msg <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>?TAG, Ver, check_neighbours<span class="token punctuation">}</span>,
+    ok <span class="token operator">=</span> neighbour_cast<span class="token punctuation">(</span>RealNeighbour, Msg<span class="token punctuation">)</span>,
+    ok <span class="token operator">=</span> <span class="token keyword">case</span> Neighbour of
+             Self -<span class="token operator">&gt;</span> ok<span class="token punctuation">;</span>
+             _    -<span class="token operator">&gt;</span> neighbour_cast<span class="token punctuation">(</span>Neighbour, Msg<span class="token punctuation">)</span>
+         end,
+    <span class="token punctuation">{<!-- --></span>Neighbour, maybe_monitor<span class="token punctuation">(</span>Neighbour, Self<span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+maybe_monitor<span class="token punctuation">(</span> Self,  Self<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> undefined<span class="token punctuation">;</span>
+maybe_monitor<span class="token punctuation">(</span>Other, _Self<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> ?INSTR_MOD:monitor<span class="token punctuation">(</span>get_pid<span class="token punctuation">(</span>Other<span class="token punctuation">))</span>.
+
+check_neighbours<span class="token punctuation">(</span>State <span class="token operator">=</span> <span class="token comment">#state { self             = Self,</span>
+                                  left             <span class="token operator">=</span> Left,
+                                  right            <span class="token operator">=</span> Right,
+                                  view             <span class="token operator">=</span> View,
+                                  broadcast_buffer <span class="token operator">=</span> Buffer <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token comment">#view_member { left = VLeft, right = VRight }</span>
+        <span class="token operator">=</span> fetch_view_member<span class="token punctuation">(</span>Self, View<span class="token punctuation">)</span>,
+    Ver <span class="token operator">=</span> view_version<span class="token punctuation">(</span>View<span class="token punctuation">)</span>,
+    Left1 <span class="token operator">=</span> ensure_neighbour<span class="token punctuation">(</span>Ver, Self, Left, VLeft<span class="token punctuation">)</span>,
+    Right1 <span class="token operator">=</span> ensure_neighbour<span class="token punctuation">(</span>Ver, Self, Right, VRight<span class="token punctuation">)</span>,
+    Buffer1 <span class="token operator">=</span> <span class="token keyword">case</span> Right1 of
+                  <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span> -<span class="token operator">&gt;</span> <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                  _                 -<span class="token operator">&gt;</span> Buffer
+              end,
+    State1 <span class="token operator">=</span> State <span class="token comment">#state { left = Left1, right = Right1,</span>
+                            broadcast_buffer <span class="token operator">=</span> Buffer1 <span class="token punctuation">}</span>,
+    ok <span class="token operator">=</span> maybe_send_catchup<span class="token punctuation">(</span>Right, State1<span class="token punctuation">)</span>,
+    State1.
+
+maybe_send_catchup<span class="token punctuation">(</span>Right, <span class="token comment">#state { right = Right }) -&gt;</span>
+    ok<span class="token punctuation">;</span>
+maybe_send_catchup<span class="token punctuation">(</span>_Right, <span class="token comment">#state { self  = Self,</span>
+                                    right <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Self, undefined<span class="token punctuation">}</span> <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ok<span class="token punctuation">;</span>
+maybe_send_catchup<span class="token punctuation">(</span>_Right, <span class="token comment">#state { members_state = undefined }) -&gt;</span>
+    ok<span class="token punctuation">;</span>
+maybe_send_catchup<span class="token punctuation">(</span>_Right, <span class="token comment">#state { self          = Self,</span>
+                                    right         <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Right, _MRef<span class="token punctuation">}</span>,
+                                    view          <span class="token operator">=</span> View,
+                                    members_state <span class="token operator">=</span> MembersState <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    send_right<span class="token punctuation">(</span>Right, View,
+               <span class="token punctuation">{<!-- --></span>catchup, Self, prepare_members_state<span class="token punctuation">(</span>MembersState<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+
+%% ---------------------------------------------------------------------------
+%% Catch_up delta detection
+%% ---------------------------------------------------------------------------
+
+find_prefix_common_suffix<span class="token punctuation">(</span>A, B<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Prefix, A1<span class="token punctuation">}</span> <span class="token operator">=</span> find_prefix<span class="token punctuation">(</span>A, B, queue:new<span class="token punctuation">(</span><span class="token punctuation">))</span>,
+    <span class="token punctuation">{<!-- --></span>Common, Suffix<span class="token punctuation">}</span> <span class="token operator">=</span> find_common<span class="token punctuation">(</span>A1, B, queue:new<span class="token punctuation">(</span><span class="token punctuation">))</span>,
+    <span class="token punctuation">{<!-- --></span>Prefix, Common, Suffix<span class="token punctuation">}</span>.
+
+%% Returns the elements of A that occur before the first element of B,
+%% plus the remainder of A.
+find_prefix<span class="token punctuation">(</span>A, B, Prefix<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> <span class="token punctuation">{<!-- --></span>queue:out<span class="token punctuation">(</span>A<span class="token punctuation">)</span>, queue:out<span class="token punctuation">(</span>B<span class="token punctuation">)</span><span class="token punctuation">}</span> of
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, Val<span class="token punctuation">}</span>, _A1<span class="token punctuation">}</span>, <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, Val<span class="token punctuation">}</span>, _B1<span class="token punctuation">}</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            <span class="token punctuation">{<!-- --></span>Prefix, A<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>empty, A1<span class="token punctuation">}</span>, <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, _A<span class="token punctuation">}</span>, _B1<span class="token punctuation">}</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            <span class="token punctuation">{<!-- --></span>Prefix, A1<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, <span class="token punctuation">{<!-- --></span>NumA, _MsgA<span class="token punctuation">}</span> <span class="token operator">=</span> Val<span class="token punctuation">}</span>, A1<span class="token punctuation">}</span>,
+         <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, <span class="token punctuation">{<!-- --></span>NumB, _MsgB<span class="token punctuation">}</span><span class="token punctuation">}</span>, _B1<span class="token punctuation">}</span><span class="token punctuation">}</span> when NumA <span class="token operator">&lt;</span> NumB -<span class="token operator">&gt;</span>
+            find_prefix<span class="token punctuation">(</span>A1, B, queue:in<span class="token punctuation">(</span>Val, Prefix<span class="token punctuation">))</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>_, <span class="token punctuation">{<!-- --></span>empty, _B1<span class="token punctuation">}</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            <span class="token punctuation">{<!-- --></span>A, Prefix<span class="token punctuation">}</span> %% Prefix well be empty here
+    end.
+
+%% A should be a prefix of B. Returns the commonality plus the
+%% remainder of B.
+find_common<span class="token punctuation">(</span>A, B, Common<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> <span class="token punctuation">{<!-- --></span>queue:out<span class="token punctuation">(</span>A<span class="token punctuation">)</span>, queue:out<span class="token punctuation">(</span>B<span class="token punctuation">)</span><span class="token punctuation">}</span> of
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, Val<span class="token punctuation">}</span>, A1<span class="token punctuation">}</span>, <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, Val<span class="token punctuation">}</span>, B1<span class="token punctuation">}</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            find_common<span class="token punctuation">(</span>A1, B1, queue:in<span class="token punctuation">(</span>Val, Common<span class="token punctuation">))</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>empty, _A<span class="token punctuation">}</span>, _<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            <span class="token punctuation">{<!-- --></span>Common, B<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        %% Drop value from B.
+        %% Match value to avoid infinite loop, since <span class="token punctuation">{<!-- --></span>empty, B<span class="token punctuation">}</span> <span class="token operator">=</span> queue:out<span class="token punctuation">(</span>B<span class="token punctuation">)</span>.
+        <span class="token punctuation">{<!-- --></span>_, <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, _<span class="token punctuation">}</span>, B1<span class="token punctuation">}</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            find_common<span class="token punctuation">(</span>A, B1, Common<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        %% Drop value from A. Empty A should be matched by second close.
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, _<span class="token punctuation">}</span>, A1<span class="token punctuation">}</span>, _<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            find_common<span class="token punctuation">(</span>A1, B, Common<span class="token punctuation">)</span>
+    end.
+
+
+%% ---------------------------------------------------------------------------
+%% Members helpers
+%% ---------------------------------------------------------------------------
+
+with_member<span class="token punctuation">(</span>Fun, Id, MembersState<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    store_member<span class="token punctuation">(</span>
+      Id, Fun<span class="token punctuation">(</span>find_member_or_blank<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">))</span>, MembersState<span class="token punctuation">)</span>.
+
+with_member_acc<span class="token punctuation">(</span>Fun, Id, <span class="token punctuation">{<!-- --></span>MembersState, Acc<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>MemberState, Acc1<span class="token punctuation">}</span> <span class="token operator">=</span> Fun<span class="token punctuation">(</span>find_member_or_blank<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span>, Acc<span class="token punctuation">)</span>,
+    <span class="token punctuation">{<!-- --></span>store_member<span class="token punctuation">(</span>Id, MemberState, MembersState<span class="token punctuation">)</span>, Acc1<span class="token punctuation">}</span>.
+
+find_member_or_blank<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> maps:find<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span> of
+        <span class="token punctuation">{<!-- --></span>ok, Result<span class="token punctuation">}</span> -<span class="token operator">&gt;</span> Result<span class="token punctuation">;</span>
+        error        -<span class="token operator">&gt;</span> blank_member<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    end.
+
+erase_member<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:remove<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span>.
+
+blank_member<span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token comment">#member { pending_ack = queue:new(), last_pub = -1, last_ack = -1 }.</span>
+
+blank_member_state<span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:new<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+
+store_member<span class="token punctuation">(</span>Id, MemberState, MembersState<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    maps:put<span class="token punctuation">(</span>Id, MemberState, MembersState<span class="token punctuation">)</span>.
+
+prepare_members_state<span class="token punctuation">(</span>MembersState<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:to_list<span class="token punctuation">(</span>MembersState<span class="token punctuation">)</span>.
+
+build_members_state<span class="token punctuation">(</span>MembersStateList<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> maps:from_list<span class="token punctuation">(</span>MembersStateList<span class="token punctuation">)</span>.
+
+make_member<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+   <span class="token punctuation">{<!-- --></span>case dirty_read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> of
+        <span class="token comment">#gm_group { version = Version } -&gt; Version;</span>
+        <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span>              -<span class="token operator">&gt;</span> ?VERSION_START
+    end, self<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span>.
+
+remove_erased_members<span class="token punctuation">(</span>MembersState, View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    lists:foldl<span class="token punctuation">(</span>fun <span class="token punctuation">(</span>Id, MembersState1<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                    store_member<span class="token punctuation">(</span>Id, find_member_or_blank<span class="token punctuation">(</span>Id, MembersState<span class="token punctuation">)</span>,
+                                 MembersState1<span class="token punctuation">)</span>
+                end, blank_member_state<span class="token punctuation">(</span><span class="token punctuation">)</span>, all_known_members<span class="token punctuation">(</span>View<span class="token punctuation">))</span>.
+
+get_version<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Version, _Pid<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Version.
+
+get_pid<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>_Version, Pid<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Pid.
+
+get_pids<span class="token punctuation">(</span>Ids<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">[</span>Pid <span class="token operator">||</span> <span class="token punctuation">{<!-- --></span>_Version, Pid<span class="token punctuation">}</span> <span class="token operator">&lt;</span>- Ids<span class="token punctuation">]</span>.
+
+%% ---------------------------------------------------------------------------
+%% Activity assembly
+%% ---------------------------------------------------------------------------
+
+activity_nil<span class="token punctuation">(</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span> queue:new<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+
+activity_cons<span class="token punctuation">(</span>   _Id,   <span class="token punctuation">[</span><span class="token punctuation">]</span>,   <span class="token punctuation">[</span><span class="token punctuation">]</span>, Tail<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Tail<span class="token punctuation">;</span>
+activity_cons<span class="token punctuation">(</span>Sender, Pubs, Acks, Tail<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> queue:in<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Sender, Pubs, Acks<span class="token punctuation">}</span>, Tail<span class="token punctuation">)</span>.
+
+activity_finalise<span class="token punctuation">(</span>Activity<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> queue:to_list<span class="token punctuation">(</span>Activity<span class="token punctuation">)</span>.
+
+maybe_send_activity<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token punctuation">]</span>, _State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ok<span class="token punctuation">;</span>
+maybe_send_activity<span class="token punctuation">(</span>Activity, <span class="token comment">#state { self  = Self,</span>
+                                       right <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Right, _MRefR<span class="token punctuation">}</span>,
+                                       view  <span class="token operator">=</span> View <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    send_right<span class="token punctuation">(</span>Right, View, <span class="token punctuation">{<!-- --></span>activity, Self, Activity<span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+send_right<span class="token punctuation">(</span>Right, View, Msg<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    ok <span class="token operator">=</span> neighbour_cast<span class="token punctuation">(</span>Right, <span class="token punctuation">{<!-- --></span>?TAG, view_version<span class="token punctuation">(</span>View<span class="token punctuation">)</span>, Msg<span class="token punctuation">}</span><span class="token punctuation">)</span>.
+
+calculate_activity<span class="token punctuation">(</span>MembersState, Confirms, Activity, Self, View<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    lists:foldl<span class="token punctuation">(</span>
+      fun <span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Id, Pubs, Acks<span class="token punctuation">}</span>, MembersStateConfirmsActivity<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+              with_member_acc<span class="token punctuation">(</span>
+                fun <span class="token punctuation">(</span>Member <span class="token operator">=</span> <span class="token comment">#member { pending_ack = PA,</span>
+                                        last_pub    <span class="token operator">=</span> LP,
+                                        last_ack    <span class="token operator">=</span> LA <span class="token punctuation">}</span>,
+                     <span class="token punctuation">{<!-- --></span>Confirms2, Activity2<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                        <span class="token keyword">case</span> is_member_alias<span class="token punctuation">(</span>Id, Self, View<span class="token punctuation">)</span> of
+                            <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+                                <span class="token punctuation">{<!-- --></span>ToAck, PA1<span class="token punctuation">}</span> <span class="token operator">=</span>
+                                    find_common<span class="token punctuation">(</span>queue_from_pubs<span class="token punctuation">(</span>Pubs<span class="token punctuation">)</span>, PA,
+                                                queue:new<span class="token punctuation">(</span><span class="token punctuation">))</span>,
+                                LA1 <span class="token operator">=</span> last_ack<span class="token punctuation">(</span>Acks, LA<span class="token punctuation">)</span>,
+                                AckNums <span class="token operator">=</span> acks_from_queue<span class="token punctuation">(</span>ToAck<span class="token punctuation">)</span>,
+                                Confirms3 <span class="token operator">=</span> maybe_confirm<span class="token punctuation">(</span>
+                                              Self, Id, Confirms2, AckNums<span class="token punctuation">)</span>,
+                                <span class="token punctuation">{<!-- --></span>Member <span class="token comment">#member { pending_ack = PA1,</span>
+                                                  last_ack    <span class="token operator">=</span> LA1 <span class="token punctuation">}</span>,
+                                 <span class="token punctuation">{<!-- --></span>Confirms3,
+                                  activity_cons<span class="token punctuation">(</span>
+                                    Id, <span class="token punctuation">[</span><span class="token punctuation">]</span>, AckNums, Activity2<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+                            <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+                                PA1 <span class="token operator">=</span> apply_acks<span class="token punctuation">(</span>Acks, join_pubs<span class="token punctuation">(</span>PA, Pubs<span class="token punctuation">))</span>,
+                                LA1 <span class="token operator">=</span> last_ack<span class="token punctuation">(</span>Acks, LA<span class="token punctuation">)</span>,
+                                LP1 <span class="token operator">=</span> last_pub<span class="token punctuation">(</span>Pubs, LP<span class="token punctuation">)</span>,
+                                <span class="token punctuation">{<!-- --></span>Member <span class="token comment">#member { pending_ack = PA1,</span>
+                                                  last_pub    <span class="token operator">=</span> LP1,
+                                                  last_ack    <span class="token operator">=</span> LA1 <span class="token punctuation">}</span>,
+                                 <span class="token punctuation">{<!-- --></span>Confirms2,
+                                  activity_cons<span class="token punctuation">(</span>Id, Pubs, Acks, Activity2<span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">}</span>
+                        end
+                end, Id, MembersStateConfirmsActivity<span class="token punctuation">)</span>
+      end, <span class="token punctuation">{<!-- --></span>MembersState, <span class="token punctuation">{<!-- --></span>Confirms, activity_nil<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">}</span>, Activity<span class="token punctuation">)</span>.
+
+callback<span class="token punctuation">(</span>Args, Module, Activity<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Result <span class="token operator">=</span>
+      lists:foldl<span class="token punctuation">(</span>
+        fun <span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Id, Pubs, _Acks<span class="token punctuation">}</span>, <span class="token punctuation">{<!-- --></span>Args1, Module1, ok<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                lists:foldl<span class="token punctuation">(</span>fun <span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>_PubNum, Pub<span class="token punctuation">}</span>, Acc <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>Args2, Module2, ok<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                                    <span class="token keyword">case</span> Module2:handle_msg<span class="token punctuation">(</span>
+                                           Args2, get_pid<span class="token punctuation">(</span>Id<span class="token punctuation">)</span>, Pub<span class="token punctuation">)</span> of
+                                        ok -<span class="token operator">&gt;</span>
+                                            Acc<span class="token punctuation">;</span>
+                                        <span class="token punctuation">{<!-- --></span>become, Module3, Args3<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+                                            <span class="token punctuation">{<!-- --></span>Args3, Module3, ok<span class="token punctuation">}</span><span class="token punctuation">;</span>
+                                        <span class="token punctuation">{<!-- --></span>stop, _Reason<span class="token punctuation">}</span> <span class="token operator">=</span> Error -<span class="token operator">&gt;</span>
+                                            Error
+                                    end<span class="token punctuation">;</span>
+                                <span class="token punctuation">(</span>_, Error <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>stop, _Reason<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                                    Error
+                            end, <span class="token punctuation">{<!-- --></span>Args1, Module1, ok<span class="token punctuation">}</span>, Pubs<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">(</span>_, Error <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>stop, _Reason<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+                Error
+        end, <span class="token punctuation">{<!-- --></span>Args, Module, ok<span class="token punctuation">}</span>, Activity<span class="token punctuation">)</span>,
+    <span class="token keyword">case</span> Result of
+        <span class="token punctuation">{<!-- --></span>Args, Module, ok<span class="token punctuation">}</span>      -<span class="token operator">&gt;</span> ok<span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>Args1, Module1, ok<span class="token punctuation">}</span>    -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>become, Module1, Args1<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>stop, _Reason<span class="token punctuation">}</span> <span class="token operator">=</span> Error -<span class="token operator">&gt;</span> Error
+    end.
+
+change_view<span class="token punctuation">(</span>View, State <span class="token operator">=</span> <span class="token comment">#state { view          = View0,</span>
+                                   module        <span class="token operator">=</span> Module,
+                                   callback_args <span class="token operator">=</span> Args <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    OldMembers <span class="token operator">=</span> all_known_members<span class="token punctuation">(</span>View0<span class="token punctuation">)</span>,
+    NewMembers <span class="token operator">=</span> all_known_members<span class="token punctuation">(</span>View<span class="token punctuation">)</span>,
+    Births <span class="token operator">=</span> NewMembers -- OldMembers,
+    Deaths <span class="token operator">=</span> OldMembers -- NewMembers,
+    Result <span class="token operator">=</span> <span class="token keyword">case</span> <span class="token punctuation">{<!-- --></span>Births, Deaths<span class="token punctuation">}</span> of
+                 <span class="token punctuation">{<!-- --></span><span class="token punctuation">[</span><span class="token punctuation">]</span>, <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">}</span> -<span class="token operator">&gt;</span> ok<span class="token punctuation">;</span>
+                 _        -<span class="token operator">&gt;</span> Module:members_changed<span class="token punctuation">(</span>
+                               Args, get_pids<span class="token punctuation">(</span>Births<span class="token punctuation">)</span>, get_pids<span class="token punctuation">(</span>Deaths<span class="token punctuation">))</span>
+             end,
+    <span class="token punctuation">{<!-- --></span>Result, check_neighbours<span class="token punctuation">(</span>State <span class="token comment">#state { view = View })}.</span>
+
+handle_callback_result<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Result, State<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    if_callback_success<span class="token punctuation">(</span>
+      Result, fun no_reply_true/3, fun no_reply_false/3, undefined, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+handle_callback_result<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>Result, Reply, State<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    if_callback_success<span class="token punctuation">(</span>
+      Result, fun reply_true/3, fun reply_false/3, Reply, State<span class="token punctuation">)</span>.
+
+no_reply_true <span class="token punctuation">(</span>_Result,        _Undefined, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> noreply<span class="token punctuation">(</span>State<span class="token punctuation">)</span>.
+no_reply_false<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>stop, Reason<span class="token punctuation">}</span>, _Undefined, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>stop, Reason, State<span class="token punctuation">}</span>.
+
+reply_true <span class="token punctuation">(</span>_Result,        Reply, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> reply<span class="token punctuation">(</span>Reply, State<span class="token punctuation">)</span>.
+reply_false<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>stop, Reason<span class="token punctuation">}</span>, Reply, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>stop, Reason, Reply, State<span class="token punctuation">}</span>.
+
+handle_msg_true <span class="token punctuation">(</span>_Result, Msg, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> handle_msg<span class="token punctuation">(</span>Msg, State<span class="token punctuation">)</span>.
+handle_msg_false<span class="token punctuation">(</span>Result, _Msg, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>Result, State<span class="token punctuation">}</span>.
+
+activity_true<span class="token punctuation">(</span>_Result, Activity, State <span class="token operator">=</span> <span class="token comment">#state { module        = Module,</span>
+                                                  callback_args <span class="token operator">=</span> Args <span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>callback<span class="token punctuation">(</span>Args, Module, Activity<span class="token punctuation">)</span>, State<span class="token punctuation">}</span>.
+activity_false<span class="token punctuation">(</span>Result, _Activity, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Result, State<span class="token punctuation">}</span>.
+
+if_callback_success<span class="token punctuation">(</span>Result, True, False, Arg, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token punctuation">{<!-- --></span>NewResult, NewState<span class="token punctuation">}</span> <span class="token operator">=</span> maybe_stop<span class="token punctuation">(</span>Result, State<span class="token punctuation">)</span>,
+    if_callback_success1<span class="token punctuation">(</span>NewResult, True, False, Arg, NewState<span class="token punctuation">)</span>.
+
+if_callback_success1<span class="token punctuation">(</span>ok, True, _False, Arg, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    True<span class="token punctuation">(</span>ok, Arg, State<span class="token punctuation">)</span><span class="token punctuation">;</span>
+if_callback_success1<span class="token punctuation">(</span>
+  <span class="token punctuation">{<!-- --></span>become, Module, Args<span class="token punctuation">}</span> <span class="token operator">=</span> Result, True, _False, Arg, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    True<span class="token punctuation">(</span>Result, Arg, State <span class="token comment">#state { module        = Module,</span>
+                                     callback_args <span class="token operator">=</span> Args <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+if_callback_success1<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>stop, _Reason<span class="token punctuation">}</span> <span class="token operator">=</span> Result, _True, False, Arg, State<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    False<span class="token punctuation">(</span>Result, Arg, State<span class="token punctuation">)</span>.
+
+maybe_stop<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>stop, Reason<span class="token punctuation">}</span>, <span class="token comment">#state{ shutting_down = false } = State) -&gt;</span>
+    ShuttingDown <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>true, Reason<span class="token punctuation">}</span>,
+    <span class="token keyword">case</span> has_pending_messages<span class="token punctuation">(</span>State<span class="token punctuation">)</span> of
+        <span class="token boolean">true</span>  -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>ok, State <span class="token comment">#state{ shutting_down = ShuttingDown }};</span>
+        <span class="token boolean">false</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>stop, Reason<span class="token punctuation">}</span>, State <span class="token comment">#state{ shutting_down = ShuttingDown }}</span>
+    end<span class="token punctuation">;</span>
+maybe_stop<span class="token punctuation">(</span>Result, <span class="token comment">#state{ shutting_down = false } = State) -&gt;</span>
+    <span class="token punctuation">{<!-- --></span>Result, State<span class="token punctuation">}</span><span class="token punctuation">;</span>
+maybe_stop<span class="token punctuation">(</span>Result, <span class="token comment">#state{ shutting_down = {true, Reason} } = State) -&gt;</span>
+    <span class="token keyword">case</span> has_pending_messages<span class="token punctuation">(</span>State<span class="token punctuation">)</span> of
+        <span class="token boolean">true</span>  -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>Result, State<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        <span class="token boolean">false</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>stop, Reason<span class="token punctuation">}</span>, State<span class="token punctuation">}</span>
+    end.
+
+has_pending_messages<span class="token punctuation">(</span><span class="token comment">#state{ broadcast_buffer = Buffer })</span>
+  when Buffer <span class="token operator">=</span>/<span class="token operator">=</span> <span class="token punctuation">[</span><span class="token punctuation">]</span> -<span class="token operator">&gt;</span>
+    <span class="token boolean">true</span><span class="token punctuation">;</span>
+has_pending_messages<span class="token punctuation">(</span><span class="token comment">#state{ members_state = MembersState }) -&gt;</span>
+    MembersWithPubAckMismatches <span class="token operator">=</span> maps:filter<span class="token punctuation">(</span>fun<span class="token punctuation">(</span>_Id, <span class="token comment">#member{last_pub = LP, last_ack = LA}) -&gt;</span>
+                                                      LP <span class="token operator">=</span>/<span class="token operator">=</span> LA
+                                              end, MembersState<span class="token punctuation">)</span>,
+    0 <span class="token operator">=</span>/<span class="token operator">=</span> maps:size<span class="token punctuation">(</span>MembersWithPubAckMismatches<span class="token punctuation">)</span>.
+
+maybe_confirm<span class="token punctuation">(</span>_Self, _Id, Confirms, <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Confirms<span class="token punctuation">;</span>
+maybe_confirm<span class="token punctuation">(</span>Self, Self, Confirms, <span class="token punctuation">[</span>PubNum <span class="token operator">|</span> PubNums<span class="token punctuation">]</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> queue:out<span class="token punctuation">(</span>Confirms<span class="token punctuation">)</span> of
+        <span class="token punctuation">{<!-- --></span>empty, _Confirms<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            Confirms<span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, <span class="token punctuation">{<!-- --></span>PubNum, From<span class="token punctuation">}</span><span class="token punctuation">}</span>, Confirms1<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            gen_server2:reply<span class="token punctuation">(</span>From, ok<span class="token punctuation">)</span>,
+            maybe_confirm<span class="token punctuation">(</span>Self, Self, Confirms1, PubNums<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span>value, <span class="token punctuation">{<!-- --></span>PubNum1, _From<span class="token punctuation">}</span><span class="token punctuation">}</span>, _Confirms<span class="token punctuation">}</span> when PubNum1 <span class="token operator">&gt;</span> PubNum -<span class="token operator">&gt;</span>
+            maybe_confirm<span class="token punctuation">(</span>Self, Self, Confirms, PubNums<span class="token punctuation">)</span>
+    end<span class="token punctuation">;</span>
+maybe_confirm<span class="token punctuation">(</span>_Self, _Id, Confirms, _PubNums<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Confirms.
+
+purge_confirms<span class="token punctuation">(</span>Confirms<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    _ <span class="token operator">=</span> <span class="token punctuation">[</span>gen_server2:reply<span class="token punctuation">(</span>From, ok<span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">{<!-- --></span>_PubNum, From<span class="token punctuation">}</span> <span class="token operator">&lt;</span>- queue:to_list<span class="token punctuation">(</span>Confirms<span class="token punctuation">)</span><span class="token punctuation">]</span>,
+    queue:new<span class="token punctuation">(</span><span class="token punctuation">)</span>.
+
+
+%% ---------------------------------------------------------------------------
+%% Msg transformation
+%% ---------------------------------------------------------------------------
+
+acks_from_queue<span class="token punctuation">(</span>Q<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">[</span>PubNum <span class="token operator">||</span> <span class="token punctuation">{<!-- --></span>PubNum, _Msg<span class="token punctuation">}</span> <span class="token operator">&lt;</span>- queue:to_list<span class="token punctuation">(</span>Q<span class="token punctuation">)</span><span class="token punctuation">]</span>.
+
+pubs_from_queue<span class="token punctuation">(</span>Q<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> queue:to_list<span class="token punctuation">(</span>Q<span class="token punctuation">)</span>.
+
+queue_from_pubs<span class="token punctuation">(</span>Pubs<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> queue:from_list<span class="token punctuation">(</span>Pubs<span class="token punctuation">)</span>.
+
+apply_acks<span class="token punctuation">(</span>  <span class="token punctuation">[</span><span class="token punctuation">]</span>, Pubs<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> Pubs<span class="token punctuation">;</span>
+apply_acks<span class="token punctuation">(</span>List, Pubs<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>_, Pubs1<span class="token punctuation">}</span> <span class="token operator">=</span> queue:split<span class="token punctuation">(</span>length<span class="token punctuation">(</span>List<span class="token punctuation">)</span>, Pubs<span class="token punctuation">)</span>,
+                          Pubs1.
+
+join_pubs<span class="token punctuation">(</span>Q, <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">)</span>   -<span class="token operator">&gt;</span> Q<span class="token punctuation">;</span>
+join_pubs<span class="token punctuation">(</span>Q, Pubs<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> queue:join<span class="token punctuation">(</span>Q, queue_from_pubs<span class="token punctuation">(</span>Pubs<span class="token punctuation">))</span>.
+
+last_ack<span class="token punctuation">(</span>  <span class="token punctuation">[</span><span class="token punctuation">]</span>, LA<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> LA<span class="token punctuation">;</span>
+last_ack<span class="token punctuation">(</span>List, LA<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> LA1 <span class="token operator">=</span> lists:last<span class="token punctuation">(</span>List<span class="token punctuation">)</span>,
+                      <span class="token boolean">true</span> <span class="token operator">=</span> LA1 <span class="token operator">&gt;</span> LA, %% ASSERTION
+                      LA1.
+
+last_pub<span class="token punctuation">(</span>  <span class="token punctuation">[</span><span class="token punctuation">]</span>, LP<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> LP<span class="token punctuation">;</span>
+last_pub<span class="token punctuation">(</span>List, LP<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>PubNum, _Msg<span class="token punctuation">}</span> <span class="token operator">=</span> lists:last<span class="token punctuation">(</span>List<span class="token punctuation">)</span>,
+                      <span class="token boolean">true</span> <span class="token operator">=</span> PubNum <span class="token operator">&gt;</span> LP, %% ASSERTION
+                      PubNum.
+
+%% ---------------------------------------------------------------------------
+
+%% Uninstrumented versions
+
+call<span class="token punctuation">(</span>Pid, Msg, Timeout<span class="token punctuation">)</span> -<span class="token operator">&gt;</span> gen_server2:call<span class="token punctuation">(</span>Pid, Msg, Timeout<span class="token punctuation">)</span>.
+cast<span class="token punctuation">(</span>Pid, Msg<span class="token punctuation">)</span>          -<span class="token operator">&gt;</span> gen_server2:cast<span class="token punctuation">(</span>Pid, Msg<span class="token punctuation">)</span>.
+monitor<span class="token punctuation">(</span>Pid<span class="token punctuation">)</span>            -<span class="token operator">&gt;</span> erlang:monitor<span class="token punctuation">(</span>process, Pid<span class="token punctuation">)</span>.
+demonitor<span class="token punctuation">(</span>MRef<span class="token punctuation">)</span>         -<span class="token operator">&gt;</span> erlang:demonitor<span class="token punctuation">(</span>MRef<span class="token punctuation">)</span>.
+
+check_membership<span class="token punctuation">(</span>Self, <span class="token comment">#gm_group{members = M} = Group) -&gt;</span>
+    <span class="token keyword">case</span> lists:member<span class="token punctuation">(</span>Self, M<span class="token punctuation">)</span> of
+        <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+            Group<span class="token punctuation">;</span>
+        <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+            throw<span class="token punctuation">(</span>lost_membership<span class="token punctuation">)</span>
+    end<span class="token punctuation">;</span>
+check_membership<span class="token punctuation">(</span>_Self, <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    throw<span class="token punctuation">(</span>lost_membership<span class="token punctuation">)</span>.
+
+check_membership<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    <span class="token keyword">case</span> dirty_read_group<span class="token punctuation">(</span>GroupName<span class="token punctuation">)</span> of
+        <span class="token comment">#gm_group{members = M} -&gt;</span>
+            <span class="token keyword">case</span> lists:keymember<span class="token punctuation">(</span>self<span class="token punctuation">(</span><span class="token punctuation">)</span>, 2, M<span class="token punctuation">)</span> of
+                <span class="token boolean">true</span> -<span class="token operator">&gt;</span>
+                    ok<span class="token punctuation">;</span>
+                <span class="token boolean">false</span> -<span class="token operator">&gt;</span>
+                    throw<span class="token punctuation">(</span>lost_membership<span class="token punctuation">)</span>
+            end<span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span> -<span class="token operator">&gt;</span>
+            throw<span class="token punctuation">(</span>lost_membership<span class="token punctuation">)</span>
+    end.
+
+check_group<span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>error, not_found<span class="token punctuation">}</span><span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    throw<span class="token punctuation">(</span>lost_membership<span class="token punctuation">)</span><span class="token punctuation">;</span>
+check_group<span class="token punctuation">(</span>Any<span class="token punctuation">)</span> -<span class="token operator">&gt;</span>
+    Any.
+
+</code></pre> 
+<h3><a id="_1682"></a>故障节点消息同步</h3> 
+<p>当闭环中某个节点故障，需要故障节点上游节点经信息同步到故障节点的下游节点，需要决定哪个节点上的信息是最新的，RabbitMQ在每个节点设置view变量，</p> 
+<p>如A-&gt;B-&gt;C-&gt;D-&gt;E变为A-&gt;E，假设A、B、C、D、E最初都有view值x。B、C、D同时退出时，A获悉B的退出消息，view值更新为x+1；E获悉D的退出消息，view值更新为x+2；然后A监控C，获悉C退出，view值更新为x+3；A继续获取下游节点E，向E发送自身状态，E的view值小于A，所以E先更新自身view（view值将更新为x+3），然后处理消息。（这是一种可能的顺序，真实的顺序按照节点收到退出消息顺序确定。）</p> 
+<p>GM的实现可直接查看源码，有很好的代码注释：<br> 　　https://github.com/rabbitmq/rabbitmq-server/blob/stable/src/gm.erl</p> 
+<h3><a id="Master_1690"></a>Master提升</h3> 
+<p>GM保证了集群中slave节点挂掉时，消息不会丢失。当master节点挂掉时，最老的slave节点将被提升为master，此时channel发给原master的消息可能并没有通过原master的GM广播出来，所以该场景下需要额外的机制来确保消息不丢失。</p> 
+<p><img src="https://images2.imgbox.com/8e/62/dByN02Ox_o.png" alt="在这里插入图片描述"><br> RabbitMQ通过以下方法解决该问题：channel进程在收到生产者消息后，将消息发送给所有的队列进程，队列进程缓存从channel收到的消息（amqqueue缓存队列）。当队列进程从gm收到该消息后，将消息入BQ队列，并删除缓存消息。当master挂掉时，新的master通过对比gm缓存和amqqueue缓存，获取上述channel已发出、原master未通过gm转发的消息。新master此时会将未确认（consume ack）的消费消息退回BQ队列（requeue），然后将上面获取的原master未转发消息入BQ队列（同时在gm广播进行同步）。</p> 
+<p>对于消费消息，channel只用与master通信，master将消费信息在集群中同步。当master挂掉时，新提升的master将未确认的消费消息退回BQ队列（由于新master不知道消费者是否ack，所以只能将消息退回队列）；已确认的消费消息由新master继续在集群中同步，不用退回队列。</p> 
+<p>该机制确保了RabbitMQ的可靠交付（at-least-once delivery）。</p> 
+<p>该部分代码在slave中：https://github.com/rabbitmq/rabbitmq-server/blob/stable/src/rabbit_mirror_queue_slave.erl#L551</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/6c6a167ed805e640147cacad8656f5ba/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">电感有哪些重要的参数，电感的等效模型？（硬件每日一题）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/fa3fab8602d13e9e7b8b8792ff881e3c/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">selenium常见元素操作之窗口切换--window</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

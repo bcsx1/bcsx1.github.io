@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>关于Erlang和SMP的一些说明 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="关于Erlang和SMP的一些说明" />
+<meta property="og:description" content="http://shiningray.cn/some-facts-about-erlang-and-smp.html
+原文：http://groups.google.com/group/erlang-questions/browse_thread/thread/7827f5e32681ca8e by.Kenneth Erlang/OTP team, Ericsson
+译：ShiningRay 以下是一些Erlang SMP实现的细节和与性能与伸缩性相关一些简单介绍。
+几周之内还有有一个关于多核如何运作以及未来如何发展的更详细的介绍。我打算将一些内容放在我的报告中，将于9月27日的ICFP2008，Erlang Workshop在Victoria BC展示给大家。
+没有SMP支持的Erlang VM只有1个运行在主处理线程中的调度器。该调度器从运行队列（run-queue）中取出可以运行的Erlang进程以及IO任务，而且因为只有一个线程访问他们所以无须锁定任何数据。
+而带有SMP支持的Erlang VM可以有一个或多个调度器，每个运行在一个线程中。调度器从同一个公共运行队列中取出可运行的Erlang进程和IO任务。在SMP VM中所有的共享数据结构都会由锁进行保护，运行队列就是这样一个由锁保护的数据结构。
+从OTP R12B开始，如果操作系统报告有多于1个的CPU（或者核心）VM的SMP版本会自动启动，并且根据CPU或者核心的数量启动同样数量的调度器。
+你可以从“erl”命令打印出来的第一行看到它选择了哪些参数。例如：
+Erlang (BEAM) emulator version 5.6.4 [source] [smp:4] [asynch-threads:0] ….. 其中“[smp:4]”表示SMP VM运行了4个调度器。 默认值可以用“-smp [enable|disable|auto]”来替换，auto是默认的。如果smp被启用了（-smp enable），要设置调度器的数量可以使用“&#43;S Number”其中Number是调度器的数量（1到1024）
+注意1：运行多于CPU或核心总数的调度器不会有任何提升。
+注意2：在某些操作系统中一个进程可使用的CPU或者核心的数量可以被限制。例如，在Linux中，命令“taskset”就可以实现这个功能。 Erlang VM目前还只能探测CPU或者核心的总数，不会考虑“taskset”所设置的掩码。正因如此，例如可能会出现（已经出现过了）即使Erlang VM运行了4个调度器，也只使用了2个核心。OS会进行限制因为它要考虑“taskset”所设置的掩码。
+每个Erlang VM的调度器都运行于一个OS线程上，是OS来决定线程是否执行在不同的核心上。一般来说OS会很好地处理这个问题并且会保证线程在执行期间运行于同一个核心上。
+Erlang进程会被不同的调度器运行，因为他们是从一个公共运行队列中被取出，由首先可用的调度器运行。
+性能和伸缩性 只有一个调度器的SMP VM要比非SMP的VM稍微慢那么一点点。SMP VM内部需要用到各种锁，不过只要不存在锁的争用，那么由锁引起的开销不会非常大（就是锁争用上面需要花时间）。这也解释了为何在某些情况下，运行多个只 有一个调度器的SMP VM要比包含多个调度器的单一SMP VM更加高效。当然运行多个VM要求应用可以按照多个并行任务的方式运行并且之间没有或者几乎不通讯。
+一个程序是否能在多核上的SMP VM中良好地进行提升很大程度上取决于程序的性质，某些程序可以保持线性提升至8核甚至16核，同时其他某些程序基本不能提升，连2核都不行。实际应用中很多程序都能在主流市场的核心数上得到提升，见下文。
+若并行的持续“通话”由每个核心一个或多个Erlang进程来表示，实际的支持大量通话的电信产品已经先现出在双核和四核处理器上不俗的伸缩性。注 意，这些产品是在SMP VM和多核处理器出现很久以前按照普通的Erlang风格来写的，他们也能无须任何修改甚至不需重新编译代码就能从Erlang SMP VM中获益。
+SMP性能得到持续改进 SMP实现正被不断改进以便能得到更好的性能和伸缩性。在每个服务发布版R12B-1,2,3,4,5…,R13B等等中，你都能发现新的优化。
+一些已知的瓶颈 单一的常见运行队列随着CPU或核心的数量的增加会成为一个显著的瓶颈。
+这从4核开始往上就会显现出来，不过4核仍然可以为多数应用程序提供不错的性能。我们正在从事一个每个调度器一个运行队列的解决方法作为目前最重要的改进。
+Ets表格会引入锁。在R12B-4之前在每次对一个ets-table的访问中会用到两个锁，但是在R12B-4中meta-table的锁被优 化过，可以显著减少争用（前面已经提到争用是有很大代价的）。如果很多Erlang进程访问同一个表格，就会有很多锁争用造成性能降低尤其当这些进程主要 工作是访问ets-table。锁存在于表级而非记录级。注意！这也会影响到Mnesia因为Mnesia用到了很多ets-table。
+我们关于SMP的策略 当我们开始实现SMP VM的最初，我们就确定了策略：“首先让它可以运行，然后测量，然后优化”。自从2006年五月我们发布了第一个稳定的SMP VM（R11B）以来，我们一直遵循着这个策略。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/fd8db8d420c60f111e45dadd30b8c129/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2008-10-14T10:31:58+08:00" />
+<meta property="article:modified_time" content="2008-10-14T10:31:58+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">关于Erlang和SMP的一些说明</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div class="entry-content"> 
+ <p><a href="http://shiningray.cn/some-facts-about-erlang-and-smp.html" rel="nofollow">http://shiningray.cn/some-facts-about-erlang-and-smp.html</a></p> 
+ <p>原文：<a href="http://groups.google.com/group/erlang-questions/browse_thread/thread/7827f5e32681ca8e" rel="nofollow">http://groups.google.com/group/erlang-questions/browse_thread/thread/7827f5e32681ca8e</a> </p> 
+ <p>by.Kenneth Erlang/OTP team, Ericsson<br> 译：<a href="http://shiningray.cn/" rel="nofollow">ShiningRay <br></a> </p> 
+ <p> </p> 
+ <p>以下是一些Erlang SMP实现的细节和与性能与伸缩性相关一些简单介绍。</p> 
+ <p>几周之内还有有一个关于多核如何运作以及未来如何发展的更详细的介绍。我打算将一些内容放在我的报告中，将于9月27日的ICFP2008，Erlang Workshop在Victoria BC展示给大家。</p> 
+ <p>没有SMP支持的Erlang VM只有1个运行在主处理线程中的调度器。该调度器从运行队列（run-queue）中取出可以运行的Erlang进程以及IO任务，而且因为只有一个线程访问他们所以无须锁定任何数据。</p> 
+ <p>而带有SMP支持的Erlang VM可以有一个或多个调度器，每个运行在一个线程中。调度器从同一个公共运行队列中取出可运行的Erlang进程和IO任务。在SMP VM中所有的共享数据结构都会由锁进行保护，运行队列就是这样一个由锁保护的数据结构。</p> 
+ <p>从OTP R12B开始，如果操作系统报告有多于1个的CPU（或者核心）VM的SMP版本会自动启动，并且根据CPU或者核心的数量启动同样数量的调度器。</p> 
+ <p>你可以从“erl”命令打印出来的第一行看到它选择了哪些参数。例如：</p> 
+ <pre><code>
+Erlang (BEAM) emulator version 5.6.4 [source] [smp:4] [asynch-threads:0] …..
+
+其中“[smp:4]”表示SMP VM运行了4个调度器。</code>
+</pre> 
+ <p>默认值可以用“-smp [enable|disable|auto]”来替换，auto是默认的。如果smp被启用了（-smp enable），要设置调度器的数量可以使用“+S Number”其中Number是调度器的数量（1到1024）</p> 
+ <p>注意1：运行多于CPU或核心总数的调度器不会有任何提升。</p> 
+ <p>注意2：在某些操作系统中一个进程可使用的CPU或者核心的数量可以被限制。例如，在Linux中，命令“taskset”就可以实现这个功能。 Erlang VM目前还只能探测CPU或者核心的总数，不会考虑“taskset”所设置的掩码。正因如此，例如可能会出现（已经出现过了）即使Erlang VM运行了4个调度器，也只使用了2个核心。OS会进行限制因为它要考虑“taskset”所设置的掩码。</p> 
+ <p>每个Erlang VM的调度器都运行于一个OS线程上，是OS来决定线程是否执行在不同的核心上。一般来说OS会很好地处理这个问题并且会保证线程在执行期间运行于同一个核心上。</p> 
+ <p>Erlang进程会被不同的调度器运行，因为他们是从一个公共运行队列中被取出，由首先可用的调度器运行。</p> 
+ <h4>性能和伸缩性</h4> 
+ <p>只有一个调度器的SMP VM要比非SMP的VM稍微慢那么一点点。SMP VM内部需要用到各种锁，不过只要不存在锁的争用，那么由锁引起的开销不会非常大（就是锁争用上面需要花时间）。这也解释了为何在某些情况下，运行多个只 有一个调度器的SMP VM要比包含多个调度器的单一SMP VM更加高效。当然运行多个VM要求应用可以按照多个并行任务的方式运行并且之间没有或者几乎不通讯。</p> 
+ <p>一个程序是否能在多核上的SMP VM中良好地进行提升很大程度上取决于程序的性质，某些程序可以保持线性提升至8核甚至16核，同时其他某些程序基本不能提升，连2核都不行。实际应用中很多程序都能在主流市场的核心数上得到提升，见下文。</p> 
+ <p>若并行的持续“通话”由每个核心一个或多个Erlang进程来表示，实际的支持大量通话的电信产品已经先现出在双核和四核处理器上不俗的伸缩性。注 意，这些产品是在SMP VM和多核处理器出现很久以前按照普通的Erlang风格来写的，他们也能无须任何修改甚至不需重新编译代码就能从Erlang SMP VM中获益。</p> 
+ <h4>SMP性能得到持续改进</h4> 
+ <p>SMP实现正被不断改进以便能得到更好的性能和伸缩性。在每个服务发布版R12B-1,2,3,4,5…,R13B等等中，你都能发现新的优化。</p> 
+ <h4>一些已知的瓶颈</h4> 
+ <p>单一的常见运行队列随着CPU或核心的数量的增加会成为一个显著的瓶颈。</p> 
+ <p>这从4核开始往上就会显现出来，不过4核仍然可以为多数应用程序提供不错的性能。我们正在从事一个每个调度器一个运行队列的解决方法作为目前最重要的改进。</p> 
+ <p>Ets表格会引入锁。在R12B-4之前在每次对一个ets-table的访问中会用到两个锁，但是在R12B-4中meta-table的锁被优 化过，可以显著减少争用（前面已经提到争用是有很大代价的）。如果很多Erlang进程访问同一个表格，就会有很多锁争用造成性能降低尤其当这些进程主要 工作是访问ets-table。锁存在于表级而非记录级。注意！这也会影响到Mnesia因为Mnesia用到了很多ets-table。</p> 
+ <h4>我们关于SMP的策略</h4> 
+ <p>当我们开始实现SMP VM的最初，我们就确定了策略：“首先让它可以运行，然后测量，然后优化”。自从2006年五月我们发布了第一个稳定的SMP VM（R11B）以来，我们一直遵循着这个策略。</p> 
+ <p>还有更多已知的东西可以改进，我们会按照性能的收益大小先后各个击破。</p> 
+ <p>我们将主要的精力放在多核（大于4）上更好的连续伸缩性上。</p> 
+ <h4>卓越典范</h4> 
+ <p>即使SMP系统有还有一些已知的瓶颈不过已经有不错的整体性能和伸缩性，同时我相信在让程序员利用多核机器事半功倍方面，我们是一个卓越的典范。</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/43e24d7ed30ec945b614732d513b2a06/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">IE浏览器出现双滚动条的原因及解决方案</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5c0e5e344a1ffac295eed20175c12b8f/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">关于List index out of bounds(0)的问题</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

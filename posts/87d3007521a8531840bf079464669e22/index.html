@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>深度好文 | Android高性能音频解析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="深度好文 | Android高性能音频解析" />
+<meta property="og:description" content="1.引言
+1.1目的和对象
+该文档用于Android音频流畅性，聚焦优化音频卡顿、杂音问题。适用于Android音频开发人员查看。
+1.2背景
+游戏、k歌、直播等一些使用场景，音频对时延有较高的要求，保障低延迟，就需要更小的buffer，降低整个链路数据传递时延，但是抗性能抖动能力就会下降。如果音频线程CPU调度延迟，生产数据不及时，系统就会错过buffer周期，产生补0噪声。
+一方面，Android音频系统框架对于音频性能策略设计偏保守，没有提供类似IOS，Windows系统那样的一套API 用于标记音频线程，系统也就不知道APP的线程哪些是音频线程，哪些不是。无法对APP音频线程在CPU资源上做一些适度地倾斜。
+另一方面，Android生态控制力较弱，多数APP在音频逻辑的实现过程中，忽略了CPU调度因素，没有按照Google的建议设置音频线程的优先级，也就是默认的优先级（Nice 120）。在整机CPU重载场景下，APP内部音频关联线程，特别是解码器线程CPU调度延迟，导致数据生产不及时，触发声音卡顿、杂音问题，这样的问题越来越突出。
+一些APP在实现过程中，在关键的播放线程中，调用AudioManager耗时接口，阻塞了数据传递，导致了声音卡顿。
+还有一些应用面在主线程/UI渲染线程中，调用Audio的耗时接口，导致游戏画面渲染帧率降低。
+与APP开发伙伴交流过程中，发现APP开发者和系统开发者，存在一些理解上的GAP，APP开发者对音频系统不熟悉，而系统开发者对APP内部业务逻辑不熟悉。遇到问题debug起来，耗时较长，不利于提升用户体验。音频流畅性体验是Android基础体验的一个核心，也是一个痛点。本文聚焦音频流畅性分析，希望能有助于音频APP开发者和音频系统开发者联合调优，提升用户音频基础体验。
+1.3音频格式
+人耳的听觉范围是在20Hz到20KHz之间的频段，不同于人眼的“暂留”生理特性，人耳鼓膜的灵敏度远高于人眼。两耳间距产生的微秒级时延（700us）带来的细微声压、声相变化，可辨别远处的音源方位。普通人可清晰辨识低至10db的响度变化，经过专业训练的“金耳朵”，可识别更低db的响度变化，人耳对时延敏感，对声音卡顿敏感。这也是音频采样率(48000 fps)远高于画面的帧率（60 fps）的原因。通过大幅增加音频流采样次数，使得响度曲线变化更平滑，避免出现邻帧之间有较大的db变化，避免听觉上不适感。
+声道数：声场还原，主要用于表达声音方位立体感。例如 单声道(1ch，mono)，双声道立体声（2ch，stereo），5.1声道, 7.1声道
+图1.1 室内5.1声道声场还原
+位宽：也称位深，即一个采样点用几个字节编码
+表1.1 PCM编码类型
+音频帧：即一个采样点，音频帧大小计算方法：声道数据 * 位宽，例如：
+16bit，2ch 音乐，它的音频帧大小为：2 * 2 = 4 字节。
+32bit，5.1ch 音乐，它的音频帧大小为：4 * 6 = 24 字节。
+采样率：也称音频帧率fps，每秒需要取样多少次，一个采样点就是一个音频帧。通过采样对模拟型号离散化成数字信号，采样率越高，声音信息越丰富。人耳听觉频段范围限制，无法听到低频声音，Android支持的采样率通常范围在闭区间[8000HZ, 384000HZ]。
+Android最常见采样率：
+通话：8k，16k, 32k
+视频及游戏：24k, 44.1k，48k
+高清音乐：96k, 192k
+图1.2 采样与量化
+音频需要足够高的采样率，使得数据更平滑。
+码率：1秒时间播放了多少字节数据（或多少bit数据）。
+计算公式：bRate = 采样率 * 位宽 * 声道数
+例如 48k，7.1声道，16bit pcm编码 码率为：48000 * 8 * 2 = 768000 Bps" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/87d3007521a8531840bf079464669e22/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-08T17:31:14+08:00" />
+<meta property="article:modified_time" content="2023-12-08T17:31:14+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">深度好文 | Android高性能音频解析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p><strong>1.引言</strong></p> 
+ <p><strong>1.1目的和对象</strong></p> 
+ <p>该文档用于Android音频流畅性，聚焦优化音频卡顿、杂音问题。适用于Android音频开发人员查看。</p> 
+ <p><strong>1.2背景</strong></p> 
+ <p>游戏、k歌、直播等一些使用场景，音频对时延有较高的要求，保障低延迟，就需要更小的buffer，降低整个链路数据传递时延，但是抗性能抖动能力就会下降。如果音频线程CPU调度延迟，生产数据不及时，系统就会错过buffer周期，产生补0噪声。</p> 
+ <p>一方面，Android音频系统框架对于音频性能策略设计偏保守，没有提供类似IOS，Windows系统那样的一套API 用于标记音频线程，系统也就不知道APP的线程哪些是音频线程，哪些不是。无法对APP音频线程在CPU资源上做一些适度地倾斜。</p> 
+ <p>另一方面，Android生态控制力较弱，多数APP在音频逻辑的实现过程中，忽略了CPU调度因素，没有按照Google的建议设置音频线程的优先级，也就是默认的优先级（Nice 120）。在整机CPU重载场景下，APP内部音频关联线程，特别是解码器线程CPU调度延迟，导致数据生产不及时，触发声音卡顿、杂音问题，这样的问题越来越突出。</p> 
+ <p>一些APP在实现过程中，在关键的播放线程中，调用AudioManager耗时接口，阻塞了数据传递，导致了声音卡顿。</p> 
+ <p>还有一些应用面在主线程/UI渲染线程中，调用Audio的耗时接口，导致游戏画面渲染帧率降低。</p> 
+ <p>与APP开发伙伴交流过程中，发现APP开发者和系统开发者，存在一些理解上的GAP，APP开发者对音频系统不熟悉，而系统开发者对APP内部业务逻辑不熟悉。遇到问题debug起来，耗时较长，不利于提升用户体验。音频流畅性体验是Android基础体验的一个核心，也是一个痛点。本文聚焦音频流畅性分析，希望能有助于音频APP开发者和音频系统开发者联合调优，提升用户音频基础体验。</p> 
+ <p><strong>1.3音频格式</strong></p> 
+ <p>人耳的听觉范围是在20Hz到20KHz之间的频段，不同于人眼的“暂留”生理特性，人耳鼓膜的灵敏度远高于人眼。两耳间距产生的微秒级时延（700us）带来的细微声压、声相变化，可辨别远处的音源方位。普通人可清晰辨识低至10db的响度变化，经过专业训练的“金耳朵”，可识别更低db的响度变化，人耳对时延敏感，对声音卡顿敏感。这也是音频采样率(48000 fps)远高于画面的帧率（60 fps）的原因。通过大幅增加音频流采样次数，使得响度曲线变化更平滑，避免出现邻帧之间有较大的db变化，避免听觉上不适感。</p> 
+ <ul><li><p><strong>声道数</strong>：声场还原，主要用于表达声音方位立体感。例如 单声道(1ch，mono)，双声道立体声（2ch，stereo），5.1声道, 7.1声道</p></li></ul> 
+ <p><img src="https://images2.imgbox.com/1c/0f/XjUjdItr_o.png" alt="3c58ffdb9572ec128a25a782b20bd600.png"></p> 
+ <p style="text-align:center;">图1.1 室内5.1声道声场还原</p> 
+ <ul><li><p> <strong>位宽</strong>：也称位深，即一个采样点用几个字节编码</p></li></ul> 
+ <p><img src="https://images2.imgbox.com/98/5e/lwUEuxt3_o.png" alt="7c4f9091e4c657a5d334c5250b1d5cf3.png"></p> 
+ <p style="text-align:center;">表1.1 PCM编码类型</p> 
+ <ul><li><p><strong>音频帧</strong>：即一个采样点，音频帧大小计算方法：声道数据 * 位宽，例如：</p></li></ul> 
+ <p>16bit，2ch 音乐，它的音频帧大小为：2 * 2 = 4 字节。</p> 
+ <p>32bit，5.1ch 音乐，它的音频帧大小为：4 * 6 = 24 字节。</p> 
+ <ul><li><p><strong>采样率：</strong>也称音频帧率fps，每秒需要取样多少次，一个采样点就是一个音频帧。通过采样对模拟型号离散化成数字信号，采样率越高，声音信息越丰富。人耳听觉频段范围限制，无法听到低频声音，Android支持的采样率通常范围在闭区间[8000HZ, 384000HZ]。</p></li></ul> 
+ <p>Android最常见采样率：</p> 
+ <p>通话：8k，16k, 32k</p> 
+ <p>视频及游戏：24k, 44.1k，48k</p> 
+ <p>高清音乐：96k, 192k</p> 
+ <p><img src="https://images2.imgbox.com/78/84/ZxoyXWLu_o.png" alt="65f550629f0affe6e6ce4bc5795d234e.png"></p> 
+ <p style="text-align:center;">图1.2 采样与量化</p> 
+ <p>音频需要足够高的采样率，使得数据更平滑。</p> 
+ <ul><li><p><strong>码率</strong>：1秒时间播放了多少字节数据（或多少bit数据）。</p></li></ul> 
+ <p>计算公式：bRate = 采样率 *  位宽 * 声道数</p> 
+ <p>例如 48k，7.1声道，16bit pcm编码  码率为：48000 * 8 * 2 = 768000 Bps</p> 
+ <p><strong>2.常见杂音类型</strong></p> 
+ <p>杂音是主观体验的概念，技术上常称为音频卡顿，“闻香可以识女人，看波形也能知音”，不同原因，有不同的杂音波形特征。例如写0，断点，重复数据，削顶，截断，高频/低频截止，白噪声，无规律断点数据。</p> 
+ <p><strong>2.1pop音</strong></p> 
+ <p>常常称为“破音”，是属于断音的一类。数据不连续，有明显跳变发生。听起来，“啪!啪!啪!”的破音，耳朵有不适感。常见的有seek pop noise，在快进，快退，或者倍速播放时，更容易遇到这类杂音。</p> 
+ <p><img src="https://images2.imgbox.com/9c/13/ASvx1ZHg_o.png" alt="29a612f315417be118617268de863cbd.png"></p> 
+ <p><strong>2.2 补0</strong></p> 
+ <p>特征是，删除重点的0数据，数据就是连续的了，因为有连续两次跳变，听起来杂音特征比pop音更明显一些。</p> 
+ <p><img src="https://images2.imgbox.com/11/e6/gx1LfuFZ_o.png" alt="e550df4afecdee214b9b397d4f28c950.png"></p> 
+ <p>删除0后：</p> 
+ <p><img src="https://images2.imgbox.com/69/20/bCLSs009_o.png" alt="b0f4a94b6b10b54b1511cabca3ee9b76.png"></p> 
+ <p><strong>2.3截断音</strong></p> 
+ <p>属于断音的一种，与pop音的区别是，启播的第一帧，没有做淡入，或者停播的最后一帧，没有做淡出。</p> 
+ <p>常见场景例如刷短视频，切换视频之间，有时候会听到“啪！啪！啪！”的破音。简单来说就是，需要做淡入淡出。FadeInFadeOut</p> 
+ <p><strong>2.3.1切换截断音</strong></p> 
+ <p><img src="https://images2.imgbox.com/76/c3/yXonpwME_o.png" alt="43c5a6b13c0ea4d409274194e24d420c.png"></p> 
+ <p><strong>2.3.2起始截断音</strong></p> 
+ <p>开始播放阶段，没有做淡入（Fade In），产生的杂音。</p> 
+ <p><img src="https://images2.imgbox.com/65/5e/NkN6Jc2C_o.png" alt="b18a71feb6959f77427ddce007244d21.png"></p> 
+ <p><strong>2.3.3 结尾截断音</strong></p> 
+ <p><img src="https://images2.imgbox.com/38/ed/uA2Cfuv8_o.png" alt="7d7dda0c483b718a9f29a9e4b1f7ee8c.png"></p> 
+ <p><strong>2.4 削顶</strong></p> 
+ <p>削顶，又称为“削波”，原因是音频信号的响度，超过了编码范围，即0db，并不是说音源存在问题，只是音源信号，幅度太大，超过手机音频系统的表达能力，无法进行还原。超出的部分，被统一削减到0db。听起来，声音有连续卡顿的感觉，不自然。</p> 
+ <p><img src="https://images2.imgbox.com/bf/82/yx9DiNHx_o.png" alt="1bf85440a82624b7c42714b6ed9899a9.png"></p> 
+ <p><strong>2.5 蜂鸣音</strong></p> 
+ <p>听感起来，像蜂鸣器，汽笛声。波形上，4ms重复数据，常见于游戏声音卡顿。</p> 
+ <p><img src="https://images2.imgbox.com/c7/de/C1yUFRDV_o.png" alt="9d8f9e7bc2a7c43188f1a2704891b597.png"></p> 
+ <p><strong>2.6 啸叫</strong></p> 
+ <p><strong>2.6.1 什么是啸叫？</strong></p> 
+ <p>啸叫现象是指音频信号通过扬声器播放后，经过一定的传播路径，再次被麦克风拾取，经过放大器的处理后，最后经由扬声器播放，倘若在 “扬声器-麦克风-扬声器”的闭环电路中，存在某种正反馈导致某些音频频率发生自激振荡，就会产生啸叫现象。</p> 
+ <p>常见于VOIP会议，通话双方，如果距离太近，就容易产生啸叫。听起来，响度非常大，声音尖锐，感官非常难受。啸叫的产生会掩盖正常语音，给人的听感也不好，而且啸叫频点能量很高，严重时甚至能破坏会议中的扩声设备，因此我们需要对啸叫进行抑制。受限于尺寸，和算法功耗，手机侧啸叫抑制能力有限。</p> 
+ <p>从波形上，可以看到，响度非常大。</p> 
+ <p><img src="https://images2.imgbox.com/3c/db/UrtVkntL_o.png" alt="3f15bc097af5cee1d2ad85a15ab920bb.png"></p> 
+ <p><strong>2.6.2 啸叫的原理</strong></p> 
+ <p><img src="https://images2.imgbox.com/68/38/V1cfysr7_o.png" alt="0ce360f6e4c6c7594dfa02b0ac0d3f1d.png"></p> 
+ <p>正反馈系统，信号一次又一次的被循环放大。</p> 
+ <p><strong>2.7 环境底噪</strong></p> 
+ <p>主要是指mic录到的环境噪声，经过降噪算法后，通常比较轻微，不仔细几乎听不出来。但是如果降噪算法调音的不均衡，可能导致底噪大，或者音质损失。</p> 
+ <p><img src="https://images2.imgbox.com/b3/6f/pDm1cySs_o.png" alt="67501a70bb0d522bbdedc7a8329bf8cb.png"></p> 
+ <p><strong>2.8 其他无规律噪声</strong></p> 
+ <p>白噪声。</p> 
+ <p><img src="https://images2.imgbox.com/7a/b0/bInkMEsy_o.png" alt="17efb77ab2a3d56f67316111b44b8d71.png"></p> 
+ <p><strong>3. 音频通路基础</strong></p> 
+ <p><strong>3.1 播放流程拆解</strong></p> 
+ <p>对系统来说，APP是黑盒子，不同的应用有不同的逻辑实现方式，特别是游戏，可能有更复杂的业务逻辑，多达100+个线程，系统不知道那个是音频播放相关的。音频能识别到的只有AudioTrack/AudioRecord调用入口，涉及到最多两个线程。以赖线程之间的唤醒关系推测，梳理大概的流程如下：</p> 
+ <p>音乐、视频类三方APP：</p> 
+ <p><img src="https://images2.imgbox.com/2f/f7/mPZYhmHK_o.png" alt="ca23dc30c0e2a8c5e178c1d6371c115e.png"></p> 
+ <p>游戏音频流程：</p> 
+ <p><img src="https://images2.imgbox.com/63/c2/HbMlfssP_o.png" alt="3a5ea42d695779318db46e8d6e06cf58.png"></p> 
+ <p><strong>3.2 音频通路</strong></p> 
+ <p>3.2.1 音频播放链路</p> 
+ <p><img src="https://images2.imgbox.com/34/20/aTI3M85Z_o.png" alt="b16c1fe60db23c7eaa65828d69ac4127.png"></p> 
+ <p>3.2.2 音频通路</p> 
+ <p><img src="https://images2.imgbox.com/f0/83/y84BZNT5_o.png" alt="2ca55c17bbe9a0e6277f5caaf6bb007a.png"></p> 
+ <p>限于篇幅，这里不对每个通路进行展开介绍，可自行阅读代码和google官方文档。</p> 
+ <p>3.2.3 AAudio通路</p> 
+ <p>Aaudio是google基于mmap思路构建的，音频通路。尽量减少数据传递环节，以降低负载和功耗，同时降低层层传递带来的时延。这个通路是google强烈推荐使用的API，可替代OpenSL ES，支持音频低延迟。也可以通过设置参数，走到低功耗通路，例如deep buffer通路。</p> 
+ <p>以下以低延迟播放实例来分析AAUDIO工作原理，从systrace上看，aaudio并没有经过audiohal write数据，可以看到audiohal的writer线程并没有被唤醒产生负载。可以证明：aaudio是通过共享内存方式来传递数据，这种方式非常高效，避免了buffer数据层层Copy。</p> 
+ <p><img src="https://images2.imgbox.com/a3/7f/jh1K4PDJ_o.png" alt="e3d403c15bfa4c95b7acfe177d65ba9d.png"></p> 
+ <p>这里简单介绍一下AAudio性能相关的内容：</p> 
+ <p>aaudio流程图如下：</p> 
+ <p><img src="https://images2.imgbox.com/dc/54/s9eVq10V_o.png" alt="9bcbb1e4a63bcb71cfb03f4f4b9f732a.png"></p> 
+ <p>AAudio设置性能模式：</p> 
+ <p>每个 AAudioStream 都具有性能模式，而这对应用行为的影响很大。共有三种模式：</p> 
+ <ul><li><p>AAUDIO_PERFORMANCE_MODE_NONE 是默认模式。这种模式使用在延迟时间与节能之间取得平衡的基本流。</p></li><li><p>AAUDIO_PERFORMANCE_MODE_LOW_LATENCY 使用较小的缓冲区和经优化的数据路径，以减少延迟时间。</p></li><li><p>AAUDIO_PERFORMANCE_MODE_POWER_SAVING 使用较大的内部缓冲区，以及以延迟时间为代价换取节能优势的数据路径。</p></li></ul> 
+ <p>可以通过调用 setPerformanceMode() 来选择性能模式，并通过调用 getPerformanceMode() 来获得当前模式。</p> 
+ <ul><li><p>音频低延迟场景，需要设置AAUDIO_PERFORMANCE_MODE_LOW_LATENCY。系统路由到AAUDIO低延迟通路，通路buffer 只有1ms，控制周期为2ms。</p></li><li><p>如果对低延迟没有要求，尽可能的节省功耗，可设置AAUDIO_PERFORMANCE_MODE_POWER_SAVING。例如播放音乐，会走到deep buffer通路上。</p></li></ul> 
+ <p style="text-align:left;">在当前版本的 AAudio 中，为了尽量减少延迟时间，必须将 AAUDIO_PERFORMANCE_MODE_LOW_LATENCY 性能模式与高优先级回调配合使用。请参阅以下示例：</p> 
+ <p><img src="https://images2.imgbox.com/62/4e/fErCQkwP_o.png" alt="e799a9f3fdfe73af62f8284ee5d37255.png"></p> 
+ <p>关于AAUDIO的详细介绍，请移步Android SPEC，这里不再详细展开：</p> 
+ <p>https://developer.android.google.cn/ndk/guides/audio/aaudio/aaudio?hl=zh-cn</p> 
+ <p>3.2.4 Low Latency通路</p> 
+ <p>也就是常说的Fast通路，有的平台和primary通路放在一起，有的是独立的Low Latency通路，这样实现依赖平台的性能，特别是ADSP性能，都有各自的优缺点。</p> 
+ <p><img src="https://images2.imgbox.com/dc/f1/r6KlCdR8_o.png" alt="502221d915597f684655b2b4ca69b97c.png"></p> 
+ <p>FastMixer的buffer 通常设置为4-5ms，通路时延较低，但更容易受到整机性能的影响，产生性能杂音。</p> 
+ <p>FastMixer的使用，通常是通过OpenSL ES，或者Sound pool API。</p> 
+ <p>3.2.5 ULL 通路</p> 
+ <p>极致低延迟通路ULL实质上，为lowlatency通路的进一步压缩buffer，buffer甚至压缩到1ms，Android非实时系统，因此CPU调度上，无法保障1ms内得到调度，因此，这个通路，很少有开放使用。如果追求极致低延迟，推荐使用AAudio来实现。</p> 
+ <p><strong>4. 音频与CPU调度</strong></p> 
+ <p><strong>4.1 TASK运行状态机</strong></p> 
+ <p><img src="https://images2.imgbox.com/d1/e2/uZ3FkdWQ_o.png" alt="59fbe9383c4636812ef03d362d8ed7fb.png"></p> 
+ <ul><li><p>R：（TASK_RUNNING ，running + runnable），运行状态，并不意味着进程一定在运行中，也可以在运行队列里；</p></li><li><p>S：（ TASK_INTERRUPTIBLE，sleeping），可中断的睡眠状态，进程在等待事件完成；（浅度睡眠，可以被唤醒）</p></li><li><p>D：（ TASK_UNINTERRUPTIBLE ），不可中断睡眠（深度睡眠，不可以被唤醒，通常在磁盘写入时发生，也有非IO的内核原子操作）</p></li><li><p>T：（ TASK_STOPPED or TASK_TRACED），停止状态，或者跟踪状态，可以通过发送SIGSTOP信号给进程来停止进程，可以发送SIGCONT信号让进程继续运行</p></li><li><p>X：（ TASK_DEAD – EXIT_DEAD ），退出状态，进程即将被销毁；</p></li><li><p>Z：（ TASK_DEAD – EXIT_ZOMBIE ），僵尸状态，子进程退出，父进程还在运行，但是父进程没有读到子进程的退出状态，子进程进入僵尸状态；</p></li></ul> 
+ <p><img src="https://images2.imgbox.com/b9/49/2qAoOubK_o.png" alt="9b786d8f80e3c04d36fc24d8e4f6c446.png"></p> 
+ <p><strong>4.2 调度器</strong></p> 
+ <p>4.2.1 调度器分类</p> 
+ <p><img src="https://images2.imgbox.com/db/a6/ydlaeuno_o.png" alt="d24204aa4c12cccb8924ce0c6c0b4ccd.png"></p> 
+ <p>Stop调度器，</p> 
+ <p>stop_sched_class：优先级最高的调度类，可以抢占其他所有进程，不能被其他进程抢占；</p> 
+ <p>Deadline调度器， dl_sched_class：使用红黑树，把进程按照绝对截止期限进行排序，选择最小进程进行调度运行；</p> 
+ <p>RT调度器， rt_sched_class：实时调度器，为每个优先级维护一个队列；</p> 
+ <p>CFS调度器， cfs_sched_class：完全公平调度器，采用完全公平调度算法，引入虚拟运行时间概念；</p> 
+ <p>IDLE-Task调度器， idle_sched_class：空闲调度器，每个CPU都会有一个idle线程，当没有其他进程可以调度时，调度运行idle线程；</p> 
+ <p>4.2.2 调度优先级策略</p> 
+ <p>linux内核的三种调度方法：1，SCHED_OTHER 分时调度策略，2，SCHED_FIFO实时调度策略，先到先服务3，SCHED_RR实时调度策略，时间片轮转 </p> 
+ <p>实时线程将得到优先调用，实时进程根据实时优先级决定调度权值，分时进程则通过nice和counter值决定权值，nice越小，counter越大，被调度的概率越大，也就是曾经使用了cpu最少的进程将会得到优先调度。</p> 
+ <p>4.2.3 CFS调度类</p> 
+ <p>cfs是绝对公平调度算法，理想情况下，优先级相同的两个task，运行时间应该各占cpu的50%，同理3个则cpu利用率为1/3。但是cfs中弱化了优先级的概念而是使用权重weight来决定任务的运行时间。</p> 
+ <p>例如：3个任务A，B，C权重（priority）分别1，2，3；则总权重，一个调度周期为6单位时间，理想状态下，A应占用1单位，B为2，C为3。</p> 
+ <p><img src="https://images2.imgbox.com/ea/64/ofGwnCxd_o.png" alt="e8cbc4b328eba9d0d7159069ef36f308.png"></p> 
+ <p><img src="https://images2.imgbox.com/b3/63/ZukBC7Ur_o.png" alt="b8f28b56440003df91177a98a16a663f.png"></p> 
+ <p>cfs中使用虚拟时间vruntime来决定运行的task，nice值-20到20 --&gt; weight --&gt;vruntime; cfs中使用rbtree来管理调度实体se。每次选取vruntime最小的task进行执行。在rb tree中vruntime最小的se在rbtree的最左侧。</p> 
+ <p>cfs是通过限制当前task的运行时间来实现公平的，task的vruntime单调递增，它在rbtree中向右移动，让出cpu使用权给vruntime更小的task。</p> 
+ <p><img src="https://images2.imgbox.com/43/b7/9qQzEYvt_o.png" alt="f1be6a8b0ba0f298f0dc98c0c227b372.png"></p> 
+ <p>Task数据结构</p> 
+ <p><img src="https://images2.imgbox.com/87/e9/NV4j7Lnb_o.png" alt="1b2461745b28403bb11a5bbc79d8774d.png"></p> 
+ <p><img src="https://images2.imgbox.com/cf/49/V8ZfOhQf_o.png" alt="bf6702dd7382dd3cfc2adca0e8f30aab.png"></p> 
+ <p>4.2.4 RT 调度类</p> 
+ <p>实现调度分为RR和FIFO两类</p> 
+ <p>SHCED_RR和SCHED_FIFO的不同：</p> 
+ <p>当采用SHCED_RR策略的进程的时间片用完，系统将重新分配时间片，并置于就绪队列尾。放在队列尾保证了所有具有相同优先级的RR任务的调度公平。    </p> 
+ <p>SCHED_FIFO一旦占用cpu则一直运行。一直运行直到有更高优先级任务到达或自己放弃。</p> 
+ <p>如果有相同优先级的实时进程（根据优先级计算的调度权值是一样的）已经准备好，FIFO时必须等待该进程主动放弃后才可以运行这个优先级相同的任务。而RR可以让每个任务都执行一段时间。</p> 
+ <p>相同点：</p> 
+ <p>  RR和FIFO都只用于实时任务。</p> 
+ <p>  创建时优先级大于0(1-99)。</p> 
+ <p>  按照可抢占优先级调度算法进行。</p> 
+ <p>  就绪态的实时任务立即抢占非实时任务。</p> 
+ <p>rt 调度类数据结构</p> 
+ <p><img src="https://images2.imgbox.com/7d/45/RuZ588LL_o.png" alt="c0bacf633b382ebace8849d6ca7395b1.png"></p> 
+ <p><strong>4.3 CGroup与TimerSlack</strong></p> 
+ <p>Android平台的进程会根据运行状态，在不同的cgroup进行迁移，不同cgroup设置的timerslack不同，导致后台进程的定时器超时唤醒变长。Oomadj会触发推组，切后台，activity会从top group 推组到background组，相应的timerslack会从0.5ms 提高到40ms。如果播放器，实现上没有使用service，那么就可能会遇到Android应用切换到后台播放音频卡顿。</p> 
+ <p><img src="https://images2.imgbox.com/51/b9/peo0IGpo_o.png" alt="b953847ad048e0fad9dce44df6305d0e.png"></p> 
+ <p style="text-align:justify;"><img src="https://images2.imgbox.com/23/95/LjL2SUUv_o.png" alt="3dfe6dcbe81efec5baa64177611d176d.png"></p> 
+ <p style="text-align:justify;"><img src="https://images2.imgbox.com/ca/54/yjc02pRm_o.png" alt="e21d0de5831fb7d701a1aa2001a703b5.png"></p> 
+ <p>4.3.1 TimerSlack基本原理</p> 
+ <p>以下简单介绍一下timerslack基本原理：</p> 
+ <p><img src="https://images2.imgbox.com/fb/17/E4DcbKCe_o.png" alt="3ab21b29cfff4296e07e99203978cc8c.png"></p> 
+ <p>4.3.2 音频播放录制请使用Service</p> 
+ <p>Service在Android定义中，一直处于foreground，因此不会有切后台timerslack变大，导致的卡音问题。因此，APP实现中，特别注意，音频解码器，播放关联线程，需要放到service中。避开前后台切换，cgroup迁移的问题。</p> 
+ <p>查看app的timerslack方法：/proc/pid/timerslack_ns</p> 
+ <p>例如，pid为11871：查看timerslack为：0.5ms</p> 
+ <p><img src="https://images2.imgbox.com/64/2f/UaDJ2Llz_o.png" alt="adf1e7986fb5a93e20fa4db4b60dbe94.png"></p> 
+ <p>当按home按键，这项数值就会变成40000000</p> 
+ <p><strong>4.4 Android音频优先级</strong></p> 
+ <p style="text-align:left;">AOSP定义上，音频定义为CFS最高优先级Nice。</p> 
+ <p><img src="https://images2.imgbox.com/bf/ab/EHAVvyPW_o.png" alt="edfdab259497d5626a3c54f26caf9f37.png"></p> 
+ <p style="text-align:left;">Android默认优先级为120， 数量越小，优先级越高。例如最高的 ANDROID_PRIORITY_URGENT_AUDIO 为 120 -19 =101， 对应cfs线程级别的101。</p> 
+ <p style="text-align:left;">总体优先级为：Audio &gt; Video &gt; UI</p> 
+ <p><strong>5. 性能卡音案例</strong></p> 
+ <p>有了以上的音频性能基础，分析起问题来，就不那么困难了。</p> 
+ <p>分析音频卡顿，最有效的还是systrace，以下介绍几个案例：</p> 
+ <p><strong>5.1 APP播放线程调度延迟</strong></p> 
+ <p><img src="https://images2.imgbox.com/d4/4b/4aUyikOc_o.png" alt="6c8e1f78701e4e47777cbc2c5270bf5b.png"></p> 
+ <p>通过systrace我们可以看到，APP的Aplayer为音频关键线程，出现了调度上的延迟，我们可以看到问题点，缓存buffer已经消化空了，CPU已经满载，但是有明显的压频行为。因此最终原因为：</p> 
+ <ol><li><p>APP的线程优先级设置不合理，默认nice的120，没有按着google的标准来设置，至少设置为104，必要时设置为101。如果nice设置的过低，CPU满载时，就容易抢不到cpu。</p></li><li><p>负载太高，触发温升限频。</p></li></ol> 
+ <p><strong>5.2 游戏音频线程调度延迟</strong></p> 
+ <p>5.2.1 audio dump发现蜂鸣杂音</p> 
+ <p>在track阶段就dump到了杂音，可以确定问题发生在app内部。</p> 
+ <p><img src="https://images2.imgbox.com/04/3f/8ccq50I6_o.png" alt="8544ad4890ff2d3e8130d68a7b806329.png"></p> 
+ <p>持续4ms重复数据</p> 
+ <p><img src="https://images2.imgbox.com/a2/8f/NivHpi6v_o.png" alt="8a8def1ad1ba0b3be656b2da66ce8a8a.png"></p> 
+ <p>5.2.2 Systrace发现游戏音频线程调度延迟</p> 
+ <p><img src="https://images2.imgbox.com/97/cf/XOzIWrfO_o.png" alt="b1c72e16a923ad863b50c7cb46c31571.png"></p> 
+ <p><img src="https://images2.imgbox.com/91/1f/pFL1uI69_o.png" alt="cd4e134c5b38202054ea3ec78ec4bc9c.png"></p> 
+ <p>5.2.3 根因：NativeThread优先级设置太低</p> 
+ <p style="text-align:left;">NativeThread使用OpenSL ES发起了FastTrack播放，实时性要求较高，当前优先是默认的120，优先级非常低。推荐APP参考google的建议来将NativeThread线程设置为nice 101即 ANDROID_PRIORITY_URGENT_AUDIO级别。</p> 
+ <p><strong>5.3 音频系统线程调度</strong></p> 
+ <p><img src="https://images2.imgbox.com/b2/1a/lKP4CjeQ_o.png" alt="d7f291f7d39da93061af2ec1764f7eee.png"></p> 
+ <p>Android音频优先级设置偏保守，IOS，Windows系统调度上，对音频有明显的倾斜。在加上链路太长，多个进程周转数据，所以Android音频流畅性体验，要低于IOS和windows。</p> 
+ <p><strong>5.4 APP在播放线程调用音频耗时接口</strong></p> 
+ <p style="text-align:left;">最常见的接口是isBluetoothScoOn()， 这个接口在系统没有切换时候的时候，会很快返回，但是如果再插拔耳机，或者接听，挂断电话/VOIP电话时，就会耗时很长，导致caller线程，产时间阻塞，不产生数据。而fastmixer callback，一遍又一遍的吧，4ms的buffer重复callback过来，导致了蜂鸣杂音的产生。类似的耗时API还有，isWiredHeadsetOn()，isSpeakerPhoneOn()。</p> 
+ <p><img src="https://images2.imgbox.com/fc/3f/2MB6Q9aT_o.png" alt="b0b86c30774bd6b561a2a996deec4187.png"></p> 
+ <p>从systrace上看，nativeThread被阻塞，根据唤醒关系结合logcat，可以定位到，此时正在做isBluetoothScoOn接口调用。由于lock被切换设备的线程持有，而切换设备又比较耗时，从而导致，nativethread被卡住，无法生产数据。Audio系统callback到了重复的杂音数据。</p> 
+ <p>误区：AudioManager接口可以立刻返回。事实上，AudioService内部有复杂的逻辑，例如切换设备，有很多业务逻辑要处理。一个简单的场景，voip来电，这时候，需要和蓝牙耳机建立链路，握手过程，可能就需要150-300ms，整个过程非常耗时。如果这时候在主线程去调用，getMode，isBluetoothScoOn等接口，都会被阻塞掉，直到耳机返回，或者连接超时。</p> 
+ <p style="text-align:justify;"><img src="https://images2.imgbox.com/b6/2b/ibkbOgUn_o.png" alt="eb52955e7ca11d24b21bf8d12469db0d.png"></p> 
+ <p><strong>5.5 渲染线程调用AudioTrack导致帧率低</strong></p> 
+ <p>例如这份日志里，在渲染线程中，去执行AudioTrack.start()，结果阻塞580ms，导致画面卡顿。应尽量避免在UI线程，图形render线程中，调用AudioTrack接口。</p> 
+ <p><img src="https://images2.imgbox.com/ee/f4/RnTSlUPJ_o.png" alt="80cccd1452181a6a05a65fa7ec2a1371.png"></p> 
+ <p><strong>5.6 FrameCount设置过大过小</strong></p> 
+ <p>FrameCount的作用是控制APP起播的起播缓存大小，设置越大，时延越高，越不容易卡音。设置越小，时延越低，越容易卡音。</p> 
+ <p style="text-align:justify;"><img src="https://images2.imgbox.com/86/99/haPiQ3Yf_o.png" alt="1ad98002d229ae5a93f7ff4b11e6fdeb.png"></p> 
+ <p>5.6.1 短促音FrameCount设置过大导致无声</p> 
+ <p style="text-align:justify;"><img src="https://images2.imgbox.com/80/dd/KEPTw7i3_o.png" alt="e0677370b3839f45ba7055df9aa9c298.png"></p> 
+ <p>5.6.2 FrameCount设置过小卡音</p> 
+ <p>常见的问题是使用OpenSL ES播放，framecount设置的太小，缓存buffer提效，当cpu调度不及时，就容易触发性能卡音。</p> 
+ <p style="text-align:justify;"><img src="https://images2.imgbox.com/13/5e/Ph6Dgbq6_o.png" alt="b2255af5053393dcfc64fff8ca05ed9f.png"></p> 
+ <p><strong>5.7 频繁调用Audio接口，导致整机重启</strong></p> 
+ <p>Android系统只提供了31个Binder线程池，也就是系统最大并发数为31个，如果APP频繁调用Audio耗时接口，binder被占用，甚至被耗尽，导致整机重启。以下某APP，持续不停的去查音量，导致系统Binder资源被耗尽，最终触发重启。</p> 
+ <p><img src="https://images2.imgbox.com/41/bc/V2A6wniv_o.png" alt="83412012cffb6d731d2e9cd19a62c733.png"></p> 
+ <p>SystemServer Binder线程池设置为31个</p> 
+ <p><img src="https://images2.imgbox.com/cf/e1/iJoEahGm_o.png" alt="0cc88bf0c1e7f09b7951821568c11fff.png"></p> 
+ <p><strong>6.音频联合调优建议</strong></p> 
+ <p><strong>6.1规范设置音频优先级</strong></p> 
+ <p><img src="https://images2.imgbox.com/eb/d8/jK2Q5bB8_o.png" alt="429841fdf5543a53650cd3641eafec69.png"></p> 
+ <p>APP 需要参考AOSP标准，将音频数据关联线程，例如解码器，至少nice设置为104级别。</p> 
+ <p><strong>6.2 高实时的线程，避免调用耗时的音频API</strong></p> 
+ <p>尽量不要在音频解码器，以及主线程中调用音频耗时接口，例如isBluetoothScoOn()，getMode等等接口，这些接口大都会持锁，导致切换设备时，耗时较长。</p> 
+ <p><strong>6.3播放逻辑进Service</strong></p> 
+ <p>尽量将音频播放逻辑，放在service中，避免切后台，timerslack被改大，CPU被限频限核，导致的声音卡顿。</p> 
+ <p><strong>6.4 非必要避免频繁调用耗时的Audio接口</strong></p> 
+ <p>例如查询音量，音频设备连接状态。</p> 
+ <p><strong>7. 参考文献</strong></p> 
+ <p style="text-align:left;">[1]https://developer.apple.com/documentation/audiotoolbox/workgroup_management/understanding_audio_workgroups/#3625591</p> 
+ <p style="text-align:left;">[2] https://learn.microsoft.com/en-us/windows/win32/procthread/multimedia-class-scheduler-service</p> 
+ <p style="text-align:left;">[3] https://zhuanlan.zhihu.com/p/556295381?utm_id=0</p> 
+ <p style="text-align:left;">[4]https://zhuanlan.zhihu.com/p/658488322</p> 
+ <p>往</p> 
+ <p>期</p> 
+ <p>推</p> 
+ <p>荐</p> 
+ <p><a href="" rel="nofollow">深入计算机系统看性能优化</a><br></p> 
+ <p><a href="" rel="nofollow">关于Ultra HDR Image的那些事</a><br></p> 
+ <p><a href="" rel="nofollow">多图文教你看懂单个图层的绘制流程</a><br></p> 
+ <p><img src="https://images2.imgbox.com/dc/c9/AHPLaM5M_o.gif" alt="0f6f807887110322211158d65fe3e8c1.gif"></p> 
+ <p>长按关注内核工匠微信</p> 
+ <p>Linux内核黑科技| 技术文章| 精选教程</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/4aecf66e992cdd3ea559f84aca24215c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">自下而上-存储全栈（TiDB/RockDB/SPDK/fuse/ceph/NVMe/ext4）存储技术专家成长路线</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/23e6d5262ee2c76cb03c6d18e34f5edb/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">SpringBoot 的 测试类的猫腻</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

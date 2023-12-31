@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>JDK19 - 虚拟线程详解 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="JDK19 - 虚拟线程详解" />
+<meta property="og:description" content="JDK19 - 虚拟线程详解 前言一. Continuation 和 虚拟线程1.1 Continuation 案例1.2 Continuation 内的重要成员1.3 run() 执行/恢复执行1.4 yield() 暂停执行1.5 测试和小总结 二. VirtualThread 解读2.1 VirtualThread 内的重要成员和构造2.2 VirtualThread 的首次执行2.3 结束阻塞再次调度2.4 跟着Debug走一遍 前言 之前在 Virtual Thread 虚拟线程探究 这篇文章里面主要讲了一下虚拟线程的使用和简要的介绍。这篇文章我们就来深入学习一下相关的原理。
+虚拟线程的实现可以由两个部分组成：
+Continuation：一种提供执行和暂停函数的服务类。Scheduler：执行器。负责将虚拟线程挂载到平台线程上。底层交给ForkJoinPool执行。 一. Continuation 和 虚拟线程 虚拟线程的实现，底层重度依赖于Continuation这个类的实现。
+Loom的愿景是啥？write sync run async。那遇到同步阻塞（write sync）的时候怎么办？将底层切换为异步非阻塞（run async）。异步事件处理完了之后怎么办？需要切回原先的代码点继续执行。 从上面可以发现，有两个重要的功能点就是：
+同步切异步：暂停执行。异步处理完毕时切同步：恢复执行。 虚拟线程会把调度任务包装到一个Continuation 实例中，在里面主要完成上面两件事情 ：
+当任务需要阻塞挂起的时候，调用 Continuation 的yield操作进行阻塞。任务需要解除阻塞继续执行的时候，则调用 Continuation 的run恢复执行。 1.1 Continuation 案例 我们用一个简单的案例，让大家直观的感受到Continuation的作用和神奇之处。不过在此之前，Continuation属于非常底层的一种API，常规情况下，我们无法直接调用，因此我们在编写测试用例的时候，需要添加相关的参数。我们给Java Compiler添加以下参数：
+--add-exports java.base/jdk.internal.vm=ALL-UNNAMED 如图：
+代码如下：
+@org.junit.Test public void testContinuation(){ ContinuationScope scope = new ContinuationScope(&#34;" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8cee3e308ef9cf16afcfe3240d3e7762/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-08-03T15:42:23+08:00" />
+<meta property="article:modified_time" content="2023-08-03T15:42:23+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">JDK19 - 虚拟线程详解</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-dracula">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>JDK19 - 虚拟线程详解</h4> 
+ <ul><li><a href="#_2" rel="nofollow">前言</a></li><li><a href="#_Continuation___11" rel="nofollow">一. Continuation 和 虚拟线程</a></li><li><ul><li><a href="#11_Continuation__31" rel="nofollow">1.1 Continuation 案例</a></li><li><a href="#12_Continuation__70" rel="nofollow">1.2 Continuation 内的重要成员</a></li><li><a href="#13_run__121" rel="nofollow">1.3 run() 执行/恢复执行</a></li><li><a href="#14_yield__195" rel="nofollow">1.4 yield() 暂停执行</a></li><li><a href="#15__261" rel="nofollow">1.5 测试和小总结</a></li></ul> 
+  </li><li><a href="#_VirtualThread__328" rel="nofollow">二. VirtualThread 解读</a></li><li><ul><li><a href="#21_VirtualThread__362" rel="nofollow">2.1 VirtualThread 内的重要成员和构造</a></li><li><a href="#22_VirtualThread__555" rel="nofollow">2.2 VirtualThread 的首次执行</a></li><li><a href="#23__675" rel="nofollow">2.3 结束阻塞再次调度</a></li><li><a href="#24_Debug_720" rel="nofollow">2.4 跟着Debug走一遍</a></li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_2"></a>前言</h2> 
+<p>之前在 <a href="https://blog.csdn.net/Zong_0915/article/details/131764671">Virtual Thread 虚拟线程探究</a> 这篇文章里面主要讲了一下虚拟线程的使用和简要的介绍。这篇文章我们就来深入学习一下相关的原理。</p> 
+<p>虚拟线程的实现可以由两个部分组成：</p> 
+<ul><li><code>Continuation</code>：一种提供执行和暂停函数的服务类。</li><li><code>Scheduler</code>：执行器。负责将虚拟线程挂载到平台线程上。底层交给<code>ForkJoinPool</code>执行。</li></ul> 
+<h2><a id="_Continuation___11"></a>一. Continuation 和 虚拟线程</h2> 
+<p>虚拟线程的实现，底层重度依赖于<code>Continuation</code>这个类的实现。</p> 
+<ol><li><code>Loom</code>的愿景是啥？<code>write sync run async</code>。</li><li>那遇到同步阻塞（<code>write sync</code>）的时候怎么办？<strong>将底层切换为异步非阻塞（<code>run async</code>）。</strong></li><li>异步事件处理完了之后怎么办？<strong>需要切回原先的代码点继续执行。</strong></li></ol> 
+<p>从上面可以发现，有两个重要的功能点就是：</p> 
+<ul><li><strong>同步切异步：暂停执行。</strong></li><li><strong>异步处理完毕时切同步：恢复执行。</strong></li></ul> 
+<p><strong>虚拟线程会把调度任务包装到一个<code>Continuation</code> 实例中，在里面主要完成上面两件事情</strong> ：</p> 
+<ul><li>当任务需要阻塞挂起的时候，调用 <code>Continuation</code> 的<code>yield</code>操作进行阻塞。</li><li>任务需要解除阻塞继续执行的时候，则调用 <code>Continuation</code> 的<code>run</code>恢复执行。</li></ul> 
+<h3><a id="11_Continuation__31"></a>1.1 Continuation 案例</h3> 
+<p>我们用一个简单的案例，让大家直观的感受到<code>Continuation</code>的作用和神奇之处。不过在此之前，<code>Continuation</code>属于非常底层的一种<code>API</code>，常规情况下，我们无法直接调用，因此我们在编写测试用例的时候，需要添加相关的参数。我们给<code>Java Compiler</code>添加以下参数：</p> 
+<pre><code class="prism language-javascript"><span class="token operator">--</span>add<span class="token operator">-</span>exports java<span class="token punctuation">.</span>base<span class="token operator">/</span>jdk<span class="token punctuation">.</span>internal<span class="token punctuation">.</span>vm<span class="token operator">=</span><span class="token constant">ALL</span><span class="token operator">-</span><span class="token constant">UNNAMED</span>
+</code></pre> 
+<p>如图：<br> <img src="https://images2.imgbox.com/5a/8d/jv3OUCIh_o.png" alt="在这里插入图片描述"><br> 代码如下：</p> 
+<pre><code class="prism language-javascript">@org<span class="token punctuation">.</span>junit<span class="token punctuation">.</span>Test
+<span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">testContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+    ContinuationScope scope <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ContinuationScope</span><span class="token punctuation">(</span><span class="token string">"scope"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    Continuation continuation <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Continuation</span><span class="token punctuation">(</span>scope<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"Running before yield"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Continuation<span class="token punctuation">.</span><span class="token function">yield</span><span class="token punctuation">(</span>scope<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"Running after yield"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"First run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 第一次执行Continuation.run</span>
+    continuation<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"Second run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 第二次执行Continuation.run</span>
+    continuation<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"Done"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>如果运行时候还是报错了：</p> 
+<pre><code class="prism language-javascript">java<span class="token punctuation">.</span>lang<span class="token punctuation">.</span>IllegalAccessError<span class="token operator">:</span> <span class="token keyword">class</span> <span class="token class-name">Test</span> <span class="token punctuation">(</span><span class="token keyword">in</span> unnamed module @<span class="token number">0x4d76f3f8</span><span class="token punctuation">)</span> cannot access <span class="token keyword">class</span> <span class="token class-name">jdk<span class="token punctuation">.</span>internal<span class="token punctuation">.</span>vm<span class="token punctuation">.</span>ContinuationScope</span> <span class="token punctuation">(</span><span class="token keyword">in</span> module java<span class="token punctuation">.</span>base<span class="token punctuation">)</span> because module java<span class="token punctuation">.</span>base does not <span class="token keyword">export</span> jdk<span class="token punctuation">.</span>internal<span class="token punctuation">.</span>vm to unnamed module @<span class="token number">0x4d76f3f8</span>
+</code></pre> 
+<p>我们给<code>UT</code>添加相关的<code>VM</code>参数即可：<img src="https://images2.imgbox.com/e9/71/RZw5R0z5_o.png" alt="在这里插入图片描述"><br> 再次运行即可成功执行：<img src="https://images2.imgbox.com/8e/c7/M9Z96iHK_o.png" alt="在这里插入图片描述"><br> 从这个运行结果我们可以看出来：</p> 
+<ol><li><code>Continuation</code>实例进行<code>yield</code>调用后进入阻塞。</li><li>再次调用其<code>run</code>方法就可以从<code>yield</code>的调用之处往下执行，从而实现了程序的中断和恢复。</li></ol> 
+<h3><a id="12_Continuation__70"></a>1.2 Continuation 内的重要成员</h3> 
+<pre><code class="prism language-javascript"><span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">Continuation</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// 是否开启本地缓存</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> final boolean <span class="token constant">PRESERVE_EXTENT_LOCAL_CACHE</span><span class="token punctuation">;</span>
+    <span class="token comment">// 主要用于对 Java 核心类库中的一些非公开方法和字段的访问</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> final JavaLangAccess <span class="token constant">JLA</span> <span class="token operator">=</span> SharedSecrets<span class="token punctuation">.</span><span class="token function">getJavaLangAccess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 实际运行的 runnable，外部传入</span>
+    <span class="token keyword">private</span> final Runnable target<span class="token punctuation">;</span>
+    <span class="token comment">// scope对象，使用同一scope的Continuation可以相互之间yield</span>
+    <span class="token keyword">private</span> final ContinuationScope scope<span class="token punctuation">;</span>
+    <span class="token comment">// 父节点</span>
+    <span class="token keyword">private</span> Continuation parent<span class="token punctuation">;</span>
+    <span class="token comment">// 子节点</span>
+    <span class="token keyword">private</span> Continuation child<span class="token punctuation">;</span> 
+    <span class="token comment">// 栈内存空间</span>
+    <span class="token keyword">private</span> StackChunk tail<span class="token punctuation">;</span>
+    <span class="token comment">// 当前Continuation是否已完成</span>
+    <span class="token keyword">private</span> boolean done<span class="token punctuation">;</span>
+    <span class="token comment">// 装载状态</span>
+    <span class="token keyword">private</span> volatile boolean mounted <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+    <span class="token comment">// yield信息</span>
+    <span class="token keyword">private</span> Object yieldInfo<span class="token punctuation">;</span>
+    <span class="token comment">// 标记一个未挂载的Continuation是否通过强制抢占式卸载</span>
+	<span class="token keyword">private</span> boolean preempted<span class="token punctuation">;</span>
+	<span class="token keyword">public</span> <span class="token function">Continuation</span><span class="token punctuation">(</span><span class="token parameter">ContinuationScope scope<span class="token punctuation">,</span> Runnable target</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>scope <span class="token operator">=</span> scope<span class="token punctuation">;</span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>target <span class="token operator">=</span> target<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>我们从这个成员结构上可以发现几个重要的点：</p> 
+<ol><li><code>Continuation</code>的数据结构是一个链表。有父节点和子节点。</li><li><code>Continuation</code>中唯一的构造函数有俩参数：一个是<code>ContinuationScope</code>（用于标识<code>Continuation</code>）。一个是<code>Runnable</code>：我们要执行的任务。</li></ol> 
+<p>如图：<br> <img src="https://images2.imgbox.com/d8/67/hLMliGtc_o.png" alt="在这里插入图片描述"><br> 我们再来说下<code>ContinuationScope</code> 和<code>Continuation</code>的关系。</p> 
+<p><code>ContinuationScope</code>是一个用于标识<code>Continuation</code>的作用域的类。<strong>它可以被看作是一个上下文环境，用于将<code>Continuation</code>与特定的执行环境相关联</strong>。在协程或轻量级线程的实现中，<code>ContinuationScope</code>通常用于区分不同的协程或线程，以便在不同的上下文中执行<code>Continuation</code>。</p> 
+<p><code>Continuation</code>是一个<strong>表示协程或轻量级线程的对象。它可以被看作是一个可以中断和恢复的执行单元</strong>。通过<code>Continuation</code>，<strong>可以实现在不同的执行环境中暂停和恢复执行，从而实现协程的切换和轻量级线程的执行。</strong></p> 
+<p>同时两者满足：</p> 
+<ul><li>一个<code>Continuation</code>必须绑定一个<code>ContinuationScope</code>上下文环境。</li><li>一个<code>ContinuationScope</code>上下文环境可以绑定多个<code>Continuation</code>。</li></ul> 
+<h3><a id="13_run__121"></a>1.3 run() 执行/恢复执行</h3> 
+<pre><code class="prism language-javascript"><span class="token keyword">public</span> final <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 进行线程装载</span>
+        <span class="token function">mount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">setExtentLocalCache</span><span class="token punctuation">(</span>extentLocalCache<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 如果这个任务已经执行完毕了，就抛异常</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>done<span class="token punctuation">)</span>
+            <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">IllegalStateException</span><span class="token punctuation">(</span><span class="token string">"Continuation terminated"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// 获取当前虚拟线程对应的运载线程</span>
+        Thread t <span class="token operator">=</span> <span class="token function">currentCarrierThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 如果parent和child都执行了yield，但是child先执行run。倘若当前线程和父</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>parent <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>parent <span class="token operator">!=</span> <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">getContinuation</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span><span class="token punctuation">)</span>
+                <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">IllegalStateException</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span>
+            <span class="token keyword">this</span><span class="token punctuation">.</span>parent <span class="token operator">=</span> <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">getContinuation</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 运载线程设置当前Continuation实例</span>
+        <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">setContinuation</span><span class="token punctuation">(</span>t<span class="token punctuation">,</span> <span class="token keyword">this</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            boolean isVirtualThread <span class="token operator">=</span> <span class="token punctuation">(</span>scope <span class="token operator">==</span> <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">virtualThreadContinuationScope</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// 此处判断是否存在堆栈内存空间，如不存在则说明未开始</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">isStarted</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> 
+                <span class="token comment">// 相当于执行我们的task任务了</span>
+                <span class="token function">enterSpecial</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">,</span> <span class="token boolean">false</span><span class="token punctuation">,</span> isVirtualThread<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+                assert <span class="token operator">!</span><span class="token function">isEmpty</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 如果执行过了，那么isContinue为true，代表继续执行。</span>
+                <span class="token function">enterSpecial</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">,</span> <span class="token boolean">true</span><span class="token punctuation">,</span> isVirtualThread<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">fence</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 清理</span>
+                assert <span class="token function">isEmpty</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> done <span class="token operator">:</span> <span class="token string">"empty: "</span> <span class="token operator">+</span> <span class="token function">isEmpty</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token string">" done: "</span> <span class="token operator">+</span> done <span class="token operator">+</span> <span class="token string">" cont: "</span> <span class="token operator">+</span> Integer<span class="token punctuation">.</span><span class="token function">toHexString</span><span class="token punctuation">(</span>System<span class="token punctuation">.</span><span class="token function">identityHashCode</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 当前Continuation执行完毕，那么重新将Continuation指向父节点，链表执行。</span>
+                <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">setContinuation</span><span class="token punctuation">(</span><span class="token function">currentCarrierThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token keyword">this</span><span class="token punctuation">.</span>parent<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 如果有父节点，那么清理一下子节点（说明这个子节点被执行过了）</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>parent <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span>
+                    parent<span class="token punctuation">.</span>child <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+				<span class="token comment">// 进行后置的yield清理工作</span>
+                <span class="token function">postYieldCleanup</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token comment">// 进行unmount卸载操作</span>
+                <span class="token function">unmount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 判断是否需要保留当前线程的本地缓存并处理</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token constant">PRESERVE_EXTENT_LOCAL_CACHE</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    extentLocalCache <span class="token operator">=</span> <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">extentLocalCache</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+                    extentLocalCache <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">setExtentLocalCache</span><span class="token punctuation">(</span><span class="token keyword">null</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span>Throwable e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> e<span class="token punctuation">.</span><span class="token function">printStackTrace</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> System<span class="token punctuation">.</span><span class="token function">exit</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">// 到这里为止，我们就来到了父Continuation</span>
+        assert yieldInfo <span class="token operator">==</span> <span class="token keyword">null</span> <span class="token operator">||</span> yieldInfo <span class="token keyword">instanceof</span> <span class="token class-name">ContinuationScope</span><span class="token punctuation">;</span>
+        <span class="token comment">// 两种可能</span>
+        <span class="token comment">// 情况一：执行完了，清除相关引用并结束死循环（返回）</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>yieldInfo <span class="token operator">==</span> <span class="token keyword">null</span> <span class="token operator">||</span> yieldInfo <span class="token operator">==</span> scope<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">this</span><span class="token punctuation">.</span>parent <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+            <span class="token keyword">this</span><span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        	<span class="token comment">// 此时是子Continuation执行了yield，那么需要将控制权转义给父Continuation来进行yield操作</span>
+            parent<span class="token punctuation">.</span>child <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">;</span>
+            parent<span class="token punctuation">.</span><span class="token function">yield0</span><span class="token punctuation">(</span><span class="token punctuation">(</span>ContinuationScope<span class="token punctuation">)</span>yieldInfo<span class="token punctuation">,</span> <span class="token keyword">this</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            parent<span class="token punctuation">.</span>child <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="14_yield__195"></a>1.4 yield() 暂停执行</h3> 
+<p>我们来看下相关代码：</p> 
+<pre><code class="prism language-javascript"><span class="token comment">// 将当前的延续挂起到给定范围</span>
+<span class="token keyword">public</span> <span class="token keyword">static</span> boolean <span class="token keyword">yield</span><span class="token punctuation">(</span>ContinuationScope scope<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 获取当前运载线程的Continuation </span>
+    Continuation cont <span class="token operator">=</span> <span class="token constant">JLA</span><span class="token punctuation">.</span><span class="token function">getContinuation</span><span class="token punctuation">(</span><span class="token function">currentCarrierThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    Continuation c<span class="token punctuation">;</span>
+    <span class="token comment">// 基于当前的 Continuation 向父节点方向遍历寻找。直到找到一个节点的ContinuationScope（上下文环境） </span>
+    <span class="token comment">// 和当前的上下文环境不一致的时候停止。也就是找到当前上下文环境里面，Continuation边界</span>
+    <span class="token keyword">for</span> <span class="token punctuation">(</span>c <span class="token operator">=</span> cont<span class="token punctuation">;</span> c <span class="token operator">!=</span> <span class="token keyword">null</span> <span class="token operator">&amp;&amp;</span> c<span class="token punctuation">.</span>scope <span class="token operator">!=</span> scope<span class="token punctuation">;</span> c <span class="token operator">=</span> c<span class="token punctuation">.</span>parent<span class="token punctuation">)</span>
+        <span class="token punctuation">;</span>
+    <span class="token comment">// 找不到就抛异常</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>c <span class="token operator">==</span> <span class="token keyword">null</span><span class="token punctuation">)</span>
+        <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">IllegalStateException</span><span class="token punctuation">(</span><span class="token string">"Not in scope "</span> <span class="token operator">+</span> scope<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 找到了就调用yield函数，将当前执行权交给父Continuation </span>
+    <span class="token keyword">return</span> cont<span class="token punctuation">.</span><span class="token function">yield0</span><span class="token punctuation">(</span>scope<span class="token punctuation">,</span> <span class="token keyword">null</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword">private</span> boolean <span class="token function">yield0</span><span class="token punctuation">(</span><span class="token parameter">ContinuationScope scope<span class="token punctuation">,</span> Continuation child</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// 代码将`preempted`变量设置为false，表示当前的Continuation对象没有被抢占。</span>
+    preempted <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+    <span class="token comment">// 检查当前传入的scope（上下文）和当前Continuation的scope是否已只，若不相等，说明需要切换到不同的scope</span>
+    <span class="token comment">// 那么就将传入的scope赋值给当前Continuation对象的yieldInfo信息中，表示要在父Continuation中进行yield操作</span>
+    <span class="token comment">// 这里和run函数的最后处理做对其（else分支）</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>scope <span class="token operator">!=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>scope<span class="token punctuation">)</span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> scope<span class="token punctuation">;</span>
+    <span class="token comment">// 进行yield操作</span>
+    int res <span class="token operator">=</span> <span class="token function">doYield</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token constant">U</span><span class="token punctuation">.</span><span class="token function">storeFence</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// needed to prevent certain transformations by the compiler</span>
+
+    assert scope <span class="token operator">!=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>scope <span class="token operator">||</span> yieldInfo <span class="token operator">==</span> <span class="token keyword">null</span> <span class="token operator">:</span> <span class="token string">"scope: "</span> <span class="token operator">+</span> scope <span class="token operator">+</span> <span class="token string">" this.scope: "</span> <span class="token operator">+</span> <span class="token keyword">this</span><span class="token punctuation">.</span>scope <span class="token operator">+</span> <span class="token string">" yieldInfo: "</span> <span class="token operator">+</span> yieldInfo <span class="token operator">+</span> <span class="token string">" res: "</span> <span class="token operator">+</span> res<span class="token punctuation">;</span>
+    assert yieldInfo <span class="token operator">==</span> <span class="token keyword">null</span> <span class="token operator">||</span> scope <span class="token operator">==</span> <span class="token keyword">this</span><span class="token punctuation">.</span>scope <span class="token operator">||</span> yieldInfo <span class="token keyword">instanceof</span> <span class="token class-name">Integer</span> <span class="token operator">:</span> <span class="token string">"scope: "</span> <span class="token operator">+</span> scope <span class="token operator">+</span> <span class="token string">" this.scope: "</span> <span class="token operator">+</span> <span class="token keyword">this</span><span class="token punctuation">.</span>scope <span class="token operator">+</span> <span class="token string">" yieldInfo: "</span> <span class="token operator">+</span> yieldInfo <span class="token operator">+</span> <span class="token string">" res: "</span> <span class="token operator">+</span> res<span class="token punctuation">;</span>
+    <span class="token comment">// 若child不是null，说明当前Continuation对象是子Continuation，那么需要把结果传递给父Continuation</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>child <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">// TODO: ugly</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>res <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            child<span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> res<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>yieldInfo <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            assert yieldInfo <span class="token keyword">instanceof</span> <span class="token class-name">Integer</span><span class="token punctuation">;</span>
+            child<span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> yieldInfo<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            child<span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> res<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+    	<span class="token comment">// 若当前是父Continuation，那么根据yield结果做不同处理</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>res <span class="token operator">==</span> <span class="token number">0</span> <span class="token operator">&amp;&amp;</span> yieldInfo <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            res <span class="token operator">=</span> <span class="token punctuation">(</span>Integer<span class="token punctuation">)</span>yieldInfo<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>yieldInfo <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>res <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+        	<span class="token comment">// 续执行前回调</span>
+            <span class="token function">onContinue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">else</span>
+        	<span class="token comment">// Continuation固定在运载线程前回调</span>
+            <span class="token function">onPinned0</span><span class="token punctuation">(</span>res<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    assert yieldInfo <span class="token operator">==</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">return</span> res <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="15__261"></a>1.5 测试和小总结</h3> 
+<p>其实对上面的流程进行一个简要的总结就是。</p> 
+<p>针对 <code>run()</code> 执行/恢复执行：</p> 
+<ol><li>先进行装载。把<code>Continuation</code>实例和运载线程进行绑定。</li><li>判断是否存在堆栈内存空间，若存在，说明之前已经执行过一部分调用栈了。那么继续执行（倘若执行过调用栈，那么会把相关数据信息存储到堆内存中）。</li><li>若不存在，则完整的执行一遍调用栈即可。</li><li>当前<code>Continuation</code>执行完毕，卸载。然后更新<code>Continuation</code>指向为父<code>Continuation</code>。</li><li>若<code>yieldInfo</code>就是当前的<code>scope</code>环境或者为<code>null</code>，说明执行完毕，退出死循环。</li><li>否则，说明是子<code>Continuation</code>执行了<code>yield</code>函数，那么此时需要将控制权交给父<code>Continuation</code>。</li></ol> 
+<p>针对 <code>yield()</code> 暂停执行：</p> 
+<ol><li>会从当前<code>Continuation</code>实例开始向父节点遍历寻找<code>scope</code>边界处的<code>Continuation</code>。将控制权交给最顶层的<code>Continuation</code>（前提是同一个<code>scope</code>上下文）</li><li>进行<code>yield</code>操作进入阻塞。</li><li>如果当前是子<code>Continuation</code>，将结果传递给父<code>Continuation</code>。</li><li>如果当前是父<code>Continuation</code>，那么针对<code>yield</code>结果做不同处理。比如是否要继续执行当前<code>Continuation</code>。</li></ol> 
+<p>案例如下：</p> 
+<pre><code class="prism language-javascript">@org<span class="token punctuation">.</span>junit<span class="token punctuation">.</span>Test
+<span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">test4</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+    ContinuationScope scope1 <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ContinuationScope</span><span class="token punctuation">(</span><span class="token string">"scope1"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    ContinuationScope scope2 <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ContinuationScope</span><span class="token punctuation">(</span><span class="token string">"scope2"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    ContinuationScope scope3 <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ContinuationScope</span><span class="token punctuation">(</span><span class="token string">"scope3"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    Continuation child2 <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Continuation</span><span class="token punctuation">(</span>scope3<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"before scope yield"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Continuation<span class="token punctuation">.</span><span class="token function">yield</span><span class="token punctuation">(</span>scope1<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"after scope yield"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    Continuation child1 <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Continuation</span><span class="token punctuation">(</span>scope2<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"before child2 run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        child2<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"after child2 run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    Continuation continuation <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Continuation</span><span class="token punctuation">(</span>scope1<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span>  <span class="token punctuation">{<!-- --></span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"before child1 run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        child1<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"after child1 run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"before run"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    continuation<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"before run again"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    continuation<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"end"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>最终输出结果如下：<br> <img src="https://images2.imgbox.com/2c/ef/UDIv2qS1_o.png" alt="在这里插入图片描述"></p> 
+<p>执行<code>yield</code>的时候，我们传入的是<code>scope1</code>，但是当前的上下文却是<code>scope3</code>。发现两者并不一致，因此根据代码逻辑，就会将控制权交给<code>scope1</code>本身。此时<code>scope1</code>进入阻塞。<br> <img src="https://images2.imgbox.com/27/c4/99QtL3OD_o.png" alt="在这里插入图片描述"><br> 用泳道图表示如下：<br> <img src="https://images2.imgbox.com/7b/be/mVXuDRCG_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="_VirtualThread__328"></a>二. VirtualThread 解读</h2> 
+<p>我们从案例出发：</p> 
+<pre><code class="prism language-javascript"><span class="token keyword">private</span> <span class="token keyword">static</span> int <span class="token function">sendHttpRequest</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        HttpClient client <span class="token operator">=</span> HttpClient<span class="token punctuation">.</span><span class="token function">newHttpClient</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        HttpRequest request <span class="token operator">=</span> HttpRequest<span class="token punctuation">.</span><span class="token function">newBuilder</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+                <span class="token punctuation">.</span><span class="token function">uri</span><span class="token punctuation">(</span><span class="token constant">URI</span><span class="token punctuation">.</span><span class="token function">create</span><span class="token punctuation">(</span><span class="token string">"https://www.google.com/"</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+                <span class="token punctuation">.</span><span class="token function">build</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        HttpResponse<span class="token operator">&lt;</span>String<span class="token operator">&gt;</span> httpResponse <span class="token operator">=</span> client<span class="token punctuation">.</span><span class="token function">send</span><span class="token punctuation">(</span>request<span class="token punctuation">,</span> HttpResponse<span class="token punctuation">.</span>BodyHandlers<span class="token punctuation">.</span><span class="token function">ofString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> httpResponse<span class="token punctuation">.</span><span class="token function">statusCode</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span>Exception e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">RuntimeException</span><span class="token punctuation">(</span>e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+@org<span class="token punctuation">.</span>junit<span class="token punctuation">.</span>Test
+<span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">testVT</span><span class="token punctuation">(</span><span class="token punctuation">)</span>throws Exception<span class="token punctuation">{<!-- --></span>
+    Runnable sendHttpTask <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">Random</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">nextInt</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 虚线程执行过程中，同步阻塞式发送Http请求</span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token function">sendHttpRequest</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">Random</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">nextInt</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+    <span class="token comment">// 1. 创建虚线程</span>
+    Thread virtualThread <span class="token operator">=</span> Thread<span class="token punctuation">.</span><span class="token function">ofVirtual</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">unstarted</span><span class="token punctuation">(</span>sendHttpTask<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 2. 启动虚线程</span>
+    virtualThread<span class="token punctuation">.</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 等待虚线程执行完毕</span>
+    virtualThread<span class="token punctuation">.</span><span class="token function">join</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="21_VirtualThread__362"></a>2.1 VirtualThread 内的重要成员和构造</h3> 
+<p>虚拟线程<code>VirtualThread</code>构造：</p> 
+<pre><code class="prism language-java"><span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">Unsafe</span> <span class="token class-name">U</span> <span class="token operator">=</span> <span class="token class-name">Unsafe</span><span class="token punctuation">.</span><span class="token function">getUnsafe</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">ContinuationScope</span> <span class="token constant">VTHREAD_SCOPE</span> <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ContinuationScope</span><span class="token punctuation">(</span><span class="token string">"VirtualThreads"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">ForkJoinPool</span> <span class="token constant">DEFAULT_SCHEDULER</span> <span class="token operator">=</span> <span class="token function">createDefaultScheduler</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">ScheduledExecutorService</span> <span class="token constant">UNPARKER</span> <span class="token operator">=</span> <span class="token function">createDelayedTaskScheduler</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">TRACE_PINNING_MODE</span> <span class="token operator">=</span> <span class="token function">tracePinningMode</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">long</span> <span class="token constant">STATE</span> <span class="token operator">=</span> <span class="token class-name">U</span><span class="token punctuation">.</span><span class="token function">objectFieldOffset</span><span class="token punctuation">(</span><span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token keyword">class</span><span class="token punctuation">,</span> <span class="token string">"state"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">long</span> <span class="token constant">PARK_PERMIT</span> <span class="token operator">=</span> <span class="token class-name">U</span><span class="token punctuation">.</span><span class="token function">objectFieldOffset</span><span class="token punctuation">(</span><span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token keyword">class</span><span class="token punctuation">,</span> <span class="token string">"parkPermit"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">long</span> <span class="token constant">CARRIER_THREAD</span> <span class="token operator">=</span> <span class="token class-name">U</span><span class="token punctuation">.</span><span class="token function">objectFieldOffset</span><span class="token punctuation">(</span><span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token keyword">class</span><span class="token punctuation">,</span> <span class="token string">"carrierThread"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">long</span> <span class="token constant">TERMINATION</span> <span class="token operator">=</span> <span class="token class-name">U</span><span class="token punctuation">.</span><span class="token function">objectFieldOffset</span><span class="token punctuation">(</span><span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token keyword">class</span><span class="token punctuation">,</span> <span class="token string">"termination"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">final</span> <span class="token class-name">Executor</span> scheduler<span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">final</span> <span class="token class-name">Continuation</span> cont<span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">final</span> <span class="token class-name">Runnable</span> runContinuation<span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">volatile</span> <span class="token keyword">int</span> state<span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">NEW</span>      <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">STARTED</span>  <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">RUNNABLE</span> <span class="token operator">=</span> <span class="token number">2</span><span class="token punctuation">;</span>     <span class="token comment">// runnable-unmounted</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">RUNNING</span>  <span class="token operator">=</span> <span class="token number">3</span><span class="token punctuation">;</span>     <span class="token comment">// runnable-mounted</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">PARKING</span>  <span class="token operator">=</span> <span class="token number">4</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">PARKED</span>   <span class="token operator">=</span> <span class="token number">5</span><span class="token punctuation">;</span>     <span class="token comment">// unmounted</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">PINNED</span>   <span class="token operator">=</span> <span class="token number">6</span><span class="token punctuation">;</span>     <span class="token comment">// mounted</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">YIELDING</span> <span class="token operator">=</span> <span class="token number">7</span><span class="token punctuation">;</span>     <span class="token comment">// Thread.yield</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">TERMINATED</span> <span class="token operator">=</span> <span class="token number">99</span><span class="token punctuation">;</span>  <span class="token comment">// final state</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">SUSPENDED</span> <span class="token operator">=</span> <span class="token number">1</span> <span class="token operator">&lt;&lt;</span> <span class="token number">8</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">RUNNABLE_SUSPENDED</span> <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token constant">RUNNABLE</span> <span class="token operator">|</span> <span class="token constant">SUSPENDED</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token keyword">int</span> <span class="token constant">PARKED_SUSPENDED</span>   <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token constant">PARKED</span> <span class="token operator">|</span> <span class="token constant">SUSPENDED</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">volatile</span> <span class="token keyword">boolean</span> parkPermit<span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">volatile</span> <span class="token class-name">Thread</span> carrierThread<span class="token punctuation">;</span>
+<span class="token keyword">private</span> <span class="token keyword">volatile</span> <span class="token class-name">CountDownLatch</span> termination<span class="token punctuation">;</span>
+</code></pre> 
+<p>挑几个重点：</p> 
+<ul><li><code>DEFAULT_SCHEDULER</code> ：默认的调度器。底层是<code>ForkJoinPool</code>。</li><li><code>UNPARKER</code> ：调度线程实例，用于唤醒带超时阻塞的虚拟线程实例。用于<code>sleep</code>的唤醒操作。</li><li><code>TRACE_PINNING_MODE</code> ：<code>pined thread</code>的跟踪模式。</li><li><code>cont</code>：<code>Continuation</code>实例。主要负责虚拟线程的阻塞和继续执行操作。</li><li><code>runContinuation</code>：<code>Continuation</code>实例中包装的<code>Runnable</code>实例。</li><li><code>state</code>：虚拟线程的状态。由<code>JVM</code>直接访问和修改。</li><li><code>parkPermit</code>：<code>park</code>操作的许可。</li><li><code>carrierThread</code>：运载线程实例。</li><li><code>termination</code>：一个栅栏值，用于<code>join</code>操作。</li></ul> 
+<p>再来看下它的唯一构造器：</p> 
+<pre><code class="prism language-javascript"><span class="token function">VirtualThread</span><span class="token punctuation">(</span><span class="token parameter">Executor scheduler<span class="token punctuation">,</span> String name<span class="token punctuation">,</span> int characteristics<span class="token punctuation">,</span> Runnable task</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">super</span><span class="token punctuation">(</span>name<span class="token punctuation">,</span> characteristics<span class="token punctuation">,</span> <span class="token comment">/*bound*/</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    Objects<span class="token punctuation">.</span><span class="token function">requireNonNull</span><span class="token punctuation">(</span>task<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 若调度器非空，直接使用，这个分支不会走到。</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>scheduler <span class="token operator">==</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        Thread parent <span class="token operator">=</span> Thread<span class="token punctuation">.</span><span class="token function">currentThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 如果父线程是虚拟线程，那么使用父虚拟线程的调度器</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>parent <span class="token keyword">instanceof</span> <span class="token class-name">VirtualThread</span> vparent<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            scheduler <span class="token operator">=</span> vparent<span class="token punctuation">.</span>scheduler<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        	<span class="token comment">// 否则使用默认的调度器</span>
+            scheduler <span class="token operator">=</span> <span class="token constant">DEFAULT_SCHEDULER</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token keyword">this</span><span class="token punctuation">.</span>scheduler <span class="token operator">=</span> scheduler<span class="token punctuation">;</span>
+    <span class="token keyword">this</span><span class="token punctuation">.</span>cont <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">VThreadContinuation</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">,</span> task<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">this</span><span class="token punctuation">.</span>runContinuation <span class="token operator">=</span> <span class="token keyword">this</span><span class="token operator">:</span><span class="token operator">:</span>runContinuation<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>主要做了这么几件事：</p> 
+<ol><li>给定一个默认的调度器<code>ForkJoinPool</code>。</li><li>初始化一个<code>Continuation</code>。在<code>Continuation</code>的基础上封装成一个<code>VThreadContinuation</code>。</li><li>封装一下<code>Continuation</code>的<code>Runnable</code>，最终将它提交给调度器来执行。</li></ol> 
+<p>我们看一下<code>VThreadContinuation</code>，它继承于<code>Continuation</code>：</p> 
+<pre><code class="prism language-javascript"><span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">class</span> <span class="token class-name">VThreadContinuation</span> <span class="token keyword">extends</span> <span class="token class-name">Continuation</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token function">VThreadContinuation</span><span class="token punctuation">(</span><span class="token parameter">VirtualThread vthread<span class="token punctuation">,</span> Runnable task</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    	<span class="token comment">// 父类Continuation构造，传入一个Scope（上下文环境）和一个VirtualThread.run()函数。</span>
+        <span class="token keyword">super</span><span class="token punctuation">(</span><span class="token constant">VTHREAD_SCOPE</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> vthread<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span>task<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">// 同时重写了onPinned函数，基于跟踪模式决定pinned线程栈的打印策略</span>
+    @Override
+    <span class="token keyword">protected</span> <span class="token keyword">void</span> <span class="token function">onPinned</span><span class="token punctuation">(</span><span class="token parameter">Continuation<span class="token punctuation">.</span>Pinned reason</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token constant">TRACE_PINNING_MODE</span> <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            boolean printAll <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token constant">TRACE_PINNING_MODE</span> <span class="token operator">==</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            PinnedThreadPrinter<span class="token punctuation">.</span><span class="token function">printStackTrace</span><span class="token punctuation">(</span>System<span class="token punctuation">.</span>out<span class="token punctuation">,</span> printAll<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>而我们上面创建虚拟线程时调用的代码，实际上就是调用构造函数进行了一系列的初始化动作：</p> 
+<pre><code class="prism language-java"><span class="token class-name">Thread</span> virtualThread <span class="token operator">=</span> <span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">ofVirtual</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">unstarted</span><span class="token punctuation">(</span>sendHttpTask<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>紧接着执行了<code>start</code>函数：</p> 
+<pre><code class="prism language-java">virtualThread<span class="token punctuation">.</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+↓↓↓↓↓↓↓↓↓↓  <span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span>  ↓↓↓↓↓↓↓↓↓↓
+<span class="token annotation punctuation">@Override</span>
+<span class="token keyword">void</span> <span class="token function">start</span><span class="token punctuation">(</span><span class="token class-name">ThreadContainer</span> container<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// 尝试将虚拟线程的状态改为 STARTED</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">compareAndSetState</span><span class="token punctuation">(</span><span class="token constant">NEW</span><span class="token punctuation">,</span> <span class="token constant">STARTED</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">IllegalThreadStateException</span><span class="token punctuation">(</span><span class="token string">"Already started"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">// bind thread to container</span>
+    <span class="token function">setThreadContainer</span><span class="token punctuation">(</span>container<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// start thread</span>
+    <span class="token keyword">boolean</span> started <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+    container<span class="token punctuation">.</span><span class="token function">onStart</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// may throw</span>
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// extent locals may be inherited</span>
+        <span class="token function">inheritExtentLocalBindings</span><span class="token punctuation">(</span>container<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 平台代码完成这段代码的执行</span>
+        <span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        started <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>started<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">setState</span><span class="token punctuation">(</span><span class="token constant">TERMINATED</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            container<span class="token punctuation">.</span><span class="token function">onExit</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token function">afterTerminate</span><span class="token punctuation">(</span><span class="token comment">/*executed*/</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+↓↓↓↓↓↓↓↓↓↓  <span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span>  ↓↓↓↓↓↓↓↓↓↓
+<span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+↓↓↓↓↓↓↓↓↓↓  <span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span>  ↓↓↓↓↓↓↓↓↓↓
+<span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token keyword">boolean</span> lazySubmit<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+    	<span class="token comment">// 是否开启延迟提交</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>lazySubmit <span class="token operator">&amp;&amp;</span> scheduler <span class="token keyword">instanceof</span> <span class="token class-name">ForkJoinPool</span> pool<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            pool<span class="token punctuation">.</span><span class="token function">lazySubmit</span><span class="token punctuation">(</span><span class="token class-name">ForkJoinTask</span><span class="token punctuation">.</span><span class="token function">adapt</span><span class="token punctuation">(</span>runContinuation<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        	<span class="token comment">// 倘若不开启，就把runContinuation任务提交。</span>
+            scheduler<span class="token punctuation">.</span><span class="token function">execute</span><span class="token punctuation">(</span>runContinuation<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">RejectedExecutionException</span> ree<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// ...省略</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+↓↓↓↓↓↓↓↓↓↓  <span class="token class-name">VirtualThread</span><span class="token punctuation">.</span><span class="token function">runContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span>  ↓↓↓↓↓↓↓↓↓↓
+<span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">runContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">// 从这段代码可以发现，到目前为止的执行任务都是交给平台线程来执行的。</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">currentThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">isVirtual</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">WrongThreadException</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">boolean</span> firstRun<span class="token punctuation">;</span>
+    <span class="token keyword">int</span> initialState <span class="token operator">=</span> <span class="token function">state</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 如果虚拟线程的状态处于刚启动，那么就把他改为执行中，并且标记为首次执行</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>initialState <span class="token operator">==</span> <span class="token constant">STARTED</span> <span class="token operator">&amp;&amp;</span> <span class="token function">compareAndSetState</span><span class="token punctuation">(</span><span class="token constant">STARTED</span><span class="token punctuation">,</span> <span class="token constant">RUNNING</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// first run</span>
+        firstRun <span class="token operator">=</span> <span class="token boolean">true</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>initialState <span class="token operator">==</span> <span class="token constant">RUNNABLE</span> <span class="token operator">&amp;&amp;</span> <span class="token function">compareAndSetState</span><span class="token punctuation">(</span><span class="token constant">RUNNABLE</span><span class="token punctuation">,</span> <span class="token constant">RUNNING</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 否则，说明这个线程已经处于执行状态了，那么就设置park的许可，并标记为非首次执行</span>
+        <span class="token function">setParkPermit</span><span class="token punctuation">(</span><span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        firstRun <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// not runnable</span>
+        <span class="token keyword">return</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">// notify JVMTI before mount</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>notifyJvmtiEvents<span class="token punctuation">)</span> <span class="token function">notifyJvmtiMountBegin</span><span class="token punctuation">(</span>firstRun<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+    	<span class="token comment">// 执行Continuation的run函数。</span>
+        cont<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 如果执行完毕了，就做后续的清理工作。</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>cont<span class="token punctuation">.</span><span class="token function">isDone</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">afterTerminate</span><span class="token punctuation">(</span><span class="token comment">/*executed*/</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        	<span class="token comment">// 倘若没有执行完成，说明某个地方调用了Continuation.yield()函数，或者pin到运载线程中进行了park操作</span>
+        	<span class="token comment">// 例如LockSupport的park操作</span>
+            <span class="token function">afterYield</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>总结下就是：（注意，这里都是平台线程来完成）</p> 
+<ol><li>虚拟线程<code>VirtualThread</code>在<code>Continuation</code>的基础上，封装了下<code>run</code>函数。主要做了虚拟线程状态<code>state</code>的维护工作。刚启动的时候改为<code>STARTED</code>。</li><li>以及虚拟线程发生<code>park</code>的时候（阻塞挂起），调用<code>afterYield()</code>函数，也是做了状态的维护的动作。</li><li>而真正的<code>run/yield</code>逻辑则交给底层的<code>Continuation</code>来实现。</li></ol> 
+<h3><a id="22_VirtualThread__555"></a>2.2 VirtualThread 的首次执行</h3> 
+<p>在经历了<code>VirtualThread</code>的一层封装之后（维护了虚拟线程的状态变化），最后会调用实际的<code>Continuation</code>对象的<code>run</code>函数。</p> 
+<hr> 
+<p>1.当首次执行<code>Continuation.run</code>函数的时候，会先执行<code>VirtualThread.run</code>方法。主要目的就是将当前的虚拟线程装载到载体线程上。</p> 
+<pre><code class="prism language-javascript">↓↓↓↓↓↓↓↓↓↓  VirtualThread<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span>  ↓↓↓↓↓↓↓↓↓↓
+@ChangesCurrentThread
+<span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token parameter">Runnable task</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    assert state <span class="token operator">==</span> <span class="token constant">RUNNING</span><span class="token punctuation">;</span>
+    boolean notifyJvmti <span class="token operator">=</span> notifyJvmtiEvents<span class="token punctuation">;</span>
+
+    <span class="token comment">// first mount</span>
+    <span class="token function">mount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>notifyJvmti<span class="token punctuation">)</span> <span class="token function">notifyJvmtiMountEnd</span><span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// emit JFR event if enabled</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>VirtualThreadStartEvent<span class="token punctuation">.</span><span class="token function">isTurnedOn</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">var</span> event <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">VirtualThreadStartEvent</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        event<span class="token punctuation">.</span>javaThreadId <span class="token operator">=</span> <span class="token function">threadId</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        event<span class="token punctuation">.</span><span class="token function">commit</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        task<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span>Throwable exc<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">dispatchUncaughtException</span><span class="token punctuation">(</span>exc<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// pop any remaining scopes from the stack, this may block</span>
+            StackableScope<span class="token punctuation">.</span><span class="token function">popAll</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// emit JFR event if enabled</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>VirtualThreadEndEvent<span class="token punctuation">.</span><span class="token function">isTurnedOn</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">var</span> event <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">VirtualThreadEndEvent</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                event<span class="token punctuation">.</span>javaThreadId <span class="token operator">=</span> <span class="token function">threadId</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                event<span class="token punctuation">.</span><span class="token function">commit</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+
+        <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// last unmount</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>notifyJvmti<span class="token punctuation">)</span> <span class="token function">notifyJvmtiUnmountBegin</span><span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token function">unmount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token comment">// final state</span>
+            <span class="token function">setState</span><span class="token punctuation">(</span><span class="token constant">TERMINATED</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>这段代码看起来比较长，但是再把它精简一点，核心的三个步骤就是：</p> 
+<pre><code class="prism language-javascript"><span class="token function">mount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">try</span><span class="token punctuation">{<!-- --></span>
+	task<span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token keyword">finally</span><span class="token punctuation">{<!-- --></span>
+	<span class="token function">unmount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol><li>将<code>VirtualThread</code>装载到<code>CarrierThread</code>上。</li><li>调用真正的<code>Task</code>任务，本文的案例就是<code>sendHttpTask</code>。</li><li>从载体上卸载这个虚拟线程。返回时，当前线程就是当前平台。</li></ol> 
+<hr> 
+<p>2.本文的案例中，<code>sendHttpTask</code>这个任务存在<code>IO阻塞</code>。而<code>Loom</code>会重写所有可能的同步阻塞。一旦出现阻塞点，最终就会调用<code>VirtualThread.park()</code>方法。这里是我的调用链：<br> <img src="https://images2.imgbox.com/3c/a5/kPyYAENK_o.png" alt="在这里插入图片描述"></p> 
+<p><code>VirtualThread.park()</code>方法做了啥：</p> 
+<pre><code class="prism language-javascript">@Override
+<span class="token keyword">void</span> <span class="token function">park</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    assert Thread<span class="token punctuation">.</span><span class="token function">currentThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token keyword">this</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// complete immediately if parking permit available or interrupted</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">getAndSetParkPermit</span><span class="token punctuation">(</span><span class="token boolean">false</span><span class="token punctuation">)</span> <span class="token operator">||</span> interrupted<span class="token punctuation">)</span>
+        <span class="token keyword">return</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// park the thread</span>
+    <span class="token function">setState</span><span class="token punctuation">(</span><span class="token constant">PARKING</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">yieldContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// park on the carrier thread when pinned</span>
+            <span class="token function">parkOnCarrierThread</span><span class="token punctuation">(</span><span class="token boolean">false</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">assert</span> <span class="token punctuation">(</span>Thread<span class="token punctuation">.</span><span class="token function">currentThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token keyword">this</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span><span class="token function">state</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">RUNNING</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>核心做了两件事情：</p> 
+<ol><li>把虚拟线程状态置为<code>PARKING</code>。</li><li>调用<code>yieldContinuation</code>函数，也是<code>VirtualThread</code>里面对原生<code>Continuation.yield()</code>函数的一层封装。</li></ol> 
+<pre><code class="prism language-javascript">@ChangesCurrentThread
+<span class="token keyword">private</span> boolean <span class="token function">yieldContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    boolean notifyJvmti <span class="token operator">=</span> notifyJvmtiEvents<span class="token punctuation">;</span>
+
+    <span class="token comment">// unmount</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>notifyJvmti<span class="token punctuation">)</span> <span class="token function">notifyJvmtiUnmountBegin</span><span class="token punctuation">(</span><span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">unmount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 利用Continuation的yield函数，停止继续执行，等待外部调用Continuation.run之后恢复执行</span>
+        <span class="token keyword">return</span> Continuation<span class="token punctuation">.</span><span class="token function">yield</span><span class="token punctuation">(</span><span class="token constant">VTHREAD_SCOPE</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 倘若执行到这里，说明外部已经调用了Continuation.run函数，此时重新将虚拟线程进行挂载，利用虚拟线程执行后续代码</span>
+        <span class="token function">mount</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>notifyJvmti<span class="token punctuation">)</span> <span class="token function">notifyJvmtiMountEnd</span><span class="token punctuation">(</span><span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol><li><code>yieldContinuation()</code>方法中，先进行<code>unmount</code>卸载。那么运载线程此刻就可以不再执行虚拟线程的任务了，就可以干别的事情了。</li><li>然后执行<code>Continuation</code>的<code>yield</code>函数，实现真正的“暂停”。等待外部调用<code>Continuation.run</code>之后恢复执行。</li></ol> 
+<p>这里可以看出来，此时虚拟线程已经进入了阻塞状态。<strong>由于运载线程已经和虚拟线程解除了绑定，因此运载线程可以做自己想做的事情。所以并没有“真正的阻塞”（真正的阻塞指<code>OS Thread</code>的阻塞，而运载线程是绑定了<code>OS Thread</code>的，而<code>VirtualThread</code>是不会直接绑定<code>OS Thread</code>的，它依靠运载线程执行代码）</strong></p> 
+<h3><a id="23__675"></a>2.3 结束阻塞再次调度</h3> 
+<p>当网络的<code>IO</code>请求处理完毕之后，就会调用<code>VirtualThread.unpark</code>方法：</p> 
+<pre><code class="prism language-javascript">@Override
+@ChangesCurrentThread
+<span class="token keyword">void</span> <span class="token function">unpark</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    Thread currentThread <span class="token operator">=</span> Thread<span class="token punctuation">.</span><span class="token function">currentThread</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">getAndSetParkPermit</span><span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> currentThread <span class="token operator">!=</span> <span class="token keyword">this</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        int s <span class="token operator">=</span> <span class="token function">state</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>s <span class="token operator">==</span> <span class="token constant">PARKED</span> <span class="token operator">&amp;&amp;</span> <span class="token function">compareAndSetState</span><span class="token punctuation">(</span><span class="token constant">PARKED</span><span class="token punctuation">,</span> <span class="token constant">RUNNABLE</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>currentThread <span class="token keyword">instanceof</span> <span class="token class-name">VirtualThread</span> vthread<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                Thread carrier <span class="token operator">=</span> vthread<span class="token punctuation">.</span>carrierThread<span class="token punctuation">;</span>
+                carrier<span class="token punctuation">.</span><span class="token function">setCurrentThread</span><span class="token punctuation">(</span>carrier<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span> <span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+                    carrier<span class="token punctuation">.</span><span class="token function">setCurrentThread</span><span class="token punctuation">(</span>vthread<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token function">submitRunContinuation</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>s <span class="token operator">==</span> <span class="token constant">PINNED</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// unpark carrier thread when pinned.</span>
+            <span class="token function">synchronized</span> <span class="token punctuation">(</span><span class="token parameter"><span class="token function">carrierThreadAccessLock</span><span class="token punctuation">(</span><span class="token punctuation">)</span></span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                Thread carrier <span class="token operator">=</span> carrierThread<span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>carrier <span class="token operator">!=</span> <span class="token keyword">null</span> <span class="token operator">&amp;&amp;</span> <span class="token function">state</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">PINNED</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    <span class="token constant">U</span><span class="token punctuation">.</span><span class="token function">unpark</span><span class="token punctuation">(</span>carrier<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>主要做了两件事情：</p> 
+<ol><li>将虚拟线程的状态置为<code>RUNNABLE</code>。</li><li>再次调用<code>submitRunContinuation</code>函数（这里就和第一次执行时候的逻辑大致一样了），将任务交给线程池来调度。同样地<code>submitRunContinuation</code>函数最终把任务交给<code>runContinuation</code>。</li></ol> 
+<p>只不过执行<code>runContinuation</code>函数的时候，走的不再是第一个分支了，如图：<br> <img src="https://images2.imgbox.com/bf/d9/9IdS8moJ_o.png" alt="在这里插入图片描述"></p> 
+<p>然后开始调用<code>cont.run()</code>，借助<code>Continuation</code>来完成任务栈的恢复调用。最终<code>Continuation</code>执行完毕，将虚拟线程的状态置为<code>TERMINATED</code>。</p> 
+<h3><a id="24_Debug_720"></a>2.4 跟着Debug走一遍</h3> 
+<p>1.启动<code>Test</code>，创建了一个虚拟线程（未启动），做一些初始化操作（调度器、<code>VirtualThread</code>自己封装的<code>Continuation</code>等）虚拟线程状态：<code>New</code>。<br> <img src="https://images2.imgbox.com/d8/cd/gTS5sFak_o.png" alt="在这里插入图片描述"><br> 2.紧接着准备启动虚拟线程了：<br> <img src="https://images2.imgbox.com/92/6e/ww7Yyfti_o.png" alt="在这里插入图片描述"><br> 此时是我们第一次启动该虚拟线程，调用栈为：</p> 
+<ol><li><code>VirtualThread.start()</code>：虚拟线程状态：<code>STARTED</code>。</li><li>调用<code>submitRunContinuation</code>–&gt;交给调度器执行<code>runContinuation</code>任务（默认底层<code>ForkJoinPool</code>）。</li><li><code>runContinuation</code>里面，主要是对原生<code>Continuation</code>的一层封装，维护了虚拟线程的状态，此时状态由<code>STARTED</code>改为<code>RUNNING</code>，并标记为第一次执行。<br> <img src="https://images2.imgbox.com/b9/0d/BbNyvVn1_o.png" alt="在这里插入图片描述"></li></ol> 
+<p>3.然后执行<code>Continuation.run();</code>，倘若是第一次执行，则还会调用一遍<code>VirtualThread.run</code>方法。将当前虚拟线程装载到运载线程上。运载完毕后调用真实的<code>task</code>任务：<br> <img src="https://images2.imgbox.com/4f/c0/EUyybul9_o.png" alt="在这里插入图片描述"><br> 调用真实的<code>task</code>任务了<br> <img src="https://images2.imgbox.com/1d/5c/NJeqpx9V_o.png" alt="在这里插入图片描述"><br> 4.直到执行<code>sendHttpRequest</code>这个任务的时候，发现存在<code>IO</code>阻塞，一旦出现阻塞点，就会调用<code>VirtualThread.park</code>函数：<strong>此时状态改为<code>PARKING</code></strong><br> <img src="https://images2.imgbox.com/67/4d/qmjYZ5cw_o.png" alt="在这里插入图片描述"><br> 5.紧接着调用<code>yieldContinuation</code>（同<code>Continuation</code>，都是<code>VirtualThread</code>进行的一层封装）<br> <img src="https://images2.imgbox.com/16/82/TPITn18w_o.png" alt="在这里插入图片描述"><br> 先进行<code>unmount</code>卸载，解放运载线程，让他可以作别的事情，然后在调用底层的<code>Continuation.yield</code>进行暂停。此时虚拟线程状态为：<code>PARKED</code></p> 
+<p>6.当<code>IO</code>结束阻塞之后，调用<code>unpark(</code>)函数：如果状态是<code>PARKED</code>，就把他改为<code>RUNNABLE</code>。<br> <img src="https://images2.imgbox.com/21/c0/LyX6wIPz_o.png" alt="在这里插入图片描述"><br> 最终再次调用了<code>submitRunContinuation</code>函数，根据上面的逻辑，最终走到第二个<code>if</code>分支：<br> <img src="https://images2.imgbox.com/f7/fe/dszxa6OT_o.png" alt="在这里插入图片描述"><br> 最终再次借助底层的<code>Continuation.run()</code>完成任务的恢复执行（这一部分<code>debug</code>不出来）</p> 
+<p>最终虚拟线程任务执行完毕，将状态改为<code>TERMINATED</code><br> <img src="https://images2.imgbox.com/7a/05/wm0QwX6S_o.png" alt="在这里插入图片描述"></p> 
+<p>下面在<code>debug</code>的时候是看不到的，因为<code>state</code>的维护都是交给<code>JVM</code>来完成的，看注释。<br> <img src="https://images2.imgbox.com/e0/3d/xhiRR2kI_o.png" alt="在这里插入图片描述"></p> 
+<p>不仅如此。源码中涉及<code>mount，unmount，notifyJvmtiMount，notifyJvmtiUnmount</code>处，<strong>涉及线程 虚线程 的装载与卸载，其之前或之后的代码可能无法<code>debug</code>到。</strong></p> 
+<p>用流程图表示如下：<br> <img src="https://images2.imgbox.com/d5/cf/AcpPokMJ_o.png" alt="在这里插入图片描述"></p> 
+<p>最后，关于虚拟线程使用还有一定的局限性，如果我们代码块包含了一些<code>synchronized</code>关键字，虚拟线程就无法在阻塞操作期间卸载，因为它被固定到其执行线程上。不仅如此，还存在着ThreadLocal的使用相关问题，这类问题会另外写一篇文章去总结分享。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/da0dce4f2ea31f58b40e2337743b761b/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Java学习笔记</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/8262cf68395366b13cd930b8d20cd527/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">金三银四好时节，python面试10K&#43;能不能得到？</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

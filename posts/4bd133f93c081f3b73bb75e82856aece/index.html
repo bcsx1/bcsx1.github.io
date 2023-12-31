@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>FreeRTOS-任务通知详解 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="FreeRTOS-任务通知详解" />
+<meta property="og:description" content="✅作者简介：嵌入式入坑者，与大家一起加油，希望文章能够帮助各位！！！！
+📃个人主页：@rivencode的个人主页
+🔥系列专栏：玩转FreeRTOS
+💬保持学习、保持热爱、认真分享、一起进步！！！
+目录 前言一、任务通知的简介二、任务通知源码分析1.发送通知函数xTaskGenericNotify2.接收任务通知 ulTaskNotifyTake()3.接收任务通知函数xTaskNotifyWait() 三.总结 前言 FreeRTOS越学越简单，前面已经把真实的队列、信号量、事件组全部学完，现在学个任务通知去模拟这些东西，真的都学会了，模拟的还不会嘛，所以我们的本文的重点主要有两点：1.搞明白任务通知的三个状态(实现任务通知的关键)，2.明白任务通知的优缺点，以及任务通知模拟出来的队列、信号量、事件组与真实的有何区别。
+一、任务通知的简介 说是任务通知，倒不如说通知任务，所谓任务通知核心就是一个32位的无符号整数和一个8位的通知状态，而这两玩意就在任务控制块中，则所谓通知任务就是一个任务或者中断改写另外一个任务中的32位的无符号整数，只不过改写这个整数的方式可以有所不同(1.可以让这个整数加1: 模拟信号量 2. 设置该整数的指定的某些位：模拟事件组 3.直接选择覆盖或者不覆盖写入： 模拟消息队列)。
+1.任务的通知状态：任务通知有三种状态 未等待通知状态：就是任务的初始状态
+等待通知状态：当任务在没有通知的时候接收通知时(也就是任务没有接收到通知的时候调用了接收通知的函数，则此时必定接收不到通知，把该任务标记为等待通知状态(去等别的任务发给我通知)，任务进入阻塞态)，这样做的用处是什么呢？ 答：当另外一个任务发通知给该任务时，此时发现任务处于等待通知的状态，然后就可以即可把该任务唤醒。
+等待接收通知状态：当有其他任务向任务发送通知，但任务还未接收这一通知的这段期间内(当其他任务给该任务发了通知，但是该任务还没有接收，则将该任务标记为等待接收通知状态)，这样做的用处就是当该任务调用了接收通知的函数，发现自身的状态为等待接收通知状态，则不用进入阻塞，直接接收通知值。
+为什么要搞一个这样的通知状态？
+答：
+1.为了判断任务是否接收到了通知
+2.不需要一个链表来挂载因等不到通知而阻塞任务，可以直接将任务挂入阻塞链表，因为当调用发送通知函数去唤醒该任务时只需要判断它是否处于等待通知状态(因等待通知进入阻塞)。
+像队列它有一个当前消息个数的变量可以知道队列中是否有消息，像信号量0就是没消息
+那为什么任务通知不能以通知值是否为0判断是否有消息呢？
+确实模拟信号量确实是怎么做的，但是如果是模拟队列的话，就不能怎么搞了，因为我发送一个0，0也算是数据，所以需要一个
+如果现在还搞不懂这三个状态什么意思，没关系看后面的源码就懂了。
+2.任务通知的优缺点： (1).任务通知的优点
+按照FreeRTOS官方的说法使用任务通知比通过队列、事件标志组或信号量通信方式解除阻塞的任务要快 45%，并且更加省 RAM 内存空间，因为像队列、信号量、事件组这些通信方式使用前必须先创建，拿队列来说如下图所示，申请内存的时候至少需要下图这么多变量，而任务通知是任务结构体中自带的一个32位的无符号整数，一个8位的通知状态变量，一共就5个字节。
+使用任务通知不需要创建，因为当创建任务的时候就已经默认创建了这两个变量，任务控制块中的两个变量如下图所示，当然这里是一个数组(为了方便以后扩展)，但是数组的元素个数默认为1。
+(2).任务通知的缺点
+虽然说任务通知可以模拟这么多通信方式，但是肯定有限制、有缺点，不然还要这些队列、信号量、事件组干嘛。
+1.不能发送通知到中断
+原因很简单，任务通知、任务通知，人家通知的是任务，是修改任务控制块中那个32位无符号整数的值，中断并没有任务控制块这一说，但为什么队列、信号量、事件组这些就可以呢，说到底人家创建了一个独立的队列、信号量、事件组结构体当然谁都可以访问里面的内容，但是可以在中断中发送通知给其他任务，这个是没毛病的。
+2.不能发送通知给多个任务
+任务通知只能指定发送给某一个任务而不能广播，而队列、信号量、事件组任何中断和任务都能访问，不过很少出现多个任务或中断接收同一个通讯对象的情况
+3.发送通知的任务不能进入阻塞
+只有等待通知的任务可以被阻塞，发送通知的任务，在任何情况下都不会因为发送失败而进入阻塞态，像队列：写队列当队列满的时候，可以进入阻塞态
+4.通知值只有一个32位的无符号的整形
+加粗样式不像队列，可以缓存多个任意类型的数据，而任务通知只有一个消息，而且只能作用一次(接收到通知值等待通知的任务才能被唤醒)
+接下来就开始分析任务通知有关函数的源码，其中会穿插着讲解用任务通知模拟出来的队列、信号量、事件组与真实的有何区别。
+二、任务通知源码分析 任务通知的创建就不用说了，任务被创建时则就便有了任务通知，而且FreeRTOS默认任务通知是开启的。
+1.发送通知函数xTaskGenericNotify FreeRTOS定义了三个发送通知的函数，其实他们都是宏定义最终调用的是xTaskGenericNotify()，只不过他们的传入的参数有所区别，这都是FreeRTOS的老套路了，所以我们先分析完xTaskGenericNotify()函数的实现，再谈谈这三个函数应用上有何区别。
+1.xTaskGenericNotify()函数原型：
+函数参数：
+1.xTaskToNotify：传入接收任务通知的任务控制块
+2.uxIndexToNotify：任务的指定通知（任务通知相关数组下标，默认为0，使用数组第一个元素当做通知）
+3.ulValue：要写入的通知值
+4.eAction：通知的方式(模拟信号量，消息队列、事件组中方式)，可取的值如下所示
+第一个取值：只起通知作用也是有用的，至少可以唤醒，因未等待到通知而阻塞的任务。 5.pulPreviousNotificationValue：用于获取发送通知前的通知值
+函数返回值
+pdPASS 任务通知发送成功
+pdFAIL 任务通知发送失败 2.TaskGenericNotify()源码分析：
+#if ( configUSE_TASK_NOTIFICATIONS == 1 ) BaseType_t xTaskGenericNotify( TaskHandle_t xTaskToNotify, UBaseType_t uxIndexToNotify, uint32_t ulValue, eNotifyAction eAction, uint32_t * pulPreviousNotificationValue ) { TCB_t * pxTCB; BaseType_t xReturn = pdPASS; uint8_t ucOriginalNotifyState; configASSERT( uxIndexToNotify &lt; configTASK_NOTIFICATION_ARRAY_ENTRIES ); configASSERT( xTaskToNotify ); pxTCB = xTaskToNotify; taskENTER_CRITICAL(); { /* 判断是否需要通知前的通知值 */ if( pulPreviousNotificationValue !" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/4bd133f93c081f3b73bb75e82856aece/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-05-24T21:09:21+08:00" />
+<meta property="article:modified_time" content="2023-05-24T21:09:21+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">FreeRTOS-任务通知详解</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <blockquote> 
+ <p><strong>✅作者简介：嵌入式入坑者，与大家一起加油，希望文章能够帮助各位！！！！</strong><br> <strong>📃个人主页：</strong><a href="https://blog.csdn.net/k666499436?spm=1011.2421.3001.5343">@rivencode的个人主页</a><br> <strong>🔥系列专栏：</strong><a href="https://blog.csdn.net/k666499436/category_12006244.html">玩转FreeRTOS</a><br> <strong>💬保持学习、保持热爱、认真分享、一起进步！！！</strong></p> 
+</blockquote> 
+<p></p> 
+<div class="toc"> 
+ <h4>目录</h4> 
+ <ul><li><a href="#_7" rel="nofollow">前言</a></li><li><a href="#_9" rel="nofollow">一、任务通知的简介</a></li><li><a href="#_51" rel="nofollow">二、任务通知源码分析</a></li><li><ul><li><a href="#1xTaskGenericNotify_53" rel="nofollow">1.发送通知函数xTaskGenericNotify</a></li><li><a href="#2_ulTaskNotifyTake_218" rel="nofollow">2.接收任务通知 ulTaskNotifyTake()</a></li><li><a href="#3xTaskNotifyWait_332" rel="nofollow">3.接收任务通知函数xTaskNotifyWait()</a></li></ul> 
+  </li><li><a href="#_463" rel="nofollow">三.总结</a></li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_7"></a>前言</h2> 
+<p><strong>FreeRTOS越学越简单，前面已经把真实的队列、信号量、事件组全部学完，现在学个任务通知去模拟这些东西，真的都学会了，模拟的还不会嘛，所以我们的本文的重点主要有两点：1.搞明白任务通知的三个状态(实现任务通知的关键)，2.明白任务通知的优缺点，以及任务通知模拟出来的队列、信号量、事件组与真实的有何区别。</strong></p> 
+<h2><a id="_9"></a>一、任务通知的简介</h2> 
+<p><strong>说是任务通知，倒不如说通知任务，所谓任务通知核心就是一个32位的无符号整数和一个8位的通知状态，而这两玩意就在任务控制块中，则所谓通知任务就是一个任务或者中断改写另外一个任务中的32位的无符号整数，只不过改写这个整数的方式可以有所不同(1.可以让这个整数加1: 模拟信号量 2. 设置该整数的指定的某些位：模拟事件组 3.直接选择覆盖或者不覆盖写入： 模拟消息队列)。</strong></p> 
+<ul><li><strong>1.任务的通知状态：任务通知有三种状态</strong></li></ul> 
+<p><strong>未等待通知状态：就是任务的初始状态</strong></p> 
+<p><strong>等待通知状态：当任务在没有通知的时候接收通知时(也就是任务没有接收到通知的时候调用了接收通知的函数，则此时必定接收不到通知，把该任务标记为等待通知状态(去等别的任务发给我通知)，任务进入阻塞态)，这样做的用处是什么呢？ 答：当另外一个任务发通知给该任务时，此时发现任务处于等待通知的状态，然后就可以即可把该任务唤醒。</strong></p> 
+<p><strong>等待接收通知状态：当有其他任务向任务发送通知，但任务还未接收这一通知的这段期间内(当其他任务给该任务发了通知，但是该任务还没有接收，则将该任务标记为等待接收通知状态)，这样做的用处就是当该任务调用了接收通知的函数，发现自身的状态为等待接收通知状态，则不用进入阻塞，直接接收通知值。</strong></p> 
+<p><strong>为什么要搞一个这样的通知状态？<br> 答：<br> 1.为了判断任务是否接收到了通知<br> 2.不需要一个链表来挂载因等不到通知而阻塞任务，可以直接将任务挂入阻塞链表，因为当调用发送通知函数去唤醒该任务时只需要判断它是否处于等待通知状态(因等待通知进入阻塞)。<br> 像队列它有一个当前消息个数的变量可以知道队列中是否有消息，像信号量0就是没消息</strong></p> 
+<p><strong>那为什么任务通知不能以通知值是否为0判断是否有消息呢？<br> 确实模拟信号量确实是怎么做的，但是如果是模拟队列的话，就不能怎么搞了，因为我发送一个0，0也算是数据，所以需要一个</strong></p> 
+<p><strong>如果现在还搞不懂这三个状态什么意思，没关系看后面的源码就懂了。</strong></p> 
+<ul><li><strong>2.任务通知的优缺点：</strong></li></ul> 
+<p><strong>(1).任务通知的优点</strong><br> <strong>按照FreeRTOS官方的说法使用任务通知比通过队列、事件标志组或信号量通信方式解除阻塞的任务要快 45%，并且更加省 RAM 内存空间，因为像队列、信号量、事件组这些通信方式使用前必须先创建，拿队列来说如下图所示，申请内存的时候至少需要下图这么多变量，而任务通知是任务结构体中自带的一个32位的无符号整数，一个8位的通知状态变量，一共就5个字节。</strong><br> <img src="https://images2.imgbox.com/b7/70/8FoDJ3cL_o.png" alt="在这里插入图片描述"><br> <strong>使用任务通知不需要创建，因为当创建任务的时候就已经默认创建了这两个变量，任务控制块中的两个变量如下图所示，当然这里是一个数组(为了方便以后扩展)，但是数组的元素个数默认为1。</strong><br> <img src="https://images2.imgbox.com/22/38/mjEGv6vl_o.png" alt="在这里插入图片描述"><br> <strong>(2).任务通知的缺点</strong><br> <strong>虽然说任务通知可以模拟这么多通信方式，但是肯定有限制、有缺点，不然还要这些队列、信号量、事件组干嘛。</strong><br> <strong>1.不能发送通知到中断</strong><br> <strong>原因很简单，任务通知、任务通知，人家通知的是任务，是修改任务控制块中那个32位无符号整数的值，中断并没有任务控制块这一说，但为什么队列、信号量、事件组这些就可以呢，说到底人家创建了一个独立的队列、信号量、事件组结构体当然谁都可以访问里面的内容，但是可以在中断中发送通知给其他任务，这个是没毛病的。</strong><br> <strong>2.不能发送通知给多个任务<br> 任务通知只能指定发送给某一个任务而不能广播，而队列、信号量、事件组任何中断和任务都能访问，不过很少出现多个任务或中断接收同一个通讯对象的情况</strong><br> <strong>3.发送通知的任务不能进入阻塞<br> 只有等待通知的任务可以被阻塞，发送通知的任务，在任何情况下都不会因为发送失败而进入阻塞态，像队列：写队列当队列满的时候，可以进入阻塞态</strong><br> <strong>4.通知值只有一个32位的无符号的整形<br> <strong>加粗样式</strong>不像队列，可以缓存多个任意类型的数据，而任务通知只有一个消息，而且只能作用一次(接收到通知值等待通知的任务才能被唤醒)</strong></p> 
+<p><strong>接下来就开始分析任务通知有关函数的源码，其中会穿插着讲解用任务通知模拟出来的队列、信号量、事件组与真实的有何区别。</strong></p> 
+<h2><a id="_51"></a>二、任务通知源码分析</h2> 
+<p><strong>任务通知的创建就不用说了，任务被创建时则就便有了任务通知，而且FreeRTOS默认任务通知是开启的。</strong></p> 
+<h3><a id="1xTaskGenericNotify_53"></a>1.发送通知函数xTaskGenericNotify</h3> 
+<p><strong>FreeRTOS定义了三个发送通知的函数，其实他们都是宏定义最终调用的是xTaskGenericNotify()，只不过他们的传入的参数有所区别，这都是FreeRTOS的老套路了，所以我们先分析完xTaskGenericNotify()函数的实现，再谈谈这三个函数应用上有何区别。</strong><br> <img src="https://images2.imgbox.com/f2/39/V7GplG9B_o.png" alt="在这里插入图片描述"><br> <mark>1.xTaskGenericNotify()函数原型：</mark><br> <img src="https://images2.imgbox.com/0b/e1/I0ON5OM4_o.png" alt="在这里插入图片描述"></p> 
+<ul><li><strong>函数参数：</strong><br> <strong>1.xTaskToNotify：传入接收任务通知的任务控制块</strong><br> <strong>2.uxIndexToNotify：任务的指定通知（任务通知相关数组下标，默认为0，使用数组第一个元素当做通知）</strong><br> <img src="https://images2.imgbox.com/d3/03/SjCzDZ9N_o.png" alt="在这里插入图片描述"><br> <strong>3.ulValue：要写入的通知值</strong><br> <strong>4.eAction：通知的方式(模拟信号量，消息队列、事件组中方式)，可取的值如下所示</strong><br> <img src="https://images2.imgbox.com/1d/01/qMhcKb8S_o.png" alt="在这里插入图片描述"><br> <strong>第一个取值：只起通知作用也是有用的，至少可以唤醒，因未等待到通知而阻塞的任务。</strong></li></ul> 
+<p><strong>5.pulPreviousNotificationValue：用于获取发送通知前的通知值</strong></p> 
+<ul><li><strong>函数返回值</strong><br> <strong>pdPASS 任务通知发送成功<br> pdFAIL 任务通知发送失败</strong></li></ul> 
+<p><strong><mark>2.TaskGenericNotify()源码分析：</mark></strong></p> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_TASK_NOTIFICATIONS <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+
+    BaseType_t <span class="token function">xTaskGenericNotify</span><span class="token punctuation">(</span> TaskHandle_t xTaskToNotify<span class="token punctuation">,</span>
+                                   UBaseType_t uxIndexToNotify<span class="token punctuation">,</span>
+                                   <span class="token class-name">uint32_t</span> ulValue<span class="token punctuation">,</span>
+                                   eNotifyAction eAction<span class="token punctuation">,</span>
+                                   <span class="token class-name">uint32_t</span> <span class="token operator">*</span> pulPreviousNotificationValue <span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        TCB_t <span class="token operator">*</span> pxTCB<span class="token punctuation">;</span>
+        BaseType_t xReturn <span class="token operator">=</span> pdPASS<span class="token punctuation">;</span>
+        <span class="token class-name">uint8_t</span> ucOriginalNotifyState<span class="token punctuation">;</span>
+
+        <span class="token function">configASSERT</span><span class="token punctuation">(</span> uxIndexToNotify <span class="token operator">&lt;</span> configTASK_NOTIFICATION_ARRAY_ENTRIES <span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">configASSERT</span><span class="token punctuation">(</span> xTaskToNotify <span class="token punctuation">)</span><span class="token punctuation">;</span>
+        pxTCB <span class="token operator">=</span> xTaskToNotify<span class="token punctuation">;</span>
+
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/* 判断是否需要通知前的通知值 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> pulPreviousNotificationValue <span class="token operator">!=</span> <span class="token constant">NULL</span> <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+               <span class="token comment">/* 获取发送通知前的通知值 */</span>
+                <span class="token operator">*</span>pulPreviousNotificationValue <span class="token operator">=</span> pxTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> 
+			<span class="token comment">/* 记录发送通知前的任务通知状态 */</span>
+            ucOriginalNotifyState <span class="token operator">=</span> pxTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span><span class="token punctuation">;</span>
+            <span class="token comment">/* 将要接收的通知的任务的状态设置为等待接收通知状态 */</span>
+            pxTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span> <span class="token operator">=</span> taskNOTIFICATION_RECEIVED<span class="token punctuation">;</span>
+
+            <span class="token keyword">switch</span><span class="token punctuation">(</span> eAction <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+               <span class="token comment">/* 模拟事件组：将通知值的某些位置一 */</span>
+                <span class="token keyword">case</span> eSetBits<span class="token operator">:</span>
+                    pxTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span> <span class="token operator">|=</span> ulValue<span class="token punctuation">;</span>
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+               <span class="token comment">/* 模拟计数型信号量：将通知值的某些位置一 */</span>
+                <span class="token keyword">case</span> eIncrement<span class="token operator">:</span>
+                    <span class="token punctuation">(</span> pxTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span> <span class="token punctuation">)</span><span class="token operator">++</span><span class="token punctuation">;</span>
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+               <span class="token comment">/* 模拟队列：覆写通知值 */</span>
+                <span class="token keyword">case</span> eSetValueWithOverwrite<span class="token operator">:</span>
+                    pxTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span> <span class="token operator">=</span> ulValue<span class="token punctuation">;</span>
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+				<span class="token comment">/* 模拟队列：(不覆盖)写通知值 */</span>
+                <span class="token keyword">case</span> eSetValueWithoutOverwrite<span class="token operator">:</span>
+                    <span class="token comment">/* 如果任务状态不处于等待接收状态，说明通知值已被读走，
+                       可以写入*/</span>
+                    <span class="token keyword">if</span><span class="token punctuation">(</span> ucOriginalNotifyState <span class="token operator">!=</span> taskNOTIFICATION_RECEIVED <span class="token punctuation">)</span>
+                    <span class="token punctuation">{<!-- --></span>
+                        pxTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToNotify <span class="token punctuation">]</span> <span class="token operator">=</span> ulValue<span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                    <span class="token keyword">else</span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token comment">/* 通知值未被读走，不能覆写 */</span>
+                        xReturn <span class="token operator">=</span> pdFAIL<span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+
+                <span class="token keyword">case</span> eNoAction<span class="token operator">:</span>
+
+                    <span class="token comment">/* 只将任务标记为等待接收通知状态
+                       并不修改通知值 */</span>
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+
+                <span class="token keyword">default</span><span class="token operator">:</span>
+
+                    <span class="token comment">/* Should not get here if all enums are handled.
+                     * Artificially force an assert by testing a value the
+                     * compiler can't assume is const. */</span>
+                    <span class="token function">configASSERT</span><span class="token punctuation">(</span> xTickCount <span class="token operator">==</span> <span class="token punctuation">(</span> TickType_t <span class="token punctuation">)</span> <span class="token number">0</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                    <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+
+            <span class="token function">traceTASK_NOTIFY</span><span class="token punctuation">(</span> uxIndexToNotify <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token comment">/* 如果在此之前，任务因等待任务通知而被阻塞(该任务为等待通知状态)，则现在解除阻塞 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> ucOriginalNotifyState <span class="token operator">==</span> taskWAITING_NOTIFICATION <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 将任务从所在任务状态列表(延时列表)中移除 */</span>
+                <span class="token function">listREMOVE_ITEM</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxTCB<span class="token operator">-&gt;</span>xStateListItem <span class="token punctuation">)</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+				<span class="token comment">/* 将任务添加到就绪任务列表中 */</span>
+                <span class="token function">prvAddTaskToReadyList</span><span class="token punctuation">(</span> pxTCB <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token comment">/* 该任务不应在事件列表中 */</span>
+                <span class="token function">configASSERT</span><span class="token punctuation">(</span> <span class="token function">listLIST_ITEM_CONTAINER</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span><span class="token punctuation">(</span> pxTCB<span class="token operator">-&gt;</span>xEventListItem <span class="token punctuation">)</span> <span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">NULL</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_TICKLESS_IDLE <span class="token operator">!=</span> <span class="token number">0</span> <span class="token punctuation">)</span></span></span>
+                    <span class="token punctuation">{<!-- --></span>
+                        <span class="token comment">/* 更新下一个解除阻塞的任务 */</span>
+                        <span class="token function">prvResetNextTaskUnblockTime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token punctuation">}</span>
+                <span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span></span>
+				<span class="token comment">/* 有任务解除阻塞后，就应该判断是否需要进行任务切换 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> pxTCB<span class="token operator">-&gt;</span>uxPriority <span class="token operator">&gt;</span> pxCurrentTCB<span class="token operator">-&gt;</span>uxPriority <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+					<span class="token comment">/* 悬起 PendSV中断，准备进行任务切换 */</span>
+                    <span class="token function">taskYIELD_IF_USING_PREEMPTION</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">return</span> xReturn<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_TASK_NOTIFICATIONS */</span></span>
+<span class="token comment">/*-----------------------------------------------------------*/</span>
+
+</code></pre> 
+<p><img src="https://images2.imgbox.com/ef/63/L57KrYbl_o.png" alt="在这里插入图片描述"><br> <strong>源码解析：</strong><br> <strong>1.如果传入的pulPreviousNotificationValue不为NULL(就是一个32位变量的地址)，则代表需要获取发送通知前的通知值。</strong><br> <img src="https://images2.imgbox.com/ac/bf/MkIz5GlP_o.png" alt="在这里插入图片描述"><br> <strong>2.这里解释一下为什么要将任务的通知状态改为等待接收通知状态<br> 首先要明白一点我们改的是要接收通知的任务通知的状态，则当调用接收通知函数时，判断一下任务的通知状态是不是等待接收通知状态如果是那说明有通知已经发送过来了。</strong><br> <img src="https://images2.imgbox.com/ba/df/pwk5V5Yh_o.png" alt="在这里插入图片描述"><br> <strong>3.解释一下框中的内容</strong><br> <strong>不能覆写：代表已经有通知值，说明前面已经调用过一次发送通知函数xTaskGenericNotify，将任务的通知状态改为等待接收通知，如果再一次调用xTaskGenericNotify去发送通知，发送这次的任务通知状态已经不等于等待接收通知了，说明通知值被取走(其中调用过接收通知函数，会将任务的状态改写，讲接收通知函数你就知道了)。</strong><br> <img src="https://images2.imgbox.com/6f/c5/JIeScLvZ_o.png" alt="在这里插入图片描述"><br> <strong>4.如果任务为等待通知状态，说明该任务在此之前已经调用过接收通知函数(如果没有通知，会将任务的通知状态改写成等待通知状态，并进入阻塞态)，此时我正好发送通知过去，就需要唤醒该任务去取通知值。</strong><br> <img src="https://images2.imgbox.com/0b/39/MPM8K0zy_o.png" alt="在这里插入图片描述"><br> <strong>当然光看一个发送通知函数，可能还是不太理解这些通知状态，所以一定是要发送/接收通知函数配合起来看，才能连贯起来，就豁然开朗。</strong></p> 
+<p><strong>函数 xTaskNotify()：<br> 此函数用于往指定任务发送任务通知，通知方式可以自由指定，并且不获取发送任务通知前任务通知的通知值。<br> 函数 xTaskNotifyAndQuery()：<br> 此函数用于往指定任务发送任务通知，通知方式可以自由指定，并且获取发送任务通知前任务通知的通知值。</strong><br> <strong>函数 xTaskNotifyGive()：<br> 此函数用于往指定任务发送任务通知，通知方式为将通知值加 1，并且不获取发送任务通知前任务通知的通知值(用于二值/计数型信号量)</strong><br> <img src="https://images2.imgbox.com/17/2b/ahgqGeqV_o.png" alt="在这里插入图片描述"><br> <strong>当然中断也可以向某任务发送通知值，函数跟上面的差不多，只不过多了中断保护。</strong></p> 
+<h3><a id="2_ulTaskNotifyTake_218"></a>2.接收任务通知 ulTaskNotifyTake()</h3> 
+<p><strong>ulTaskNotifyTake()函数其实是一个宏真正调用的是ulTaskGenericNotifyTake()函数，该函数就是专门服务与模拟二值信号量/计数型信号量的。</strong><br> <img src="https://images2.imgbox.com/f8/b1/0gpNgqVK_o.png" alt="在这里插入图片描述"><br> <strong><mark>1.ulTaskNotifyTake()函数原型</mark></strong><br> <img src="https://images2.imgbox.com/12/00/yPhsyvF0_o.png" alt="在这里插入图片描述"></p> 
+<ul><li><strong>函数参数</strong></li></ul> 
+<p><strong>1.uxIndexToWaitOn :任务的指定通知（任务通知相关数组下标）<br> 2.xClearCountOnExit: <mark>在成功接收通知后</mark>，将通知值<mark>清零或减 1</mark>（分别对应二值信号量,计数型信号量）<br> 3.xTicksToWait: 阻塞等待任务通知值的最大时间</strong></p> 
+<ul><li><strong>函数返回值</strong><br> <strong>0：接收失败<br> 非 0： 接收成功，返回任务通知的通知值(当前计数值)</strong></li></ul> 
+<p><strong><mark>2.ulTaskNotifyTake()函数源码</mark></strong></p> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_TASK_NOTIFICATIONS <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+
+    <span class="token class-name">uint32_t</span> <span class="token function">ulTaskGenericNotifyTake</span><span class="token punctuation">(</span> UBaseType_t uxIndexToWait<span class="token punctuation">,</span>
+                                      BaseType_t xClearCountOnExit<span class="token punctuation">,</span>
+                                      TickType_t xTicksToWait <span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">uint32_t</span> ulReturn<span class="token punctuation">;</span>
+
+        <span class="token function">configASSERT</span><span class="token punctuation">(</span> uxIndexToWait <span class="token operator">&lt;</span> configTASK_NOTIFICATION_ARRAY_ENTRIES <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/* 通知值为0代表没有接收到通知 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">==</span> <span class="token number">0UL</span> <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 将任务通知的状态设置为等待通知状态 */</span>
+                pxCurrentTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">=</span> taskWAITING_NOTIFICATION<span class="token punctuation">;</span>
+
+			    <span class="token comment">/* 如果设置了等待时间 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> xTicksToWait <span class="token operator">&gt;</span> <span class="token punctuation">(</span> TickType_t <span class="token punctuation">)</span> <span class="token number">0</span> <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token comment">/* 将当前任务添加到阻塞态任务列表 */</span>
+                    <span class="token function">prvAddCurrentTaskToDelayedList</span><span class="token punctuation">(</span> xTicksToWait<span class="token punctuation">,</span> pdTRUE <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token function">traceTASK_NOTIFY_TAKE_BLOCK</span><span class="token punctuation">(</span> uxIndexToWait <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                    <span class="token comment">/* 悬起 PendSV中断 准备进行任务切换 */</span>
+                    <span class="token function">portYIELD_WITHIN_API</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token comment">/* 任务如果进入阻塞，在这段时间里，任务可能被
+		   发送通知的函数唤醒，唤醒则继续往下执行 */</span>
+
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+           <span class="token comment">/* 代码执行到这里有三种情况
+            1.一直没有接收到通知，任务阻塞超时被唤醒。
+            2.一进该函数通知值就不等于0，说明有通知，任务也不需要阻塞。
+            3.任务因没通知而阻塞，但是在该任务阻塞期间
+             有其他任务向该任务发送了通知，并唤醒该任务。*/</span>
+            
+            <span class="token function">traceTASK_NOTIFY_TAKE</span><span class="token punctuation">(</span> uxIndexToWait <span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token comment">/* 再次获取任务通知的通知值，如果等于0说明接收通知失败*/</span>
+            ulReturn <span class="token operator">=</span> pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span><span class="token punctuation">;</span>
+
+            <span class="token keyword">if</span><span class="token punctuation">(</span> ulReturn <span class="token operator">!=</span> <span class="token number">0UL</span> <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 接收通知成功
+                xClearCountOnExit == pdTRUE  通知值清0 ： 二值信号量
+                xClearCountOnExit == pdFALSE 通知值减一 ：计数信号量*/</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> xClearCountOnExit <span class="token operator">!=</span> pdFALSE <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                    pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token number">0UL</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">=</span> ulReturn <span class="token operator">-</span> <span class="token punctuation">(</span> <span class="token class-name">uint32_t</span> <span class="token punctuation">)</span> <span class="token number">1</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>	
+			<span class="token comment">/* 不论接收通知成功或者失败，都将任务通知的状态标记为未等待通知状态 */</span>
+            pxCurrentTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">=</span> taskNOT_WAITING_NOTIFICATION<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">return</span> ulReturn<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_TASK_NOTIFICATIONS */</span></span>
+<span class="token comment">/*-----------------------------------------------------------*/</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/5a/8d/Aa5Q3sM1_o.png" alt="在这里插入图片描述"><br> <strong>源码分析：</strong><br> <strong>1.如果任务没有通知的情况下，调用了接收通知函数，则将任务通知状态设置为等待通知状态，这样等调用发送通知函数的时候，就方便去唤醒该任务(有通知了，唤醒该任务去接收通知做后续处理)。</strong><br> <img src="https://images2.imgbox.com/03/24/cSTeMqak_o.png" alt="在这里插入图片描述"><br> <strong>2.下图也印证了上面发送通知函数的是否可以覆写的问题</strong><br> <img src="https://images2.imgbox.com/72/89/6AHIlLr4_o.png" alt="在这里插入图片描述"><br> <strong>用任务通知模拟的二值或者计数型信号量与真实的有何区别？<br> 真实的计数型信号量可以指定初始值，且有最大值，而模拟的初始值为0且不能设置最大值。</strong><br> <strong>自己对比一下：</strong><br> <a href="https://blog.csdn.net/k666499436/article/details/128732808?spm=1001.2014.3001.5502">FreeRTOS信号量详解</a></p> 
+<h3><a id="3xTaskNotifyWait_332"></a>3.接收任务通知函数xTaskNotifyWait()</h3> 
+<p><strong>该函数一般用来模拟队列或者事件组的接收，该函数可以在等待前和成功等待到任务通知后清除通知指定位，与消息队列不同的是在任务等待超时后任务通仍然可以获取通知值。但假设用该函数获取了一次通知值，但是没有清除通知值，等下次又调用该函数时会直接进入阻塞(因为判断是否有通知不是取决于通知是否不等于0(当然模拟信号量的确实以是否为0作为是否有通知的标准)，而是别的任务发送通知到该任务)。</strong></p> 
+<p><strong>当然xTaskNotifyWait()函数只是一个宏，真正调用的是xTaskGenericNotifyWait()函数.</strong></p> 
+<p><img src="https://images2.imgbox.com/b7/45/3Gj70rUX_o.png" alt="在这里插入图片描述"><br> <strong><mark>1.xTaskGenericNotifyWait()函数原型：</mark></strong><br> <img src="https://images2.imgbox.com/0c/0c/AVwD8DcY_o.png" alt="在这里插入图片描述"></p> 
+<ul><li> <p><strong>函数参数</strong><br> <strong>1.uxIndexToWaitOn ：任务的指定通知（任务通知相关数组下标）<br> 2.ulBitesToClearOnEntry： 等待前指定清零的任务通知通知值比特位<br> 3.ulBitesToClearOnExit ：成功等待后指定清零的任务通知通知值比特位<br> 4.pulNotificationValue ：要获取的通知值(队列消息或者事件组)<br> 5.xTicksToWait ：阻塞等待任务通知值的最大时间</strong></p> </li><li> <p><strong>函数返回值</strong><br> <strong>pdTRUE：等待任务通知成功<br> pdFALSE：等待任务通知失败</strong></p> </li></ul> 
+<p><strong><mark>xTaskGenericNotifyWait()函数源码：</mark></strong></p> 
+<pre><code class="prism language-c"><span class="token comment">/*-----------------------------------------------------------*/</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">if</span> <span class="token expression"><span class="token punctuation">(</span> configUSE_TASK_NOTIFICATIONS <span class="token operator">==</span> <span class="token number">1</span> <span class="token punctuation">)</span></span></span>
+
+    BaseType_t <span class="token function">xTaskGenericNotifyWait</span><span class="token punctuation">(</span> UBaseType_t uxIndexToWait<span class="token punctuation">,</span>
+                                       <span class="token class-name">uint32_t</span> ulBitsToClearOnEntry<span class="token punctuation">,</span>
+                                       <span class="token class-name">uint32_t</span> ulBitsToClearOnExit<span class="token punctuation">,</span>
+                                       <span class="token class-name">uint32_t</span> <span class="token operator">*</span> pulNotificationValue<span class="token punctuation">,</span>
+                                       TickType_t xTicksToWait <span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        BaseType_t xReturn<span class="token punctuation">;</span>
+        <span class="token comment">/* 不能数组越界 */</span>
+        <span class="token function">configASSERT</span><span class="token punctuation">(</span> uxIndexToWait <span class="token operator">&lt;</span> configTASK_NOTIFICATION_ARRAY_ENTRIES <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">/* 若不为等待接收通知状态，说明其他任务没有发送通知给该任务
+               如果设置了超时时间，则任务需要进入阻塞态 */</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> pxCurrentTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">!=</span> taskNOTIFICATION_RECEIVED <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 等待通知前清除任务通知值中的位，因为通知任务或中断可能会设置位。 这可用于将值清除为零。 */</span>
+                pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">&amp;=</span> <span class="token operator">~</span>ulBitsToClearOnEntry<span class="token punctuation">;</span>
+
+				<span class="token comment">/* 设置任务通知的状态为等待通知状态 */</span>
+                pxCurrentTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">=</span> taskWAITING_NOTIFICATION<span class="token punctuation">;</span>
+                <span class="token comment">/* 如果允许阻塞 */</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span> xTicksToWait <span class="token operator">&gt;</span> <span class="token punctuation">(</span> TickType_t <span class="token punctuation">)</span> <span class="token number">0</span> <span class="token punctuation">)</span>
+                <span class="token punctuation">{<!-- --></span>
+                
+				    <span class="token comment">/* 设置任务通知的状态为等待通知状态 */</span>
+                    <span class="token function">prvAddCurrentTaskToDelayedList</span><span class="token punctuation">(</span> xTicksToWait<span class="token punctuation">,</span> pdTRUE <span class="token punctuation">)</span><span class="token punctuation">;</span>
+                    <span class="token function">traceTASK_NOTIFY_WAIT_BLOCK</span><span class="token punctuation">(</span> uxIndexToWait <span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                    <span class="token comment">/* 悬起 PendSv中断，准备进行任务切换*/</span>
+                    <span class="token function">portYIELD_WITHIN_API</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+                <span class="token keyword">else</span>
+                <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">mtCOVERAGE_TEST_MARKER</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		<span class="token comment">/* 如果该任务被阻塞了，解除阻塞后继续从这往下执行 */</span> 
+		 
+        <span class="token function">taskENTER_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">{<!-- --></span>
+            <span class="token function">traceTASK_NOTIFY_WAIT</span><span class="token punctuation">(</span> uxIndexToWait <span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">/* 当代码执行到这里可能是以下三种情况：
+               1.前面的判断不成立，一进来就有通知任务不需要进入阻塞 
+               2.前面的判断成立，任务进入阻塞，但是有其他任务向该任务发送
+               通知并将该任务唤醒 
+               3.前面的判断处理，任务进入阻塞，但是阻塞超时                 任务被迫唤醒       
+            */</span>
+               
+            <span class="token keyword">if</span><span class="token punctuation">(</span> pulNotificationValue <span class="token operator">!=</span> <span class="token constant">NULL</span> <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* 输出当前通知值，该值可能已更改，也可能未更改
+                   未更改说明是任务是超时被唤醒的此时虽然能获取通知值
+                   但是通知值是上次的，其实是获取通知值失败的 */</span>
+                <span class="token operator">*</span>pulNotificationValue <span class="token operator">=</span> pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+
+            <span class="token comment">/*如果设置了 ucNotifyValue，则任务从未进入阻止状态
+            （因为通知已挂起）或任务由于通知被唤醒。 
+            否则，任务由于超时而解除阻止 */</span>
+            
+            <span class="token comment">/* 如果任务通知的状态还不等于等待接收通知状态的话
+            说明任务还是没有接收到通知任务只不过是超时被唤醒*/</span>
+            <span class="token keyword">if</span><span class="token punctuation">(</span> pxCurrentTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">!=</span> taskNOTIFICATION_RECEIVED <span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">/* A notification was not received. */</span>
+                xReturn <span class="token operator">=</span> pdFALSE<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">else</span>
+            <span class="token punctuation">{<!-- --></span>
+				<span class="token comment">/* 在成功接收到通知后将通知值的指定比特位清零 */</span>
+                pxCurrentTCB<span class="token operator">-&gt;</span>ulNotifiedValue<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">&amp;=</span> <span class="token operator">~</span>ulBitsToClearOnExit<span class="token punctuation">;</span>
+                xReturn <span class="token operator">=</span> pdTRUE<span class="token punctuation">;</span><span class="token number">1</span>
+            <span class="token punctuation">}</span>
+            <span class="token comment">/* 不论接收通知成功或者失败都将任务通知的状态标记为未等待通知状态*/</span>
+            pxCurrentTCB<span class="token operator">-&gt;</span>ucNotifyState<span class="token punctuation">[</span> uxIndexToWait <span class="token punctuation">]</span> <span class="token operator">=</span> taskNOT_WAITING_NOTIFICATION<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">taskEXIT_CRITICAL</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">return</span> xReturn<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">endif</span> <span class="token comment">/* configUSE_TASK_NOTIFICATIONS */</span></span>
+<span class="token comment">/*-----------------------------------------------------------*/</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/fc/5b/iSNMjMqV_o.png" alt="在这里插入图片描述"><br> <strong>源码我就分析了，直接看代码注释，一定要接收/发送两个通知函数一起分析，这样理解起来轻松多了，然后再对比一下ulTaskNotifyTake()与xTaskNotifyWait函数有何区别，其实他们最大的区别就是服务对象不一样，前者为模拟信号量服务，后着为队列,事件组服务。</strong></p> 
+<p><strong>1.模拟的队列与真实的队列有何区别？<br> (1).真实的队列可以容纳多个数据而且数据大小可以指定，而任务通知只有一个数据(32位的无符号整数)<br> (2).真实的队列，写队列时可以阻塞，任务通知则不能</strong></p> 
+<p><strong>与事件组的区别：</strong><br> <strong>其实你真正看懂源码，区别显而易见，留给你们的作业，哈哈哈哈哈哈哈</strong><br> <a href="https://blog.csdn.net/k666499436/article/details/130629291?spm=1001.2014.3001.5502">事件组详解</a></p> 
+<h2><a id="_463"></a>三.总结</h2> 
+<p><strong>发现学通了，都是有套路的，FreeRTOS全程都是一个风格，还怕研究不透嘛，只需将源码学透，接下来应用就是熟练度的问题了。</strong></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/42fa5d8782d70e39e9586e9674030073/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">【Tinker】踩坑之路（1）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5c0d80ea30e7b0a26f75eb01b7a6c050/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">奇怪的AndroidStudio报错--checkDebugAarMetadata--修改SDK版本为33成功修复</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

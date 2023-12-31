@@ -1,0 +1,1688 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>文件系统 | 以F2FS为具体操作系统的数据写流程 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="文件系统 | 以F2FS为具体操作系统的数据写流程" />
+<meta property="og:description" content="在前面的学习中，我们已经知道了一个文件的打开和读写时的系统调用过程，但是它们都在VFS层及之前，今天我们尝试以F2FS为具体操作系统，观察它的写入过程并着重观察F2FS冷热分流在其中的作用。这篇文章会比较长。
+数据写流程整体概览：
+首先我们要明确的是，在调用了write接口后，write的内容并不会一下子啪的一下就到磁盘上，而是通过操作系统中熟悉的脏页回写机制冲刷到磁盘上（见附推分享），所以，在write中的调用过程是不会下发bio的。
+write在vfs到具体文件系统是通过write_iter回调函数转接的，这个函数的主要作用是在数据写入之前进行预处理：
+static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from) { struct inode *inode = file_inode(iocb-&gt;ki_filp); const loff_t orig_pos = iocb-&gt;ki_pos; const size_t orig_count = iov_iter_count(from); loff_t target_size; bool dio; bool may_need_sync = true; int preallocated; ssize_t ret; ...... 对inode加锁 if (iocb-&gt;ki_flags &amp; IOCB_NOWAIT) { if (!inode_trylock(inode)) { ret = -EAGAIN; goto out; } } else { inode_lock(inode); } ret = f2fs_write_checks(iocb, from); // 做一些check if (ret &lt;= 0) goto out_unlock; /*！！dio 决定当前写是直接写到磁盘，还是写到缓存，dio=true将写直达 */ /* Determine whether we will do a direct write or a buffered write." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/864151c6d992f38f45c138ab0f6e5a12/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-04-12T18:48:11+08:00" />
+<meta property="article:modified_time" content="2023-04-12T18:48:11+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">文件系统 | 以F2FS为具体操作系统的数据写流程</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p>在前面的学习中，我们已经知道了一个文件的打开和读写时的系统调用过程，但是它们都在VFS层及之前，今天我们尝试<strong>以F2FS为具体操作系统，观察它的写入过程并着重观察F2FS冷热分流在其中的作用</strong>。这篇文章会比较长。</p> 
+ <p>数据写流程整体概览：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/cc/a1/VhjREo9V_o.png" alt="a18d50acd7376d0fd2b6ae37ba2ee2e0.png"></p> 
+ <p>首先我们要明确的是，在调用了write接口后，write的内容并不会一下子啪的一下就到磁盘上，而是通过操作系统中熟悉的脏页回写机制冲刷到磁盘上（见附推分享），所以，在write中的调用过程是不会下发bio的。<br></p> 
+ <p>write在vfs到具体文件系统是通过write_iter回调函数转接的，这个函数的主要作用是在数据写入之前进行预处理：</p> 
+ <pre class="has"><code class="language-cs">static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+  struct inode *inode = file_inode(iocb-&gt;ki_filp);
+  const loff_t orig_pos = iocb-&gt;ki_pos;
+  const size_t orig_count = iov_iter_count(from);
+  loff_t target_size;
+  bool dio;
+  bool may_need_sync = true;
+  int preallocated;
+  ssize_t ret;
+
+
+  ......
+  对inode加锁
+  if (iocb-&gt;ki_flags &amp; IOCB_NOWAIT) {
+    if (!inode_trylock(inode)) {
+      ret = -EAGAIN;
+      goto out;
+    }
+  } else {
+    inode_lock(inode);
+  }
+
+
+  ret = f2fs_write_checks(iocb, from); // 做一些check
+  if (ret &lt;= 0)
+    goto out_unlock;
+  /*！！dio 决定当前写是直接写到磁盘，还是写到缓存，dio=true将写直达 */
+  /* Determine whether we will do a direct write or a buffered write. */
+  dio = f2fs_should_use_dio(inode, iocb, from);
+  /* target_size = 文件当前写入位置+写入长度，即期望文件写入后位置
+  /* Possibly preallocate the blocks for the write. */
+  target_size = iocb-&gt;ki_pos + iov_iter_count(from);
+  /* 如果必要的话，为本次写请求预先申请空间，返回正数表明已经成功申请，
+  * 返回0表示没有需要预先申请的块，返回负数表示严重错误，如果inode的所有
+  * 请求的块都被申请，会设置FI_PREALLOCATED_ALL标志位
+  */
+  preallocated = f2fs_preallocate_blocks(iocb, from, dio);
+  if (preallocated &lt; 0) {
+    ret = preallocated; // 发生了严重错误
+  } else {
+    ......（trace相关）
+skip_write_trace:
+    /* Do the actual write. */
+    ret = dio ?
+      f2fs_dio_write_iter(iocb, from, &amp;may_need_sync): // dio为true以写直达方式写
+      f2fs_buffered_write_iter(iocb, from); // dio为false写到缓冲区
+
+
+    if (trace_f2fs_datawrite_end_enabled())
+      trace_f2fs_datawrite_end(inode, orig_pos, ret);
+  }
+
+
+  /* Don't leave any preallocated blocks around past i_size. */
+  if (preallocated &amp;&amp; i_size_read(inode) &lt; target_size) {
+    f2fs_down_write(&amp;F2FS_I(inode)-&gt;i_gc_rwsem[WRITE]);
+    filemap_invalidate_lock(inode-&gt;i_mapping);
+    if (!f2fs_truncate(inode))
+      file_dont_truncate(inode);
+    filemap_invalidate_unlock(inode-&gt;i_mapping);
+    f2fs_up_write(&amp;F2FS_I(inode)-&gt;i_gc_rwsem[WRITE]);
+  } else {
+    file_dont_truncate(inode);
+  }
+
+
+  clear_inode_flag(inode, FI_PREALLOCATED_ALL);
+out_unlock:
+  inode_unlock(inode);
+out:
+  trace_f2fs_file_write_iter(inode, orig_pos, orig_count, ret);
+  if (ret &gt; 0 &amp;&amp; may_need_sync)
+    ret = generic_write_sync(iocb, ret);
+  return ret;
+}</code></pre> 
+ <p>在第28行，通过函数f2fs_should_use_dio判断本次write应该写入到缓冲区或是直接提交到磁盘。这将决定着两种不同的处理方式。</p> 
+ <p>下面来分析一下36行中的函数：<br></p> 
+ <pre class="has"><code class="language-cpp">static int f2fs_preallocate_blocks(struct kiocb *iocb, struct iov_iter *iter,
+           bool dio)
+{
+  struct inode *inode = file_inode(iocb-&gt;ki_filp); // 获取inode
+  struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  const loff_t pos = iocb-&gt;ki_pos;
+  const size_t count = iov_iter_count(iter);
+  struct f2fs_map_blocks map = {};
+  int flag;
+  int ret;
+
+
+  /* If it will be an out-of-place direct write, don't bother. */
+  if (dio &amp;&amp; f2fs_lfs_mode(sbi))
+    return 0;
+  /*
+   * Don't preallocate holes aligned to DIO_SKIP_HOLES which turns into
+   * buffered IO, if DIO meets any holes.
+   */
+  if (dio &amp;&amp; i_size_read(inode) &amp;&amp;
+    (F2FS_BYTES_TO_BLK(pos) &lt; F2FS_BLK_ALIGN(i_size_read(inode))))
+    return 0;
+
+
+  /* No-wait I/O can't allocate blocks. */
+  if (iocb-&gt;ki_flags &amp; IOCB_NOWAIT)
+    return 0;
+
+
+  /* If it will be a short write, don't bother. */
+  if (fault_in_iov_iter_readable(iter, count))
+    return 0;
+
+
+  if (f2fs_has_inline_data(inode)) {
+    /* If the data will fit inline, don't bother. */
+    if (pos + count &lt;= MAX_INLINE_DATA(inode))
+      return 0;
+    ret = f2fs_convert_inline_inode(inode);
+    if (ret)
+      return ret;
+  }
+
+
+  /* Do not preallocate blocks that will be written partially in 4KB. */
+  map.m_lblk = F2FS_BLK_ALIGN(pos); // 根据当前文件偏移计算从第几个block开始写入
+  map.m_len = F2FS_BYTES_TO_BLK(pos + count); // 写入的终点块
+  if (map.m_len &gt; map.m_lblk)
+    map.m_len -= map.m_lblk; // 终点-起点=本次写入块数量
+  else
+    map.m_len = 0;
+  map.m_may_create = true;
+  if (dio) {
+    // 对于dio请求，在这里进行了冷热划分
+    map.m_seg_type = f2fs_rw_hint_to_seg_type(inode-&gt;i_write_hint);
+    flag = F2FS_GET_BLOCK_PRE_DIO; // flag设置为dio
+  } else {
+    map.m_seg_type = NO_CHECK_TYPE;
+    flag = F2FS_GET_BLOCK_PRE_AIO; // flag设置为aio
+  }
+
+
+  ret = f2fs_map_blocks(inode, &amp;map, 1, flag); // 进行初始化
+  /* -ENOSPC|-EDQUOT are fine to report the number of allocated blocks. */
+  if (ret &lt; 0 &amp;&amp; !((ret == -ENOSPC || ret == -EDQUOT) &amp;&amp; map.m_len &gt; 0))
+    return ret;
+  if (ret == 0)
+    set_inode_flag(inode, FI_PREALLOCATED_ALL);
+  return map.m_len;
+}
+---数据结构f2fs_map_blocks:
+struct f2fs_map_blocks {
+  struct block_device *m_bdev;  /* for multi-device dio */
+  block_t m_pblk;                /* 起始块物理地址 */
+  block_t m_lblk;                /* 起始块逻辑位置 */ 
+  unsigned int m_len;            /* 块数量 */
+  unsigned int m_flags;      /* 数据状态flag */
+  pgoff_t *m_next_pgofs;    /* 指向下一个offset point next possible non-hole pgofs */
+  pgoff_t *m_next_extent;    /* point to next possible extent */
+  int m_seg_type;        /*！！ 段的温度 */
+  bool m_may_create;    /* indicate it is from write path */
+  bool m_multidev_dio;    /* indicate it allows multi-device dio */
+};</code></pre> 
+ <p>接着在57行中，调用f2fs_map_blocks函数，尝试去找到和建立逻辑地址（文件偏移指针）找到对应的物理地址（block号）的映射关系，并在f2fs_map_blocks数据结构中返回<br></p> 
+ <p>f2fs_map_blocks是一个相当复杂的函数，作用是先根据逻辑地址将物理地址读取出来，如果这个物理地址没有被分配过，则初始化为新地址，用于下一步的磁盘写操作，核心逻辑如下：<br></p> 
+ <pre class="has"><code class="language-cpp">int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
+            int create, int flag)
+{
+  unsigned int maxblocks = map-&gt;m_len;
+
+
+  struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  int mode = create ? ALLOC_NODE : LOOKUP_NODE;
+
+
+  map-&gt;m_len = 0;
+  map-&gt;m_flags = 0;
+
+
+  pgofs =  (pgoff_t)map-&gt;m_lblk; // 获得文件访问偏移量
+  end = pgofs + maxblocks; // 获得需要读取的block的长度
+
+
+next_dnode:
+
+
+  set_new_dnode(&amp;dn, inode, NULL, NULL, 0); // 初始化dnode，dnode的作用是根据逻辑地址找到物理地址
+  
+  // 根据inode找到对应的f2fs_inode或者direct_node结构，然后通过pgofs(文件页偏移)获得物理地址，记录在dn中
+  err = f2fs_get_dnode_of_data(&amp;dn, pgofs, mode); 
+
+
+  start_pgofs = pgofs;
+  prealloc = 0;
+  last_ofs_in_node = ofs_in_node = dn.ofs_in_node;
+  end_offset = ADDRS_PER_PAGE(dn.node_page, inode);
+
+
+next_block:
+  // 根据dn获得物理地址，ofs_in_node表示这个物理地址位于当前node的第几个数据块
+  // 如 f2fs_inode-&gt;i_addr[3]，那么dn.ofs_in_node=3
+  blkaddr = datablock_addr(dn.inode, dn.node_page, dn.ofs_in_node); 
+  ...
+  if (__is_valid_data_blkaddr(blkaddr)) { // 存在旧数据
+    /* use out-place-update for driect IO under LFS mode */
+    if (f2fs_lfs_mode(sbi) &amp;&amp; flag == F2FS_GET_BLOCK_DIO &amp;&amp;
+              map-&gt;m_may_create) {
+      err = __allocate_data_block(&amp;dn, map-&gt;m_seg_type); // 按照m_seg_type分配数据块
+      if (err)
+        goto sync_out;
+      blkaddr = dn.data_blkaddr;
+      set_inode_flag(inode, FI_APPEND_WRITE); // 采用追加写
+    }
+  } else { // 不存在旧数据
+    if (create) {
+      if (unlikely(f2fs_cp_error(sbi))) {
+        err = -EIO;
+        goto sync_out;
+      }
+      if (flag == F2FS_GET_BLOCK_PRE_AIO) {
+        if (blkaddr == NULL_ADDR) {
+          prealloc++; // 记录有多少个预分配block
+          last_ofs_in_node = dn.ofs_in_node;
+        }
+      } else {
+        WARN_ON(flag != F2FS_GET_BLOCK_PRE_DIO &amp;&amp;
+          flag != F2FS_GET_BLOCK_DIO);
+        err = __allocate_data_block(&amp;dn,
+              map-&gt;m_seg_type); // DIO按照m_seg_type分配块
+        if (!err) {
+          if (flag == F2FS_GET_BLOCK_PRE_DIO)
+            file_need_truncate(inode);
+          set_inode_flag(inode, FI_APPEND_WRITE);
+        }
+      }
+     ......
+  }
+  ......
+  // 记录处理了多少个block
+  dn.ofs_in_node++; 
+  pgofs++;
+  ......
+  // 这里表示已经处理到最后一个block了
+  if (flag == F2FS_GET_BLOCK_PRE_AIO &amp;&amp;
+      (pgofs == end || dn.ofs_in_node == end_offset)) {
+
+
+    dn.ofs_in_node = ofs_in_node; // 回到第一个block
+    err = f2fs_reserve_new_blocks(&amp;dn, prealloc); // 通过这个函数将其地址设置为NEW_ADDR
+    map-&gt;m_len += dn.ofs_in_node - ofs_in_node;
+    dn.ofs_in_node = end_offset;
+  } 
+  ...
+  if (pgofs &gt;= end)
+    goto sync_out; // 表示已经全部处理完，可以退出这个函数了
+  else if (dn.ofs_in_node &lt; end_offset)
+    goto next_block; // goto式循环，每执行上面的流程就处理一个block，如果没有处理所有用户写入的block，那么回去继续处理
+  ...
+sync_out:
+  ...
+out:
+  return err;
+}</code></pre> 
+ <p>根据是否为dio，最终处理路径发生变化，若为aio，实际使用f2fs_buffered_write_iter函数处理，若为dio，实际使用f2fs_dio_write_iter函数处理。</p> 
+ <p>首先看aio的情况：</p> 
+ <pre class="has"><code class="language-cs">aio:
+static ssize_t f2fs_buffered_write_iter(struct kiocb *iocb,
+          struct iov_iter *from)
+{
+  struct file *file = iocb-&gt;ki_filp;
+  struct inode *inode = file_inode(file);
+  ssize_t ret;
+
+
+  if (iocb-&gt;ki_flags &amp; IOCB_NOWAIT)
+    return -EOPNOTSUPP;
+
+
+  current-&gt;backing_dev_info = inode_to_bdi(inode); // FLUSH时使用
+  ret = generic_perform_write(file, from, iocb-&gt;ki_pos);
+  current-&gt;backing_dev_info = NULL;
+
+
+  if (ret &gt; 0) {
+    iocb-&gt;ki_pos += ret;
+    f2fs_update_iostat(F2FS_I_SB(inode), APP_BUFFERED_IO, ret);
+  }
+  return ret;
+}
+--- 实际上起作用的函数是generic_perform_write
+ssize_t generic_perform_write(struct file *file,
+        struct iov_iter *i, loff_t pos)
+{
+  struct address_space *mapping = file-&gt;f_mapping;
+  const struct address_space_operations *a_ops = mapping-&gt;a_ops;
+  long status = 0;
+  ssize_t written = 0; // 已写的字节数
+  unsigned int flags = 0;
+
+
+  do {
+    struct page *page;
+    unsigned long offset;  /* Offset into pagecache page 页面中偏移 */
+    unsigned long bytes;  /* Bytes to write to page 要写到页面的字节数 */
+    size_t copied;    /* Bytes copied from user 从用户空间复制过来的字节数 */
+    void *fsdata;
+
+
+    offset = (pos &amp; (PAGE_SIZE - 1)); // 计算页内偏移
+    bytes = min_t(unsigned long, PAGE_SIZE - offset,
+            iov_iter_count(i)); // 要写到页面的字节数不能超过页面剩下的字节数
+
+
+again:
+    /*
+     * Bring in the user page that we will copy from _first_.
+     * Otherwise there's a nasty deadlock on copying from the
+     * same page as we're writing to, without it being marked
+     * up-to-date.
+     */
+    if (unlikely(fault_in_iov_iter_readable(i, bytes))) {
+      status = -EFAULT;
+      break;
+    }
+
+
+    if (fatal_signal_pending(current)) {
+      status = -EINTR;
+      break;
+    }
+    // 准备写file，地址空间mapping，从pos开始，写bytes长度，页面分配完成的结果放在page指针中
+    status = a_ops-&gt;write_begin(file, mapping, pos, bytes, flags,
+            &amp;page, &amp;fsdata); // 调用address_space的write_begin通知具体操作系统
+    if (unlikely(status &lt; 0))
+      break;
+
+
+    if (mapping_writably_mapped(mapping))
+      flush_dcache_page(page);
+    // 将数据从用户空间复制到页面中，并且会移动iov_iter
+    copied = copy_page_from_iter_atomic(page, offset, bytes, i);
+    flush_dcache_page(page);// 将包含用户数据的page加入到page cache中，等待系统触发writeback的时候回写
+    // 复制完毕，调用write_end通知具体文件系统，数据已复制到页面，可以提交磁盘
+    status = a_ops-&gt;write_end(file, mapping, pos, bytes, copied,
+            page, fsdata);
+    if (unlikely(status != copied)) { // 正常情况下，返回status为copied
+      iov_iter_revert(i, copied - max(status, 0L));
+      if (unlikely(status &lt; 0))
+        break;
+    }
+    cond_resched();
+
+
+    if (unlikely(status == 0)) {
+      /*
+       * A short copy made -&gt;write_end() reject the
+       * thing entirely.  Might be memory poisoning
+       * halfway through, might be a race with munmap,
+       * might be severe memory pressure.
+       */
+      if (copied)
+        bytes = copied;
+      goto again;
+    }
+    pos += status;
+    written += status;
+
+
+    balance_dirty_pages_ratelimited(mapping);
+  } while (iov_iter_count(i)); // 分批处理迭代器中的字节，直到处理完毕退出循环
+
+
+  return written ? written : status;
+}</code></pre> 
+ <p>总体上来说，就是调用了write_begin，把数据复制到page，再调用write_end三个步骤。<br></p> 
+ <pre class="has"><code class="language-cpp">static int f2fs_write_begin(struct file *file, struct address_space *mapping,
+    loff_t pos, unsigned len, unsigned flags,
+    struct page **pagep, void **fsdata)
+{
+  struct inode *inode = mapping-&gt;host;
+  struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  struct page *page = NULL;
+  pgoff_t index = ((unsigned long long) pos) &gt;&gt; PAGE_SHIFT;
+  bool need_balance = false, drop_atomic = false;
+  block_t blkaddr = NULL_ADDR;
+  int err = 0;
+
+
+......
+
+
+repeat:
+  /*
+   * Do not use grab_cache_page_write_begin() to avoid deadlock due to
+   * wait_for_stable_page. Will wait that below with our IO control.
+   */
+  page = f2fs_pagecache_get_page(mapping, index,
+        FGP_LOCK | FGP_WRITE | FGP_CREAT, GFP_NOFS); // 第一步创建或者获取page cache
+  if (!page) {
+    err = -ENOMEM;
+    goto fail;
+  }
+
+
+  /* TODO: cluster can be compressed due to race with .writepage */
+
+
+  *pagep = page;
+
+
+  err = prepare_write_begin(sbi, page, pos, len,
+          &amp;blkaddr, &amp;need_balance); // 根据页偏移获取对应的物理地址存在blkaddr中
+  if (err)
+    goto fail;
+
+
+  if (need_balance &amp;&amp; !IS_NOQUOTA(inode) &amp;&amp;
+      has_not_enough_free_secs(sbi, 0, 0)) {
+    unlock_page(page);
+    f2fs_balance_fs(sbi, true); // 前台GC，平衡脏节点和目录项页面，也控制垃圾回收，如果没有free_secs，则开始垃圾回收
+    lock_page(page);
+    if (page-&gt;mapping != mapping) {
+      /* The page got truncated from under us */
+      f2fs_put_page(page, 1);
+      goto repeat;
+    }
+  }
+  // 如果PageWriteback设置了, 那么当前线程就要调用
+  // wait_on_page_writeback 函数, 然后进入一个while循环判断,
+  // 如果依然被置位,那么你就被仍在队列中接着睡觉, 否则进入下个竞争过程.
+  // 在对一个页开始写前，都需要调用此函数
+  f2fs_wait_on_page_writeback(page, DATA, false, true);
+
+
+  if (len == PAGE_SIZE || PageUptodate(page))
+    return 0; // 需要写入的长度为一页或者页面已经是最新
+
+
+  if (!(pos &amp; (PAGE_SIZE - 1)) &amp;&amp; (pos + len) &gt;= i_size_read(inode) &amp;&amp;
+      !f2fs_verity_in_progress(inode)) {
+    zero_user_segment(page, len, PAGE_SIZE);
+    return 0;
+  }
+
+
+  if (blkaddr == NEW_ADDR) { // 物理地址是新分配地址
+    zero_user_segment(page, 0, PAGE_SIZE); // 直接用0填充
+    SetPageUptodate(page); // 标记页为最新
+  } else { // 可能是覆盖写的情况
+    if (!f2fs_is_valid_blkaddr(sbi, blkaddr,
+        DATA_GENERIC_ENHANCE_READ)) { // 不是有效地址，报错
+      err = -EFSCORRUPTED;
+      goto fail;
+    }
+    err = f2fs_submit_page_read(inode, page, blkaddr, 0, true); // 把这一页从磁盘里读出来
+    if (err)
+      goto fail;
+
+
+    lock_page(page);
+    if (unlikely(page-&gt;mapping != mapping)) {
+      f2fs_put_page(page, 1);
+      goto repeat;
+    }
+    if (unlikely(!PageUptodate(page))) {
+      err = -EIO;
+      goto fail;
+    }
+  }
+  return 0;
+
+
+fail:
+  f2fs_put_page(page, 1);
+  f2fs_write_failed(inode, pos + len);
+  if (drop_atomic)
+    f2fs_drop_inmem_pages_all(sbi, false);
+  return err;
+}</code></pre> 
+ <p>完成数据复制后，调用write_end函数：</p> 
+ <pre class="has"><code class="language-cpp">static int f2fs_write_end(struct file *file,
+      struct address_space *mapping,
+      loff_t pos, unsigned len, unsigned copied,
+      struct page *page, void *fsdata)
+{
+  struct inode *inode = page-&gt;mapping-&gt;host;
+
+
+  /*
+   * This should be come from len == PAGE_SIZE, and we expect copied
+   * should be PAGE_SIZE. Otherwise, we treat it with zero copied and
+   * let generic_perform_write() try to copy data again through copied=0.
+   */
+  if (!PageUptodate(page)) { // 判断页面是否已为最新
+    if (unlikely(copied != len))
+      copied = 0;
+    else
+      SetPageUptodate(page);  // 设置页面为最新
+  }
+
+
+  if (!copied)
+    goto unlock_out;
+
+
+  set_page_dirty(page); // 标记为脏页，会加入到inode-&gt;mapping的基树中，等待系统回写
+
+
+  if (pos + copied &gt; i_size_read(inode) &amp;&amp;
+      !f2fs_verity_in_progress(inode))
+    f2fs_i_size_write(inode, pos + copied); // 更新文件大小
+unlock_out:
+  f2fs_put_page(page, 1);
+  f2fs_update_time(F2FS_I_SB(inode), REQ_TIME); // 更新修改时间
+  return copied;
+}</code></pre> 
+ <p>在23行的set_page_dirty中，最终还是会落实到aops中的set_page_dirty函数中，最后实际由f2fs_set_data_page_dirty函数执行。</p> 
+ <pre class="has"><code class="language-cs">static int f2fs_set_data_page_dirty(struct page *page)
+{
+  struct inode *inode = page_file_mapping(page)-&gt;host;
+
+
+  trace_f2fs_set_page_dirty(page, DATA);
+
+
+  if (!PageUptodate(page))
+    SetPageUptodate(page); // 要设置为脏页的时候，页面已经是最新了
+  if (PageSwapCache(page))
+    return __set_page_dirty_nobuffers(page);
+
+
+  if (f2fs_is_atomic_file(inode) &amp;&amp; !f2fs_is_commit_atomic_write(inode)) {
+    if (!page_private_atomic(page)) {
+      f2fs_register_inmem_page(inode, page);
+      return 1;
+    }
+    /*
+     * Previously, this page has been registered, we just
+     * return here.
+     */
+    return 0;
+  }
+
+
+  if (!PageDirty(page)) {
+    __set_page_dirty_nobuffers(page);
+    // -&gt; __set_page_dirty_nobuffers -&gt; __set_page_dirty 设置page和inode为脏
+    f2fs_update_dirty_page(inode, page);
+    // -&gt; inode_inc_dirty_pages F2FS_I(inode)-&gt;dirty_pages值加1，之后有用
+    return 1;
+  }
+  return 0;
+}</code></pre> 
+ <p>write操作完成后，实际上数据仍然在内存中，需要等待脏页回写时，才会被写到磁盘上。脏页回写机制见附推，我们这里主要关注F2FS实际干了什么。</p> 
+ <p>vfs最终调用f2fs_write_data_pages处理数据页面回写的操作。<br></p> 
+ <pre class="has"><code class="language-cs">static int f2fs_write_data_pages(struct address_space *mapping,
+          struct writeback_control *wbc)
+{
+  struct inode *inode = mapping-&gt;host;
+
+
+  return __f2fs_write_data_pages(mapping, wbc,
+      F2FS_I(inode)-&gt;cp_task == current ?
+      FS_CP_DATA_IO : FS_DATA_IO);
+}
+---
+static int __f2fs_write_data_pages(struct address_space *mapping,
+            struct writeback_control *wbc,
+            enum iostat_type io_type)
+{
+  struct inode *inode = mapping-&gt;host;
+  struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  struct blk_plug plug;
+  int ret;
+  bool locked = false;
+
+
+  /* deal with chardevs and other special file */
+  if (!mapping-&gt;a_ops-&gt;writepage)
+    return 0;
+
+
+  /* skip writing if there is no dirty page in this inode */
+  if (!get_dirty_pages(inode) &amp;&amp; wbc-&gt;sync_mode == WB_SYNC_NONE)
+    return 0;
+
+
+  /* during POR, we don't need to trigger writepage at all. */
+  if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
+    goto skip_write;
+
+
+  if ((S_ISDIR(inode-&gt;i_mode) || IS_NOQUOTA(inode)) &amp;&amp;
+      wbc-&gt;sync_mode == WB_SYNC_NONE &amp;&amp;
+      get_dirty_pages(inode) &lt; nr_pages_to_skip(sbi, DATA) &amp;&amp;
+      f2fs_available_free_memory(sbi, DIRTY_DENTS))
+    goto skip_write;
+
+
+  /* skip writing in file defragment preparing stage */
+  if (is_inode_flag_set(inode, FI_SKIP_WRITES))
+    goto skip_write;
+
+
+  trace_f2fs_writepages(mapping-&gt;host, wbc, DATA);
+
+
+  /* to avoid spliting IOs due to mixed WB_SYNC_ALL and WB_SYNC_NONE */
+  if (wbc-&gt;sync_mode == WB_SYNC_ALL)
+    atomic_inc(&amp;sbi-&gt;wb_sync_req[DATA]);
+  else if (atomic_read(&amp;sbi-&gt;wb_sync_req[DATA])) {
+    /* to avoid potential deadlock */
+    if (current-&gt;plug)
+      blk_finish_plug(current-&gt;plug);
+    goto skip_write;
+  }
+
+
+  if (__should_serialize_io(inode, wbc)) {
+    mutex_lock(&amp;sbi-&gt;writepages);
+    locked = true;
+  }
+
+
+  blk_start_plug(&amp;plug);
+  ret = f2fs_write_cache_pages(mapping, wbc, io_type); // 取出需要回写的page，然后写入
+  blk_finish_plug(&amp;plug);
+
+
+  if (locked)
+    mutex_unlock(&amp;sbi-&gt;writepages);
+
+
+  if (wbc-&gt;sync_mode == WB_SYNC_ALL)
+    atomic_dec(&amp;sbi-&gt;wb_sync_req[DATA]);
+  /*
+   * if some pages were truncated, we cannot guarantee its mapping-&gt;host
+   * to detect pending bios.
+   */
+
+
+  f2fs_remove_dirty_inode(inode); // 写入后将inode从dirty标志清除，即不需要再回写
+  return ret;
+
+
+skip_write:
+  wbc-&gt;pages_skipped += get_dirty_pages(inode);
+  trace_f2fs_writepages(mapping-&gt;host, wbc, DATA);
+  return 0;
+}</code></pre> 
+ <p>这个函数实际上进行了许多判断后，由f2fs_write_cache_pages函数来干活。</p> 
+ <pre class="has"><code class="language-cpp">--- 入参数据结构writeback_control 
+/*
+ * A control structure which tells the writeback code what to do.  These are
+ * always on the stack, and hence need no locking.  They are always initialised
+ * in a manner such that unspecified fields are set to zero.
+ */
+struct writeback_control {
+  long nr_to_write;    /* Write this many pages, and decrement
+             this for each page written */
+  long pages_skipped;    /* Pages which were not written */
+
+
+  /*
+   * For a_ops-&gt;writepages(): if start or end are non-zero then this is
+   * a hint that the filesystem need only write out the pages inside that
+   * byterange.  The byte at `end' is included in the writeout request.
+   */
+  loff_t range_start;
+  loff_t range_end;
+
+
+  enum writeback_sync_modes sync_mode;
+
+
+  unsigned for_kupdate:1;    /* A kupdate writeback */
+  unsigned for_background:1;  /* A background writeback */
+  unsigned tagged_writepages:1;  /* tag-and-write to avoid livelock */
+  unsigned for_reclaim:1;    /* Invoked from the page allocator */
+  unsigned range_cyclic:1;  /* range_start is cyclic */
+  unsigned for_sync:1;    /* sync(2) WB_SYNC_ALL writeback */
+  ......
+};
+---
+/* 这里说，这个函数基本上是抄的，主要修改就是区分了热度
+ * This function was copied from write_cche_pages from mm/page-writeback.c.
+ * The major change is making write step of cold data page separately from
+ * warm/hot data page.
+ */
+static int f2fs_write_cache_pages(struct address_space *mapping,
+          struct writeback_control *wbc,
+          enum iostat_type io_type)
+{
+  int ret = 0;
+  int done = 0, retry = 0;
+  struct pagevec pvec;
+  struct f2fs_sb_info *sbi = F2FS_M_SB(mapping);
+  struct bio *bio = NULL;
+  sector_t last_block;
+
+
+  int nr_pages;
+  pgoff_t index;
+  pgoff_t end;    /* Inclusive */
+  pgoff_t done_index;
+  int range_whole = 0;
+  xa_mark_t tag;
+  int nwritten = 0;
+  int submitted = 0;
+  int i;
+
+
+  pagevec_init(&amp;pvec); // 这是一个用于装载page的数组，数组大小是15个page
+
+
+  if (get_dirty_pages(mapping-&gt;host) &lt;=
+        SM_I(F2FS_M_SB(mapping))-&gt;min_hot_blocks)
+    set_inode_flag(mapping-&gt;host, FI_HOT_DATA); 
+    // min_hot_blocks默认值为16，少于16页（一个块=一页）认为文件是热的。
+  else
+    clear_inode_flag(mapping-&gt;host, FI_HOT_DATA);
+
+
+  if (wbc-&gt;range_cyclic) {
+    index = mapping-&gt;writeback_index; /* prev offset */
+    end = -1; // 循环冲刷
+  } else {
+    index = wbc-&gt;range_start &gt;&gt; PAGE_SHIFT; // 冲刷开始页索引
+    end = wbc-&gt;range_end &gt;&gt; PAGE_SHIFT; // 冲刷结束页索引
+    if (wbc-&gt;range_start == 0 &amp;&amp; wbc-&gt;range_end == LLONG_MAX)
+      range_whole = 1; // 0~LLONG_MAX
+  }
+  if (wbc-&gt;sync_mode == WB_SYNC_ALL || wbc-&gt;tagged_writepages)
+    tag = PAGECACHE_TAG_TOWRITE; // 标记page属性
+  else
+    tag = PAGECACHE_TAG_DIRTY;
+retry:
+  retry = 0;
+  if (wbc-&gt;sync_mode == WB_SYNC_ALL || wbc-&gt;tagged_writepages)
+    tag_pages_for_writeback(mapping, index, end); 
+    // 将index-&gt;end范围内的PAGECACHE_TAG_DIRTY修改为PAGECACHE_TAG_TOWRITE，作用是SYNC模式下必须全部回写到磁盘
+  done_index = index;
+  while (!done &amp;&amp; !retry &amp;&amp; (index &lt;= end)) {
+    // 从mapping中取出tag类型的15个page，装载到pvec中
+    nr_pages = pagevec_lookup_range_tag(&amp;pvec, mapping, &amp;index, end,
+        tag);
+    if (nr_pages == 0)
+      break;
+
+
+    for (i = 0; i &lt; nr_pages; i++) {
+      struct page *page = pvec.pages[i];
+      bool need_readd;
+readd:
+      need_readd = false;
+      /* give a priority to WB_SYNC threads */
+      if (atomic_read(&amp;sbi-&gt;wb_sync_req[DATA]) &amp;&amp;
+          wbc-&gt;sync_mode == WB_SYNC_NONE) {
+        done = 1;
+        break;
+      }
+
+
+      done_index = page-&gt;index;
+retry_write:
+      lock_page(page);
+
+
+      if (unlikely(page-&gt;mapping != mapping)) {
+continue_unlock:
+        unlock_page(page);
+        continue;
+      }
+
+
+      if (!PageDirty(page)) {
+        /* someone wrote it for us 页面已经不脏了 */
+        goto continue_unlock;
+      }
+
+
+      if (PageWriteback(page)) { // 页面正在回写
+        if (wbc-&gt;sync_mode != WB_SYNC_NONE)
+          f2fs_wait_on_page_writeback(page,
+              DATA, true, true);
+        else
+          goto continue_unlock;
+      }
+
+
+      if (!clear_page_dirty_for_io(page)) // 清除脏页标记，如果page之前是脏的，返回true，不会进入if结构体内
+        goto continue_unlock;
+
+
+      // 写page，是否提交merge标记submmitted
+      ret = f2fs_write_single_data_page(page, &amp;submitted,
+          &amp;bio, &amp;last_block, wbc, io_type,
+          0, true); // 真正执行写入操作的函数
+      if (ret == AOP_WRITEPAGE_ACTIVATE)
+        unlock_page(page);
+
+
+      nwritten += submitted; // submitted的取值为0或1，记录提交数
+      wbc-&gt;nr_to_write -= submitted; // 剩余应提交数
+
+
+      if (unlikely(ret)) {
+        /*
+         * keep nr_to_write, since vfs uses this to
+         * get # of written pages.
+         */
+        if (ret == AOP_WRITEPAGE_ACTIVATE) {
+          ret = 0;
+          goto next;
+        } else if (ret == -EAGAIN) {
+          ret = 0;
+          if (wbc-&gt;sync_mode == WB_SYNC_ALL) {
+            f2fs_io_schedule_timeout(
+              DEFAULT_IO_TIMEOUT);
+            goto retry_write;
+          }
+          goto next;
+        }
+        done_index = page-&gt;index + 1;
+        done = 1;
+        break;
+      }
+
+
+      if (wbc-&gt;nr_to_write &lt;= 0 &amp;&amp;
+          wbc-&gt;sync_mode == WB_SYNC_NONE) {
+         /*
+          enum writeback_sync_modes {
+          WB_SYNC_NONE,  // Don't wait on anything 不等
+          WB_SYNC_ALL,  // Wait on every mapping 需要等待所有冲刷完成
+          };
+         设置为 NONE的话，写完就跑 */
+        done = 1;
+        break;
+      }
+next:
+      if (need_readd)
+        goto readd;
+    }
+    pagevec_release(&amp;pvec); // 释放掉pvec
+    cond_resched();
+  }
+
+
+  if (retry) {
+    index = 0;
+    end = -1;
+    goto retry;
+  }
+  if (wbc-&gt;range_cyclic &amp;&amp; !done)
+    done_index = 0;
+  if (wbc-&gt;range_cyclic || (range_whole &amp;&amp; wbc-&gt;nr_to_write &gt; 0))
+    mapping-&gt;writeback_index = done_index;
+
+
+  if (nwritten)
+    // page通过一些函数后，会放入到bio中，然后提交到磁盘。
+    // f2fs的机制是不会马上提交bio，需要等到bio包含了一定数目的page之后才会提交
+    // 因此这个函数作用是，只要有提交到merge的，强制提交bio，需要与磁盘同步
+    f2fs_submit_merged_write_cond(F2FS_M_SB(mapping), mapping-&gt;host,
+                NULL, 0, DATA);
+  /* submit cached bio of IPU write */
+  if (bio)
+    f2fs_submit_merged_ipu_write(sbi, &amp;bio, NULL);
+
+
+  return ret;
+}</code></pre> 
+ <p>f2fs_write_single_data_page函数根据写入的文件类型（目录文件、内联文件、普通文件），选择不同的方法进行写入。</p> 
+ <pre class="has"><code class="language-cpp">int f2fs_write_single_data_page(struct page *page, int *submitted,
+        struct bio **bio,
+        sector_t *last_block,
+        struct writeback_control *wbc,
+        enum iostat_type io_type,
+        int compr_blocks,
+        bool allow_balance)
+{
+  struct inode *inode = page-&gt;mapping-&gt;host;
+  struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  loff_t i_size = i_size_read(inode);
+  const pgoff_t end_index = ((unsigned long long)i_size)
+              &gt;&gt; PAGE_SHIFT;
+  loff_t psize = (loff_t)(page-&gt;index + 1) &lt;&lt; PAGE_SHIFT;
+  unsigned offset = 0;
+  bool need_balance_fs = false;
+  int err = 0;
+  // 该数据结构记录了写入的信息，important
+  struct f2fs_io_info fio = {
+    .sbi = sbi, 
+    .ino = inode-&gt;i_ino, 
+    .type = DATA, 
+    .op = REQ_OP_WRITE, // op在此处定义
+    .op_flags = wbc_to_write_flags(wbc),
+    .old_blkaddr = NULL_ADDR, // 记录旧地址
+    .page = page, // 即将写入的page
+    .encrypted_page = NULL,
+    .submitted = false,
+    .compr_blocks = compr_blocks,
+    .need_lock = LOCK_RETRY,
+    .io_type = io_type,
+    .io_wbc = wbc,
+    .bio = bio,
+    .last_block = last_block,
+  };
+
+
+  trace_f2fs_writepage(page, DATA);
+
+
+  /* we should bypass data pages to proceed the kworkder jobs */
+  if (unlikely(f2fs_cp_error(sbi))) {
+    mapping_set_error(page-&gt;mapping, -EIO);
+    /*
+     * don't drop any dirty dentry pages for keeping lastest
+     * directory structure.
+     */
+    if (S_ISDIR(inode-&gt;i_mode))
+      goto redirty_out;
+    goto out;
+  }
+
+
+  if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
+    goto redirty_out;
+
+
+  if (page-&gt;index &lt; end_index ||
+      f2fs_verity_in_progress(inode) ||
+      compr_blocks)
+    goto write;
+
+
+  /*
+   * If the offset is out-of-range of file size,
+   * this page does not have to be written to disk.
+   */
+  offset = i_size &amp; (PAGE_SIZE - 1);
+  if ((page-&gt;index &gt;= end_index + 1) || !offset)
+    goto out;
+
+
+  zero_user_segment(page, offset, PAGE_SIZE);
+write:
+  if (f2fs_is_drop_cache(inode))
+    goto out;
+  /* we should not write 0'th page having journal header */
+  if (f2fs_is_volatile_file(inode) &amp;&amp; (!page-&gt;index ||
+      (!wbc-&gt;for_reclaim &amp;&amp;
+      f2fs_available_free_memory(sbi, BASE_CHECK))))
+    goto redirty_out;
+
+
+  /* Dentry/quota blocks are controlled by checkpoint */
+  if (S_ISDIR(inode-&gt;i_mode) || IS_NOQUOTA(inode)) {
+    // 针对目录文件的写法
+    /*
+     * We need to wait for node_write to avoid block allocation during
+     * checkpoint. This can only happen to quota writes which can cause
+     * the below discard race condition.
+     */
+    if (IS_NOQUOTA(inode))
+      f2fs_down_read(&amp;sbi-&gt;node_write);
+
+
+    fio.need_lock = LOCK_DONE;
+    err = f2fs_do_write_data_page(&amp;fio);
+
+
+    if (IS_NOQUOTA(inode))
+      f2fs_up_read(&amp;sbi-&gt;node_write);
+
+
+    goto done;
+  }
+
+
+  if (!wbc-&gt;for_reclaim)
+    need_balance_fs = true;
+  else if (has_not_enough_free_secs(sbi, 0, 0))
+    goto redirty_out;
+  else
+    set_inode_flag(inode, FI_HOT_DATA);
+
+
+  err = -EAGAIN;
+  if (f2fs_has_inline_data(inode)) {
+    // 针对内联文件的写法
+    err = f2fs_write_inline_data(inode, page);
+    if (!err)
+      goto out;
+  }
+
+
+  if (err == -EAGAIN) {
+    // 普通文件的方法
+    err = f2fs_do_write_data_page(&amp;fio);
+    if (err == -EAGAIN) {
+      // 重试，增加锁要求
+      fio.need_lock = LOCK_REQ;
+      err = f2fs_do_write_data_page(&amp;fio);
+    }
+  }
+
+
+  if (err) {
+    file_set_keep_isize(inode);
+  } else {
+    spin_lock(&amp;F2FS_I(inode)-&gt;i_size_lock);
+    if (F2FS_I(inode)-&gt;last_disk_size &lt; psize)
+      F2FS_I(inode)-&gt;last_disk_size = psize;
+    spin_unlock(&amp;F2FS_I(inode)-&gt;i_size_lock);
+  }
+
+
+done:
+  if (err &amp;&amp; err != -ENOENT)
+    goto redirty_out;
+
+
+out:
+  inode_dec_dirty_pages(inode); // 每写入一个page，将inode的一个dirty计数-1
+  if (err) {
+    ClearPageUptodate(page);
+    clear_page_private_gcing(page);
+  }
+
+
+  if (wbc-&gt;for_reclaim) {
+    f2fs_submit_merged_write_cond(sbi, NULL, page, 0, DATA);
+    clear_inode_flag(inode, FI_HOT_DATA);
+    f2fs_remove_dirty_inode(inode);
+    submitted = NULL;
+  }
+  unlock_page(page);
+  if (!S_ISDIR(inode-&gt;i_mode) &amp;&amp; !IS_NOQUOTA(inode) &amp;&amp;
+      !F2FS_I(inode)-&gt;cp_task &amp;&amp; allow_balance)
+    f2fs_balance_fs(sbi, need_balance_fs); //GC
+
+
+  if (unlikely(f2fs_cp_error(sbi))) {
+    f2fs_submit_merged_write(sbi, DATA);
+    f2fs_submit_merged_ipu_write(sbi, bio, NULL);
+    submitted = NULL;
+  }
+
+
+  if (submitted)
+    *submitted = fio.submitted ? 1 : 0; 
+    // 如果在本函数中没有调用过f2fs_submit_merged_write这样的函数
+    // 则它们应该在外层函数中被调用，需要返回1
+  return 0;
+
+
+redirty_out:
+  redirty_page_for_writepage(wbc, page);
+  /*
+   * pageout() in MM traslates EAGAIN, so calls handle_write_error()
+   * -&gt; mapping_set_error() -&gt; set_bit(AS_EIO, ...).
+   * file_write_and_wait_range() will see EIO error, which is critical
+   * to return value of fsync() followed by atomic_write failure to user.
+   */
+  if (!err || wbc-&gt;for_reclaim)
+    return AOP_WRITEPAGE_ACTIVATE;
+  unlock_page(page);
+  return err;
+}</code></pre> 
+ <p>主要跟踪一个普通函数的读写，12行中函数的作用是根据系统的状态选择就地更新数据(inplace update)还是异地更新数据(outplace update)。一般情况下，系统只会在磁盘空间比较满的时候选择就地更新策略，避免触发过多的gc影响性能：</p> 
+ <pre class="has"><code class="language-php">int f2fs_do_write_data_page(struct f2fs_io_info *fio)
+{
+  struct page *page = fio-&gt;page;
+  struct inode *inode = page-&gt;mapping-&gt;host;
+  struct dnode_of_data dn;
+  struct extent_info ei = {0, };
+  struct node_info ni;
+  bool ipu_force = false;
+  int err = 0;
+
+
+  set_new_dnode(&amp;dn, inode, NULL, NULL, 0);
+  if (need_inplace_update(fio) &amp;&amp; // 这个函数判断了这个fio应该就地更新还是异地更新
+      f2fs_lookup_extent_cache(inode, page-&gt;index, &amp;ei)) {
+    fio-&gt;old_blkaddr = ei.blk + page-&gt;index - ei.fofs;
+    /* f2fs_lookup_extent_cache 函数查询了page-&gt;index所在的逻辑地址和物理地址映射关系，并存于ei
+    * 记录旧的块地址 = 文件起始的块地址 + 文件内偏移 = ei.blk - ei.fofs + page-&gt;index
+    * （推测）ei通过查询rbtree返回，表示该偏移对应的块地址段空间及相较于文件起始的偏移
+    *  这个映射关系在之前 f2fs_map_blocks处被建立
+    */
+    if (!f2fs_is_valid_blkaddr(fio-&gt;sbi, fio-&gt;old_blkaddr,
+            DATA_GENERIC_ENHANCE))
+      return -EFSCORRUPTED;
+
+
+    ipu_force = true;
+    fio-&gt;need_lock = LOCK_DONE;
+    goto got_it; // 跳转避免旧地址被覆盖
+  }
+
+
+  /* Deadlock due to between page-&gt;lock and f2fs_lock_op */
+  if (fio-&gt;need_lock == LOCK_REQ &amp;&amp; !f2fs_trylock_op(fio-&gt;sbi))
+    return -EAGAIN;
+  // 根据文件偏移获取dn信息，内含指向的物理地址
+  err = f2fs_get_dnode_of_data(&amp;dn, page-&gt;index, LOOKUP_NODE);
+  if (err)
+    goto out;
+  // 异地更新保存旧的物理地址为dn指向的地址
+  fio-&gt;old_blkaddr = dn.data_blkaddr;
+  // 前面提及到f2fs_file_write_iter已经将物理地址设置为NEW_ADDR或者具体的block号，
+  // 因此这里表示在写入磁盘之前，用户又将这部分数据删除了，所以没必要写入了
+  /* This page is already truncated */
+  if (fio-&gt;old_blkaddr == NULL_ADDR) {
+    ClearPageUptodate(page);
+    clear_page_private_gcing(page);
+    goto out_writepage;
+  }
+got_it:
+  if (__is_valid_data_blkaddr(fio-&gt;old_blkaddr) &amp;&amp;
+    !f2fs_is_valid_blkaddr(fio-&gt;sbi, fio-&gt;old_blkaddr,
+            DATA_GENERIC_ENHANCE)) {
+    err = -EFSCORRUPTED;
+    goto out_writepage;
+  }
+  /*
+   * If current allocation needs SSR,
+   * it had better in-place writes for updated data.
+   */
+  if (ipu_force ||
+    (__is_valid_data_blkaddr(fio-&gt;old_blkaddr) &amp;&amp;
+          need_inplace_update(fio))) { // 就地更新路径
+    err = f2fs_encrypt_one_page(fio); // 如果开启加密，则先将fio-&gt;page加密
+    if (err)
+      goto out_writepage;
+
+
+    set_page_writeback(page); // 标志这一页正在写回，前面判断某页是否正在写回就判断是否经过该操作后
+    ClearPageError(page);
+    f2fs_put_dnode(&amp;dn);
+    if (fio-&gt;need_lock == LOCK_REQ)
+      f2fs_unlock_op(fio-&gt;sbi);
+    err = f2fs_inplace_write_data(fio); // 就地更新
+    if (err) {
+      if (fscrypt_inode_uses_fs_layer_crypto(inode))
+        fscrypt_finalize_bounce_page(&amp;fio-&gt;encrypted_page);
+      if (PageWriteback(page))
+        end_page_writeback(page); // 结束写回状态
+    } else {
+      set_inode_flag(inode, FI_UPDATE_WRITE);
+    }
+    trace_f2fs_do_write_data_page(fio-&gt;page, IPU);
+    return err;
+  }
+
+
+  if (fio-&gt;need_lock == LOCK_RETRY) {
+    if (!f2fs_trylock_op(fio-&gt;sbi)) {
+      err = -EAGAIN;
+      goto out_writepage;
+    }
+    fio-&gt;need_lock = LOCK_REQ;
+  }
+
+
+  err = f2fs_get_node_info(fio-&gt;sbi, dn.nid, &amp;ni, false);
+  if (err)
+    goto out_writepage;
+
+
+  fio-&gt;version = ni.version;
+
+
+  err = f2fs_encrypt_one_page(fio); // 如果需要加密
+  if (err)
+    goto out_writepage;
+
+
+  set_page_writeback(page); // 设置正在写回
+  ClearPageError(page);
+
+
+  if (fio-&gt;compr_blocks &amp;&amp; fio-&gt;old_blkaddr == COMPRESS_ADDR)
+    f2fs_i_compr_blocks_update(inode, fio-&gt;compr_blocks - 1, false);
+
+
+  /* LFS mode write path */
+  f2fs_outplace_write_data(&amp;dn, fio); // 进行异地更新
+  trace_f2fs_do_write_data_page(page, OPU);
+  set_inode_flag(inode, FI_APPEND_WRITE);
+  if (page-&gt;index == 0)
+    set_inode_flag(inode, FI_FIRST_BLOCK_WRITTEN);
+out_writepage:
+  f2fs_put_dnode(&amp;dn);
+out:
+  if (fio-&gt;need_lock == LOCK_REQ)
+    f2fs_unlock_op(fio-&gt;sbi);
+  return err;
+}</code></pre> 
+ <p>因此，从该函数中，根据异地更新和就地更新的不同方式，再次做了区分，由于异地更新是主要的更新方式，我们主要跟踪异地更新，这个函数<strong>首先生成summary(每一个block都有一个summary，入口记录在SAA中，sum存放在CURSEG中），然后</strong><strong>分配一个新的物理地址，将数据写入新的物理地址中，将旧地址无效化，最后更新逻辑地址和物理地址的映射关系，</strong>而且可以看出，它只需要更新直接节点信息，这是F2FS的一个特性：</p> 
+ <p>SSA: https://blog.csdn.net/qq_38232437/article/details/108227856</p> 
+ <pre class="has"><code class="language-php">void f2fs_outplace_write_data(struct dnode_of_data *dn,
+          struct f2fs_io_info *fio)
+{
+  struct f2fs_sb_info *sbi = fio-&gt;sbi;
+  struct f2fs_summary sum;
+
+
+  f2fs_bug_on(sbi, dn-&gt;data_blkaddr == NULL_ADDR);
+  set_summary(&amp;sum, dn-&gt;nid, dn-&gt;ofs_in_node, fio-&gt;version); // 生成summary
+  do_write_page(&amp;sum, fio); // 完成新地址分配、复制、旧地址失效
+  f2fs_update_data_blkaddr(dn, fio-&gt;new_blkaddr); // 建立新的映射关系
+
+
+  f2fs_update_iostat(sbi, fio-&gt;io_type, F2FS_BLKSIZE);
+}
+--- 更新映射关系：
+void f2fs_update_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
+{
+  dn-&gt;data_blkaddr = blkaddr; // 修改为新的物理地址
+  f2fs_set_data_blkaddr(dn);  // 更新地址到节点上
+  f2fs_update_extent_cache(dn); // 更新cache中的映射关系
+}
+---
+void f2fs_set_data_blkaddr(struct dnode_of_data *dn)
+{
+  f2fs_wait_on_page_writeback(dn-&gt;node_page, NODE, true, true); // 首先等待写入完成
+  __set_data_blkaddr(dn); 
+  if (set_page_dirty(dn-&gt;node_page))
+    dn-&gt;node_changed = true;
+}
+---
+static void __set_data_blkaddr(struct dnode_of_data *dn)
+{
+  struct f2fs_node *rn = F2FS_NODE(dn-&gt;node_page);
+  __le32 *addr_array;
+  int base = 0;
+
+
+  if (IS_INODE(dn-&gt;node_page) &amp;&amp; f2fs_has_extra_attr(dn-&gt;inode))
+    base = get_extra_isize(dn-&gt;inode);
+
+
+  /* Get physical address of data block */
+  addr_array = blkaddr_in_node(rn); 
+  addr_array[base + dn-&gt;ofs_in_node] = cpu_to_le32(dn-&gt;data_blkaddr); // 完成更新
+}</code></pre> 
+ <p>主要干活的还是do_write_page函数：<br></p> 
+ <pre class="has"><code class="language-php">static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
+{
+  int type = __get_segment_type(fio); // 获取段的温度
+  bool keep_order = (f2fs_lfs_mode(fio-&gt;sbi) &amp;&amp; type == CURSEG_COLD_DATA);
+
+
+  if (keep_order)
+    f2fs_down_read(&amp;fio-&gt;sbi-&gt;io_order_lock);
+reallocate:
+  // 分配新地址，并复制到新地址，新地址保存在fio-&gt;new_blkaddr中
+  f2fs_allocate_data_block(fio-&gt;sbi, fio-&gt;page, fio-&gt;old_blkaddr,
+      &amp;fio-&gt;new_blkaddr, sum, type, fio);
+  if (GET_SEGNO(fio-&gt;sbi, fio-&gt;old_blkaddr) != NULL_SEGNO) {
+    invalidate_mapping_pages(META_MAPPING(fio-&gt;sbi),
+          fio-&gt;old_blkaddr, fio-&gt;old_blkaddr);
+    f2fs_invalidate_compress_page(fio-&gt;sbi, fio-&gt;old_blkaddr);
+  }
+
+
+  /* writeout dirty page into bdev */
+  f2fs_submit_page_write(fio); // 提交读写bio到设备
+  if (fio-&gt;retry) {
+    fio-&gt;old_blkaddr = fio-&gt;new_blkaddr;
+    goto reallocate;
+  }
+  // 多设备更新设备状态
+  f2fs_update_device_state(fio-&gt;sbi, fio-&gt;ino, fio-&gt;new_blkaddr, 1);
+
+
+  if (keep_order)
+    f2fs_up_read(&amp;fio-&gt;sbi-&gt;io_order_lock);
+}</code></pre> 
+ <p>f2fs_allocate_data_block首先会根据温度获得CURSEG，然后在CURSEG分配一个新的物理块，然后将旧块无效化。</p> 
+ <pre class="has"><code class="language-php">void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
+    block_t old_blkaddr, block_t *new_blkaddr,
+    struct f2fs_summary *sum, int type,
+    struct f2fs_io_info *fio)
+{
+  struct sit_info *sit_i = SIT_I(sbi);
+  struct curseg_info *curseg = CURSEG_I(sbi, type);
+  unsigned long long old_mtime;
+  bool from_gc = (type == CURSEG_ALL_DATA_ATGC);
+  struct seg_entry *se = NULL;
+
+
+  f2fs_down_read(&amp;SM_I(sbi)-&gt;curseg_lock);
+
+
+  mutex_lock(&amp;curseg-&gt;curseg_mutex);
+  down_write(&amp;sit_i-&gt;sentry_lock);
+
+
+  if (from_gc) {
+    f2fs_bug_on(sbi, GET_SEGNO(sbi, old_blkaddr) == NULL_SEGNO);
+    se = get_seg_entry(sbi, GET_SEGNO(sbi, old_blkaddr));
+    sanity_check_seg_type(sbi, se-&gt;type);
+    f2fs_bug_on(sbi, IS_NODESEG(se-&gt;type));
+  }
+  *new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg); 
+  // 获取新的物理地址，需要查位图
+
+
+  f2fs_bug_on(sbi, curseg-&gt;next_blkoff &gt;= sbi-&gt;blocks_per_seg);
+
+
+  f2fs_wait_discard_bio(sbi, *new_blkaddr);
+
+
+  /*
+   * __add_sum_entry should be resided under the curseg_mutex
+   * because, this function updates a summary entry in the
+   * current summary block.
+   */
+  __add_sum_entry(sbi, type, sum); // 把sum更新到CURSEG中
+
+
+  __refresh_next_blkoff(sbi, curseg); // 更新下一个可用的物理地址
+
+
+  stat_inc_block_count(sbi, curseg);
+
+
+  if (from_gc) {
+    old_mtime = get_segment_mtime(sbi, old_blkaddr);
+  } else {
+    update_segment_mtime(sbi, old_blkaddr, 0); // 更新老段时间信息
+    old_mtime = 0;
+  }
+  update_segment_mtime(sbi, *new_blkaddr, old_mtime);// 更新新段时间信息
+
+
+  /*
+   * SIT information should be updated before segment allocation,
+   * since SSR needs latest valid block information.
+   */
+  update_sit_entry(sbi, *new_blkaddr, 1); // 根据新地址找到sit_entry，更新块为有效
+  if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
+    update_sit_entry(sbi, old_blkaddr, -1); // 更新老地址块为-1，表示被覆盖了，等待GC回收
+
+
+  if (!__has_curseg_space(sbi, curseg)) { // 如果当前段没有空间再分配了
+    if (from_gc)
+      get_atssr_segment(sbi, type, se-&gt;type,
+            AT_SSR, se-&gt;mtime);
+    else
+      sit_i-&gt;s_ops-&gt;allocate_segment(sbi, type, false); // 那么就分配一个新的type温度的段
+  }
+  /*
+   * segment dirty status should be updated after segment allocation,
+   * so we just need to update status only one time after previous
+   * segment being closed.
+   */
+   // 将segment设置为脏，等待checkpoint写回磁盘
+  locate_dirty_segment(sbi, GET_SEGNO(sbi, old_blkaddr));
+  locate_dirty_segment(sbi, GET_SEGNO(sbi, *new_blkaddr));
+
+
+  up_write(&amp;sit_i-&gt;sentry_lock);
+
+
+  if (page &amp;&amp; IS_NODESEG(type)) {
+    fill_node_footer_blkaddr(page, NEXT_FREE_BLKADDR(sbi, curseg));
+
+
+    f2fs_inode_chksum_set(sbi, page);
+  }
+
+
+  if (fio) {
+    struct f2fs_bio_info *io;
+
+
+    if (F2FS_IO_ALIGNED(sbi))
+      fio-&gt;retry = false;
+
+
+    INIT_LIST_HEAD(&amp;fio-&gt;list);
+    fio-&gt;in_list = true; // 标记为在链表中
+    io = sbi-&gt;write_io[fio-&gt;type] + fio-&gt;temp;
+    spin_lock(&amp;io-&gt;io_lock);
+    list_add_tail(&amp;fio-&gt;list, &amp;io-&gt;io_list); // 将fio链入到这个类型write_io的链表里面
+    spin_unlock(&amp;io-&gt;io_lock);
+  }
+
+
+  mutex_unlock(&amp;curseg-&gt;curseg_mutex);
+
+
+  f2fs_up_read(&amp;SM_I(sbi)-&gt;curseg_lock);
+}</code></pre> 
+ <p>最后一步，提交到磁盘，它会将同类型同温度的io全部提交：</p> 
+ <pre class="has"><code class="language-php">void f2fs_submit_page_write(struct f2fs_io_info *fio)
+{
+  struct f2fs_sb_info *sbi = fio-&gt;sbi;
+  enum page_type btype = PAGE_TYPE_OF_BIO(fio-&gt;type);
+  struct f2fs_bio_info *io = sbi-&gt;write_io[btype] + fio-&gt;temp; // 把这个type的这个温度的io信息取出来
+  struct page *bio_page;
+
+
+  f2fs_bug_on(sbi, is_read_io(fio-&gt;op));
+
+
+  f2fs_down_write(&amp;io-&gt;io_rwsem);
+next:
+  if (fio-&gt;in_list) { // 它被上一个函数指定为true
+    spin_lock(&amp;io-&gt;io_lock);
+    if (list_empty(&amp;io-&gt;io_list)) {
+      spin_unlock(&amp;io-&gt;io_lock);
+      goto out;
+    }
+    fio = list_first_entry(&amp;io-&gt;io_list,
+            struct f2fs_io_info, list);
+    list_del(&amp;fio-&gt;list); // 将它的链接件移除，相当于出队
+    spin_unlock(&amp;io-&gt;io_lock);
+  }
+
+
+  verify_fio_blkaddr(fio);
+
+
+  if (fio-&gt;encrypted_page) // 根据加密或压缩情况赋值bio_page
+    bio_page = fio-&gt;encrypted_page;
+  else if (fio-&gt;compressed_page)
+    bio_page = fio-&gt;compressed_page;
+  else
+    bio_page = fio-&gt;page;
+
+
+  /* set submitted = true as a return value */
+  fio-&gt;submitted = true;
+
+
+  inc_page_count(sbi, WB_DATA_TYPE(bio_page));
+
+
+  if (io-&gt;bio &amp;&amp;
+      (!io_is_mergeable(sbi, io-&gt;bio, io, fio, io-&gt;last_block_in_bio,
+            fio-&gt;new_blkaddr) ||
+       !f2fs_crypt_mergeable_bio(io-&gt;bio, fio-&gt;page-&gt;mapping-&gt;host,
+               bio_page-&gt;index, fio)))
+    __submit_merged_bio(io);  // 不能合并直接提交的状态
+alloc_new:
+  if (io-&gt;bio == NULL) {
+    if (F2FS_IO_ALIGNED(sbi) &amp;&amp;
+        (fio-&gt;type == DATA || fio-&gt;type == NODE) &amp;&amp;
+        fio-&gt;new_blkaddr &amp; F2FS_IO_SIZE_MASK(sbi)) {
+      dec_page_count(sbi, WB_DATA_TYPE(bio_page));
+      fio-&gt;retry = true;
+      goto skip;
+    }
+    io-&gt;bio = __bio_alloc(fio, BIO_MAX_VECS); // submit之后为NULL
+    f2fs_set_bio_crypt_ctx(io-&gt;bio, fio-&gt;page-&gt;mapping-&gt;host,
+               bio_page-&gt;index, fio, GFP_NOIO);
+    io-&gt;fio = *fio;
+  }
+
+
+  if (bio_add_page(io-&gt;bio, bio_page, PAGE_SIZE, 0) &lt; PAGE_SIZE) {
+    __submit_merged_bio(io);
+    goto alloc_new;
+  } // 将page加入到bio中，如果&lt;page_size表示bio已满，直接提交，下一个生成一个新的交
+
+
+  if (fio-&gt;io_wbc)
+    wbc_account_cgroup_owner(fio-&gt;io_wbc, bio_page, PAGE_SIZE);
+
+
+  io-&gt;last_block_in_bio = fio-&gt;new_blkaddr; // 最后一个物理块就是我们最新写入的这个块
+
+
+  trace_f2fs_submit_page_write(fio-&gt;page, fio);
+skip:
+  if (fio-&gt;in_list)
+    goto next; // 会将整个链表处理完成
+out:
+  if (is_sbi_flag_set(sbi, SBI_IS_SHUTDOWN) ||
+        !f2fs_is_checkpoint_ready(sbi))
+    __submit_merged_bio(io);
+  f2fs_up_write(&amp;io-&gt;io_rwsem);
+}
+
+
+---在53行中调用了__bio_alloc生成bio：
+static struct bio *__bio_alloc(struct f2fs_io_info *fio, int npages)
+{
+  struct f2fs_sb_info *sbi = fio-&gt;sbi;
+  struct bio *bio;
+
+
+  bio = bio_alloc_bioset(GFP_NOIO, npages, &amp;f2fs_bioset);
+
+
+  f2fs_target_device(sbi, fio-&gt;new_blkaddr, bio);
+  if (is_read_io(fio-&gt;op)) {
+    bio-&gt;bi_end_io = f2fs_read_end_io;
+    bio-&gt;bi_private = NULL; // 如果是读，private不加任何信息
+  } else {
+    bio-&gt;bi_end_io = f2fs_write_end_io;
+    bio-&gt;bi_private = sbi; // 如果是写，private加入sbi
+    bio-&gt;bi_write_hint = f2fs_io_type_to_rw_hint(sbi,
+            fio-&gt;type, fio-&gt;temp); // bi_write_hint为温度信息
+  }
+  iostat_alloc_and_bind_ctx(sbi, bio, NULL);
+
+
+  if (fio-&gt;io_wbc)
+    wbc_init_bio(fio-&gt;io_wbc, bio);
+
+
+  return bio;
+}</code></pre> 
+ <p>在这个函数，<strong>当bio还没有填满page的时候是不会被提交到磁盘的</strong>，这是因为F2FS通过增大bio的size提高了写性能。因此，在用户fsync或者系统writeback的时候，为了保证这些page都可以刷写到磁盘，会如f2fs_write_cache_pages函数所介绍一样，通过f2fs_submit_merged_write_cond函数或者其他函数强行提交这个page未满的bio。</p> 
+ <p>最后将会调用到submit_bio提交内核block层处理。内核的处理如<a href="https://so.csdn.net/so/search?q=block%E5%B1%82%E5%A4%84%E7%90%86">block层处理</a>，<a href="https://so.csdn.net/so/search?q=scsi%E5%B1%82%E5%A4%84%E7%90%86">scsi层处理</a>，<a href="https://so.csdn.net/so/search?q=UFS%E5%A4%84%E7%90%86">UFS处理</a>等文章中也有过分析。</p> 
+ <p>bio完成后，会回调通知f2fs，主要进行一些内存页的状态修改和回收操作：</p> 
+ <pre class="has"><code class="language-cpp">static void f2fs_write_end_io(struct bio *bio)
+{
+  struct f2fs_sb_info *sbi;
+  struct bio_vec *bvec;
+  struct bvec_iter_all iter_all;
+
+
+  iostat_update_and_unbind_ctx(bio, 1);
+  sbi = bio-&gt;bi_private; // __alloc_bio的时候埋下的
+  if (time_to_inject(sbi, FAULT_WRITE_IO)) {
+    f2fs_show_injection_info(sbi, FAULT_WRITE_IO);
+    bio-&gt;bi_status = BLK_STS_IOERR;
+  }
+  bio_for_each_segment_all(bvec, bio, iter_all) { // 对写入的每个segment
+    struct page *page = bvec-&gt;bv_page; // 取出页面
+    enum count_type type = WB_DATA_TYPE(page);
+
+
+    if (page_private_dummy(page)) {
+      clear_page_private_dummy(page);
+      unlock_page(page);
+      mempool_free(page, sbi-&gt;write_io_dummy);
+
+
+      if (unlikely(bio-&gt;bi_status))
+        f2fs_stop_checkpoint(sbi, true);
+      continue;
+    } // 回收内存页
+
+
+    fscrypt_finalize_bounce_page(&amp;page);
+    if (unlikely(bio-&gt;bi_status)) {
+      mapping_set_error(page-&gt;mapping, -EIO);
+      if (type == F2FS_WB_CP_DATA)
+        f2fs_stop_checkpoint(sbi, true);
+    }
+    f2fs_bug_on(sbi, page-&gt;mapping == NODE_MAPPING(sbi) &amp;&amp;
+          page-&gt;index != nid_of_node(page));
+
+
+    dec_page_count(sbi, type);
+    if (f2fs_in_warm_node_list(sbi, page))
+      f2fs_del_fsync_node_entry(sbi, page);
+    clear_page_private_gcing(page);
+    end_page_writeback(page); // 结束页面的写回状态
+  }
+  if (!get_pages(sbi, F2FS_WB_CP_DATA) &amp;&amp;
+        wq_has_sleeper(&amp;sbi-&gt;cp_wait))
+    wake_up(&amp;sbi-&gt;cp_wait);
+  bio_put(bio);
+}</code></pre> 
+ <p>到此完成了一个数据的写流程，但是，对于元数据，比如SIT和NAT，它们并没有落盘，它们实际的落盘时间，是在checkpoint时，才会被写入磁盘，这也是避免雪崩效应的优化内容，至于这个流程，有必要的话之后再分析。</p> 
+ <p>“由于f2fs的log-structure特性，每次写一个数据块，需要相应更改direct node，NAT和SIT，尤其是NAT和SIT区域，可能仅仅需要修改一个entry几个字节的信息，就要重写整个page，这会严重降低文件系统的性能和SSD的使用寿命，因此，f2fs使用了journal的机制来减少NAT和SIT的写次数。所谓journal，其实就是把NAT和SIT的更改写到f2fs_summary_block中，当写checkpoint时，才把dirty的SIT和NAT区域回写。这里就是fsfs 避免wander tree ”</p> 
+ <p>------------</p> 
+ <p>文章参考：</p> 
+ <p>https://blog.csdn.net/u011649400/article/details/94589060</p> 
+ <p>https://blog.51cto.com/xiamachao/2348759</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/9bb61e1ad67a99bc7b279bb76d2a7438/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">java 如何计算两个汉字的相似度？如何获得一个汉字的相似汉字？</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5a44d493ac76143128c9635ae4060602/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">HASHMAP死锁分析</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

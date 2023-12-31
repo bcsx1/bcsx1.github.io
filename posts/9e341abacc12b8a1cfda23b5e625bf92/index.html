@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>An Efficient Design and Implementation of LSM-Tree based Key-Value Store on Open-Channel SSD - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="An Efficient Design and Implementation of LSM-Tree based Key-Value Store on Open-Channel SSD" />
+<meta property="og:description" content="摘要 各种键值（KV）存储被广泛用于数据管理以支持Internet服务，因为它们提供了比关系数据库系统更高的效率，可伸缩性和可用性。基于日志结构的合并树（LSM-tree）的KV存储吸引了越来越多的关注，因为它们可以消除随机写入并保持可接受的读取性能。最近，随着NAND闪存每单位价格的下降，固态磁盘（SSD）已在企业级数据中心中广泛采用，以提供高I / O带宽和低访问延迟。但是，将基于LSM树的KV存储与SSD幼稚地组合起来效率低下，因为无法充分利用SSD内启用的高度并行性。当前基于LSM树的KV存储在设计时未假设SSD的多通道架构。
+为了解决这一不足，我们建议使用LOCS系统，该系统配备了定制的SSD设计，可向应用程序公开其内部闪存通道，以与基于LSM树的KV存储（尤其是LevelDB）配合使用。我们扩展LevelDB以显式利用SSD的多个通道来利用其丰富的并行性。我们优化并发I / O请求的调度和调度策略，以进一步提高数据访问效率。与在常规SSD上运行库存LevelDB的情况相比，应用所有建议的优化技术后，存储系统的吞吐量可以提高4倍以上。
+介绍 随着Web 2.0应用程序和云计算的飞速发展，大规模分布式存储系统被广泛部署以支持Internet范围的服务。为了存储超大规模数据和服务高并发访问，使用传统的关系数据库管理系统（RDBMS）作为数据存储可能不是一个有效的选择[15]。对于许多Web应用程序而言，RDBMS的许多特性和功能（例如事务一致性保证和支持复杂的SQL查询）不是必需的。因此，在大数据时代出现了一种新的存储架构，即键值（KV）存储。
+键值存储将一组键映射到关联的值，可以将其视为分布式哈希表。与传统的RDBMS [37] [29]相比，无需提供数据库系统通常所需的特性和功能，KV存储可以提供更高的性能，更好的可伸缩性和更高的可用性。他们在数据中心中起着至关重要的作用，以支持许多Internet服务，包括Google的BigTable [18]，Facebook的Cassandra [28]，亚马逊的Dynamo [22]和Github的Redis [4]。
+B &#43;树是传统数据库和某些KV store中使用的通用结构。因为它的高扇出有助于减少查询操作的I / O操作数量。但是，使用数据结构支持随机插入和更新的效率非常低。当需要对数据存储进行大量更改时，使用B &#43;树将导致大量昂贵的磁盘搜索并显着降低性能。日志结构的合并树（LSM-tree）[32]是一种针对写入进行优化的数据结构，包括插入，修改和删除。基本思想是通过聚合内存中的多个更新并将它们作为批处理转储到存储中，从而将随机写入转换为顺序写入。传入的数据项被存储在主存储器中保留的缓冲区中，并根据它们的键进行排序。当缓冲区已满时，其所有数据将整体写入到存储中。有很多流行的KV商店都采用基于LSM树的数据管理，包括BigTable [18]，Cassandra [28]，Hbase [9]和LevelDB [10]。
+最初提出KV商店时，硬盘驱动器（HDD）被视为其主要目标存储设备。近年来，随着NAND闪存技术的发展，基于闪存的固态磁盘（SSD）的单位容量价格一直在下降。因此，SSD在当今的数据中心中变得越来越流行。与HDD相比，SSD提供更高的吞吐量和更低的延迟，特别是对于随机操作。但是，SSD也有其自身的局限性：随机写入的性能大大落后于顺序写入操作和读取操作的性能，这主要是由于产生了昂贵的垃圾回收[31]。如前所述，由于基于LSM树的KV存储可以有效地消除随机写入，因此，将基于LSM树的KV存储与基于NAND闪存的SSD集成在一起，从而实现读写I的高吞吐量被证明是有希望的/ O操作。
+尽管研究人员已经意识到将基于LSM树的KV商店与SSD结合起来的潜在优势[11]，但据我们所知，在以前的工作中尚未对该主题进行很好的研究。实际上，这两种技术的简单集成效率不高。一方面，基于LSM树的KV存储中的数据移动过程最初是为HDD（而非SSD）设计的。由于硬盘驱动器只有一个磁盘头，因此KV存储将向硬盘驱动器串行发出I / O请求。我们需要提高并发级别，以便利用SSD的随机读取性能优势。另一方面，SSD丰富的内部并行性尚未得到充分利用。尽管现代的SSD通常包含多个通道，但SSD控制器硬件仅提供与操作系统的一个块设备接口，并且内部通道之间的I / O请求的调度和分派对于软件层而言是隐藏的。这使得基于LSM树的KV商店不知道SSD的多通道体系结构，并且根据基于LSM树的KV商店的数据访问模式，未优化SSD控制器做出的调度和调度决策。
+为了解决这些问题，我们建议使用一种定制的SSD（称为SDF [33]），该SSD仅在最近才可用，以便与基于LSM的流行KV商店LevelDB一起使用[10]。 SDF最初是在百度的数据中心设计和采用的，而百度是中国最大的互联网搜索公司。它提供了独特的功能，其中对内部闪存通道的访问是开放的，并且可以由应用程序管理以充分利用SSD的高带宽。为了利用此独特功能，我们修改了LevelDB以应用许多优化。同时，我们观察到在这种新颖的系统中，调度策略对I / O性能具有至关重要的影响。因此，我们研究如何通过优化的调度和调度策略来提高吞吐量，并考虑使用LevelDB的访问模式的特征。我们的系统称为LOCS，是“ Open Channel SSD上基于LSM树的KV存储”的缩写。
+这是将基于LSM树的KVstore与可在应用程序中直接访问其内部通道的开放通道SSD集成的第一项工作。我们扩展了LevelDB以支持多线程I / O访问，以利用SDF中丰富的并行性此外，我们优化了LevelDB的写请求流量控制机制，以利用设备内并行性来提高吞吐量。我们研究了I / O请求调度和调度策略的影响，并提出了相应的优化技术以进一步改进我们提供了广泛的实验结果，表明LOCS可以胜过原始LevelDB与具有类似硬件组织的传统SSD设计的原始集成。结果还表明，使用我们的请求调度和调度优化技术可以进一步提高I / O性能。 本文的其余部分安排如下。第2节介绍了LevelDB，并简要描述了开放通道SSD设计（SDF）。在第3节中，我们描述如何扩展LevelDB，以便它可以与SDF一起有效地工作。此外，我们提出了几种用于调度和调度策略的优化技术，以提高I / O性能。我们还演示了LOCS提供的灵活性。第4节提供了广泛的实验和比较。我们将在第5节中介绍相关文献，然后在第6节中得出结论。
+背景 levelDB
+当用户在LevelDB中插入键值对时，它将首先保存在日志文件中。然后将其插入到内存中的分类结构中，该结构称为MemTable，用于保存最新更新。当传入数据项的大小达到最大容量时，MemTable将转换为只读的不可变MemTable。将创建一个新的MemTable来累积新的更新。同时，后台线程开始将Immutable MemTable转储到磁盘中并生成新的Sorted String Table文件（SSTable）。删除是其中存储删除标记的更新的特例。
+SSTable存储一系列按其键排序的数据项。 SSTable的集合被组织为一系列级别，如图1所示。最年轻的级别Level 0是通过将Immutable MemTable从主内存写入磁盘而产生的。因此，级别0中的SSTables可以包含重叠键。但是，在其他级别，SSTable的关键范围是不重叠的。每个级别对SSTable的最大数量有限制，或者等效地，对数据总量也有限制，因为每个SSTable在级别中具有固定的大小。限制随着级别数以指数速率增长。例如，级别1的最大数据量将不超过10 MB，级别2的最大数据量将不超过100 MB。
+为了将存储的数据保持在优化的布局中，将执行压缩过程。后台压缩线程将监视SSTable文件。当级别L的总大小超过其限制时，压缩线程将从级别L中选择一个SSTable，并从下一个级别L &#43; 1中选择所有重叠的SSTable。这些文件用作压缩的输入，并合并在一起以生成一系列新的L &#43; 1级文件。当输出文件达到预定义的大小（默认为2 MB）时，将创建另一个新的SSTable。压缩后将丢弃所有输入。请注意，从级别0到级别1的压缩与其他级别之间的处理不同。当级别0的SSTables的数量超过上限（默认为4）时，将触发压缩。如果某些压缩文件相互重叠，则压缩可能涉及多个0级文件。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/9e341abacc12b8a1cfda23b5e625bf92/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-05-29T12:02:25+08:00" />
+<meta property="article:modified_time" content="2020-05-29T12:02:25+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">An Efficient Design and Implementation of LSM-Tree based Key-Value Store on Open-Channel SSD</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="_0"></a>摘要</h2> 
+<p>各种键值（KV）存储被广泛用于数据管理以支持Internet服务，因为它们提供了比关系数据库系统更高的效率，可伸缩性和可用性。基于日志结构的合并树（LSM-tree）的KV存储吸引了越来越多的关注，因为它们可以消除随机写入并保持可接受的读取性能。最近，随着NAND闪存每单位价格的下降，固态磁盘（SSD）已在企业级数据中心中广泛采用，以提供高I / O带宽和低访问延迟。但是，将基于LSM树的KV存储与SSD幼稚地组合起来效率低下，因为无法充分利用SSD内启用的高度并行性。当前基于LSM树的KV存储在设计时未假设SSD的多通道架构。</p> 
+<p>为了解决这一不足，我们建议使用LOCS系统，该系统配备了定制的SSD设计，可向应用程序公开其内部闪存通道，以与基于LSM树的KV存储（尤其是LevelDB）配合使用。我们扩展LevelDB以显式利用SSD的多个通道来利用其丰富的并行性。我们优化并发I / O请求的调度和调度策略，以进一步提高数据访问效率。与在常规SSD上运行库存LevelDB的情况相比，应用所有建议的优化技术后，存储系统的吞吐量可以提高4倍以上。</p> 
+<h2><a id="_6"></a>介绍</h2> 
+<p>随着Web 2.0应用程序和云计算的飞速发展，大规模分布式存储系统被广泛部署以支持Internet范围的服务。为了存储超大规模数据和服务高并发访问，使用传统的关系数据库管理系统（RDBMS）作为数据存储可能不是一个有效的选择[15]。对于许多Web应用程序而言，RDBMS的许多特性和功能（例如事务一致性保证和支持复杂的SQL查询）不是必需的。因此，<mark>在大数据时代出现了一种新的存储架构，即键值（KV）存储</mark>。</p> 
+<p>键值存储将一组键映射到关联的值，可以将其视为分布式哈希表。与传统的RDBMS [37] [29]相比，<mark>无需提供数据库系统通常所需的特性和功能，KV存储可以提供更高的性能，更好的可伸缩性和更高的可用性</mark>。他们在数据中心中起着至关重要的作用，以支持许多Internet服务，包括Google的BigTable [18]，Facebook的Cassandra [28]，亚马逊的Dynamo [22]和Github的Redis [4]。</p> 
+<p>B +树是传统数据库和某些KV store中使用的通用结构。因为它的高扇出有助于减少查询操作的I / O操作数量。但是，<mark>使用数据结构支持随机插入和更新的效率非常低。当需要对数据存储进行大量更改时，使用B +树将导致大量昂贵的磁盘搜索并显着降低性能</mark>。<mark>日志结构的合并树（LSM-tree）[32]是一种针对写入进行优化的数据结构，包括插入，修改和删除。基本思想是通过聚合内存中的多个更新并将它们作为批处理转储到存储中，从而将随机写入转换为顺序写入</mark>。传入的数据项被存储在主存储器中保留的缓冲区中，并根据它们的键进行排序。当缓冲区已满时，其所有数据将整体写入到存储中。有很多流行的KV商店都采用基于LSM树的数据管理，包括BigTable [18]，Cassandra [28]，Hbase [9]和LevelDB [10]。</p> 
+<p>最初提出KV商店时，硬盘驱动器（HDD）被视为其主要目标存储设备。近年来，随着NAND闪存技术的发展，基于闪存的固态磁盘（SSD）的单位容量价格一直在下降。因此，SSD在当今的数据中心中变得越来越流行。与HDD相比，<mark>SSD提供更高的吞吐量和更低的延迟，特别是对于随机操作。但是，SSD也有其自身的局限性：随机写入的性能大大落后于顺序写入操作和读取操作的性能，这主要是由于产生了昂贵的垃圾回收[31]。如前所述，由于基于LSM树的KV存储可以有效地消除随机写入，因此，将基于LSM树的KV存储与基于NAND闪存的SSD集成在一起，从而实现读写I的高吞吐量被证明是有希望的/ O操作</mark>。</p> 
+<p>尽管研究人员已经意识到将基于LSM树的KV商店与SSD结合起来的潜在优势[11]，但据我们所知，在以前的工作中尚未对该主题进行很好的研究。实际上，这两种技术的简单集成效率不高。一方面，基于LSM树的KV存储中的数据移动过程最初是为HDD（而非SSD）设计的。由于硬盘驱动器只有一个磁盘头，因此KV存储将向硬盘驱动器串行发出I / O请求。我们需要提高并发级别，以便利用SSD的随机读取性能优势。另一方面，SSD丰富的内部并行性尚未得到充分利用。尽管现代的SSD通常包含多个通道，但SSD控制器硬件仅提供与操作系统的一个块设备接口，并且内部通道之间的I / O请求的调度和分派对于软件层而言是隐藏的。这使得基于LSM树的KV商店不知道SSD的多通道体系结构，并且根据基于LSM树的KV商店的数据访问模式，未优化SSD控制器做出的调度和调度决策。</p> 
+<p>为了解决这些问题，我们建议使用一种定制的SSD（称为SDF [33]），该SSD仅在最近才可用，以便与基于LSM的流行KV商店LevelDB一起使用[10]。 SDF最初是在百度的数据中心设计和采用的，而百度是中国最大的互联网搜索公司。<mark>它提供了独特的功能，其中对内部闪存通道的访问是开放的，并且可以由应用程序管理以充分利用SSD的高带宽</mark>。为了利用此独特功能，我们修改了LevelDB以应用许多优化。同时，我们观察到在这种新颖的系统中，调度策略对I / O性能具有至关重要的影响。因此，我们研究如何通过优化的调度和调度策略来提高吞吐量，并考虑使用LevelDB的访问模式的特征。我们的系统称为LOCS，是“ Open Channel SSD上基于LSM树的KV存储”的缩写。</p> 
+<ul><li>这是将基于LSM树的KVstore与可在应用程序中直接访问其内部通道的开放通道SSD集成的第一项工作。</li><li>我们扩展了LevelDB以支持多线程I / O访问，以利用SDF中丰富的并行性此外，我们优化了LevelDB的写请求流量控制机制，以利用设备内并行性来提高吞吐量。</li><li>我们研究了I / O请求调度和调度策略的影响，并提出了相应的优化技术以进一步改进</li><li>我们提供了广泛的实验结果，表明LOCS可以胜过原始LevelDB与具有类似硬件组织的传统SSD设计的原始集成。结果还表明，使用我们的请求调度和调度优化技术可以进一步提高I / O性能。</li></ul> 
+<p>本文的其余部分安排如下。第2节介绍了LevelDB，并简要描述了开放通道SSD设计（SDF）。在第3节中，我们描述如何扩展LevelDB，以便它可以与SDF一起有效地工作。此外，我们提出了几种用于调度和调度策略的优化技术，以提高I / O性能。我们还演示了LOCS提供的灵活性。第4节提供了广泛的实验和比较。我们将在第5节中介绍相关文献，然后在第6节中得出结论。</p> 
+<h2><a id="_28"></a>背景</h2> 
+<p><strong>levelDB</strong><br> <img src="https://images2.imgbox.com/e2/a2/CKqURd14_o.png" alt="在这里插入图片描述"><br> 当用户在LevelDB中插入键值对时，它将首先保存在日志文件中。然后将其插入到内存中的分类结构中，该结构称为MemTable，用于保存最新更新。当传入数据项的大小达到最大容量时，MemTable将转换为只读的不可变MemTable。将创建一个新的MemTable来累积新的更新。同时，后台线程开始将Immutable MemTable转储到磁盘中并生成新的Sorted String Table文件（SSTable）。删除是其中存储删除标记的更新的特例。</p> 
+<p>SSTable存储一系列按其键排序的数据项。 SSTable的集合被组织为一系列级别，如图1所示。最年轻的级别Level 0是通过将Immutable MemTable从主内存写入磁盘而产生的。因此，级别0中的SSTables可以包含重叠键。但是，在其他级别，SSTable的关键范围是不重叠的。每个级别对SSTable的最大数量有限制，或者等效地，对数据总量也有限制，因为每个SSTable在级别中具有固定的大小。限制随着级别数以指数速率增长。例如，级别1的最大数据量将不超过10 MB，级别2的最大数据量将不超过100 MB。</p> 
+<p>为了将存储的数据保持在优化的布局中，将执行压缩过程。后台压缩线程将监视SSTable文件。当级别L的总大小超过其限制时，压缩线程将从级别L中选择一个SSTable，并从下一个级别L + 1中选择所有重叠的SSTable。这些文件用作压缩的输入，并合并在一起以生成一系列新的L + 1级文件。当输出文件达到预定义的大小（默认为2 MB）时，将创建另一个新的SSTable。压缩后将丢弃所有输入。请注意，从级别0到级别1的压缩与其他级别之间的处理不同。当级别0的SSTables的数量超过上限（默认为4）时，将触发压缩。如果某些压缩文件相互重叠，则压缩可能涉及多个0级文件。</p> 
+<p>通过执行压缩，LevelDB消除了覆盖的值并删除了已删除的标记。压缩操作还确保最新数据驻留在最低级别。过时的数据将逐渐移到更高的级别。与插入相比，数据的检索或读取操作更加复杂。当LevelDB收到Get（Key，Value）请求时，它将首先在MemTable中进行查找，然后在Immutable MemTable中进行查找，最后按顺序从Level 0到更高级别搜索SSTable，直到匹配的KV数据项被发现。 LevelDB一旦找到特定级别的密钥，它将停止搜索。如前所述，较低级别包含较新的数据项。将比旧数据更早地搜索新数据。与压缩类似，由于数据重叠，可以搜索多个0级文件。通常采用布隆滤波器[14]来减少读取不包含请求的KV项目的数据块的I / O成本。</p> 
+<p><strong>Open-Channel SSD</strong><br> 我们在这项工作中使用的开放通道SSD（SDF）是定制的SSD，广泛部署在百度的存储基础架构中，以支持各种Internet规模的服务[33]。目前，在生产系统中已部署了3000多个SDF。在SDF中，硬件通过定制的控制器向应用程序公开其内部通道。此外，它还通过简化的I / O堆栈来实现大粒度访问并提供轻量级基本功能。</p> 
+<p>SDF设备包含44个独立通道。每个闪存通道都有专用的通道引擎来提供FTL功能，包括块级地址映射，动态损耗均衡，不良块管理以及闪存数据路径的逻辑。从软件层的抽象角度来看，SDF表现出以下功能。</p> 
+<p>首先，SDF向用户应用程序公开了SSD的内部并行性。如前所述，SDF的每个通道都有其专用的数据控制引擎。与将整个设备视为单个块设备（例如/ dev / sda）的常规SSD相比，<mark>SDF将每个通道作为独立的设备呈现给应用程序（例如，从/ dev / ssd0到/ dev / ssd43）。通过直接访问SDF上的各个闪存通道的功能，用户应用程序可以有效地组织其数据并安排其数据访问，以充分利用原始闪存的性能</mark>。</p> 
+<p>其次，SDF提供了一个非对称的I / O接口。读取单位大小与写入单位大小不同。 SDF积极将写入单元的大小增加到闪存块的大小（2 MB），并要求将写地址进行块对齐。<mark>因此，几乎消除了写放大，因为在垃圾回收时，没有闪存块将同时包含有效和无效页面。最小读取单位设置为闪存页的大小（8 KB），这保留了SSD固有的随机读取功能</mark>。换句话说，SDF放弃了对小的随机写入的支持，同时保持了随机读取的能力，这与基于LSM树的KV存储的访问模式非常匹配。</p> 
+<p>第三，将擦除操作作为对设备的新命令公开给软件。与读取或写入相比，擦除是一项昂贵的操作。例如，擦除2 MB的块大约需要3毫秒。当通道中正在进行擦除操作时，它会大大延迟发布给该通道的常规请求的服务。常规SSD控制器计划的擦除操作对应用程序是隐藏的。它们可能导致不可预测的服务质量波动，这对于性能至关重要的工作负载尤其有害。使用此擦除命令，软件可在覆盖块之前负责执行擦除操作。但它也使软件能够安排擦除操作，以最大程度地减少延迟，提高吞吐量并减轻与高优先级请求服务的冲突。</p> 
+<p>第四，专门为SDF设计了一个简化的I / O堆栈。 Linux构建了一个复杂的I / O堆栈，该堆栈主要是为传统的低速磁盘设计的。 I / O堆栈层（例如块层）已成为当今高性能SSD的瓶颈[16] [17]。实验表明，<mark>由软件层引入的额外延迟在我们的服务器上可能高达12 µs。对于高速闪存数据访问，此开销非常大</mark>。由于SDF是为基于LSM树的KV存储量身定制的，因此文件系统的大多数功能都变得不必要。为了提高效率，我们绕过了内核中的大多数I / O层，并使用ioctl接口直接与SDF驱动程序进行通信。 SDF的I / O堆栈的等待时间仅为2 µs至4 µs。 SDF为应用程序提供了用户空间存储API库，以利用此处所述的功能。</p> 
+<h2><a id="_52"></a>设计实现</h2> 
+<p>在本节中，我们首先介绍LOCS系统的体系结构概述。然后，我们描述如何扩展原始的LevelDB设计，以便于同时访问SDF中的多个通道。接下来，我们分析了在LevelDB中进行请求调度以及将其调度到SDF通道的影响，并提出了提高访问效率的策略。</p> 
+<p>用软件和硬件级别说明了LOCS系统。软件级别由四个主要层组成：<mark>LevelDB，拟议的调度程序，存储API层和SSD驱动程序</mark>。如上一节所述，LevelDB是一种流行的基于LSM树的KV存储，并在此工作中用作案例研究。为了使LevelDB能够与开放通道SDF一起使用并提高其对SSD的高并发访问的效率，我们对LevelDB进行了一些必要的修改。有关详细信息，请参见第3.2节。注意，这项工作中提出的技术也可以应用于其他基于LSM树的KV store。</p> 
+<p>与传统的系统设计不同，在LevelDB和存储API层之间添加了调度程序。调度程序专门用于将来自LevelDB的请求调度和调度到SDF的各个通道。请注意，该调度程序与传统I / O堆栈中的OS调度程序不同。如第2.2节所述，使用SDF时，传统I / O堆栈中的大多数功能已被删除。此外，OS调度程序还负责所有进程的I / O请求。相反，<mark>图2中的调度程序仅考虑了LevelDB的请求。此外，用于垃圾回收的擦除操作也由调度程序管理</mark>。详细的设计和请求管理策略将在第3.3节中描述。<br> <img src="https://images2.imgbox.com/af/19/0CU5qJcG_o.png" alt="在这里插入图片描述"><br> 在调度和调度之后，来自LevDB的请求将针对不同的操作（包括读取，写入和擦除）调用相应的API。然后，调用SSD驱动程序以将这些请求发送到硬件设备中的SSD控制器。<mark>由于调度程序已由软件级别的调度程序接管，因此减少了传统硬件SSD控制器中的相应单元。 SSD控制器仅负责根据软件调度程序的指令将请求发送到相应的通道。另外，由于擦除操作也是由调度程序在软件级别上明确发出的，因此也不需要进行垃圾收集功能</mark>。其他基本功能（例如损耗平衡，ECC和DRAM缓存控制）仍保留在SSD控制器中。</p> 
+<p><strong>延展LevelDB</strong></p> 
+<ol><li><strong>启用对多个通道的并发访问</strong></li></ol> 
+<p>尽管LevelDB支持多个并发用户查询，但是只有一个后台线程将MemTables转储到存储设备并处理压缩过程。对于具有HDD的传统系统来说，这种设计是合理的，因为HDD中只有一个访问端口。由于移动磁盘头的延迟，使用多个线程进行SSTable写入和压缩会在不同线程的请求之间引入干扰，并降低I / O性能。但是，对于基于SSD的存储系统，可以删除查找时间。对于这项工作中使用的SDF，由于内部闪存通道已暴露于软件级别，因此有必要扩展LevelDB设计以允许并发访问这些通道。</p> 
+<p>首先，我们<mark>增加内存中不可变MemTable的数量</mark>，以充分利用SDF的44个通道。正如第2节中介绍的那样，在股票LevelDB中只有两个Memtable：一个工作的MemTable和一个不可变的MemTable。整个不可变内存表在单个写入请求中被刷新到SSD。如果在不可变的MemTable仍被刷新的同时工作的MemTable已满，则LevelDB将等待直到转储结束。由于一个写请求无法填满所有通道，因此我们增加了不可变内存表的数量上限，以存储更多传入数据。<mark>当工作的MemTable已累积足够的更新并达到大小阈值（此工作中为2 MB）时，它将生成一个不可变的MemTable，将其设置为可写入，然后将其发送到调度程序。通过这种修改，可以同时发出由多个不可变MemTables产生的写请求</mark>。我们将在第4节中展示不可变MemTables数量的影响。</p> 
+<p>当调度程序接收到写请求时，它将根据调度策略将写请求插入适当的请求队列中。如图2所示，<mark>每个闪存通道都有一个I / O请求队列。这意味着队列中的所有请求都由单个闪存通道独占服务。使用适当的调度策略，可以有效利用对多个通道的访问并发。对于读取和擦除请求，将根据要访问的数据的位置将它们插入相应的队列。对于写请求，将根据分派策略将它们插入合适的队列中。应该解决的是，如果将多个压缩过程应用于分布在不同通道上的SSTable，则也可以并行执行多个压缩过程</mark>。</p> 
+<ol start="2"><li><strong>编写流量控制策略</strong></li></ol> 
+<p>LevelDB的第二个修改与写流量控制策略有关。<mark>流量控制意味着LevelDB具有在Level 0 SSTables数量达到阈值时限制来自用户的写请求速率的机制。该机制的目的是限制0级SSTable的数量，从而减少与多个重叠的0级SSTable相关的搜索成本。换句话说，写吞吐量被交换为读性能</mark>。</p> 
+<p>（如何控制写流量, 牛皮）<br> 有几个阈值可控制0级SSTable的数量。当达到阈值kL0压缩触发器（默认为4）时，将触发压缩过程。如果在压缩过程中不能有效地减少Level-0 SSTable的数量并达到第二个阈值kL0 SlowdownWritesTrigger（在库存LevelDB中设置为8），则LevelDB将进入睡眠模式一毫秒以减少接收到的数据。写请求的速率。但是，如果Level-0 SSTable的数量持续增加并超过了第三个阈值kL0 StopWritesTrigger（默认值为12），则所有写请求都将被阻止，直到后台压缩完成为止。</p> 
+<p>写流量控制策略会严重影响写吞吐量。当KV对的插入被阻止时，写入吞吐量将大大降低。考虑到SDF的多通道体系结构，我们调整了写流量控制策略以提高吞吐量。首先，我们增加这些阈值的值，这些阈值最初是为HDD优化的。当有多个MemTables同时刷新到SSD时，不应过于频繁地触发阈值。<mark>通过增加阈值，我们可以扩大暂停之间的间隔。其次，当触发减速条件时，我们引入了一个额外的后台线程</mark><strong>加粗样式</strong>。在传统HDD中，所有读写I / O请求共享唯一的磁盘头。同时运行多个压缩将导致随机的I / O问题。但是，SDF中的多个通道使同时触发多个压缩变得可行。当用户请求被阻止时，单个压缩线程无法有效利用所有通道，即某些通道将处于空闲状态。通过创建一个额外的线程在暂停期间进行压缩，我们可以更快地减少0级文件的数量，并减轻暂停带来的吞吐量损失。值得一提的是，如果引入太多用于压缩的线程，它们将干扰正常的数据访问。我们的实验表明，附加的压实线足以降低吞吐量波动。此外，在所有0级SSTable被压缩之前，我们不需要阻止写请求。相反，我们修改LevelDB以确保当Level 0 SSTables的数量小于kL0 CompactionTrigger的一半时，它将再次接受用户写入请求。</p> 
+<p>3.<strong>预写式日志</strong></p> 
+<p>当发生断电等事故时，LevelDB维护一个单一的日志文件以恢复主存储器中的存储器。在原始LevelDB设计中，使用内存映射文件将日志写入HDD。新的更新作为连续的I / O请求附加到当前日志文件中。<mark>当存在大量并发写入请求时，使用单个日志文件的这种日志策略会严重影响写入吞吐量。在这项工作中，我们假设我们有一小部分高性能非易失性存储器（NVM）（例如PCM或备用电池DRAM）来保存这些日志。由于只要将MemTable转储到SSD即可丢弃日志，因此对非易失性存储器上存储空间的需求适中</mark>。例如，使用带有44个通道的SDF，我们只需要大约100 MB</p> 
+<p><strong>调度和调度策略</strong></p> 
+<p>通过上一部分中介绍的扩展，LevelDB现在可以与SDF一起使用。在LOCS中，我们发现写请求的调度策略会影响SSD的吞吐量和工作效率。例如，如果一个通道中有大量I / O请求而其他通道则处于空闲状态，则性能将严重下降。但是，由于我们可以直接控制对SDF多个通道的访问，因此可以利用LevelDB的指导信息来优化调度和调度。因此，在本小节中，我们研究了几种不同的策略，并讨论了如何提高系统性能。</p> 
+<ol><li><strong>循环调度</strong></li></ol> 
+<p>我们的基准调度策略是简单的循环（RR）调度，它可以将写入请求均匀地分配到SSD中的所有通道。来自LevelDB的写请求采用SSTable的粒度，其大小为2 MB。我们以循环顺序将所有写请求分配到每个通道。</p> 
+<p>这类似于传统的基于硬件的SSD控制器中的设计。例如，在我们的实验中使用的华为SSD中，来自LevelDB的每个大写请求都被剥离到多个通道上，以受益于并行访问。在我们的系统中，使用多个请求队列，情况有所不同。<mark>来自LevelDB的大型写请求被发布到一个通道，并且其数据不会被分割。因此，请求以2MB的粒度分配到通道</mark>。</p> 
+<p>循环调度具有简单性的优点。由于每个写请求的大小是固定的，因此在写请求占主导的情况下，它可以有效地工作。但是，当队列中有密集的读取和擦除请求时，循环调度的效率就会降低。这是因为两种类型的请求的分发都是固定的。特别是在同一队列中有多个读取/擦除请求等待的情况下，这可能导致队列长度不平衡。</p> 
+<p>图3（a）给出了循环调度的示例。假设SSD中有三个通道。图3（c）中显示了11个I / O请求的踪迹，包括6个写请求和5个读请求。第三行显示读取请求的通道地址。请注意，读取请求的通道地址已经确定并且不能更改，但是我们可以灵活地决定应在哪个通道上服务每个写入请求。应用循环调度时，所有写请求均以循环顺序均匀地调度到通道。但是，循环调度使通道2的请求队列比其他两个通道长得多，因为四个连续的读取请求全部落入通道2。因此，请求队列不平衡，这意味着通道2将与通道1和通道3相比，处理I / O请求所花的时间更长，并且通道2和2仍很忙时，通道1和3可能处于空闲状态。在这种情况下，不能充分利用多个通道启用的并行性。实际上，我们已经观察到，这种不平衡的队列会严重影响性能。详细的实验结果在第4节中显示和讨论。<br> <img src="https://images2.imgbox.com/5e/0e/0cYZciZe_o.png" alt="在这里插入图片描述"><br> 2. <strong>最小加权队列长度WriteDispatching</strong></p> 
+<p>为了缓解循环调度的不平衡队列问题，我们提出了基于请求队列长度的调度策略。基本思想是维护一个加权队列长度表，以预测处理这些队列中所有请求的延迟。由于存在三种不同类型的请求（读，写和擦除），因此我们应该为这三种类型的请求分配不同的权重。然后，可以如下表示队列的加权长度，<br> <img src="https://images2.imgbox.com/ac/75/DhPXxI6m_o.png" alt="在这里插入图片描述"><br> 注意，N表示队列中请求的总数，Wi和Sizei分别表示每个请求的权重和大小。权重是根据每种请求的相应延迟确定的。写入和擦除请求的大小都是固定的，只有读取请求的大小可能有所不同。然后，我们选择一个加权队列长度值最小的通道，并将当前来自LevelDB的写请求插入该通道。与循环调度策略不同，最小加权队列长度（表示为LWQL）调度策略考虑了所有三种I / O请求。图3（b）是使用LWQL调度的示例。</p> 
+<ol start="3"><li><strong>压缩的调度优化</strong></li></ol> 
+<p><img src="https://images2.imgbox.com/fe/b8/Y0zCeQ3r_o.png" alt="在这里插入图片描述">LevelDB生成两种类型的写请求。除了将内存转储到级别0的写入请求外，其他写入请求都是通过压缩生成的。我们注意到压缩的数据访问模式是可预测的。因此，我们提出用于压缩的调度优化。如第2.1节所述，压缩将在特定键范围内合并SSTable。该过程包括读取和写入请求。由于读取请求的通道地址是固定的，因此，如果将用于一次压缩的某些输入SSTable分配在同一通道中，则必须按顺序读取它们，从而增加了压缩的等待时间。图4（a）显示了这种情况的示例。首先，在执行压缩过程时，将三个SSTable分别表示为级别0“ b〜d”（即，级别0的键范围为“ b〜d”的SSTable），级别1“ a〜b”和级别1如步骤1所示，将从SDF中读取“ c〜d”到主存储器。然后对这些SSTable执行多路合并排序，以生成两个新的SSTable，分别为Level 1“ a〜b”和Level 1 “ c〜d。”合并操作之后，它们将被写回到SDF，如步骤2所示。如果我们不仔细分配这些SS表，则可能会将级别1“ a〜b”分配给通道1。 ，其中包含2级“ a〜b” SSTable。这意味着我们必须在下一次压缩中从同一通道读取这两个SSTable，如步骤3所示。因此，压缩效率受到影响。</p> 
+<p>显然，在当前压缩中生成的新SSTables的分配将影响未来压缩的效率。因此，需要针对压缩的写调度优化来提高压缩效率。目的是确保精心分配SSTable，以使具有相邻键范围的SSTable不会分配在同一通道中。因此，我们提出了一种技术，用于优化从压缩生成的SSTable的调度。<mark>调度策略基于LWQL策略，描述如下</mark>。</p> 
+<ul><li>我们在清单文件中记录每个SSTable的通道位置。清单文件还包含构成每个级别的SSTable的集合以及相应的键范围。</li><li>对于从压缩生成的每个SSTable，我们首先寻找加权队列长度最短的队列作为候选项。如果下一个级别中有任何SSTable，其关键字位于四个最接近的SSTable的范围内，则将跳过此候选队列。</li><li>然后，我们在其余队列中找到加权队列长度最短的队列，并且与上一步一样，检查键范围的条件。重复该步骤，直到满足条件为止。</li></ul> 
+<p>图4（b）显示了此策略的示例。步骤1与4（a）相同。在步骤1之后，压缩线程在步骤2中为新生成的SSTable选择候选队列。假设根据LWQL策略为1级“ a〜b” SSTable选择了通道1，则该线程将搜索四个2级的最近邻居。因此，它将找到2级“ a〜b”，这意味着它们可能会在以后的压实中合并。因此，通道1被跳过，它将找到另一个加权队列长度最小的候选队列。然后选择第2通道，在第2层不存在相邻的SSTable。如前所述，压缩操作会将所有涉及的相邻SSTable读入内存。因此，如图4（b）的步骤3所示，避免将具有相邻关键字范围的SSTable留在同一通道中可以有效地提高读取性能。类似地，内存中的级别1“ c〜d” SSTable将逃避级别2“ a〜b”，“ c〜d”，“ e〜f”和“ g〜h” SSTable。一项统计实验表明，在我们的工作负载中，超过93％的压缩操作涉及不超过五个SSTable，这意味着在大多数情况下，一个SSTable将与下一个级别的四个或更少的SSTable合并。考虑到这一事实，我们在<mark>左右两个方向上将搜索范围设置为四个最近的SSTable</mark>。请注意，这种技术无法应用于传统的基于硬件的SSD控制器，因为它没有足够的来自软件级别的信息。它展示了LOCS中调度程序提供的软件-硬件协同优化的灵活性。</p> 
+<ol start="4"><li><strong>擦除的调度优化</strong></li></ol> 
+<p>到目前为止，调度策略仅针对写请求进行了优化。除了调度之外，请求的调度还可能影响系统的性能。在本小节中，我们将讨论如何安排擦除请求以提高吞吐量。</p> 
+<p>如前几小节所述，擦除请求的分派无法适应。但是，由于擦除过程不在关键路径上，因此可以动态调整调度。对于基于LSM树的KV存储，仅在压缩后才执行擦除操作。用作压实输入的SS表无用，应删除。<mark>一种简单的方法是在压缩后立即擦除SSTable，以回收这些存储空间。但是，这种擦除策略可能会降低性能，尤其是在进行大量读取操作时。首先，由于长的擦除等待时间，读取操作可能会长时间被擦除阻止。其次，由于擦除和读取请求的分配策略都是固定的，因此队列可能变得不平衡</mark>。图5（a）中显示了一个示例。通道1的请求队列中只有一个擦除操作会导致随后的两个读取操作的长时间延迟。<br> <img src="https://images2.imgbox.com/c2/2d/fB20Rmvr_o.png" alt="在这里插入图片描述"><br> <mark>解决此问题的方法是延迟擦除请求，并在有足够的写请求时安排它们</mark>。这是因为写请求可以帮助平衡队列长度。该解决方案的关键是确定是否有足够的写请求。在LOCS中，我们为写请求的比率设置了阈值THw。当写请求的比例达到阈值时，将安排擦除请求。注意，当空闲块的百分比低于阈值时，将强制安排擦除请求。此设计类似于传统的基于硬件的SSD控制器中的垃圾回收策略。</p> 
+<p>图5（b）显示，通过从通道1的请求队列中删除此擦除操作，可以大大降低总读取延迟。图5（c）显示了一个队列包含七个写操作的情况。每个队列由LWQL策略调度。处理请求需要12个时隙。如图5（d）所示，将延迟的擦除操作插入到请求队列中时，LWQL策略确保将在擦除请求之后到达的四个写请求插入到最短的队列中，从而使队列达到平衡而不增加处理量时间。我们可以看到，在没有擦除调度的情况下，完成图5（a）和5（c）中所有操作的总时间为19，而在优化时，它减少为图5（b）和5（d）中的15。被申请;被应用。因此，提高了整体吞吐量。【妙啊】</p> 
+<h2><a id="_132"></a>实验</h2> 
+<p>我们比较了华为SSD上运行的库存LevelDB和SDF上运行的优化LevelDB的性能。图6（a）显示了I / O吞吐量的比较。循环调度策略用于SDF。华为SSD的通道调度是在其固件中实现的，LevelDB生成的SSTable被剥离并统一调度到所有通道。结果表明，针对不同的基准和不同的吞吐量请求比率，使用优化的LevelDB，可以在SDF上显着提高I / O吞吐量。平均而言，I / O吞吐量可以提高约2.98倍。它表明，即使不对调度策略进行任何优化，LOCS也可以利用高访问并行度。在华为SSD中，来自LevelDB的每个大写入请求（2MB）都会通过其44个通道进行剥离，剥离单元大小为8 KB，并分配到不同的通道中，从而受益于对多个通道的并行访问。在SDF中，多个请求队列的情况有所不同。来自LevelDB的大写请求被发布到通道而不会剥离。因此，请求以2MB的粒度均匀地分布到通道。大型请求在华为SSD中分为多个子请求，并通过不同的渠道提供服务。因此，在请求服务中必须拆分（用于写）或合并（用于读）请求的数据，并且每个通道服务于更大数量的较小请求。这增加了开销并降低了吞吐量。此外，华为SSD中的垃圾回收会导致额外的写入放大开销。昂贵的垃圾回收会损害性能稳定性。</p> 
+<p>图6（b）在每秒操作数（OP）方面比较了LevelDB的性能。该趋势类似于I / O吞吐量。平均提高了约2.84倍，比I / O吞吐量要低一点。原因是由于压缩而产生的写入被计入I / O吞吐量，但在LevelDB的OP的计算中并未考虑。请注意，由于空间限制，我们只显示大小为100字节的数据的结果。实际上，我们的LOCS系统始终在不同数据值大小上实现性能提升。</p> 
+<p><img src="https://images2.imgbox.com/a2/fe/ptLIPjOG_o.png" alt="在这里插入图片描述"><br> 在图7中，我们研究了主存储器中不可变内存对SDF I / O吞吐量的影响。在此实验中，将吞吐量数据比率设置为1：1，并且密钥值大小为8 KB。由于不可变内存表的数量决定了对SDF的并发写入请求的数量，因此I / O吞吐量与内存表的数量成比例地增加。结果表明，当MemTables计数达到闪存通道数时，I / O吞吐量达到饱和。实际上，如果我们进一步增加计数，则由于每个闪存通道上过多的并发写入请求而导致服务竞争，因此SDF的I / O吞吐量可能会降低。因此，我们总是将MemTables的数量设置为闪存通道的数量。其他配置的结果显示相同的趋势。<br> <img src="https://images2.imgbox.com/2e/75/Bed3g0ii_o.png" alt="在这里插入图片描述"><br> 在图8中，说明了I / O吞吐量的波动，并将其与将阈值kL0 Slowdown WritesTrigger分别设置为8和68时的两种情况进行了比较。阈值kL0 StopWritesTrigger设置为1.5·kL0 Slowdown WritesTrigger。周期性波动和明显的吞吐量下降是由对写请求的流量控制引起的。显然，波动周期随着阈值的增大而变大。它从30秒增加到大约70秒，因此，平均吞吐量从221 MB / s增加到349 MB / s。这表明阈值应在SDF中设置为更大的值，以适应其更高的访问并行性。<br> <img src="https://images2.imgbox.com/67/b5/2ctAc1jF_o.png" alt="在这里插入图片描述"><br> 请注意，阈值增加时，吞吐量并不会始终得到提高。这是因为较高的阈值会导致级别0的更多SSTable。由于级别0的SSTable中搜索数据的等待时间增加，因此，如果阈值太大，则可能会降低总体吞吐量。为了证实这一发现，我们用不同的阈值测量吞吐量，并在图9中进行比较。我们发现最有效点出现在68左右。<br> <img src="https://images2.imgbox.com/c5/c3/JQwwWq2F_o.png" alt="在这里插入图片描述"><br> 我们在图10中研究了引入额外的压缩线程的影响。我们发现，使用该额外的线程可以减轻吞吐量的波动。这是因为可以以更高的速率压缩级别0中的SSTable，从而可以减轻写请求的速度。平均而言，吞吐量可以从221 MB / s增加到大约361 MB / s。注意，kL0 Slowdown WritesTrigger阈值仍设置为8，以突出显示添加一个额外线程的影响。将这两种技术结合在一起的结果如图11所示。吞吐量平均可提高到375 MB / s。<br> <img src="https://images2.imgbox.com/99/65/rDbjsrgr_o.png" alt="在这里插入图片描述"><br> 在接下来的几组实验中，我们研究了调度策略对SDF吞吐量和LevelDB性能的影响。值大小为8 KB，吞吐量为1：1。如图12所示，为了证明平衡加权队列长度的重要性，我们首先说明了暂时空队列与I / O吞吐量之间的关系。空队列的平均数目是通过在LevelDB的较长执行周期内对队列长度进行采样而获得的。我们发现，SDF的吞吐量有很大的波动，并且与空队列的数量成反比。不难理解，暂时空的队列是由不平衡的请求分发引起的。平均而言，空队列可能导致大约14 MB / s的I / O吞吐量损失。<br> <img src="https://images2.imgbox.com/5d/c7/cBjYk953_o.png" alt="在这里插入图片描述"><br> 为了解决此问题，我们提出了LWQL调度策略。在图13中，我们比较了LevelDB长时间执行期间所有44个通道的队列长度的标准偏差。不难看出，与基线轮询策略相比，使用LWQL调度策略后，队列长度的偏差显着减小。这表明针对写请求的优化调度策略可以有效地帮助平衡通道之间的I / O强度。</p> 
+<p>图13中的第三组结果显示了当应用压缩的优化分配时队列长度的偏差。如第3.3.3节所述，该技术可以帮助解决将多个SSTable分发到同一通道的问题，这些SSTable可能会在以后的压缩中读取。换句话说，它可以帮助平衡不同通道之间的读取请求强度。因此，与LWQL策略相比，使用这种技术后可以进一步减少队列长度的偏差。请注意，由于优化只能应用于队列长度最短的通道，因此改进不是很明显。<br> <img src="https://images2.imgbox.com/03/47/TPTwckYT_o.png" alt="在这里插入图片描述"><br> 我们在图14中评估了LOCS系统的性能。为了获得持续的性能结果，每个工作负载中写入的数据总量至少为1500 GB，是SDF容量的两倍。图14（a）-（d）中显示了不同值大小，吞吐量数据比率和各种基准的I / O吞吐量结果。所有这些结果证明了相似的趋势，并支持了有关平衡队列长度的调度优化的先前讨论。例如，与使用循环调度策略的基准情况相比，使用LWQL策略后，SDF的I / O吞吐量平均提高了30％。对于相同的设置，在应用优化技术进行压实后，SDF的生产率提高了39％。注意，这种改进不仅来自平衡队列长度，还得益于更有效的压缩操作。另一个观察结果是，随着吞吐量请求比率的降低，改进程度会降低。正如我们在第3节中提到的，这是因为在写入强度较高时，循环策略效果很好。与仅在SSD上运行库存LevelDB的基准相比，吞吐量提高了4倍以上。</p> 
+<p>在图14（e）-（h）中，我们比较了三种具有不同值大小，吞吐量数据比率和基准的调度策略在LevelDB OP方面的LevelDB性能。我们发现吞吐量趋势类似于SSD吞吐量。平均而言，使用LWQL调度策略后，OP的数量提高了21％，而采用优化技术进行压实后，OP的数量进一步提高到31％。这意味着我们的优化技术不仅可以提高SSD的吞吐量，而且可以提高LevelDB的性能。</p> 
+<p>在图14（i）中，我们说明了擦除调度操作对两个具有不同读/写比率的工作负载的影响。第一个工作负载（工作负载1）可以分为两个阶段：读写请求比率为1的均等读写阶段和读写请求比率为1/4的写主导阶段。第二个工作负载（工作负载2）的读取-修改-写入模式的吞吐率约为1。基线策略是在压缩后立即擦除块，而无需进行智能擦除调度。这与第3.3.4节中描述的擦除调度策略进行了比较，其中写入请求的比率具有各种阈值T Hw。我们可以看到，当使用T Hw小于4的调度策略时，工作负载1的吞吐量得到了提高。这是因为读写比率的显着变化为策略提供了机会，以明确标识执行以下操作的时间段：更高的吞吐量。但是，对于Workload 2，我们的调度策略会降低吞吐量，因为写入强度很少达到执行擦除操作的阈值。因此，大多数擦除操作将推迟到可用块用完，并且必须在请求服务的关键路径上执行。<br> <img src="https://images2.imgbox.com/6f/5b/9LH1XV8Q_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="_160"></a>总结</h2> 
+<p>基于LSM树的KV存储和SSD的结合具有改善存储系统I / O性能的潜力。但是，两者的直接集成无法完全利用SSD中多个通道支持的高并行性。我们发现，如果可以将对SSD内部通道的访问暴露给KV商店，则I / O吞吐量可以得到显着提高。实验结果表明，I / O吞吐量最多可以提高2.98倍。有了这样的存储系统，来自KV商店的请求的调度策略将对吞吐量产生重要影响。因此，我们提出了几种在软件级别上用于调度程序的调度和调度策略的优化技术。利用这些技术，LOCS的I / O吞吐量可以平均平均提高约39％。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/642fa5c9cafe3030dfb97fc2e760869e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">docker 集群搭建及使用docker compose 搭建es集群</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/1a734fa1f998f42d8df0c58c5f16d7a4/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">微信小程序埋点技术</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

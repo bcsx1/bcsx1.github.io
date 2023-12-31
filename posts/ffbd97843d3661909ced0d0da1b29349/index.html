@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>arm系统调用过程 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="arm系统调用过程" />
+<meta property="og:description" content="寄存器介绍来自于 https://blog.csdn.net/a999818/article/details/123837580 ARM 处理器一般共有 37 个寄存器，其中包括： 1） 31 个通用寄存器，包括 PC（程序计数器）在内，都是 32 位的寄存器。 2） 6 个状态寄存器，都是 32 位的寄存器。 ARM 处理器共有 7 种不同的处理器模式： （1）USR（10000）：正常用户模式，程序正常执行模式。 （2）FIQ（10001）：快速中断模式，以处理快速情况，支持高速数据传输或通道处理。 （3）IRQ（10010）：外部中断模式，普通中断处理 （4）SVC（10011）：操作系统保护模式（管理模式），即操作系统使用的特权模式（内核），处理软件中断swi reset （5）abt（10111）：数据访问中止模式，用于 虚拟存储器 和 存储器 保护 （6）und（11011）：未定义指令终止模式，用于支持通过软件仿真硬件的协处理器 （7）sys（11111）：系统模式，用于运行特权级的操作系统任务（ armv4 以上版本才具有） 1、 在所有的寄存器中，有些是各模式共用同一个物理寄存器，有些寄存器是各个模式自己拥有独立的物理寄存器 2、CPSR和SPSR都是程序状态寄存器，其中SPSR是用来保存中断前的CPSR中的值，以便在中断返回之后恢复处理器程序状态。 从下图可以看到system和user模式的所有寄存器是共享的。而svc和user模式的r13和r14是不共享。这意味着当从用户态态转到svc模式时，同样是在访问寄存器r13。这个r13在不同模式下的值是不同的.
+例如针对同样的汇编指令
+mov r0,r13（user模式）--&gt;（假设这条指令直接到了svc模式下）mov r0,r13//svc下的r13就不是用户态的r13。他们只是同名而已，其实是两个不同的寄存器了。
+这是为什么说arm有31个通用寄存器 16（user&amp;system）&#43; 7 (FIQ)&#43;2（svc）&#43;2(abort)&#43;2(irq)&#43;2(undef) = 31
+状态寄存器6个=1&#43;1&#43;1&#43;1&#43;1&#43;1
+除用户模式之外的其他6种处理器模式被称为特权模式。在这些模式下，程序可以访问所有的系统资源，也可以进行处理器模式切换
+系统调用产生过程
+如：open ---&gt; __libc_open() ---&gt; svc/swi ---&gt; vector_swi ---&gt;system_call ---&gt; sys_func
+svc和swi的区别 svc和swi都是supervisor call指令，都是系统调用. 再armv7之前，用的都是swi， 触发异步异常，进入vector_swi异常向量表; 在armv8-arch64架构下，抛弃了swi，改用了 svc，触发的是同步异常，进入同步异常向量表el1_sync 系统调用和普通的函数调用是不同的。对于普通的函数调用，参数被保存到了r0-r3中，如果形参超过了4个，那么多余的参数可以用栈进行传递。但是对于系统调用(swi/svc)，会引起处理器模式切换user切换到svc，而svc模式下的sp和user模式的sp是不同的。因此系统调用无法使用栈传入参数，需要将所有的参数通过寄存器传递。arm最多支持6个（r0-r5）。sp究竟是怎么切换的呢?" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/ffbd97843d3661909ced0d0da1b29349/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-04-17T22:48:31+08:00" />
+<meta property="article:modified_time" content="2023-04-17T22:48:31+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">arm系统调用过程</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div class="kdocs-document"> 
+ <blockquote class="kdocs-blockquote" style=""> 
+  <span class="kdocs-bold" style="font-weight:bold;">寄存器介绍来自于</span> 
+  <br> 
+  <a class="kdocs-link" style="color:#0A6CFF;" href="https://blog.csdn.net/a999818/article/details/123837580" target="_blank" rel="noopener noreferrer">https://blog.csdn.net/a999818/article/details/123837580</a> 
+  <br> 
+  <span class="kdocs-bold" style="font-weight:bold;">ARM 处理器一般共有 37 个寄存器，其中包括：</span> 
+  <br>1） 31 个通用寄存器，包括 PC（程序计数器）在内，都是 32 位的寄存器。 
+  <br>2） 6 个状态寄存器，都是 32 位的寄存器。 
+  <br>ARM 处理器共有 7 种不同的处理器模式： 
+  <br>（1）USR（10000）：正常用户模式，程序正常执行模式。 
+  <br>（2）FIQ（10001）：快速中断模式，以处理快速情况，支持高速数据传输或通道处理。 
+  <br>（3）IRQ（10010）：外部中断模式，普通中断处理 
+  <br>（4）SVC（10011）：操作系统保护模式（管理模式），即操作系统使用的特权模式（内核），处理软件中断swi reset 
+  <br>（5）abt（10111）：数据访问中止模式，用于 虚拟存储器 和 存储器 保护 
+  <br>（6）und（11011）：未定义指令终止模式，用于支持通过软件仿真硬件的协处理器 
+  <br>（7）sys（11111）：系统模式，用于运行特权级的操作系统任务（ armv4 以上版本才具有） 
+  <br> 
+  <span class="kdocs-bold" style="font-weight:bold;">1、</span> 
+  <span class="kdocs-color" style="background-color:#F7C7D3;"><span class="kdocs-bold" style="font-weight:bold;">在所有的寄存器中，有些是各模式共用同一个物理寄存器，有些寄存器是各个模式自己拥有独立的物理寄存器</span></span> 
+  <br> 
+  <span class="kdocs-color" style="background-color:#F7C7D3;"><span class="kdocs-bold" style="font-weight:bold;">2、CPSR和SPSR都是程序状态寄存器，其中SPSR是用来保存中断前的CPSR中的值，以便在中断返回之后恢复处理器程序状态。</span></span> 
+  <br> 
+ </blockquote> 
+ <p style="">从下图可以看到system和user模式的所有寄存器是共享的。而svc和user模式的r13和r14是不共享。这意味着当从用户态态转到svc模式时，同样是在访问寄存器r13。这个r13在不同模式下的值是不同的.</p> 
+ <p style="">例如针对同样的汇编指令</p> 
+ <p style="">mov r0,r13（user模式）--&gt;（假设这条指令直接到了svc模式下）mov r0,r13//svc下的r13就不是用户态的r13。他们只是同名而已，其实是两个不同的寄存器了。</p> 
+ <p style="">这是为什么说arm有31个通用寄存器 16（user&amp;system）+ 7 (FIQ)+2（svc）+2(abort)+2(irq)+2(undef) = 31</p> 
+ <p style="">状态寄存器6个=1+1+1+1+1+1</p> 
+ <div class="kdocs-line-container" style="display:flex;"> 
+  <div class="kdocs-img" style="flex-direction:column;max-width:100%;display:flex;width:460px;justify-content:center;align-items:center;height:auto;"> 
+   <div class="kdocs-img" style="padding-top:71.08696%;height:0;"> 
+    <img src="https://images2.imgbox.com/3d/1c/cclwDUoJ_o.png" style="margin-left:;display:block;width:460px;margin-top:-71.08696%;height:auto;"> 
+   </div> 
+  </div> 
+ </div> 
+ <p style="">除用户模式之外的其他6种处理器模式被称为特权模式。在这些模式下，程序可以访问所有的系统资源，也可以进行处理器模式切换</p> 
+ <p style="">系统调用产生过程</p> 
+ <ol start="1"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p><span class="kdocs-fontSize" style="font-size:9pt;">如：open ---&gt; __libc_open() ---&gt; svc/swi ---&gt; vector_swi ---&gt;system_call ---&gt; sys_func</span></p></li></ol> 
+ <blockquote class="kdocs-blockquote" style=""> 
+  <span class="kdocs-bold" style="font-weight:bold;">svc和swi的区别</span> 
+  <br> 
+  <span class="kdocs-fontSize" style="font-size:13pt;">svc和swi都是supervisor call指令，都是系统调用.</span> 
+  <br>再armv7之前，用的都是swi， 
+  <span class="kdocs-color" style="background-color:#F7C7D3;">触发异步异常</span>，进入vector_swi异常向量表; 
+  <br>在armv8-arch64架构下，抛弃了swi，改用了 
+  <span class="kdocs-color" style="background-color:#DFF0C4;">svc，触发的是同步异常</span>，进入同步异常向量表el1_sync 
+ </blockquote> 
+ <p style="">系统调用和普通的函数调用是不同的。对于普通的函数调用，参数被保存到了r0-r3中，如果形参超过了4个，那么多余的参数可以用栈进行传递。但是对于系统调用(swi/svc)，会引起处理器模式切换user切换到svc，而svc模式下的sp和user模式的sp是不同的。因此系统调用无法使用栈传入参数，需要将所有的参数通过寄存器传递。arm最多支持6个（r0-r5）。<span class="kdocs-color" style="background-color:#FBF5B3;">sp究竟是怎么切换的呢?</span></p> 
+ <p style="">随便在glibc里面找到了clone.S。看看clone的实现</p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">ENTRY(__clone)
+    @ sanity check args
+    cmp    r0, #0
+    ite    ne
+    cmpne    r1, #0
+    moveq    r0, #-EINVAL
+    beq    PLTJMP(syscall_error)
+
+    @ insert the args onto the new stack
+    str    r3, [r1, #-4]!
+    str    r0, [r1, #-4]!
+
+    @ do the system call
+    @ get flags
+    mov    r0, r2
+    mov    ip, r2
+    @ new sp is already in r1
+    push    {r4, r7}
+    cfi_adjust_cfa_offset (8)
+    cfi_rel_offset (r4, 0)
+    cfi_rel_offset (r7, 4)
+    ldr    r2, [sp, #8]
+    ldr    r3, [sp, #12]
+    ldr    r4, [sp, #16]
+    ldr    r7, =SYS_ify(clone)
+    swi    0x0//产生软中断
+    cfi_endproc
+    cmp    r0, #0
+    beq    1f
+    pop    {r4, r7}
+    blt    PLTJMP(C_SYMBOL_NAME(__syscall_error))
+......................</code></pre> 
+ <pre class="kdocs-cpp"><code class="language-cpp">    ldr    r7, =SYS_ify(clone)
+    swi    0x0</code></pre> 
+ <p style="">可以看到系统调用号被保存到了r7里面.并且是使用的swi指令触发异常进入内核态。</p> 
+ <p style="text-align:left;">在异常产生的时候,会发生什么?硬件做了哪些事,软件需要做哪些事?这是我们必须要知道的,下面就是异常发生时 arm 处理器自动执行的操作:</p> 
+ <blockquote class="kdocs-blockquote" style="text-align:left;">
+   1、将异常发生前所属模式的 CPSR(user下为APSR) 拷贝到异常发生后将要进入模式的 SPSR_mode（我们这个例子是SPSR_svc） 中,除了 System 模式,其它所有 PL1 特权级模式都有 SPSR bank 寄存器,这个操作并不难理解,就是保存现场,方便在异常处理完成之后还原之前的 CPSR. 
+  <br>2、将返回地址保存到 LR 寄存器中,返回地址自然是当前指令的下一条指令的地址,但是因为指令流水线的存在,PC寄存器中保存的是当前指令地址 +8 处的指令,所以需要针对 PC 做一个偏移,这个偏移并不是固定的,而是根据不同模式有不同的值. 
+  <br>3、修改 CPSR 中的某些 bit。修改 CPSR 的 mode 部分,修改为异常处理模式下的模式；设置 CP15 的 TE bit；J(指令集模式) bit被清除,同时 E(大小端) bit 设置为 EE(exception 大小端) bit. 主要是根据预先的设置配置异常处理的指令集模式和大小端； 
+  <span class="kdocs-color" style="background-color:#FBF5B3;">设置 PC 指针到对应的异常模式向量处,执行软件定义的异常处理程序.</span> 
+ </blockquote> 
+ <p style="text-align:left;">根据硬件自动所做的动作以及上面保存现场的代码可以看到，r13和r14里面保存的是用户态的sp和lr。r15(pc)里面保存的则是用户态返回的地址（ str lr, [sp, #S_PC]），即用户态调用swi指令的下一条地址。r16里面则是用户态的cpsr寄存器。所以说内核栈里面的pt_regs里面保存的都是用户态的现场信息。然后还会将PC设置为异常模式向量表的起始地址，执行对应预先定义的异常处理程序。</p> 
+ <p style="">下面这个是向量表。因此swi指令触发异常，进入内核态是从这里开始执行的。至于怎么走到vector_swi没有看明白。具体可以参考<a class="kdocs-link" style="color:#0A6CFF;" href="https://dandelioncloud.cn/article/details/1570975835916300289" rel="nofollow noopener noreferrer" target="_blank">https://dandelioncloud.cn/article/details/1570975835916300289</a></p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">__vectors_start:
+    W(b)    vector_rst
+    W(b)    vector_und
+    W(ldr)    pc, __vectors_start + 0x1000
+    W(b)    vector_pabt
+    W(b)    vector_dabt
+    W(b)    vector_addrexcptn
+    W(b)    vector_irq
+    W(b)    vector_fiq</code></pre> 
+ <pre class="kdocs-cpp"><code class="language-cpp">ENTRY(vector_swi)
+#ifdef CONFIG_CPU_V7M
+    v7m_exception_entry
+#else
+    /************** 保存断点部分 ***************/
+    /* S_FRAME_SIZE=72=sizeof(struct pt_regs) */
+    sub    sp, sp, #S_FRAME_SIZE
+    /*
+    将r0-r12寄存器保存到栈中,目前还没有保存r13(sp),r14(lr),r15(pc),cpsr,orig_r0
+    sp不是sp!，因此这里只是将13个寄存器保存到了sp里面地址开始的空间中，sp的值并未变化
+    这里首先保存r0-r12，估计是因为user模式和svc模式，这几个寄存器是共享的。直接使用会
+    破坏用户态的现场
+    */
+    stmia    sp, {r0 - r12}            @ Calling r0 - r12
+    /* 
+    60 offsetof(struct pt_regs, ARM_pc)
+    r8 = sp + 60
+    因此此时r8是指向了最开始开辟的72字节栈中的第60字节(pc).
+    但是前面只是保存了13*4=48字节的内存。此时sp+60里面没有有效数据
+    */
+ ARM(    add    r8, sp, #S_PC        )
+     /*
+     将用户空间的 sp 和 lr 保存到 r8 地址处,那这里的sp还是用户栈咯?
+     前面不是开辟了72字节的栈空间嘛?这部分也是用户空间的栈??这里其实已经到了内核栈
+     stmdb压栈指令,从右到左入栈 r8=r8-4, [r8]=lr
+    因此相当于将sp_user和lr_user保存到uregs[14]和uregs[13]中,
+    至此pt_regs中r0-r14保存完毕
+    */
+ ARM(    stmdb    r8, {sp, lr}^        )    @ Calling sp, lr
+ THUMB(    mov    r8, sp            )
+ THUMB(    store_user_sp_lr r8, r10, S_SP    )    @ calling sp, lr
+     /*  spsr 中保存了 user 下的 APSR，将spsr给r8 */
+    mrs    r8, spsr            @ called from non-FIQ mode, so ok.
+    /*
+     lr里面保存了返回地址（即用户空间执行swi指令的下一条指令的地址。将返回地址保存到lr是硬件自己做的），因此将其存入pc
+     这样等系统调用返回时，就从这个返回地址开始执行 
+    */
+    str    lr, [sp, #S_PC]            @ Save calling PC
+    str    r8, [sp, #S_PSR]        @ Save CPSR
+    str    r0, [sp, #S_OLD_R0]        @ Save OLD_R0
+#endif</code></pre> 
+ <pre class="kdocs-cpp"><code class="language-cpp"> ARM(    stmdb    r8, {sp, lr}^        )    @ Calling sp, lr</code></pre> 
+ <p style=""><span class="kdocs-color" style="background-color:#F7C7D3;">stm* 指令后添加 ^,表示操作的不是当前模式下的 sp,lr,而是 USER 模式下的寄存器</span></p> 
+ <blockquote class="kdocs-blockquote" style="">
+   当通过系统调用进入内核的时候，内核栈已经是准备好了，不过这时候内核栈上是空的，执行完上述代码之后，在内核栈上形成如下的用户空间现场： 
+ </blockquote> 
+ <div class="kdocs-line-container" style="display:flex;"> 
+  <div class="kdocs-img" style="flex-direction:column;max-width:100%;display:flex;width:613px;justify-content:center;align-items:center;height:auto;"> 
+   <div class="kdocs-img" style="padding-top:65.08972%;height:0;"> 
+    <img src="https://images2.imgbox.com/36/9d/HhmHkOtH_o.png" style="margin-left:;display:block;width:613px;margin-top:-65.08972%;height:auto;"> 
+   </div> 
+  </div> 
+ </div> 
+ <blockquote class="kdocs-blockquote" style="">
+   上面这段（vector_swi）会被是保存user模式下的寄存器断点保存。所以网上说struct pt_regs保存了 
+  <span class="kdocs-color" style="background-color:#F7C7D3;">用户态的信息。但是我感觉很多汇编代码在 重复保存寄存器呢？？？前面不是已经保存了嘛？？</span> 
+  <br>1、ARM( stmdb r8, {sp, lr}^ ) @ Calling sp, lr //这个不就是将用户模式的sp,lr保存到内核栈嘛？ 
+  <br>2、 
+  <br>THUMB(mov r8, sp) 
+  <br>THUMB(store_user_sp_lr r8, r10, S_SP)@ calling sp, lr 
+  <br>等价于 
+  <br>mrs r10, cpsr 
+  <br>eor r10, r10, #(SVC_MODE ^ SYSTEM_MODE) 
+  <br>msr cpsr_c,r10 @ switch to the SYS mode 系统模式和用户模式公用sp和lr 
+  <br>str sp, [r8, #S_SP] @ save sp_usr 系统模式和svc模式共用r8，因此r8指向了 
+  <br> @ 内核栈指针sp。这不就是向内核栈里面保存用户态的sp 
+  <br> @ 和lr嘛 
+  <br>str lr, [r8, #S_SP + 4] @ save lr_usr 
+  <br>eor r10, r10, #(SVC_MODE ^ SYSTEM_MODE) 
+  <br>ms rcpsr_c, r10 @ switch back to the SVC mode 最后保存完了，返回svc 
+  <br>感觉这上面的代码功能是一样的呢？不过arm的汇编不熟，后面再来看吧 
+  <br>好像arm有两种指令状态arm和THUMB，是不是这两个里面只会执行一个哦 
+ </blockquote> 
+ <p style=""><span class="kdocs-color" style="background-color:#FBF5B3;"><span class="kdocs-bold" style="font-weight:bold;">还有就是用户空间进入到内核空间，内核栈是在何时设定的呢？如何就切换为当前进程的内核栈呢？</span></span></p> 
+ <blockquote class="kdocs-blockquote" style="">
+   答案来自于 
+  <br>X86切换方式，好像操作系统真像还原那本书里面也提了这个 
+  <br> 
+  <a class="kdocs-link" style="color:#0A6CFF;" href="https://blog.csdn.net/orchidofocean/article/details/56972305" target="_blank" rel="noopener noreferrer">https://blog.csdn.net/orchidofocean/article/details/56972305</a> 
+  <br> 
+  <a class="kdocs-link" style="color:#0A6CFF;" href="https://www.cnblogs.com/justcxtoworld/p/3155741.html" rel="nofollow noopener noreferrer" target="_blank">https://www.cnblogs.com/justcxtoworld/p/3155741.html</a> 
+  <br>arm 
+  <br> 
+  <a class="kdocs-link" style="color:#0A6CFF;" href="https://tech.hqew.com/fangan_1727106" rel="nofollow noopener noreferrer" target="_blank">https://tech.hqew.com/fangan_1727106</a> 
+ </blockquote> 
+ <p style="">每个进程都一个用户栈和内核栈。当进程从用户态进行到内核态时，可以看到上面vector_swi里面直接就默认sp是内核栈。但是既然每个进程都有一个单独的内核栈，那通过svc/swi进入到内核态，它是怎么确定改用哪个进程的内核栈呢?代码里面也没有看到传了什么进程号之类的东西，也没有看到去找对应的内核栈。</p> 
+ <p style="">上面的文章里面是这样解释的（这个解释对于用户态被中断打断进入内核态，感觉也是适用的。应该是从用户态到内核态）：</p> 
+ <blockquote class="kdocs-blockquote" style="">
+   关于SP寄存器，这里有一个问题值得澄清一下，前面提到“在进入SVC模式时，SP/R13寄存器所指向的位置就正好是当前进程的内核栈”，原因是什么呢？ 
+ </blockquote> 
+ <ol start="1"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>svc模式和user模式下的sp和lr都是独立的。</p></li></ol> 
+ <ol start="2"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>当前进程被中断打断或者通过系统调用主动陷入内核态，有个前提就是当前进程是被cpu选中，正在被调度。<span class="kdocs-color" style="background-color:#FBF5B3;">因此一定有这样一个过程当前进程被调度(schedule)（从内核态进入了用户态），然后在运行的过程中进入内核态。</span>在进行schedule的时候会进行上下文切换的时候就会设置内核栈，即sp_svc。设置完了之后返回用户态。由于sp_svc和sp_user都是独立的。因此当进程在用户态进入内核态时，此时的sp_svc还是在当前进程被schedule的时候设置的sp_svc。因此进入svc模式时的sp刚好就是当前进程的内核栈。</p></li></ol> 
+ <p style="">接下来继续看vector_swi的执行。</p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">    ...........................
+     /*  spsr 中保存了 user 下的 APSR,将spsr给r8 */
+    mrs    r8, spsr            @ called from non-FIQ mode, so ok.
+    str    lr, [sp, #S_PC]            @ Save calling PC
+    str    r8, [sp, #S_PSR]        @ Save CPSR
+    str    r0, [sp, #S_OLD_R0]        @ Save OLD_R0
+#endif
+    /**************** 系统设置 ****************/
+    /* mov    fp, #0,具体见entry_header.S中zero_fp */
+    zero_fp
+    alignment_trap ip, __cr_alignment
+    enable_irq
+    ct_user_exit
+    /* 将r9设置为thread_info的基地址 */
+    get_thread_info tsk
+
+    /*
+     * Get the system call number.
+     */
+    /*
+    EABI和OABI是arm平台架构中两种不同的系统调用规则
+    OABI 和 EABI 最大的区别在于,
+    OABI 的系统调用指令需要传递参数来指定系统调用号,
+    而 EABI 中将系统调用号保存在 r7 中.
+    */
+#if defined(CONFIG_OABI_COMPAT)
+
+    /*
+     * If we have CONFIG_OABI_COMPAT then we need to look at the swi
+     * value to determine if it is an EABI or an old ABI call.
+     */
+#ifdef CONFIG_ARM_THUMB
+    tst    r8, #PSR_T_BIT//判断是arm状态还是Thumb状态
+    movne    r10, #0                @ no thumb OABI emulation
+ USER(    ldreq    r10, [lr, #-4]        )    @ get SWI instruction
+#else
+ USER(    ldr    r10, [lr, #-4]        )    @ get SWI instruction
+#endif
+ ARM_BE8(rev    r10, r10)            @ little endian instruction
+
+#elif defined(CONFIG_AEABI)
+
+    /*
+     * Pure EABI user space always put syscall number into scno (r7).
+     */
+#elif defined(CONFIG_ARM_THUMB)
+    /* Legacy ABI only, possibly thumb mode. */
+    /* T[5] : 状态位,标记是arm状态或者Thumb状态 */
+    tst    r8, #PSR_T_BIT            @ this is SPSR from save_user_regs
+    /* r7保存系统调用号,scno是r7的别称 */
+    addne    scno, r7, #__NR_SYSCALL_BASE    @ put OS number in
+ USER(    ldreq    scno, [lr, #-4]        )
+
+#else
+    /* Legacy ABI only. */
+ USER(    ldr    scno, [lr, #-4]        )    @ get SWI instruction
+#endif
+    /* tbl是r8的别称 将sys_call_table的地址给r8*/
+    adr    tbl, sys_call_table        @ load syscall table pointer
+
+#if defined(CONFIG_OABI_COMPAT)
+    /*
+     * If the swi argument is zero, this is an EABI call and we do nothing.
+     *
+     * If this is an old ABI call, get the syscall number into scno and
+     * get the old ABI syscall table address.
+     */
+    bics    r10, r10, #0xff000000
+    eorne    scno, r10, #__NR_OABI_SYSCALL_BASE
+    ldrne    tbl, =sys_oabi_call_table
+#elif !defined(CONFIG_AEABI)
+    bic    scno, scno, #0xff000000        @ mask off SWI op-code
+    eor    scno, scno, #__NR_SYSCALL_BASE    @ check OS number
+#endif
+
+local_restart:
+    ldr    r10, [tsk, #TI_FLAGS]        @ check for syscall tracing
+    // 将 r4 和 r5 的值保存在栈上，因为arm只有r0-r34个寄存器保存参数，
+    //超过了需要保存到栈上??
+    // 这两个寄存器中保存着系统调用第五个和第六个参数(如果存在)
+    stmdb    sp!, {r4, r5}            @ push fifth and sixth args
+
+    tst    r10, #_TIF_SYSCALL_WORK        @ are we tracing syscalls?
+    bne    __sys_trace
+
+    cmp    scno, #NR_syscalls        @ check upper syscall limit
+    /* 将返回地址设置为ret_fast_syscall */
+    adr    lr, BSYM(ret_fast_syscall)    @ return address
+    /*
+    pc = tbl + scno * (2&lt;&lt;2)(一个异常处理程序地址占用4字节) 
+    应该就是从这里就跳转到真正的系统调用函数那里去了
+    等到函数执行完了，就会通过lr转到到ret_fast_syscall
+    */
+    ldrcc    pc, [tbl, scno, lsl #2]        @ call sys_* routine
+
+    /* 这下面的应该是系统调用号超过NR_syscalls了，才走这里把 */
+    add    r1, sp, #S_OFF
+2:    cmp    scno, #(__ARM_NR_BASE - __NR_SYSCALL_BASE)
+    eor    r0, scno, #__NR_SYSCALL_BASE    @ put OS number back
+    bcs    arm_syscall
+    mov    why, #0                @ no longer a real syscall
+    b    sys_ni_syscall            @ not private func
+
+#if defined(CONFIG_OABI_COMPAT) || !defined(CONFIG_AEABI)
+    /*
+     * We failed to handle a fault trying to access the page
+     * containing the swi instruction, but we're not really in a
+     * position to return -EFAULT. Instead, return back to the
+     * instruction and re-enter the user fault handling path trying
+     * to page it in. This will likely result in sending SEGV to the
+     * current task.
+     */
+9001:
+    sub    lr, lr, #4
+    str    lr, [sp, #S_PC]
+    b    ret_fast_syscall
+#endif
+ENDPROC(vector_swi)</code></pre> 
+ <p style="">系统调用执行完毕之后，由于lr寄存器被设置为了ret_fast_syscall。因此在系统调用返回的时候，是执行ret_fast_syscall</p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">ret_fast_syscall:
+ UNWIND(.fnstart    )
+ UNWIND(.cantunwind    )
+    disable_irq                @ disable interrupts
+    ldr    r1, [tsk, #TI_FLAGS]
+    tst    r1, #_TIF_WORK_MASK
+    /*  如果存在未处理的信号或者进程可被抢占时，执行 fast_work_pending */
+    bne    fast_work_pending
+    asm_trace_hardirqs_on
+
+    /* perform architecture specific actions before user return */
+    arch_ret_to_user r1, lr
+    ct_user_enter
+    /* 返回代码 */
+    restore_user_regs fast = 1, offset = S_OFF
+ UNWIND(.fnend        )
+</code></pre> 
+ <p style="">ret_fast_syscall--&gt;fast_work_pending:如果有信号需要处理走这个流程：没有看明白</p> 
+ <p style=""></p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">fast_work_pending:
+    str    r0, [sp, #S_R0+S_OFF]!        @ returned r0
+work_pending:
+    mov    r0, sp                @ 'regs'
+    mov    r2, why                @ 'syscall'
+    bl    do_work_pending
+    cmp    r0, #0
+    beq    no_work_pending
+    movlt    scno, #(__NR_restart_syscall - __NR_SYSCALL_BASE)
+    ldmia    sp, {r0 - r6}            @ have to reload r0 - r6
+    b    local_restart            @ ... and off we go为什么又要重新跳转回去？？
+</code></pre> 
+ <p style="">反之直接返回用户态:</p> 
+ <p style=""><span class="kdocs-color" style="background-color:#FBF5B3;">1、restore_user_regs fast = 1, offset = S_OFF。fast = 1 offset = 8。感觉这个offer=8就是因为我们将额外的r4和r5入栈了。因此会多8字节的偏移。并且代码里面的注释也能对应上。</span></p> 
+ <p style="">2、stmdb sp!, {r4, r5} 。这个指令会将sp的值改变。因此offset为8也能对上；</p> 
+ <p style="">3、为什么执行到这里sp并没有改变。我感觉类似于函数调用。f1调用f2，f2调用f3；f3执行完出栈，回到f2，f2执行完出栈回到f1。在回到f1的时候，sp和调用f2时的sp是一样的</p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">@
+@ Most of the stack format comes from struct pt_regs, but with
+@ the addition of 8 bytes for storing syscall args 5 and 6.
+@ This _must_ remain a multiple of 8 for EABI.
+@
+#define S_OFF        8</code></pre> 
+ <p style="">下面的代码我们就假设sp刚好执行pt_regs，offset为0</p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">.macro    restore_user_regs, fast = 0, offset = 0
+    /* r1 = spsr_svc, spsr_svc其实在进入svc模式时，保存了用户态的cpsr*/
+    ldr    r1, [sp, #\offset + S_PSR]    @ get calling cpsr
+    /*
+     这里面保存的是用户态的返回地址
+    vector_swi里面有一句
+    lr里面保存的是用户态的返回地址,这个指令将其保存到pt_regs里面的pc里面去了
+    str    lr, [sp, #S_PC]            @ Save calling PC
+     */
+    ldr    lr, [sp, #\offset + S_PC]!    @ get pc
+    /* 将r1保存到spsr的控制域(c),状态域(s),x,f.感觉就是等同spsr */
+    msr    spsr_cxsf, r1            @ save in spsr_svc
+#if defined(CONFIG_CPU_V6)
+    strex    r1, r2, [sp]            @ clear the exclusive monitor
+#elif defined(CONFIG_CPU_32v6K)
+    clrex                    @ clear the exclusive monitor
+#endif
+    .if    \fast
+    /* 将之前保存的用户态的寄存器值会恢复到用户态的寄存器中
+    (注意^,只不过部分寄存器user和svc共用)r1-lr中
+    r0 ~ r12 是共用的寄存器，r0 中保存了系统调用返回值，
+      不需要返回到断点 r0 
+     */
+    ldmdb    sp, {r1 - lr}^            @ get calling r1 - lr
+    .else
+    /* 如果执行的是 fast_work_pending 分支，r0 是保存在栈上的，也需要一并重新加载 */
+    ldmdb    sp, {r0 - lr}^            @ get calling r0 - lr
+    .endif
+    mov    r0, r0                @ ARMv5T and earlier require a nop
+                        @ after ldm {}^
+    /*
+     恢复内核栈指针为初始值 
+     ldmdb指令会修改sp的值
+    因此此时sp回到原来位置，只需要增加S_FRAME_SIZE - S_PC大小
+    */
+    add    sp, sp, #S_FRAME_SIZE - S_PC
+    /* 将用户态返回地址设置为pc,去执行用户态代码 */
+    movs    pc, lr    </code></pre> 
+ <pre class="kdocs-cpp"><code class="language-cpp">/* 将用户态返回地址设置为pc,去执行用户态代码，并且movs，隐含将spsr复制到cpsr中，这个也实现了arm处理器模式切换为user模式 */
+    movs    pc, lr    </code></pre> 
+ <p style=""><span class="kdocs-color" style="background-color:#F8D7B7;">最终通过指令通过movs pc, lr返回用户空间，将arm处理器模式切换为user模式</span></p> 
+ <pre class="kdocs-cpp"><code class="language-cpp"> ldmdb    sp, {r1 - lr}^            @ get calling r1 - lr</code></pre> 
+ <p style="">没有看明白这条指令。ldmdb不是先sp = sp-4，然后lr_user=[sp - 4]；sp = sp-4，sp_user=[sp - 4].</p> 
+ <p style="">那这不就意味着sp在最上面吗？？？</p> 
+ <pre class="kdocs-cpp"><code class="language-cpp">ldr    lr, [sp, #\offset + S_PC]!    @ get pc</code></pre> 
+ <p style="">但是看这句，有感觉sp在下面 lr = sp + s_pc。这个不是矛盾的吗？？没有看明白。。。。。</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/0e8433f9a404f1f3ba601c14b026d321/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">HTTPS</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/bed352168c2bcba9e0420b9dd8e58266/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">力扣-两数之和-暴力解法</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

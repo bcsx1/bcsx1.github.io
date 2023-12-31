@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Linux kernel | 块IO子系统请求处理过程、multi-queue框架、请求合并处理blk_plug - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Linux kernel | 块IO子系统请求处理过程、multi-queue框架、请求合并处理blk_plug" />
+<meta property="og:description" content="Linux 通用块层提供给上层的接口函数是submit_bio。上层在构造好bio请求之后，调用该接口提交给Linux通用块层处理。
+上层向块io子系统提交请求
+我们首先从submit_bio函数入手：
+//common/block/blk-core.c:10 blk_qc_t submit_bio(struct bio *bio) { if (blkcg_punt_bio_submit(bio)) return BLK_QC_T_NONE; /* * If it&#39;s a regular read/write or a barrier with data attached, * go through the normal accounting stuff before submission. */ if (bio_has_data(bio)) { unsigned int count; if (unlikely(bio_op(bio) == REQ_OP_WRITE_SAME)) count = queue_logical_block_size( bio-&gt;bi_bdev-&gt;bd_disk-&gt;queue) &gt;&gt; 9; else count = bio_sectors(bio); if (op_is_write(bio_op(bio))) { count_vm_events(PGPGOUT, count); } else { task_io_account_read(bio-&gt;bi_iter.bi_size); count_vm_events(PGPGIN, count); } } /* * If we&#39;re reading data that is part of the userspace workingset, count * submission time as memory stall." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/14aec011011ec67b1fa7ed199965fbe8/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-02-07T17:50:29+08:00" />
+<meta property="article:modified_time" content="2023-02-07T17:50:29+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Linux kernel | 块IO子系统请求处理过程、multi-queue框架、请求合并处理blk_plug</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p>Linux 通用块层提供给上层的接口函数是submit_bio。上层在构造好bio请求之后，调用该接口提交给Linux通用块层处理。<br></p> 
+ <p>上层向块io子系统提交请求</p> 
+ <p>我们首先从submit_bio函数入手：<br></p> 
+ <pre class="has"><code class="language-cpp">//common/block/blk-core.c:10
+blk_qc_t submit_bio(struct bio *bio)
+{
+  if (blkcg_punt_bio_submit(bio))
+    return BLK_QC_T_NONE;
+
+
+  /*
+   * If it's a regular read/write or a barrier with data attached,
+   * go through the normal accounting stuff before submission.
+   */
+  if (bio_has_data(bio)) {
+    unsigned int count;
+
+
+    if (unlikely(bio_op(bio) == REQ_OP_WRITE_SAME))
+      count = queue_logical_block_size(
+          bio-&gt;bi_bdev-&gt;bd_disk-&gt;queue) &gt;&gt; 9;
+    else
+      count = bio_sectors(bio);
+
+
+    if (op_is_write(bio_op(bio))) {
+      count_vm_events(PGPGOUT, count);
+    } else {
+      task_io_account_read(bio-&gt;bi_iter.bi_size);
+      count_vm_events(PGPGIN, count);
+    }
+  }
+
+
+  /*
+   * If we're reading data that is part of the userspace workingset, count
+   * submission time as memory stall.  When the device is congested, or
+   * the submitting cgroup IO-throttled, submission can be a significant
+   * part of overall IO time.
+   */
+  if (unlikely(bio_op(bio) == REQ_OP_READ &amp;&amp;
+      bio_flagged(bio, BIO_WORKINGSET))) {
+    unsigned long pflags;
+    blk_qc_t ret;
+
+
+    psi_memstall_enter(&amp;pflags);
+    ret = submit_bio_noacct(bio);
+    psi_memstall_leave(&amp;pflags);
+
+
+    return ret;
+  }
+
+
+  return submit_bio_noacct(bio);
+}
+EXPORT_SYMBOL(submit_bio);</code></pre> 
+ <p>这个函数所做的其实是台账account工作，做的基本上都是统计工作，真正的实际活动是由submit_bio_noacct函数来做的：</p> 
+ <pre class="has"><code class="language-php">//common/block/blk-core.c:1025
+blk_qc_t submit_bio_noacct(struct bio *bio)
+{
+  /*
+   * We only want one -&gt;submit_bio to be active at a time, else stack
+   * usage with stacked devices could be a problem.  Use current-&gt;bio_list
+   * to collect a list of requests submited by a -&gt;submit_bio method while
+   * it is active, and then process them after it returned.
+   * 如果存在bio_list，则将bio放入bio_list就返回等待执行就好了
+   */
+  if (current-&gt;bio_list) {
+    bio_list_add(&amp;current-&gt;bio_list[0], bio);
+    return BLK_QC_T_NONE;
+  }
+  // 如果不存在 bio_list，也不存在bd_disk所对应的submit_bio操作
+  if (!bio-&gt;bi_bdev-&gt;bd_disk-&gt;fops-&gt;submit_bio)
+    return __submit_bio_noacct_mq(bio);
+  // 如果不存在 bio_list，但是存储设备定义了submit_bio操作
+  return __submit_bio_noacct(bio);
+}
+EXPORT_SYMBOL(submit_bio_noacct);</code></pre> 
+ <p>从上代码中可以看出，当存储设备定义了submit_bio操作时，会通过调用__submit_bio_noacct，否则调用__submit_bio_noacct,它们的区别主要在于有没有对队列中bio的排序归并操作。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/10/c7/LKZiZQVb_o.png" alt="outside_default.png"></p> 
+ <p style="text-align:center;">（图源csdn-geshifei，处理bio的路径）<br></p> 
+ <p>由于“栈式块设备”（例如md和dm设备）的存在和堆栈大小限制，为防止在栈式块设备执行过程中可能出现的问题，在一个时刻只允许进程有一个submit_bio处于active状态，在实现上，使用了一个bio等待处理链表bio_list，当该进程bio_list处于active状态时，后续的bio直接被链入链表，在当前bio处理完成后顺序逐个地处理。</p> 
+ <p>submit_bio_noacct与bio_list有关的执行过程是：<br></p> 
+ <ol><li><p>首先判断bio_list是否处于激活状态，如是，直接链入bio_list并返回，反之进入第二步；<br></p></li><li><p>无论最后由__submit_bio_noacct_mq或__submit_bio_noacct继续进行，都会新建一个bio_list表明当前的submit_bio正处于活动状态，让后来的bio有机会链入链表；</p></li><li><p>从链表中取出bio并处理；</p></li><li><p>没有bio需要处理后，置bio_list为NULL，使得该进程的submit_bio处于非活动状态。</p></li></ol> 
+ <p>例如以__submit_bio_noacct_mq函数为例：</p> 
+ <pre class="has"><code class="language-cpp">//common/block/blk-core.c:1001
+static blk_qc_t __submit_bio_noacct_mq(struct bio *bio)
+{
+  struct bio_list bio_list[2] = { };
+  blk_qc_t ret;
+
+
+  current-&gt;bio_list = bio_list; // 设置了bio_list
+
+
+  do {
+    ret = __submit_bio(bio); // 处理bio
+  } while ((bio = bio_list_pop(&amp;bio_list[0]))); // 处理下一个bio
+
+
+  current-&gt;bio_list = NULL; // 置bio_list为null
+  return ret;
+}</code></pre> 
+ <p>无论走noacct_mq还是noacct，最终都会调用__submit_bio函数来处理bio。<br></p> 
+ <pre class="has"><code class="language-php">//common/block/blk-core.c:915
+static blk_qc_t __submit_bio(struct bio *bio)
+{
+  struct gendisk *disk = bio-&gt;bi_bdev-&gt;bd_disk;
+  blk_qc_t ret = BLK_QC_T_NONE;
+
+
+  if (unlikely(bio_queue_enter(bio) != 0))
+    return BLK_QC_T_NONE;
+
+
+  if (!submit_bio_checks(bio) || !blk_crypto_bio_prep(&amp;bio))
+    goto queue_exit;
+  if (disk-&gt;fops-&gt;submit_bio) { // 存储设备定义了submit_bio操作
+    ret = disk-&gt;fops-&gt;submit_bio(bio);
+    goto queue_exit;
+  }
+  return blk_mq_submit_bio(bio); // 存储设备没有定义submit_bio操作
+
+
+queue_exit:
+  blk_queue_exit(disk-&gt;queue);
+  return ret;
+}</code></pre> 
+ <p>可以发现，存储设备是否定义了submit_bio操作，它们的行为在这这个函数中发生了变化，如果定义了相关操作，则会直接调用，否则调用blk_mq所提供的通用处理函数blk_mq_submit_bio。</p> 
+ <p>blk_mq_submit_bio函数是一个比较复杂的函数，它将根据bio创建和发送一个request给块设备。但是在分析这个函数之前，我们需要首先了解一下block层的multi-queue机制，即blk-mq。<br></p> 
+ <p>blk-mq<br></p> 
+ <p>Linux传统上的块设备层和IO调度器主要是针对HDD（hard disk drivers）设计的，而HDD的随机读写性能很差，吞吐量只有几百IO per second，延迟在毫秒级，所以当时IO性能的瓶颈在硬件，而不是内核。但是随着科技的发展，高速SDD（Solid State Disk）的出现并展现出越来越高的性能，百万级甚至千万级的数据访问已经成为趋势，传统块设备层已经无法满足如此高的IOPS需求，逐渐成为系统IO的性能瓶颈。</p> 
+ <p>于是为了适配现代设备高IOPS、低延迟的特征，新的块设备层框架blk-mq应运而生。<br></p> 
+ <p>在单队列架构下，向块设备层提交bio后，仅有一个层次的一个请求队列：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/68/27/YahTO8Kv_o.png" alt="outside_default.png"></p> 
+ <p>在<strong>多核体系</strong>下，单队列的缺点尤为突出：<br></p> 
+ <ol><li><p> 请求队列锁竞争：单队列机制下使用spinlock来同步IO请求队列的访问，每次想往请求队列里插入或删除IO请求，必须先获取此锁，要操作请求队列、对IO排序和调度时，也需要获取此锁，这一系列的操作继续之前，必须先请求锁，在高IOPS场景，多个线程同时提交IO请求的情况下，锁的竞争非常剧烈，带来不可忽视的软件开销。</p><p style="text-align:center;"><img src="https://images2.imgbox.com/b7/64/KTpG5wOr_o.png" alt="outside_default.png"></p><p>从上图可以看到，在单队列机制高IOPS场景下，约80%的cpu时间耗费在锁获取上。<br></p></li><li><p>硬件中断：高的IOPS意味着高的中断数量，在多数情况下，完成一次IO需要两次中断，一次是存储器件触发的硬件中断，另一次是cpu核间中断。</p></li><li><p>远端内存访问：如果提交IO请求的cpu不是接收硬件中断的cpu且两个cpu中间没有共享缓存，那么获取请求队列锁的过程中，还存在远端访问的问题。</p></li></ol> 
+ <p>综上，实验证明，核数越多，单队列性能越差。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/b3/e1/H6wNIHZK_o.png" alt="outside_default.png"></p> 
+ <p>就像单行线拥挤了可以修更宽敞的路一样，针对单队列框架下存在的问题，多队列框架被提出：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/f7/f4/mKW0QNsj_o.png" alt="outside_default.png"></p> 
+ <p>多队列框架采用了两层队列，将单个请求队列锁的竞争分散到多个队列中，极大地提高了Block层并发处理IO的能力。<br></p> 
+ <p>两层队列设计分工明确：</p> 
+ <p><strong>软件暂存队列（Software Staging Queue）</strong>：</p> 
+ <p>blk-mq为每一个cpu分配一个软件队列，bio的提交/完成处理、IO请求的合并排序标记调度记账等block层应该完成的功能都在这个队列上进行。由于每个cpu有单独的队列，所以每个cpu的io操作可以同时进行且不存在锁竞争的问题。<br></p> 
+ <p><strong>硬件派发队列（Hardware Dispatch Queue）</strong>：<br></p> 
+ <p>blk-mq为存储器件的每个硬件队列（多数存储器件只有一个）分配一个硬件派发队列，负责存放软件队列往这个硬件队列派发的io请求。在存储设备驱动初始化时，blk-mq会通过固定的映射关系将一个或多个软件队列映射(map)到一个硬件派发队列（合理的设计以保证每个硬件队列的软件队列数量基本一致），之后这些软件队列上的io请求会往映射的硬件队列上派发。<br></p> 
+ <p>解决了锁的问题的同时，远端访问问题也同时解决，极大提高了block层的IOPS吞吐量，从下图可看出，锁获取所消耗的cpu时间比例大大减小：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/72/08/FHYVBtw4_o.png" alt="outside_default.png"></p> 
+ <p>性能上，mq也更加接近raw设备的性能：<br></p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/fd/0c/8tarnZhg_o.png" alt="outside_default.png"></p> 
+ <p>mq当下已经成为内核默认选项。我们之前了解过的null_blk空设备驱动也是基于blk-mq实现。想要了解更多mq知识，可以参考资料2，如有必要之后还会继续研究。</p> 
+ <p>在回到我们的主线之前，还需要补充关于blk_plug的知识。</p> 
+ <p>blk_plug<br></p> 
+ <p>blk_plug构建了一个缓存碎片IO的请求队列，用于将顺序请求合并成一个更大的请求。合并后请求批量从各自的任务链表移动到设备的request_queue，减少了设备请求队列锁竞争，从而提高效率。<br></p> 
+ <p>如果一个线程开启了请求合并模式 blk_start_plug，就会启用blk_plug，反之，如果设置了blk_finish_plug，则会关闭线程的请求合并。</p> 
+ <p>根据参考资料3中的测试情况：<br></p> 
+ <pre class="has"><code class="language-properties">测试环境：
+SATA控制器：intel 82801JI
+OS: linux3.6, redhat 
+raid5: 4个ST31000524NS盘
+没有blk_plug:
+Total (8,16):
+ Reads Queued:      309811,     1239MiB  Writes Queued:           0,        0KiB
+ Read Dispatches:   283583,     1189MiB  Write Dispatches:        0,        0KiB
+ Reads Requeued:         0               Writes Requeued:         0
+ Reads Completed:   273351,     1149MiB  Writes Completed:        0,        0KiB
+ Read Merges:        23533,    94132KiB  Write Merges:            0,        0KiB
+ IO unplugs:             0               Timer unplugs:           0
+
+
+添加了 blk_plug:
+Total (8,16):
+ Reads Queued:      428697,     1714MiB  Writes Queued:           0,        0KiB
+ Read Dispatches:     3954,     1714MiB  Write Dispatches:        0,        0KiB
+ Reads Requeued:         0               Writes Requeued:         0
+ Reads Completed:     3956,     1715MiB  Writes Completed:        0,        0KiB
+ Read Merges:       424743,     1698MiB  Write Merges:            0,        0KiB
+ IO unplugs:             0               Timer unplugs:        3384</code></pre> 
+ <p>可以看出，读请求被大量合并了，提高了效率。</p> 
+ <p>blk_mq_submit_bio</p> 
+ <p>回到这个函数中来，只要存储设备没有定义submit_bio，在mq已经成为默认选项的情况下，极大一部分的submit_bio操作都会走到这个函数。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/47/54/FEl2TcpF_o.png" alt="outside_default.png"></p> 
+ <p>在这个函数中，将bio转化为request后，会根据不同的情况（if-else结构），进行不同的操作：</p> 
+ <ol><li><p>如果本次io是flush、fua类型，执行此路径，此类bio需要尽快分发器件处理，不能缓存在上层队列中，直接插入队列后立即启动。</p><p style="text-align:center;"><img src="https://images2.imgbox.com/bc/1e/0BZR25h8_o.png" alt="outside_default.png"></p></li><li><p>如果启用了请求合并plug，且满足以下之一：硬件队列长度为1或存储设备定义了自己的commit_rqs函数或存储设备是旋转的机械磁盘（QUEUE_FLAG_NONROT标记位置）或队列为sbitmap_shared，这个场景针对慢速设备，会将request暂存进入自己的plug list，然后再进行调度，对于慢速设备而言，会较大地提高性能。</p><p style="text-align:center;"><img src="https://images2.imgbox.com/c5/88/K92Tp9sl_o.png" alt="outside_default.png"></p></li><li><p>如果存在IO调度器，交由IO调度器去处理。</p><p style="text-align:center;"><img src="https://images2.imgbox.com/db/9a/G519ZLZ6_o.png" alt="outside_default.png"></p></li><li><p>如果启用了请求合并plug，且存储设备设置了不允许合并io请求标志位，执行此路径，这个场景下，仅作有限合并，若本次request与plug list中的request可以合并则合并，否则就添加到plug中，接着将plug list中的request发送到下层队列中。从代码上看，由于每一次都下发，plug中属于一个存储设备的request有且只有一个。</p><p style="text-align:center;"><img src="https://images2.imgbox.com/13/c8/RaW5xJfw_o.png" alt="outside_default.png"></p></li><li><p>如果硬件队列数量大于1且请求是同步的，或者硬件队列不忙，为了充分利用存储器件处理能力，直接下发。</p><p style="text-align:center;"><img src="https://images2.imgbox.com/e7/bb/8mZeZLeh_o.png" alt="outside_default.png"></p></li><li><p>默认执行路径。如果是emmc、ufs这些单队列设备，或者nvme这类多队列设备但异步请求，或者nvme这类多队列设备且同步请求但是硬件队列忙，执行此路径。</p></li></ol> 
+ <p>由于采用if-else结构，当前面的路径满足后，后面的路径就不会再判断。<br></p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/2b/88/VqfAUodo_o.png" alt="outside_default.png"></p> 
+ <p>代码分析：</p> 
+ <pre class="has"><code class="language-php">blk_qc_t blk_mq_submit_bio(struct bio *bio)
+{
+  struct request_queue *q = bio-&gt;bi_bdev-&gt;bd_disk-&gt;queue;
+  const int is_sync = op_is_sync(bio-&gt;bi_opf);
+  const int is_flush_fua = op_is_flush(bio-&gt;bi_opf);
+  struct blk_mq_alloc_data data = {
+    .q    = q,
+  };
+  struct request *rq;
+  struct blk_plug *plug;
+  struct request *same_queue_rq = NULL;
+  unsigned int nr_segs;
+  blk_qc_t cookie;
+  blk_status_t ret;
+  bool hipri;
+
+
+  blk_queue_bounce(q, &amp;bio); // 创建一个反弹缓冲区
+  __blk_queue_split(&amp;bio, &amp;nr_segs); // 将bio拆分
+  // 拆分与合并能提高吞吐效率，详见资料一
+  if (!bio_integrity_prep(bio))
+    goto queue_exit;
+  // plug list merge：尝试将入参bio合并到plug list管理的rq中。
+  if (!is_flush_fua &amp;&amp; !blk_queue_nomerges(q) &amp;&amp;
+      blk_attempt_plug_merge(q, bio, nr_segs, &amp;same_queue_rq))
+    goto queue_exit;
+  // 调度器 merge：尝试将入参bio合并到调度器队列或者软件队列ctx管理的rq中。
+  if (blk_mq_sched_bio_merge(q, bio, nr_segs))
+    goto queue_exit;
+
+
+  rq_qos_throttle(q, bio);
+
+
+  hipri = bio-&gt;bi_opf &amp; REQ_HIPRI;
+
+
+  data.cmd_flags = bio-&gt;bi_opf;
+  rq = __blk_mq_alloc_request(&amp;data);
+  if (unlikely(!rq)) {
+    rq_qos_cleanup(q, bio);
+    if (bio-&gt;bi_opf &amp; REQ_NOWAIT)
+      bio_wouldblock_error(bio);
+    goto queue_exit;
+  }
+
+
+  trace_block_getrq(bio);
+
+
+  rq_qos_track(q, rq, bio);
+  // 回包
+  cookie = request_to_qc_t(data.hctx, rq);
+  // bio -&gt; request
+  blk_mq_bio_to_request(rq, bio, nr_segs);
+  // 加解密相关
+  ret = blk_crypto_init_request(rq);
+  if (ret != BLK_STS_OK) {
+    bio-&gt;bi_status = ret;
+    bio_endio(bio);
+    blk_mq_free_request(rq);
+    return BLK_QC_T_NONE;
+  }
+  // 六条路径分流，if-else结构
+  plug = blk_mq_plug(q, bio);
+  if (unlikely(is_flush_fua)) {
+    /* Bypass scheduler for flush requests */
+    blk_insert_flush(rq);
+    blk_mq_run_hw_queue(data.hctx, true);
+  } else if (plug &amp;&amp; (q-&gt;nr_hw_queues == 1 ||
+       blk_mq_is_sbitmap_shared(rq-&gt;mq_hctx-&gt;flags) ||
+       q-&gt;mq_ops-&gt;commit_rqs || !blk_queue_nonrot(q))) {
+    /*
+     * Use plugging if we have a -&gt;commit_rqs() hook as well, as
+     * we know the driver uses bd-&gt;last in a smart fashion.
+     *
+     * Use normal plugging if this disk is slow HDD, as sequential
+     * IO may benefit a lot from plug merging.
+     */
+    unsigned int request_count = plug-&gt;rq_count;
+    struct request *last = NULL;
+
+
+    if (!request_count)
+      trace_block_plug(q);
+    else
+      last = list_entry_rq(plug-&gt;mq_list.prev);
+
+
+    if (request_count &gt;= blk_plug_max_rq_count(plug) || (last &amp;&amp;
+        blk_rq_bytes(last) &gt;= BLK_PLUG_FLUSH_SIZE)) {
+      blk_flush_plug_list(plug, false);
+      trace_block_plug(q);
+    }
+
+
+    blk_add_rq_to_plug(plug, rq);
+  } else if (q-&gt;elevator) {
+    /* Insert the request at the IO scheduler queue */
+    blk_mq_sched_insert_request(rq, false, true, true);
+  } else if (plug &amp;&amp; !blk_queue_nomerges(q)) {
+    /*
+     * We do limited plugging. If the bio can be merged, do that.
+     * Otherwise the existing request in the plug list will be
+     * issued. So the plug list will have one request at most
+     * The plug list might get flushed before this. If that happens,
+     * the plug list is empty, and same_queue_rq is invalid.
+     */
+    if (list_empty(&amp;plug-&gt;mq_list))
+      same_queue_rq = NULL;
+    if (same_queue_rq) {
+      list_del_init(&amp;same_queue_rq-&gt;queuelist);
+      plug-&gt;rq_count--;
+    }
+    blk_add_rq_to_plug(plug, rq);
+    trace_block_plug(q);
+
+
+    if (same_queue_rq) {
+      data.hctx = same_queue_rq-&gt;mq_hctx;
+      trace_block_unplug(q, 1, true);
+      blk_mq_try_issue_directly(data.hctx, same_queue_rq,
+          &amp;cookie);
+    }
+  } else if ((q-&gt;nr_hw_queues &gt; 1 &amp;&amp; is_sync) ||
+      !data.hctx-&gt;dispatch_busy) {
+    /*
+     * There is no scheduler and we can try to send directly
+     * to the hardware.
+     */
+    blk_mq_try_issue_directly(data.hctx, rq, &amp;cookie);
+  } else {
+    /* Default case. */
+    blk_mq_sched_insert_request(rq, false, true, true);
+  }
+
+
+  if (!hipri)
+    return BLK_QC_T_NONE;
+  return cookie;
+queue_exit:
+  blk_queue_exit(q);
+  return BLK_QC_T_NONE;
+}</code></pre> 
+ <p>请求的切分与合并是请求处理过程中的重要内容，但是考虑篇幅限制和当前工作的重点不在这里，之后可能另起一文学习。</p> 
+ <p>参考资料</p> 
+ <p>https://blog.csdn.net/geshifei/article/details/120590183</p> 
+ <p>https://www.cnblogs.com/Linux-tech/p/12961279.html</p> 
+ <p>https://blog.csdn.net/Faded0104/article/details/103224969</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/d33f5721f2abc65c0160d2d067205056/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">线程复习（针对面试）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/bc831170467d912a9277d251b156c524/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">windows jenkins获取管理员权限或本地用户权限</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

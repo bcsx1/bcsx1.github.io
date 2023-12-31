@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>kubelet 创建pod流程（代码图解&#43;日志说明） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="kubelet 创建pod流程（代码图解&#43;日志说明）" />
+<meta property="og:description" content="本文将从如下方面介绍kubelet创建pod的过程
+kubernetes调度pod简介kubelet 创建pod代码图解说明 （本文重点）kubelet 调用cri创建容器说明 （本文重点）通过日志来分析kubelet真实创建日志的全过程 （本文重点） kubernetes调度pod简介 kubernetes（后面简称k8s）主要有三种管理（创建）pod的方式：
+一种是直接申明创建一个裸pod另一种是通过controller 来申明创建pod：比如，deployments、replicationcontrollers、daemonsets或者replicasets还有一种是static（静态） pod 这种用的比较少，一般是把pod的申明文件放在对应的kubernetes/manifest 目录下，通常用来创建apiserver，controller-manager，scheduler这类k8s管理组件的pod。 k8s推荐使用controller来管理pod，这符合k8s管理pod的习惯，便于使用k8s相关功能，比如弹性扩缩容，pod故障自动拉起等。 我们也以controller管理的pod为例，简单梳理下k8s创建及调度pod流程，如下图
+客户端请求apiserver创建replicasets，apiserver通过认证、鉴权、准入后，会把请求相关信息持久化至etcdController-manager 管理的replicaset controller 通过list-watch机制，watch到有replicasets创建请求，通过label selector发现集群中与这个replicasets 关联的pod当前状态与期望状态不一致，则会进行调协（reconcile）向apiserver发起创建pod请求Scheduler 通过list-watch机制来发现未绑定的pod，并通过预选及优选策略算法，来计算出pod最终可调度的node节点，并通过apiserver将数据更新至etcdKubelet 通过list-watch发现有新的pod bound到本node上，则会发起创建pod相关流程 kubelet 创建pod代码及图解说明 kubelet 简介 Kubelet 有点和controller类似，也是通过list-watch相关信息，或者轮询本地pod相关信息及事件，来触发相关动作，使pod处于”期望状态”，并且向apiserver上报本node（宿主机）及node里所有pod的状态信息。
+kubelet 不同于其他controller的一点就是，它是部署在每个node节点上的agent，它需要与apiserver 打交道同样也需要与cri(contain-runtime-interface)打交道来管理node上的容器。所以它需要通过apiserver来watch到对本地pod变更的事件，也需要不断轮询pod状态信息，将状态及时同步给apiserver，所以Kubelet整体工作逻辑是loop监听各类生产者产生的消息或者定时触发消息，来调用相应的消费者（不同的子模块）完成不同的操作，比如watch 到apiserver的请求，PLEG(pod lifecycle event generator)产生的事件，定时触发的任务等
+kubelet创建及启动pod流程 kubelet 创建pod代码调用图解 kubelet 创建pod详细说明 kubelet 会listwatch所有namespace下、绑定到本node上的pod，并将信息传入updatechannel。kubelet 的SyncLoop（是kubele的主循环函数，来控制例行循环往复的事情：同步接收、更新、处理pod变更相关信息）下的syncLoopIteration方法会监听多方消息，会监听各个消息源，来触发相应的操作，这个方法会接收前面listwatch到的updatechannel信息，交由对应的handler:如pod创建：调用HandlePodAdditions处理，pod删除调用HandlePodUpdates处理（DELETE is treated as a UPDATE because of graceful deletion.）
+HandlePodAdditions 会对pods 进行排序，判断，准入校验，之后调用dispatchWork 把对某个pod的操作 分配给 podWorkers 做异步操作（pod创建、删除、更新）处理
+异步操作会调用kubelet syncPod（syncPod is the transaction script for the sync of a single pod." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/534ec9f29fc141470170fb8b376f9412/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-09-25T18:04:00+08:00" />
+<meta property="article:modified_time" content="2022-09-25T18:04:00+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">kubelet 创建pod流程（代码图解&#43;日志说明）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <blockquote> 
+ <p>本文将从如下方面介绍kubelet创建pod的过程</p> 
+</blockquote> 
+<ol><li>kubernetes调度pod简介</li><li>kubelet 创建pod代码图解说明 （本文重点）</li><li>kubelet 调用cri创建容器说明 （本文重点）</li><li>通过日志来分析kubelet真实创建日志的全过程 （本文重点）</li></ol> 
+<h2><a id="kubernetespod_9"></a>kubernetes调度pod简介</h2> 
+<p>kubernetes（后面简称k8s）主要有三种管理（创建）pod的方式：</p> 
+<ul><li>一种是直接申明创建一个裸pod</li><li>另一种是通过controller 来申明创建pod：比如，deployments、replicationcontrollers、daemonsets或者replicasets</li><li>还有一种是static（静态） pod 这种用的比较少，一般是把pod的申明文件放在对应的kubernetes/manifest 目录下，通常用来创建apiserver，controller-manager，scheduler这类k8s管理组件的pod。</li></ul> 
+<p>k8s推荐使用controller来管理pod，这符合k8s管理pod的习惯，便于使用k8s相关功能，比如弹性扩缩容，pod故障自动拉起等。 我们也以controller管理的pod为例，简单梳理下k8s创建及调度pod流程，如下图</p> 
+<p><img src="https://images2.imgbox.com/e6/21/gC8h9ADM_o.png" alt="在这里插入图片描述"></p> 
+<ol><li>客户端请求apiserver创建replicasets，apiserver通过认证、鉴权、准入后，会把请求相关信息持久化至etcd</li><li>Controller-manager 管理的replicaset controller 通过list-watch机制，watch到有replicasets创建请求，通过label selector发现集群中与这个replicasets 关联的pod当前状态与期望状态不一致，则会进行调协（reconcile）向apiserver发起创建pod请求</li><li>Scheduler 通过list-watch机制来发现未绑定的pod，并通过预选及优选策略算法，来计算出pod最终可调度的node节点，并通过apiserver将数据更新至etcd</li><li>Kubelet 通过list-watch发现有新的pod bound到本node上，则会发起创建pod相关流程</li></ol> 
+<h2><a id="kubelet_pod_26"></a>kubelet 创建pod代码及图解说明</h2> 
+<h3><a id="kubelet__28"></a>kubelet 简介</h3> 
+<p>Kubelet 有点和controller类似，也是通过list-watch相关信息，或者轮询本地pod相关信息及事件，来触发相关动作，使pod处于”期望状态”，并且向apiserver上报本node（宿主机）及node里所有pod的状态信息。</p> 
+<p>kubelet 不同于其他controller的一点就是，它是部署在每个node节点上的agent，它需要与apiserver 打交道同样也需要与cri(contain-runtime-interface)打交道来管理node上的容器。所以它需要通过apiserver来watch到对本地pod变更的事件，也需要不断轮询pod状态信息，将状态及时同步给apiserver，所以Kubelet整体工作逻辑是loop监听各类生产者产生的消息或者定时触发消息，来调用相应的消费者（不同的子模块）完成不同的操作，比如watch 到apiserver的请求，PLEG(pod lifecycle event generator)产生的事件，定时触发的任务等</p> 
+<h3><a id="kubeletpod_33"></a>kubelet创建及启动pod流程</h3> 
+<h4><a id="kubelet_pod_35"></a>kubelet 创建pod代码调用图解</h4> 
+<p><img src="https://images2.imgbox.com/26/23/5EOtlTpr_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="kubelet_pod_38"></a>kubelet 创建pod详细说明</h4> 
+<ol><li> <p>kubelet 会listwatch所有namespace下、绑定到本node上的pod，并将信息传入updatechannel。kubelet 的SyncLoop（是kubele的主循环函数，来控制例行循环往复的事情：同步接收、更新、处理pod变更相关信息）下的syncLoopIteration方法会监听多方消息，会监听各个消息源，来触发相应的操作，这个方法会接收前面listwatch到的updatechannel信息，交由对应的handler:如pod创建：调用HandlePodAdditions处理，pod删除调用HandlePodUpdates处理（DELETE is treated as a UPDATE because of graceful deletion.）</p> </li><li> <p>HandlePodAdditions 会对pods 进行排序，判断，准入校验，之后调用dispatchWork 把对某个pod的操作 分配给 podWorkers 做异步操作（pod创建、删除、更新）处理</p> </li><li> <p>异步操作会调用kubelet syncPod（syncPod is the transaction script for the sync of a single pod.）方法,syncPod会做一些pod创建前的准备工作</p> </li></ol> 
+<pre><code>
+a.如果pod updateType 为podkill，立即执行并返回(走pod删除流程)
+
+b.pod准入检查检查pod是否能运行在本节点
+
+c.更新状态给 status manager ，status manager将pod状态上报给apiserver
+
+d.检查网络插件是否就绪
+
+e.创建并更新pod cgroups配置
+
+f.为pod创建对应的目录：pod目录，volume目录
+
+g.等待pod sepc中的volme都被attach/mount
+
+h.从apiserver中获取pull secrets
+
+i.调用 containerRuntime 的 SyncPod 方法开始创建容器
+</code></pre> 
+<p>4.containerRuntime 的 SyncPod 会做如下主要工作</p> 
+<pre><code>
+a.创建sandbox
+
+b.Create ephemeral containers
+
+c.Create init containers
+
+d.Create normal containers
+</code></pre> 
+<p>其中创建sandbox是关键，sandbox可以理解为pod的运行环境，是业务pod的父容器，在k8s里就是pause 容器,所有容器创建前都需要创建pause容器。首先会生成podsandbox相关配置：如dnsconfig，podhostname，设置sysctl，cgroups以及namespace</p> 
+<p>然后会调用CRI（container-runtime-interface）来调用底层container runtime来真实操作容器,之后还会调用CNI插件来为容器设置网络。</p> 
+<p>5.我们再来看下创建sandbox：RunpodSandbox的步骤<br> (ds *dockerService) RunPodSandbox 是在是一个cri的是实现，所以在dockershim下dockershim是内置在kubelet里的cri实现，用来衔接kubelet与docker,dockershim翻译为docker"垫片"，很形象）。kubelet通过grp call调用的dockershim来实现容器的创建管理。</p> 
+<pre><code>a.调用docker API Pull the image for the sandbox.
+(kubelet 的sandbox镜像：defaultSandboxImage = "k8s.gcr.io/pause:3.2")
+b. 调用docker Create the sandbox container.
+c.Create Sandbox Checkpoint.
+d.调用docker Start the sandbox container.
+e.Rewrite resolv.conf file generated by docker.
+f. Setup networking for the sandbox. 调用cni插件为容器设置网络
+
+</code></pre> 
+<h5><a id="kubelet_cri_95"></a>kubelet 调用cri说明</h5> 
+<p>我们目前container-runtime为docker，docker并不支持CRI，所以要想调用docker 操作容器，k8s内置了dockershim来调用docker，dockershim可以理解为一个满足CRI标准的容器运行时，kubelet通过grpc call 来调用dockershim，dockershim收到kubelet的请求后，将其转化为REST API请求，再发送给docker daemon，docker daemon 在通过组装请求，调用docker API来完成container的最终创建、启动等相关操作。</p> 
+<p>这块有两个地方需要说明下：</p> 
+<p>1是为啥会有dockershim？ 这里有个小故事，首先k8s再具有一定市场规模后，想与docker 解耦，不想强依赖docker,同时为了支持多种container-runtime，故制定了CRI，只有满足CRI，kubelet便可以直接完成调用来管理container,然而docker一开始并不支持CRI，故k8s想了个这种的方式，开发了一个dockershim（docker “垫片”）来转发请求,这样k8s也完成了对docker的解耦,当然这看起来较繁琐且影响性能，故在kubernetes 1.24后，kubernetes宣布启用dockershim，需要我们在该版本后主动配置container-runtime。</p> 
+<p>2.docker这面也很早就做了应对，docker抽离出了支持CRI标准的containerd，通过containerd来管理容器。</p> 
+<p>所以如下图，调用docker API创建容器后，docker还会调用docker-containerd来管理创建容器，docker-containerd通过docker-containerd-shim来间接管理container，这样一个好处就是升级或重启docker，我们的业务容器依然可以正常运行，最终docker-containerd-shim通过runc来创建container，runc是docker做的oci实现就是以前的libcontainer，用于容器创建。</p> 
+<h4><a id="kubeletpod_107"></a>kubelet创建pod整体架构图</h4> 
+<blockquote> 
+ <p>（container-runtime=“docker”，大多数企业目前应该都是使用的这种方式）</p> 
+</blockquote> 
+<p><img src="https://images2.imgbox.com/15/84/nLFr8Kbt_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="kubeletpod_114"></a>kubelet创建pod日志说明</h3> 
+<blockquote> 
+ <p>我们通过实战，开启debug日志来看下kubelet在创建pod时做了哪些工作</p> 
+</blockquote> 
+<blockquote> 
+ <p>注：日志仅保留主要输出及过滤敏感信息</p> 
+</blockquote> 
+<pre><code>1.收到新pod创建时间，写入updatechannel通道
+I0921 18:10:00.486345   26075 config.go:414] Receiving a new pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+
+2.syncLoop: 收到add事件
+I0921 18:10:00.757557   26075 kubelet.go:2007] SyncLoop (ADD, "api"): opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)
+
+3.准入验证pod fit success
+I0921 18:10:00.759786   26075 predicates.go:986] Pod: opslk1-xxx fit success. Node: xx.xx.10.9 has enough resources.
+
+4.流转至syncPod，SyncPodType=create
+I0921 18:10:00.759956   26075 kubelet.go:1498] syncPod "xxx-3995-11ed-80a8-48df37244930" updateType:{<!-- -->{ }  types.SyncPodType=create)
+
+5.获取pod状态
+I0921 18:10:00.760128   26075 kubelet_pods.go:1529] Generating status for "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+I0921 18:10:00.760148   26075 kubelet_pods.go:1494] pod waiting &gt; 0, pending
+I0921 18:10:00.760174   26075 kubelet.go:1603] apiPodStatus.Phase:Pending pod:"opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+
+6.配置cgroupConfig,设置cpu，内存
+I0921 18:10:00.760200   26075 kubelet_resources.go:149] Newest cgroupConfig for pod:"opslk1-5sfjn_lktest01(739e1c1a-3175-11ed-aff8-48df37244926)"
+are kubelet.cgroupResource{cpuShares:xxx, cpuQuota:xxx, memoryLimit:xxx, memoryLimitSwap:xxx}.
+
+7.等待pod相关volume attach及挂载
+I0921 18:10:00.768211   26075 volume_manager.go:350] Waiting for volumes to attach and mount for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+
+8.向apiserver同步状态，先GET后PATCH
+I0921 18:10:00.791361   26075 round_trippers.go:419] curl -k -v -XGET   'https://xxx/api/v1/namespaces/lktest01/pods/opslk1-xxx'
+I0921 18:10:00.794250   26075 round_trippers.go:419] curl -k -v -XPATCH  'https://xxx/api/v1/namespaces/lktest01/pods/opslk1-xxx/status'
+I0921 18:10:00.798998   26075 status_manager.go:506] Status for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)" updated successfully: (1, {Phase:Pending Conditions:[{Type:Initialized
+
+9.根据期望状态开始调协，Reconcile Pod "Ready" condition if necessary. Trigger sync pod for reconciliation.
+I0921 18:10:00.799365   26075 kubelet.go:2020] SyncLoop (RECONCILE, "api"): "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+
+10.mount volume
+I0921 18:10:02.177479   26075 operation_generator.go:506] MountVolume.WaitForAttach succeeded for volume "volume"  DevicePath "/dev/mapper/docker-xxx_3995_11ed_80a8_48df37244930"
+I0921 18:10:03.136754   26075 operation_generator.go:527] MountVolume.MountDevice succeeded for volume "volume"  device mount path "/export/kubelet/pods/xxx-3995-11ed-80a8-48df37244930/volumes/kubernetes.io~lvm/volume"
+I0921 18:10:03.136851   26075 operation_generator.go:567] MountVolume.SetUp succeeded for volume "volume" (UniqueName: "flexvolume-kubernetes.io/lvm/xxx_3995_11ed_80a8_48df37244930") pod "opslk1-xxx"
+
+11.volumes  attached、mounted 完毕
+I0921 18:10:03.168555   26075 volume_manager.go:384] All volumes are attached and mounted for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+
+12.调用 containerRuntime 的 SyncPod 方法开始创建容器
+I0921 18:10:03.168568   26075 kuberuntime_manager.go:468] Syncing Pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)": &amp;Pod{}
+
+13.创建sandbox容器:Setting cgroup parent,RunPodSandbox,Calling network plugin cni to set up pod
+I0921 18:10:03.168833   26075 kuberuntime_manager.go:398] No sandbox for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)" can be found. Need to start a new one"opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+I0921 18:10:03.168885   26075 kuberuntime_manager.go:605] SyncPod received new pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)", will create a sandbox for it
+I0921 18:10:03.168891   26075 kuberuntime_manager.go:614] Stopping PodSandbox for "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)", will start new one
+I0921 18:10:03.168901   26075 kuberuntime_manager.go:841] Stop app containers for pod:"opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)".
+I0921 18:10:03.168913   26075 kuberuntime_manager.go:666] Creating sandbox for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+I0921 18:10:03.170818   26075 docker_service.go:460] Setting cgroup parent to: "/kubepods/burstable/podxxx-3995-11ed-80a8-48df37244930"
+I0921 18:10:03.170827   26075 docker_sandbox.go:108] RunPodSandbox PodName:opslk1-xxx PodUID:xxx-3995-11ed-80a8-48df37244930 NameSpace:lktest01
+I0921 18:10:04.297831   26075 plugins.go:377] Calling network plugin cni to set up pod "opslk1-xxx_lktest01"
+I0921 18:10:04.298323   26075 manager.go:1011] Added container: "/kubepods/burstable/podxxx-3995-11ed-80a8-48df37244930/805dda102e017247685240c2f740295396edcb7071dfe211979215eac0870e0b" 
+I0921 18:10:04.298535   26075 container.go:448] Start housekeeping for container "/kubepods/burstable/podxxx-3995-11ed-80a8-48df37244930/805dda102e017247685240c2f740295396edcb7071dfe211979215eac0870e0b"
+I0921 18:10:04.298693   26075 cni.go:337] Got netns path /proc/26876/ns/net
+I0921 18:10:04.298701   26075 cni.go:338] Using podns path lktest01
+I0921 18:10:04.298820   26075 cni.go:307] About to add CNI network cni-loopback (type=loopback)
+I0921 18:10:04.301399   26075 cni.go:337] Got netns path /proc/26876/ns/net
+I0921 18:10:04.301405   26075 cni.go:338] Using podns path lktest01
+I0921 18:10:04.301466   26075 cni.go:307] About to add CNI network cni (type=cni)
+I0921 18:10:04.392172   26075 kuberuntime_manager.go:680] Created PodSandbox "805dda102e017247685240c2f740295396edcb7071dfe211979215eac0870e0b" for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)"
+I0921 18:10:04.396981   26075 kuberuntime_manager.go:699] Determined the ip "xx.xx.226.17" for pod "opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)" after sandbox changed
+
+14,创建常规容器
+I0921 18:10:04.397114   26075 kuberuntime_manager.go:750] Creating container &amp;Container{} in pod opslk1-xxx_lktest01(xxx-3995-11ed-80a8-48df37244930)
+I0921 18:10:04.398859   26075 kuberuntime_container.go:108] Generating ref for container opslk: &amp;v1.ObjectReference{Kind:"Pod", Namespace:"lktest01", Name:"opslk1-xxx"}
+I0921 18:10:04.398883   26075 kuberuntime_container.go:117] To determine whether to restart the old container. Pod:opslk1-xxx_lktest01 PodIP: PodSandboxId: NameSpace:lktest01
+I0921 18:10:04.398888   26075 kuberuntime_container.go:258] pod:opslk1-xxx default KeepRootDirForPod: true
+I0921 18:10:04.398935   26075 server.go:471] Event(v1.ObjectReference{Kind:"Pod", Namespace:"lktest01", Name:"opslk1-xxx", UID:"xxx-3995-11ed-80a8-48df37244930", APIVersion:"v1", ResourceVersion:"19846024411", FieldPath:"spec.containers{opslk}"})
+
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/458af216f44ed4c43f357d3320df7575/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">JavaScript代码实现九九乘法表</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/273600f9e19dd96710109f567613909c/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">动态规划 1025.除数博弈</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

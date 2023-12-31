@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>mbedtls基础及其应用 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="mbedtls基础及其应用" />
+<meta property="og:description" content="摘要
+SSL/TLS加密的介绍，重点是mbedtls的基础以及移植说明。
+1、引言 1.1 为什么要加密 互联网是开放环境，通信双方都是未知身份，为通信双方的有效信息不被第三方窃听、篡改或者被冒充身份进行通信，需要为信息加上保护措施。也就是对所有信息都进行加密，避免被第三方窃听；采用校验机制，可以识别出信息是否被篡改，配备身份认证防止被冒充身份。互联网的通信安全，就是建立在SSL/TLS协议之上。
+1.2 SSL/TLS协议的历史 1996年，在前面的基础上，SSL 3.0版问世并得到大规模应用；
+1999年，互联网标准化组织ISOC接替NetScape公司，发布了SSL的升级版TLS 1.0版，也称为SSL 3.1；SSL和TLS指的是同一套加密协议，只是不同时期的名字差异。
+2006年和2008年，TLS进行了两次升级，分别为TLS 1.1版和TLS 1.2版。
+一般推荐使用TLS 1.2，主流的浏览器都支持。
+2、SSL/TLS演化 熟悉一套技术的演进步骤，比直接看最新版本，更容量理解。
+2.1 明文时代 小帅向小美发送信息，直接以明文形式发送。
+缺点显而易见，第三方小黑很容易就窃取到信息，也可以进行篡改后发给小美，而且小美收到后并不知情，以为是小帅发来的。
+2.2 对称加密时代 小帅和小美保存一份相同的秘钥，小帅发出的信息先经过加密，小美收到后使用同样的密码进行解密。这种加密和解密使用同一个密钥的算法称为对称加密算法。
+短期内小黑对加密数据无能为力，但是每次变更秘钥需要事先协商，如果协商出问题，小帅告知小美新秘钥时，秘钥被小黑截取，那后续的密文对小黑来说，他也可以解密成明文。也可以篡改明文信息后，再使用同样的秘钥加密后发给小美。
+2.3 非对称加密时代 既然进行秘钥交换存在风险，小帅和小美采用非对称加密算法。双方各自保存私钥、公钥，两者配对，私钥自己保存，公钥由私钥运算生成发给对方，不能由公钥反推算出私钥；但是使用公钥加密的密文，却可以使用私钥解密；使用私钥签名，使用公钥验证；这种加密和解密使用不同的密钥的算法成为非对称加密算法。
+通信前，双发先将自己的公钥发给对方，私钥保密；小帅先使用小美提供的公钥加密数据，同时也使用自己的私钥进行签名标记，一起打包后发给小美，小美使用自己的私钥进行解密，再使用小帅的公钥进行验证，确认收到的信息是否来自小帅。
+这种形式的加密通信，协商传输的是公钥，即使被小黑截取，他也不能解密后续的信息，因为解密得使用私钥。
+但是百密一疏，如果小黑子在最初交互公钥时，截取公钥，把小帅发给小美的公钥截取，把自己的假公钥发给小美；截取小美发出的数据，小黑用自己的私钥解密，然后再使用自己的私钥加密后发给小帅。
+整了这么复杂的一套加密协议，结果还是存在隐患。
+2.4 公证时代 问题就出在公钥交换，小美收到一份公钥，如何证明这公钥确实是小帅发出的？譬如买房，只有房管局确认盖章导入系统的房产证，才是真的房产证，才能放心进行交易。通过CA（Certificate Authority）证书颁发机构来保证公钥的真实性，为公钥的真实性进行担保公证。
+CA也是基于非对称加密算法，小帅先先把自己的公钥交给CA，CA用自己的私钥加密这些数据，加密完的数据称为小帅的数字证书，先前小帅发给小美的公钥，改为发送CA加密之后的数字证书。小美收到以后，通过CA发布的CA证书（包含了CA的公钥），来解密小帅的数字证书，从而获得小帅的公钥。
+问题是小美怎么确保CA证书不是小黑伪造的？CA证书是提前预置在浏览器或操作系统，或者嵌入式设备内，不需要联网获取，自然也不存在劫持篡改的问题。
+虽然小黑还是可以拦截带公钥的数字签名证书，可以用CA公钥解密看到内容；但是他没CA的秘钥，无法伪造出正确的数字签名证书，也就是小帅的真实公钥小黑可见不可改，改了小美会发现异常，但只有公钥并没什么价值。
+2.5 TLS协议时代 公证时代的解决方案就是SSL/TLS协议加密通信基础。
+因为使用非对称加密算法比对称加密算法要复杂，消耗运算资源，为考虑效率，非对称加密只会用来传递一条信息，即对称加密的密钥。对称加密的密钥确定，后续有效信息使用对称加密算法进行网络传输。既保证了网络通信的安全性，又不影响效率。
+SSL/TLS协议的基本过程：
+1、通过CA体系交换公钥
+2、使用非对称加密算法，交换用于对称加密的密钥
+3、有效数据使用对称加密算法，进行密文传输
+前两步又称为&#34;握手阶段&#34;（handshake）,是SSL/TLS加密通信的基础。
+2.6 TLS的应用 在SSL/TLS出现之前，很多应用层协议（http、ftp、smtp等）都存在着网络安全问题。最常见的http协议，在传输过程中使用的是明文信息，传输报文一旦被截获便会泄露传输内容；传输过程中报文如果被篡改，对方无法轻易发现；无法保证消息交换的对端身份的可靠性。为了解决此类安全问题，在应用层和传输层之间加入了SSL/TLS协议，升级为https。SSL/TLS目前已经广泛用于数据安全协议。关于SSL/TLS有很多开源软件包，如openSSL,mbedtls等。openSSL功能更强大，mbedtls小巧更适合嵌入式设备。
+3、 mbedtls 随着物联网的发展，设备节点的安全问题也越来越重要，相比互联网的openSSL，物联网的嵌入式设备适合小巧灵活的MbedTLS，曾用名PolarSSL，可以根据需求进行配置，降低对硬件资源的消耗。mbedtls内置了非常多的加密解密，散列算法源码，即使不使用tls加密，也从里面挖掘各种算法，诸如AES/RSA/MD5等。但是openSSL功能更强大，
+mbedtls是一款采用Apache 2.0许可证协议开源软件加密库，使用标准C语言编写；独立的模块设计，降低模块之间的耦合度。从功能上看，主要包括加密库、X509证书、SSL/TLS协议三部分。
+3.1 软件包 进入https://tls.mbed.org/，点击download，在https://github.com/ARMmbed/mbedtls下载源码。
+Git下载界面有说明编译方式
+Compiling
+There are currently three active build systems used within Mbed TLS releases:" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/abcda921013f8e693d4926220bd47581/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-12-18T18:20:44+08:00" />
+<meta property="article:modified_time" content="2020-12-18T18:20:44+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">mbedtls基础及其应用</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p><strong>摘要</strong><br> SSL/TLS加密的介绍，重点是mbedtls的基础以及移植说明。</p> 
+<h2><a id="1_3"></a>1、引言</h2> 
+<h3><a id="11__5"></a>1.1 为什么要加密</h3> 
+<p>互联网是开放环境，通信双方都是未知身份，为通信双方的有效信息不被第三方窃听、篡改或者被冒充身份进行通信，需要为信息加上保护措施。也就是对所有信息都进行加密，避免被第三方窃听；采用校验机制，可以识别出信息是否被篡改，配备身份认证防止被冒充身份。互联网的通信安全，就是建立在SSL/TLS协议之上。</p> 
+<h3><a id="12_SSLTLS_8"></a>1.2 SSL/TLS协议的历史</h3> 
+<p>1996年，在前面的基础上，SSL 3.0版问世并得到大规模应用；</p> 
+<p>1999年，互联网标准化组织ISOC接替NetScape公司，发布了SSL的升级版TLS 1.0版，也称为SSL 3.1；SSL和TLS指的是同一套加密协议，只是不同时期的名字差异。</p> 
+<p>2006年和2008年，TLS进行了两次升级，分别为TLS 1.1版和TLS 1.2版。</p> 
+<p>一般推荐使用TLS 1.2，主流的浏览器都支持。</p> 
+<h2><a id="2SSLTLS_17"></a>2、SSL/TLS演化</h2> 
+<p>熟悉一套技术的演进步骤，比直接看最新版本，更容量理解。</p> 
+<h3><a id="21__20"></a>2.1 明文时代</h3> 
+<p>小帅向小美发送信息，直接以明文形式发送。<br> <img src="https://images2.imgbox.com/54/47/LjfLp8Zv_o.png" alt="在这里插入图片描述"></p> 
+<p>缺点显而易见，第三方小黑很容易就窃取到信息，也可以进行篡改后发给小美，而且小美收到后并不知情，以为是小帅发来的。</p> 
+<h3><a id="22__26"></a>2.2 对称加密时代</h3> 
+<p>小帅和小美保存一份相同的秘钥，小帅发出的信息先经过加密，小美收到后使用同样的密码进行解密。这种加密和解密使用同一个密钥的算法称为对称加密算法。<br> <img src="https://images2.imgbox.com/91/c8/o8F740FK_o.png" alt="在这里插入图片描述"></p> 
+<p>短期内小黑对加密数据无能为力，但是每次变更秘钥需要事先协商，如果协商出问题，小帅告知小美新秘钥时，秘钥被小黑截取，那后续的密文对小黑来说，他也可以解密成明文。也可以篡改明文信息后，再使用同样的秘钥加密后发给小美。</p> 
+<h3><a id="23__32"></a>2.3 非对称加密时代</h3> 
+<p>既然进行秘钥交换存在风险，小帅和小美采用非对称加密算法。双方各自保存私钥、公钥，两者配对，私钥自己保存，公钥由私钥运算生成发给对方，不能由公钥反推算出私钥；但是使用公钥加密的密文，却可以使用私钥解密；使用私钥签名，使用公钥验证；这种加密和解密使用不同的密钥的算法成为非对称加密算法。<br> <img src="https://images2.imgbox.com/dc/cf/olC6ywjs_o.png" alt="在这里插入图片描述"></p> 
+<p>通信前，双发先将自己的公钥发给对方，私钥保密；小帅先使用小美提供的公钥加密数据，同时也使用自己的私钥进行签名标记，一起打包后发给小美，小美使用自己的私钥进行解密，再使用小帅的公钥进行验证，确认收到的信息是否来自小帅。<br> 这种形式的加密通信，协商传输的是公钥，即使被小黑截取，他也不能解密后续的信息，因为解密得使用私钥。<br> 但是百密一疏，如果小黑子在最初交互公钥时，截取公钥，把小帅发给小美的公钥截取，把自己的假公钥发给小美；截取小美发出的数据，小黑用自己的私钥解密，然后再使用自己的私钥加密后发给小帅。<br> <img src="https://images2.imgbox.com/85/87/IGDiEHgS_o.png" alt="在这里插入图片描述"><br> 整了这么复杂的一套加密协议，结果还是存在隐患。</p> 
+<h3><a id="24__42"></a>2.4 公证时代</h3> 
+<p>问题就出在公钥交换，小美收到一份公钥，如何证明这公钥确实是小帅发出的？譬如买房，只有房管局确认盖章导入系统的房产证，才是真的房产证，才能放心进行交易。通过CA（Certificate Authority）证书颁发机构来保证公钥的真实性，为公钥的真实性进行担保公证。</p> 
+<p>CA也是基于非对称加密算法，小帅先先把自己的公钥交给CA，CA用自己的私钥加密这些数据，加密完的数据称为小帅的数字证书，先前小帅发给小美的公钥，改为发送CA加密之后的数字证书。小美收到以后，通过CA发布的CA证书（包含了CA的公钥），来解密小帅的数字证书，从而获得小帅的公钥。<br> <img src="https://images2.imgbox.com/5f/e3/5HRs1fdy_o.png" alt="在这里插入图片描述"></p> 
+<p>问题是小美怎么确保CA证书不是小黑伪造的？CA证书是提前预置在浏览器或操作系统，或者嵌入式设备内，不需要联网获取，自然也不存在劫持篡改的问题。</p> 
+<p>虽然小黑还是可以拦截带公钥的数字签名证书，可以用CA公钥解密看到内容；但是他没CA的秘钥，无法伪造出正确的数字签名证书，也就是小帅的真实公钥小黑可见不可改，改了小美会发现异常，但只有公钥并没什么价值。</p> 
+<h3><a id="25_TLS_52"></a>2.5 TLS协议时代</h3> 
+<p>公证时代的解决方案就是SSL/TLS协议加密通信基础。<br> 因为使用非对称加密算法比对称加密算法要复杂，消耗运算资源，为考虑效率，非对称加密只会用来传递一条信息，即对称加密的密钥。对称加密的密钥确定，后续有效信息使用对称加密算法进行网络传输。既保证了网络通信的安全性，又不影响效率。</p> 
+<p>SSL/TLS协议的基本过程：<br> 1、通过CA体系交换公钥<br> 2、使用非对称加密算法，交换用于对称加密的密钥<br> 3、有效数据使用对称加密算法，进行密文传输<br> 前两步又称为"握手阶段"（handshake）,是SSL/TLS加密通信的基础。</p> 
+<h3><a id="26_TLS_62"></a>2.6 TLS的应用</h3> 
+<p>在SSL/TLS出现之前，很多应用层协议（http、ftp、smtp等）都存在着网络安全问题。最常见的http协议，在传输过程中使用的是明文信息，传输报文一旦被截获便会泄露传输内容；传输过程中报文如果被篡改，对方无法轻易发现；无法保证消息交换的对端身份的可靠性。为了解决此类安全问题，在应用层和传输层之间加入了SSL/TLS协议，升级为https。SSL/TLS目前已经广泛用于数据安全协议。关于SSL/TLS有很多开源软件包，如openSSL,mbedtls等。openSSL功能更强大，mbedtls小巧更适合嵌入式设备。</p> 
+<h2><a id="3_mbedtls_65"></a>3、 mbedtls</h2> 
+<p>随着物联网的发展，设备节点的安全问题也越来越重要，相比互联网的openSSL，物联网的嵌入式设备适合小巧灵活的MbedTLS，曾用名PolarSSL，可以根据需求进行配置，降低对硬件资源的消耗。mbedtls内置了非常多的加密解密，散列算法源码，即使不使用tls加密，也从里面挖掘各种算法，诸如AES/RSA/MD5等。但是openSSL功能更强大，</p> 
+<p>mbedtls是一款采用Apache 2.0许可证协议开源软件加密库，使用标准C语言编写；独立的模块设计，降低模块之间的耦合度。从功能上看，主要包括加密库、X509证书、SSL/TLS协议三部分。</p> 
+<h3><a id="31__71"></a>3.1 软件包</h3> 
+<p>进入<a href="https://tls.mbed.org/" rel="nofollow" title="https://tls.mbed.org/">https://tls.mbed.org/</a>，点击download，在<a href="https://github.com/ARMmbed/mbedtls" title="https://github.com/ARMmbed/mbedtls">https://github.com/ARMmbed/mbedtls</a>下载源码。</p> 
+<p>Git下载界面有说明编译方式</p> 
+<blockquote> 
+ <p><strong>Compiling</strong></p> 
+ <p>There are currently three active build systems used within Mbed TLS releases:</p> 
+ <p>GNU Make</p> 
+ <p>CMake</p> 
+ <p>Microsoft Visual Studio (Microsoft Visual Studio 2013 or later)</p> 
+</blockquote> 
+<p>目前个人接触的芯片SDK内置mbedtls有v2.4.0，v2.4.2和v2.14.1三种，将git版本切到v2.14.1，最后提交是2018年。前期先在电脑模拟测试，选择Visual Studio 2013。</p> 
+<h3><a id="32__87"></a>3.2 软件结构</h3> 
+<p>mbedtls源码结构如下图<br> <img src="https://images2.imgbox.com/1b/90/XcEJ5ZES_o.png" alt="在这里插入图片描述"></p> 
+<p>mbedtls\include\mbedtls下面，可以version.h查看版本信息，重点是<strong>config.h</strong>配置，mbedtls是一套加密集合，实际项目使用中仅需选择少部分即可，配置功能宏裁剪代码，简化运算，毕竟mbedtls跑一遍，一般的arm单片机不一定扛得住。</p> 
+<p>programs\ssl下是参考范例，TLS的客户端和服务端范例，以及UDP版本的DTLS。嵌入式设备以客户端应用居多，主要参考<code>ssl_client2.c</code>里面很多配置参数可选，也可以针对应用替换<code>ssl_client1.c</code>。</p> 
+<p>测试TLS客户端首先要准备3个文件，CA证书，客户端公钥数字证书以及私钥。一般情况下命名后缀如下：</p> 
+<blockquote> 
+ <p>.crt CA证书<br> .pem 公钥，经CA加密后的公钥，也称为数字证书<br> .key 私钥<br> 有时crt和pem混用，其本质都是CA公钥加密后的文件</p> 
+</blockquote> 
+<p>如果没有服务器联调，也可以使用自身的ssl_server2.c做服务器。</p> 
+<h3><a id="33_demo_104"></a>3.3 demo流程分析</h3> 
+<p>ssl_client2.c范例都在main函数，其大体流程如下：</p> 
+<ul><li> <p>1、先加载各种证书、秘钥，配置opt结构体成员初始化，如TLS版本，加密套件类型等</p> </li><li> <p>2、然后开始连接服务器 mbedtls_net_connect</p> </li><li> <p>3、初始化tls参数 mbedtls_ssl_config_defaults，设置网络收发回调函数等</p> </li><li> <p>4、SSL/TLS握手流程，过程比较复杂，简化就是通信双方校验对方身份，获取对方的公钥，确认加密方式，后续数据进行加密或解密做准备 mbedtls_ssl_handshake</p> </li><li> <p>5、校验服务端返回的证书 mbedtls_ssl_get_verify_result</p> </li><li> <p>6、如果前面流程顺畅，就可以使用mbedtls_ssl_write，mbedtls_ssl_read收发数据了</p> </li><li> <p>7、测试结束后的清理工作</p> </li><li> <p>8、与标准socket编程对比，接口存在一定的对应关系：<br> <img src="https://images2.imgbox.com/37/71/QJ8iTR7r_o.png" alt="在这里插入图片描述"></p> </li></ul> 
+<h2><a id="4_mbedtls_123"></a>4、 mbedtls移植</h2> 
+<p>先在电脑端模拟测试，确定参数，简化范例里的赋值，因为实际项目参数不会经常变更，优化代码，尤其是秘钥加载，嵌入式都是以数组保存文件内容，而不会使用文件形式加载。另外结合加密等级，确定加密套件类型。</p> 
+<p>模拟测试正常后，再移植到ARM平台，主要改动涉及网络连接、内存管理和定时器三个方面。</p> 
+<h3><a id="41__128"></a>4.1 网络接口</h3> 
+<p>mbedtls默认的网络接口<code>mbedtls/library/net_socket.c</code>，可以在windows下运行，特别注意，默认的socket操作都是阻塞模式；一般不适合ARM平台，关闭MBEDTLS_NET_C，结合硬件平台重新实现网络接口。主要包括以下函数：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">mbedtls_net_init</span><span class="token punctuation">(</span> mbedtls_net_context <span class="token operator">*</span>ctx <span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">int</span> <span class="token function">mbedtls_net_connect</span><span class="token punctuation">(</span> mbedtls_net_context <span class="token operator">*</span>ctx<span class="token punctuation">,</span> <span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span>host<span class="token punctuation">,</span> <span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span>port<span class="token punctuation">,</span> <span class="token keyword">int</span> proto <span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">int</span> <span class="token function">mbedtls_net_recv</span><span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token operator">*</span>ctx<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span>buf<span class="token punctuation">,</span> size_t len <span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">int</span> <span class="token function">mbedtls_net_recv_timeout</span><span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token operator">*</span>ctx<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span>buf<span class="token punctuation">,</span> size_t len<span class="token punctuation">,</span> uint32_t timeout <span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">int</span> <span class="token function">mbedtls_net_send</span><span class="token punctuation">(</span> <span class="token keyword">void</span> <span class="token operator">*</span>ctx<span class="token punctuation">,</span> <span class="token keyword">const</span> <span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span>buf<span class="token punctuation">,</span> size_t len <span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">void</span> <span class="token function">mbedtls_net_free</span><span class="token punctuation">(</span> mbedtls_net_context <span class="token operator">*</span>ctx <span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>若需要DUP版本的DTLS，还需要实现该文件下另外几个接口，具体流程参考<code>dtls_client.c</code>。</p> 
+<p>自定义实现的网络收发接口，需要注册mbedtls_ssl_set_bio告知底层。</p> 
+<pre><code class="prism language-c"><span class="token function">mbedtls_ssl_set_bio</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>ssl<span class="token punctuation">,</span> <span class="token operator">&amp;</span>server_fd<span class="token punctuation">,</span>
+				    mbedtls_custom_send<span class="token punctuation">,</span><span class="token comment">//改写后的mbedtls_net_send，为底层提供发送接口</span>
+				    mbedtls_custom_recv<span class="token punctuation">,</span><span class="token comment">//为底层提供接收接口</span>
+				    mbedtls_custom_recv_timeout<span class="token punctuation">)</span>
+</code></pre> 
+<h3><a id="42__151"></a>4.2 内存管理</h3> 
+<p>自定义实现类型如下内存的申请和释放接口:</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span><span class="token operator">*</span> calloc（<span class="token keyword">unsigned</span> <span class="token keyword">int</span> num，<span class="token keyword">unsigned</span> <span class="token keyword">int</span> size）
+<span class="token keyword">void</span> <span class="token function">free</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span> ptr<span class="token punctuation">)</span>
+</code></pre> 
+<p>实现后将函数注册给底层</p> 
+<pre><code class="prism language-c"><span class="token function">mbedtls_platform_set_calloc_free</span><span class="token punctuation">(</span>custom_calloc<span class="token punctuation">,</span> custom_free<span class="token punctuation">)</span>
+</code></pre> 
+<h3><a id="43__166"></a>4.3 定时器</h3> 
+<p>对DTLS定时器接口，并注册到底层。</p> 
+<pre><code class="prism language-c">   <span class="token macro property">#<span class="token directive keyword">if</span> defined (__MBEDTLS_DTLS__)</span>
+    
+    <span class="token comment">//Set delays to watch</span>
+    <span class="token keyword">void</span> <span class="token function">platform_timing_set_delay</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>data<span class="token punctuation">,</span> uint32_t int_ms<span class="token punctuation">,</span> uint32_t fin_ms<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+	    platform_timing_delay_context <span class="token operator">*</span>ctx <span class="token operator">=</span> <span class="token punctuation">(</span>platform_timing_delay_context <span class="token operator">*</span><span class="token punctuation">)</span> data<span class="token punctuation">;</span>
+	    
+	    ctx<span class="token operator">-&gt;</span>int_ms <span class="token operator">=</span> int_ms<span class="token punctuation">;</span>
+	    ctx<span class="token operator">-&gt;</span>fin_ms <span class="token operator">=</span> fin_ms<span class="token punctuation">;</span>
+	    
+	    <span class="token keyword">if</span><span class="token punctuation">(</span>fin_ms <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span>
+	    <span class="token punctuation">{<!-- --></span>
+	    	ctx<span class="token operator">-&gt;</span>snapshot <span class="token operator">=</span> <span class="token function">custom_get_systicks</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	    <span class="token punctuation">}</span>    
+    <span class="token punctuation">}</span>    
+
+    <span class="token comment">//Get number of delays expired</span>
+    <span class="token keyword">int</span> <span class="token function">platform_timing_get_delay</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>data<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+	    platform_timing_delay_context <span class="token operator">*</span>ctx <span class="token operator">=</span> <span class="token punctuation">(</span>platform_timing_delay_context <span class="token operator">*</span><span class="token punctuation">)</span> data<span class="token punctuation">;</span>
+	    <span class="token keyword">unsigned</span> <span class="token keyword">long</span> elapsed_ms<span class="token punctuation">;</span>
+	    
+	    <span class="token keyword">if</span><span class="token punctuation">(</span>ctx<span class="token operator">-&gt;</span>fin_ms <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+		<span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	    
+	    elapsed_ms <span class="token operator">=</span> <span class="token function">custom_ticks_to_milli_secs</span><span class="token punctuation">(</span><span class="token function">custom_get_systicks</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">-</span> ctx<span class="token operator">-&gt;</span>snapshot<span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">//转换成毫秒</span>
+	    
+    	<span class="token keyword">if</span><span class="token punctuation">(</span>elapsed_ms <span class="token operator">&gt;=</span> ctx<span class="token operator">-&gt;</span>fin_ms<span class="token punctuation">)</span>
+	    <span class="token punctuation">{<!-- --></span>
+	    	<span class="token keyword">return</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	    <span class="token punctuation">}</span>
+    	
+    	<span class="token keyword">if</span><span class="token punctuation">(</span>elapsed_ms <span class="token operator">&gt;=</span> ctx<span class="token operator">-&gt;</span>int_ms<span class="token punctuation">)</span>
+	    <span class="token punctuation">{<!-- --></span>
+	    	<span class="token keyword">return</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	    <span class="token punctuation">}</span>
+    	
+    	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token macro property">#<span class="token directive keyword">endif</span> </span><span class="token comment">/* __MBEDTLS_DTLS__ */</span>
+    
+    <span class="token comment">//注册到底层</span>
+    <span class="token function">mbedtls_ssl_set_timer_cb</span><span class="token punctuation">(</span> <span class="token operator">&amp;</span>ssl<span class="token punctuation">,</span> <span class="token operator">&amp;</span>platform_timer<span class="token punctuation">,</span> platform_timing_set_delay<span class="token punctuation">,</span> platform_timing_get_delay <span class="token punctuation">)</span><span class="token punctuation">;</span>
+    
+</code></pre> 
+<h3><a id="44___220"></a>4.4 网络阻塞与非阻塞机制</h3> 
+<p>mbedtls在电脑模拟测试时其网络连接非常顺畅，而且测试只是跑这一项功能，即使采用阻塞模式也不会有其它问题。实际嵌入式设备在联网时，肯定还有其他任务需要执行。</p> 
+<p>如果设备支持操作系统，可以为mbedtls单独分配一个线程或者任务，推荐使用阻塞机制实现接口，而且容易调试，尤其是https下载这种场景。但是特殊情况下不支持阻塞的，在改写网络接口时，需要特殊处理。</p> 
+<p>例如范例mbedtls_net_connect进行域名解析、连接服务器，嵌入式设备的无线网络在这个步骤，基本会返回异常表示阻塞等待中，要解决这个问题，需要将后续的握手流程拆分执行。原本联网后执行mbedtls_ssl_handshake，在while里面等待握手流程MBEDTLS_SSL_HANDSHAKE_OVER结束或者错误，改为每次收到读消息的事件，执行一次或多次mbedtls_ssl_handshake_step。（<strong>这个并没亲自验证</strong>）</p> 
+<p>mbedtls_ssl_set_bio注册的读写接口支持设为非阻塞，mbedtls_ssl_write和mbedtls_ssl_read对应用层接口，在底层socket上报read_ready之后，判断当前握手已经完成，再执行mbedtls_ssl_read。</p> 
+<h3><a id="45__228"></a>4.5 证书与密钥</h3> 
+<p>测试可以使用mbedtls范例自带的证书和公钥、私钥，但实际项目需要自己根据服务器域名生成ca证书，以及双方的公钥、私钥。<br> 在源码programs\pkey下有秘钥生成的代码，作为客户端，需要验证服务器提供的公钥证书，因此本地还要CA证书，类似首次登录12306提示要下载的证书，再加上客户端自身的公钥和私钥，一共3个文件。<br> gen_key.c生成keyfile.key私钥，默认秘钥长度是4096，虽然1024理论上有风险，但是运算更快；后面再使用openSSL 命令行生成公钥。</p> 
+<blockquote> 
+ <p>OpenSSL&gt; rsa -in private.key -pubout -out public.key</p> 
+</blockquote> 
+<p>openSSL下载地址 <a href="https://www.openssl.org/" rel="nofollow">https://www.openssl.org/</a>，安装后提示使用收费，实际使用未见异常。秘钥也可使用openSSL生成</p> 
+<blockquote> 
+ <p>OpenSSL&gt;genrsa -out private.key 2048</p> 
+</blockquote> 
+<p>如果使用未知，使用help查看说明。至于CA证书，需要平台侧生成再提供给设备端。</p> 
+<h3><a id="46__241"></a>4.6 加密套件与配置裁剪</h3> 
+<p>确定合适的加密套件，未使用的算法就可以屏蔽；在电脑运行瞬间完成，在实际arm硬件可能需要较长时间，比如使用RSA在握手阶段可能需要较长时间，可以选择ECDSA或者减小秘钥长度。</p> 
+<h2><a id="5__243"></a>5、 小节</h2> 
+<p>目前的物联网对数据安全不是很关注，使用自定义协议近似明文的方式交互，或者使用单一加密方式，未来智能家居、涉及财物计费的、特殊行业的设备节点，可能会逐渐使用加密通信，而mbedtls则是较好的选择之一。即使不使用TLS，也可以选择简单的对称加密，mbedtls也是一个加密算法库，可根据需求提取合适的源码集成。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/25ffc28b65b8ccacbb2329286de1058c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">日志：MySQL 百万级数据表使用了错误索引的解决方法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/d8dbfa170dac65e48f591bcab92445b4/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">token失效 判断access_记一次微信公众号accesstoken失效的排查</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

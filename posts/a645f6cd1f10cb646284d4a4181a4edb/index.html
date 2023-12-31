@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>OpenGL核心技术之帧缓冲 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="OpenGL核心技术之帧缓冲" />
+<meta property="og:description" content="OpenGL核心技术之帧缓冲
+笔者介绍：姜雪伟，I。
+https://blog.csdn.net/jxw167/article/details/54985183/
+CSDN视频网址：http://edu.csdn.net/lecturer/144
+本篇博文主要是给读者解密关于游戏后处理渲染效果的原理，后处理渲染效果在Unity，UE4虚幻引擎等商业引擎 使用的非常多，
+比如Bloom，Blur，SSAO，PSSM，HDR等等都属于后处理渲染效果，它们的实现其实就是应用帧缓冲技术实现的，本篇博文主要是
+围绕帧缓冲给读者介绍其实现原理以及应用案例。
+在前面给读者介绍了几种不同的屏幕缓冲：用于写入颜色值的颜色缓冲，用于写入深度信息的深度缓冲，以及允许我们基于一些条件丢弃指定片段的模板缓冲。本篇博客主要是给读者介绍帧缓冲，什么是帧缓冲？其实就是把前面介绍的这几种缓冲结合起来叫做帧缓冲(Framebuffer)，它被储存于内存中。OpenGL给了我们自己定义帧缓冲的自由，我们可以选择性的定义自己的颜色缓冲、深度和模板缓冲。本篇博客主要是给读者介绍帧缓冲，我们前面介绍的渲染操作都是在默认的帧缓冲之上进行的，当你创建了你的窗口的时候默认帧缓冲就被创建和配置好了，通过创建我们自己的帧缓冲我们能够获得一种额外的渲染方式。通过帧缓冲可以将你的场景渲染到一个不同的帧缓冲中，可以使我们能够在场景中创建镜子这样的效果，或者做出一些炫酷的特效。首先我们会讨论它们是如何工作的，然后我们将利用帧缓冲来实现一些炫酷的效果。
+我们在引擎渲染中经常会使用一些后处理效果，这些后处理效果就是在帧缓冲中进行的。下面我们就告诉读者帧缓冲是如何工作的？
+我们可以使用一个叫做glGenFramebuffers的函数来创建一个帧缓冲对象（简称FBO）：
+GLuint fbo;
+glGenFramebuffers(1, &amp;fbo);
+首先我们要创建一个帧缓冲对象，把它绑定到当前帧缓冲，做一些操作，然后解绑帧缓冲。我们使用glBindFramebuffer来绑定帧缓冲：
+glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+绑定到GL_FRAMEBUFFER目标后，接下来所有的读、写帧缓冲的操作都会影响到当前绑定的帧缓冲。也可以把帧缓冲分开绑定到读或写目标上，分别使用GL_READ_FRAMEBUFFER或GL_DRAW_FRAMEBUFFER来做这件事。如果绑定到了GL_READ_FRAMEBUFFER，就能执行所有读取操作，
+像glReadPixels这样的函数使用了，绑定到GL_DRAW_FRAMEBUFFER上，就允许进行渲染、清空和其他的写入操作。在此给读者总结一下构建一个完整的帧
+缓冲满足的条件：
+建构一个完整的帧缓冲必须满足以下条件：
+我们必须往里面加入至少一个附件（颜色、深度、模板缓冲）。
+其中至少有一个是颜色附件。
+所有的附件都应该是已经完全做好的（已经存储在内存之中）。
+每个缓冲都应该有同样数目的样本。
+上面的条件提到了样本，如果你不知道什么是样本也不用担心，我们会在后面的博文中讲到。
+我们需要为帧缓冲创建一些附件(Attachment)，还需要把这些附件附加到帧缓冲上。当我们做完所有上面提到的条件的时候我们就可以用 glCheckFramebufferStatus 带上 GL_FRAMEBUFFER 这个参数来检查是否真的成功做到了。然后检查当前绑定的帧缓冲，返回了这些规范中的哪个值。如果返回的是 GL_FRAMEBUFFER_COMPLETE就对了：
+if(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+// Execute victory dance
+后续所有渲染操作将渲染到当前绑定的帧缓冲的附加缓冲中，由于我们的帧缓冲不是默认的帧缓冲，渲染命令对窗口的视频输出不会产生任何影响。出于这个原因，它被称为离屏渲染（off-screen rendering），就是渲染到一个另外的缓冲中。为了让所有的渲染操作对主窗口产生影响我们必须通过绑定为0来使默认帧缓冲被激活：
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+当我们做完所有帧缓冲操作，不要忘记删除帧缓冲对象：
+glDeleteFramebuffers(1, &amp;fbo);
+现在在执行完成检测前，我们需要把一个或更多的附件附加到帧缓冲上。一个附件就是一个内存地址，这个内存地址里面包含一个为帧缓冲准备的缓冲，它可以是个图像。当创建一个附件的时候我们有两种方式可以采用：纹理或渲染缓冲（renderbuffer）对象。
+接下来介绍纹理，当把一个纹理附加到帧缓冲上的时候，所有渲染命令会写入到纹理上，就像它是一个普通的颜色/深度或者模板缓冲一样。使用纹理的好处是，所有渲染操作的结果都会被储存为一个纹理图像，这样我们就可以简单的在着色器中使用了。
+创建一个帧缓冲的纹理和创建普通纹理差不多：
+GLuint texture;
+glGenTextures(1, &amp;texture);
+glBindTexture(GL_TEXTURE_2D, texture);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 800, 600, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/a645f6cd1f10cb646284d4a4181a4edb/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-05-26T10:55:56+08:00" />
+<meta property="article:modified_time" content="2021-05-26T10:55:56+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">OpenGL核心技术之帧缓冲</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>OpenGL核心技术之帧缓冲<br> 笔者介绍：姜雪伟，I。</p> 
+<p><a href="https://blog.csdn.net/jxw167/article/details/54985183/">https://blog.csdn.net/jxw167/article/details/54985183/</a></p> 
+<p>CSDN视频网址：http://edu.csdn.net/lecturer/144</p> 
+<p>本篇博文主要是给读者解密关于游戏后处理渲染效果的原理，后处理渲染效果在Unity，UE4虚幻引擎等商业引擎 使用的非常多，</p> 
+<p>比如Bloom，Blur，SSAO，PSSM，HDR等等都属于后处理渲染效果，它们的实现其实就是应用帧缓冲技术实现的，本篇博文主要是</p> 
+<p>围绕帧缓冲给读者介绍其实现原理以及应用案例。</p> 
+<p>在前面给读者介绍了几种不同的屏幕缓冲：用于写入颜色值的颜色缓冲，用于写入深度信息的深度缓冲，以及允许我们基于一些条件丢弃指定片段的模板缓冲。本篇博客主要是给读者介绍帧缓冲，什么是帧缓冲？其实就是把前面介绍的这几种缓冲结合起来叫做帧缓冲(Framebuffer)，它被储存于内存中。OpenGL给了我们自己定义帧缓冲的自由，我们可以选择性的定义自己的颜色缓冲、深度和模板缓冲。本篇博客主要是给读者介绍帧缓冲，我们前面介绍的渲染操作都是在默认的帧缓冲之上进行的，当你创建了你的窗口的时候默认帧缓冲就被创建和配置好了，通过创建我们自己的帧缓冲我们能够获得一种额外的渲染方式。通过帧缓冲可以将你的场景渲染到一个不同的帧缓冲中，可以使我们能够在场景中创建镜子这样的效果，或者做出一些炫酷的特效。首先我们会讨论它们是如何工作的，然后我们将利用帧缓冲来实现一些炫酷的效果。</p> 
+<p>我们在引擎渲染中经常会使用一些后处理效果，这些后处理效果就是在帧缓冲中进行的。下面我们就告诉读者帧缓冲是如何工作的？</p> 
+<p>我们可以使用一个叫做glGenFramebuffers的函数来创建一个帧缓冲对象（简称FBO）：</p> 
+<p> </p> 
+<p>GLuint fbo;<br> glGenFramebuffers(1, &amp;fbo);<br>  </p> 
+<p>首先我们要创建一个帧缓冲对象，把它绑定到当前帧缓冲，做一些操作，然后解绑帧缓冲。我们使用glBindFramebuffer来绑定帧缓冲：</p> 
+<p>glBindFramebuffer(GL_FRAMEBUFFER, fbo);<br>  </p> 
+<p>绑定到GL_FRAMEBUFFER目标后，接下来所有的读、写帧缓冲的操作都会影响到当前绑定的帧缓冲。也可以把帧缓冲分开绑定到读或写目标上，分别使用GL_READ_FRAMEBUFFER或GL_DRAW_FRAMEBUFFER来做这件事。如果绑定到了GL_READ_FRAMEBUFFER，就能执行所有读取操作，</p> 
+<p>像glReadPixels这样的函数使用了，绑定到GL_DRAW_FRAMEBUFFER上，就允许进行渲染、清空和其他的写入操作。在此给读者总结一下构建一个完整的帧</p> 
+<p>缓冲满足的条件：</p> 
+<p>建构一个完整的帧缓冲必须满足以下条件：</p> 
+<p>我们必须往里面加入至少一个附件（颜色、深度、模板缓冲）。<br> 其中至少有一个是颜色附件。<br> 所有的附件都应该是已经完全做好的（已经存储在内存之中）。<br> 每个缓冲都应该有同样数目的样本。<br> 上面的条件提到了样本，如果你不知道什么是样本也不用担心，我们会在后面的博文中讲到。</p> 
+<p>我们需要为帧缓冲创建一些附件(Attachment)，还需要把这些附件附加到帧缓冲上。当我们做完所有上面提到的条件的时候我们就可以用 glCheckFramebufferStatus 带上 GL_FRAMEBUFFER 这个参数来检查是否真的成功做到了。然后检查当前绑定的帧缓冲，返回了这些规范中的哪个值。如果返回的是 GL_FRAMEBUFFER_COMPLETE就对了：</p> 
+<p> </p> 
+<p>if(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)<br>   // Execute victory dance<br> 后续所有渲染操作将渲染到当前绑定的帧缓冲的附加缓冲中，由于我们的帧缓冲不是默认的帧缓冲，渲染命令对窗口的视频输出不会产生任何影响。出于这个原因，它被称为离屏渲染（off-screen rendering），就是渲染到一个另外的缓冲中。为了让所有的渲染操作对主窗口产生影响我们必须通过绑定为0来使默认帧缓冲被激活：</p> 
+<p> </p> 
+<p> </p> 
+<p>glBindFramebuffer(GL_FRAMEBUFFER, 0);<br> 当我们做完所有帧缓冲操作，不要忘记删除帧缓冲对象：</p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p>glDeleteFramebuffers(1, &amp;fbo);</p> 
+<p>现在在执行完成检测前，我们需要把一个或更多的附件附加到帧缓冲上。一个附件就是一个内存地址，这个内存地址里面包含一个为帧缓冲准备的缓冲，它可以是个图像。当创建一个附件的时候我们有两种方式可以采用：纹理或渲染缓冲（renderbuffer）对象。</p> 
+<p> </p> 
+<p>接下来介绍纹理，当把一个纹理附加到帧缓冲上的时候，所有渲染命令会写入到纹理上，就像它是一个普通的颜色/深度或者模板缓冲一样。使用纹理的好处是，所有渲染操作的结果都会被储存为一个纹理图像，这样我们就可以简单的在着色器中使用了。</p> 
+<p>创建一个帧缓冲的纹理和创建普通纹理差不多：</p> 
+<p>GLuint texture;<br> glGenTextures(1, &amp;texture);<br> glBindTexture(GL_TEXTURE_2D, texture);<br>  <br> glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 800, 600, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);<br>  <br> glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);<br> glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);<br> 这里主要的区别是我们把纹理的维度设置为屏幕大小（尽管不是必须的），我们还传递NULL作为纹理的data参数。对于这个纹理，</p> 
+<p> </p> 
+<p>我们只分配内存，而不去填充它。纹理填充会在渲染到帧缓冲的时候去做。</p> 
+<p> </p> 
+<p>如果你打算把整个屏幕渲染到一个或大或小的纹理上，你需要用新的纹理的尺寸作为参数再次调用glViewport（要在渲染到你的帧缓冲之前</p> 
+<p>做好），否则只有一小部分纹理或屏幕能够绘制到纹理上。现在我们已经创建了一个纹理，最后一件要做的事情是把它附加到帧缓冲上：</p> 
+<p>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D, texture, 0);<br> glFramebufferTexture2D函数需要传入下列参数：</p> 
+<p>target：我们所创建的帧缓冲类型的目标（绘制、读取或两者都有）。<br> attachment：我们所附加的附件的类型。现在我们附加的是一个颜色附件。需要注意，最后的那个0是暗示我们可以附加1个以上颜色的附件。我们会在后面的教程中谈到。<br> textarget：你希望附加的纹理类型。<br> texture：附加的实际纹理。<br> level：Mipmap level。我们设置为0。<br> 除颜色附件以外，我们还可以附加一个深度和一个模板纹理到帧缓冲对象上。为了附加一个深度缓冲，我们可以知道那个GL_DEPTH_ATTACHMENT作为附件类型。记住，这时纹理格式和内部格式类型（internalformat）就成了 GL_DEPTH_COMPONENT去反应深度缓冲的存储格式。附加一个模板缓冲，你要使用 GL_STENCIL_ATTACHMENT作为第二个参数，把纹理格式指定为GL_STENCIL_INDEX。</p> 
+<p>也可以同时附加一个深度缓冲和一个模板缓冲为一个单独的纹理，这样纹理的每32位数值就包含了24位的深度信息和8位的模板信息。为了把一个深度和模板缓冲附加到一个单独纹理上，我们使用GL_DEPTH_STENCIL_ATTACHMENT类型配置纹理格式以包含深度值和模板值的结合物。下面是一个附加了深度和模板缓冲为单一纹理的例子：</p> 
+<p>glTexImage2D( GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 800, 600, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL );<br>  <br> glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, texture, 0);<br> 再介绍渲染缓冲对象，OpenGL引进了渲染缓冲对象(Renderbuffer objects)，所以在过去那些美好时光里纹理是附件的唯一可用的类型。和纹理图像一样，渲染缓冲对象也是一个缓冲，它可以是一堆字节、整数、像素或者其他东西。渲染缓冲对象的一大优点是，它以OpenGL原生渲染格式储存它的数据，因此在离屏渲染到帧缓冲的时候，这些数据就相当于被优化过的了。</p> 
+<p>渲染缓冲对象将所有渲染数据直接储存到它们的缓冲里，而不会进行针对特定纹理格式的任何转换，这样它们就成了一种快速可写的存储介质了。然而，渲染缓冲对象通常是只写的，不能修改它们（就像获取纹理，不能写入纹理一样）。可以用glReadPixels函数去读取，函数返回一个当前绑定的帧缓冲的特定像素区域，而不是直接返回附件本身。</p> 
+<p>因为它们的数据已经是原生格式了，在写入或把它们的数据简单地到其他缓冲的时候非常快。当使用渲染缓冲对象时，像切换缓冲这种操作变得异常高速。我们在每个渲染迭代末尾使用的那个glfwSwapBuffers函数，同样以渲染缓冲对象实现：我们简单地写入到一个渲染缓冲图像，最后交换到另一个里。渲染缓冲对象对于这种操作来说很完美。</p> 
+<p>创建一个渲染缓冲对象和创建帧缓冲代码差不多：</p> 
+<p>GLuint rbo;<br> glGenRenderbuffers(1, &amp;rbo);</p> 
+<p>相似地，我们打算把渲染缓冲对象绑定，这样所有后续渲染缓冲操作都会影响到当前的渲染缓冲对象：</p> 
+<p> </p> 
+<p>glBindRenderbuffer(GL_RENDERBUFFER, rbo);<br>  </p> 
+<p>由于渲染缓冲对象通常是只写的，它们经常作为深度和模板附件来使用，由于大多数时候，我们不需要从深度和模板缓冲中读取数据，但仍关心深度和模板测试。我们就需要有深度和模板值提供给测试，但不需要对这些值进行采样（sample），所以深度缓冲对象是完全符合的。当我们不去从这些缓冲中采样的时候，渲染缓冲对象通常很合适，因为它们等于是被优化过的。</p> 
+<p> </p> 
+<p>调用glRenderbufferStorage函数可以创建一个深度和模板渲染缓冲对象：</p> 
+<p>glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 800, 600);<br>  </p> 
+<p>创建一个渲染缓冲对象与创建纹理对象相似，不同之处在于这个对象是专门被设计用于图像的，而不是通用目的的数据缓冲，比如纹理。这里我们选择GL_DEPTH24_STENCIL8作为内部格式，它同时代表24位的深度和8位的模板缓冲。</p> 
+<p> </p> 
+<p>最后一件还要做的事情是把帧缓冲对象附加上：</p> 
+<p>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);</p> 
+<p>在帧缓冲项目中，渲染缓冲对象可以提供一些优化，但更重要的是知道何时使用渲染缓冲对象，何时使用纹理。通常的规则是，如果你永远都不需要从特定的缓冲中进行采样，渲染缓冲对象对特定缓冲是更明智的选择。如果哪天需要从比如颜色或深度值这样的特定缓冲采样数据的话，你最好还是使用纹理附件。从执行效率角度考虑，它不会对效率有太大影响。</p> 
+<p> </p> 
+<p> </p> 
+<p>下面通过案例的方式介绍如何使用帧缓存，我们会把场景渲染到一个颜色纹理上，这个纹理附加到一个我们创建的帧缓冲上，然后把纹</p> 
+<p> </p> 
+<p> </p> 
+<p>理绘制到一个简单的四边形上，这个四边形铺满整个屏幕。输出的图像看似和没用帧缓冲一样，但是这次，它其实是直接打印到了一个单独的</p> 
+<p>四边形上面。为什么这很有用呢？下一部分我们会看到原因。</p> 
+<p>第一件要做的事情是创建一个帧缓冲对象，并绑定它，这比较明了：</p> 
+<p> </p> 
+<p>GLuint framebuffer;<br> glGenFramebuffers(1, &amp;framebuffer);<br> glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);<br> 第二件要做的事情是我们创建一个纹理图像，这是我们将要附加到帧缓冲的颜色附件。我们把纹理的尺寸设置为窗口的宽度和高度，并保持数据未初始化：</p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p>// Generate texture<br> GLuint texColorBuffer;<br> glGenTextures(1, &amp;texColorBuffer);<br> glBindTexture(GL_TEXTURE_2D, texColorBuffer);<br> glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 800, 600, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);<br> glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );<br> glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);<br> glBindTexture(GL_TEXTURE_2D, 0);<br>  <br> // Attach it to currently bound framebuffer object<br> glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texColorBuffer, 0);<br> 我们同样打算要让OpenGL确定可以进行深度测试（模板测试，如果你用的话）所以我们必须还要确保向帧缓冲中添加一个深度（和模板）</p> 
+<p> </p> 
+<p>附件。由于我们只采样颜色缓冲，并不采样其他缓冲，我们可以创建一个渲染缓冲对象来达到这个目的。</p> 
+<p>创建一个渲染缓冲对象不太难。唯一一件要记住的事情是，我们正在创建的是一个渲染缓冲对象的深度和模板附件。我们把它的内部给事设置</p> 
+<p>为GL_DEPTH24_STENCIL8，对于我们的目的来说这个精确度已经足够了。</p> 
+<p>GLuint rbo;<br> glGenRenderbuffers(1, &amp;rbo);<br> glBindRenderbuffer(GL_RENDERBUFFER, rbo);<br> glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 800, 600);  <br> glBindRenderbuffer(GL_RENDERBUFFER, 0);<br>  </p> 
+<p>我们为渲染缓冲对象分配了足够的内存空间以后，我们可以解绑渲染缓冲。</p> 
+<p>接着，在做好帧缓冲之前，还有最后一步，我们把渲染缓冲对象附加到帧缓冲的深度和模板附件上：</p> 
+<p> </p> 
+<p>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);<br>  </p> 
+<p>然后我们要检查帧缓冲是否真的做好了，如果没有，我们就打印一个错误消息。</p> 
+<p> </p> 
+<p> </p> 
+<p>if(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)<br>  cout &lt;&lt; "ERROR::FRAMEBUFFER:: Framebuffer is not complete!" &lt;&lt; endl;<br> glBindFramebuffer(GL_FRAMEBUFFER, 0);<br>  </p> 
+<p>还要保证解绑帧缓冲，这样我们才不会意外渲染到错误的帧缓冲上。</p> 
+<p>现在帧缓冲做好了，我们要做的全部就是渲染到帧缓冲上，而不是绑定到帧缓冲对象的默认缓冲。余下所有命令会影响到当前绑定的帧缓冲上。所有深度和模板操作同样会从当前绑定的帧缓冲的深度和模板附件中读取，当然，得是在它们可用的情况下。如果你遗漏了比如深度缓冲，所有深度测试就不会工作，因为当前绑定的帧缓冲里没有深度缓冲。</p> 
+<p>所以，为把场景绘制到一个单独的纹理，我们必须以下面步骤来做：</p> 
+<p>使用新的绑定为激活帧缓冲的帧缓冲，像往常那样渲染场景。<br> 绑定到默认帧缓冲。<br> 绘制一个四边形，让它平铺到整个屏幕上，用新的帧缓冲的颜色缓冲作为他的纹理。<br> 为了绘制四边形我们将会创建新的着色器。我们不打算引入任何花哨的变换矩阵，因为我们只提供已经是标准化设备坐标的顶点坐标，所以我们可以直接把它们作为顶点着色器的输出。顶点着色器看起来像这样：</p> 
+<p> </p> 
+<p>#version 330 core<br> layout (location = 0) in vec2 position;<br> layout (location = 1) in vec2 texCoords;<br>  <br> out vec2 TexCoords;<br>  <br> void main()<br> {<!-- --><br>     gl_Position = vec4(position.x, position.y, 0.0f, 1.0f);<br>     TexCoords = texCoords;<br> }</p> 
+<p>片段着色器更简洁，因为我们做的唯一一件事是从纹理采样：</p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p>#version 330 core<br> in vec2 TexCoords;<br> out vec4 color;<br>  <br> uniform sampler2D screenTexture;<br>  <br> void main()<br> {<!-- --><br>     color = texture(screenTexture, TexCoords);<br> }<br>  </p> 
+<p>接着需要你为屏幕上的四边形创建和配置一个VAO。渲染迭代中帧缓冲处理会有下面的结构：</p> 
+<p>// First pass<br> glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);<br> glClearColor(0.1f, 0.1f, 0.1f, 1.0f);<br> glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // We're not using stencil buffer now<br> glEnable(GL_DEPTH_TEST);<br> DrawScene();<br>  <br> // Second pass<br> glBindFramebuffer(GL_FRAMEBUFFER, 0); // back to default<br> glClearColor(1.0f, 1.0f, 1.0f, 1.0f);<br> glClear(GL_COLOR_BUFFER_BIT);<br>  <br> screenShader.Use();  <br> glBindVertexArray(quadVAO);<br> glDisable(GL_DEPTH_TEST);<br> glBindTexture(GL_TEXTURE_2D, textureColorbuffer);<br> glDrawArrays(GL_TRIANGLES, 0, 6);<br> glBindVertexArray(0);<br>  </p> 
+<p>第一，由于我们用的每个帧缓冲都有自己的一系列缓冲，我们打算使用glClear设置的合适的位（bits）来清空这些缓冲。</p> 
+<p> </p> 
+<p>第二，当渲染四边形的时候，我们关闭深度测试，因为我们不关系深度测试，我们绘制的是一个简单的四边形；当我们绘制普通场景时我们必须再次开启深度测试。实现效果如下所示：</p> 
+<p> </p> 
+<p>上述案例实现得出的结果是可以自由的获取渲染场景中的任何像素，其实就是把它作为一个纹理图像。接下来利用帧缓冲实现我们游戏中经常使用的后处理效果，比如游戏中颜色的反相处理，就是把颜色值取反。这个在片段着色器中处理即可，在片段着色器里返回这些颜色的反色(Inversion)并不难。我们得到屏幕纹理的颜色，然后用1.0减去它：</p> 
+<p> </p> 
+<p>void main()<br> {<!-- --><br>     color = vec4(vec3(1.0 - texture(screenTexture, TexCoords)), 1.0);<br> }<br> 反相是一种相对简单的后处理特效，实现的效果如下所示：</p> 
+<p> </p> 
+<p><br>  </p> 
+<p>这样把整个场景都处理了，这也是后处理渲染实现的效果，这样只需要在上述片段着色器中修改一行代码即可实现。</p> 
+<p>下面再继续深入探讨，在单独纹理图像上进行后处理的另一个好处是我们可以从纹理的其他部分进行采样。比如我们可以从当前纹理值的周围采样多个纹理值。创造性地把它们结合起来就能创造出有趣的效果了。</p> 
+<p>kernel是一个长得有点像一个小矩阵的数值数组，它中间的值中心可以映射到一个像素上，这个像素和这个像素周围的值再乘以kernel，最后再把结果相加就能得到一个值。所以，我们基本上就是给当前纹理坐标加上一个它四周的偏移量，然后基于kernel把它们结合起来。下面是一个kernel的例子：</p> 
+<p>这个kernel表示一个像素周围八个像素乘以2，它自己乘以-15。这个例子基本上就是把周围像素乘上2，中间像素去乘以一个比较大的负数来进行平衡。kernel对于后处理来说非常管用，因为用起来简单。网上能找到有很多实例，为了能用上kernel我们还得改改片段着色器。这里假设每个kernel都是3×3（实际上大多数都是3×3）：</p> 
+<p> </p> 
+<p>const float offset = 1.0 / 300;  <br>  <br> void main()<br> {<!-- --><br>     vec2 offsets[9] = vec2[](<br>         vec2(-offset, offset),  // top-left<br>         vec2(0.0f,    offset),  // top-center<br>         vec2(offset,  offset),  // top-right<br>         vec2(-offset, 0.0f),    // center-left<br>         vec2(0.0f,    0.0f),    // center-center<br>         vec2(offset,  0.0f),    // center-right<br>         vec2(-offset, -offset), // bottom-left<br>         vec2(0.0f,    -offset), // bottom-center<br>         vec2(offset,  -offset)  // bottom-right<br>     );<br>  <br>     float kernel[9] = float[](<br>         -1, -1, -1,<br>         -1,  9, -1,<br>         -1, -1, -1<br>     );<br>  <br>     vec3 sampleTex[9];<br>     for(int i = 0; i &lt; 9; i++)<br>     {<!-- --><br>         sampleTex[i] = vec3(texture(screenTexture, TexCoords.st + offsets[i]));<br>     }<br>     vec3 col;<br>     for(int i = 0; i &lt; 9; i++)<br>         col += sampleTex[i] * kernel[i];<br>  <br>     color = vec4(col, 1.0);<br> }<br>  </p> 
+<p> </p> 
+<p>在片段着色器中我们先为每个四周的纹理坐标创建一个9个vec2偏移量的数组。偏移量是一个简单的常数，你可以设置为自己喜欢的。接着我们定义kernel，这里应该是一个锐化kernel，它通过一种有趣的方式从所有周边的像素采样，对每个颜色值进行锐化。最后，在采样的时候我们把每个偏移量加到当前纹理坐标上，然后用加在一起的kernel的值乘以这些纹理值。</p> 
+<p>这个锐化的kernel看起来像这样：</p> 
+<p>再举个例子关于模糊（Blur）效果的Kernel定义如下：</p> 
+<p>由于所有数值加起来的总和为16,简单返回结合起来的采样颜色是非常亮的,所以我们必须将kernel的每个值除以16.最终的kernel数组会是这样的:</p> 
+<p> </p> 
+<p>float kernel[9] = float[](<br>     1.0 / 16, 2.0 / 16, 1.0 / 16,<br>     2.0 / 16, 4.0 / 16, 2.0 / 16,<br>     1.0 / 16, 2.0 / 16, 1.0 / 16  <br> );<br> 通过在像素着色器中改变kernel的float数组,我们就完全改变了之后的后处理效果.现在看起来会像是这样:</p> 
+<p> </p> 
+<p><br>  </p> 
+<p>这样的模糊效果具有创建许多有趣效果的潜力，模糊效果在后处理中使用的非常多，它会结合着Bloom后处理渲染使用。模糊也能为我们在后面的教程中提供都颜色值进行平滑处理的能力。</p> 
+<p>最后把关于帧缓冲的顶点着色器和片段着色器代码分别给读者展示如下：</p> 
+<p>顶点着色器代码：</p> 
+<p> </p> 
+<p>#version 330 core<br> layout (location = 0) in vec2 position;<br> layout (location = 1) in vec2 texCoords;<br>  <br> out vec2 TexCoords;<br>  <br> void main()<br> {<!-- --><br>     gl_Position = vec4(position.x, position.y, 0.0f, 1.0f); <br>     TexCoords = texCoords;<br> } </p> 
+<p>片段着色器代码如下所示：</p> 
+<p> </p> 
+<p> </p> 
+<p>#version 330 core<br> in vec2 TexCoords;<br>  <br> out vec4 color;<br>  <br> uniform sampler2D screenTexture;<br>  <br> const float offset = 1.0 / 300;  <br>  <br> void main()<br> {<!-- --><br>     vec2 offsets[9] = vec2[](<br>         vec2(-offset, offset),  // top-left<br>         vec2(0.0f,    offset),  // top-center<br>         vec2(offset,  offset),  // top-right<br>         vec2(-offset, 0.0f),    // center-left<br>         vec2(0.0f,    0.0f),    // center-center<br>         vec2(offset,  0.0f),    // center-right<br>         vec2(-offset, -offset), // bottom-left<br>         vec2(0.0f,    -offset), // bottom-center<br>         vec2(offset,  -offset)  // bottom-right    <br>     );<br>  <br>     float kernel[9] = float[](<br>         -1, -1, -1,<br>         -1,  9, -1,<br>         -1, -1, -1<br>     );<br>     <br>     vec3 sampleTex[9];<br>     for(int i = 0; i &lt; 9; i++)<br>     {<!-- --><br>         sampleTex[i] = vec3(texture(screenTexture, TexCoords.st + offsets[i]));<br>     }<br>     vec3 col;<br>     for(int i = 0; i &lt; 9; i++)<br>         col += sampleTex[i] * kernel[i];<br>     <br>     color = vec4(col, 1.0);<br> } <br> 另外把在C++中关于处理帧缓存的核心代码给读者展示如下：</p> 
+<p> </p> 
+<p> </p> 
+<p>// Setup cube VAO<br>     GLuint cubeVAO, cubeVBO;<br>     glGenVertexArrays(1, &amp;cubeVAO);<br>     glGenBuffers(1, &amp;cubeVBO);<br>     glBindVertexArray(cubeVAO);<br>     glBindBuffer(GL_ARRAY_BUFFER, cubeVBO);<br>     glBufferData(GL_ARRAY_BUFFER, sizeof(cubeVertices), &amp;cubeVertices, GL_STATIC_DRAW);<br>     glEnableVertexAttribArray(0);<br>     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)0);<br>     glEnableVertexAttribArray(1);<br>     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));<br>     glBindVertexArray(0);<br>     // Setup plane VAO<br>     GLuint floorVAO, floorVBO;<br>     glGenVertexArrays(1, &amp;floorVAO);<br>     glGenBuffers(1, &amp;floorVBO);<br>     glBindVertexArray(floorVAO);<br>     glBindBuffer(GL_ARRAY_BUFFER, floorVBO);<br>     glBufferData(GL_ARRAY_BUFFER, sizeof(floorVertices), &amp;floorVertices, GL_STATIC_DRAW);<br>     glEnableVertexAttribArray(0);<br>     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)0);<br>     glEnableVertexAttribArray(1);<br>     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));<br>     glBindVertexArray(0);<br>     // Setup screen VAO<br>     GLuint quadVAO, quadVBO;<br>     glGenVertexArrays(1, &amp;quadVAO);<br>     glGenBuffers(1, &amp;quadVBO);<br>     glBindVertexArray(quadVAO);<br>     glBindBuffer(GL_ARRAY_BUFFER, quadVBO);<br>     glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), &amp;quadVertices, GL_STATIC_DRAW);<br>     glEnableVertexAttribArray(0);<br>     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (GLvoid*)0);<br>     glEnableVertexAttribArray(1);<br>     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (GLvoid*)(2 * sizeof(GLfloat)));<br>     glBindVertexArray(0);<br>  <br>     // Load textures<br>     GLuint cubeTexture = loadTexture(FileSystem::getPath("resources/textures/container.jpg").c_str());<br>     GLuint floorTexture = loadTexture(FileSystem::getPath("resources/textures/metal.png").c_str());<br>     #pragma endregion<br>  <br>     // Framebuffers<br>     GLuint framebuffer;<br>     glGenFramebuffers(1, &amp;framebuffer);<br>     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);  <br>     // Create a color attachment texture<br>     GLuint textureColorbuffer = generateAttachmentTexture(false, false);<br>     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);<br>     // Create a renderbuffer object for depth and stencil attachment (we won't be sampling these)<br>     GLuint rbo;<br>     glGenRenderbuffers(1, &amp;rbo);<br>     glBindRenderbuffer(GL_RENDERBUFFER, rbo); <br>     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, screenWidth, screenHeight); // Use a single renderbuffer object for both a depth AND stencil buffer.<br>     glBindRenderbuffer(GL_RENDERBUFFER, 0);<br>     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo); // Now actually attach it<br>     // Now that we actually created the framebuffer and added all attachments we want to check if it is actually complete now<br>     if(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)<br>         cout &lt;&lt; "ERROR::FRAMEBUFFER:: Framebuffer is not complete!" &lt;&lt; endl;<br>     glBindFramebuffer(GL_FRAMEBUFFER, 0);</p> 
+<p>每一帧处理的代码如下所示：</p> 
+<p> </p> 
+<p> </p> 
+<p>        /<br>         // Bind to framebuffer and draw to color texture <br>         // as we normally would.<br>         // //<br>         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);<br>         // Clear all attached buffers        <br>         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);<br>         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // We're not using stencil buffer so why bother with clearing?<br>  <br>         glEnable(GL_DEPTH_TEST);<br>         // Set uniforms<br>         shader.Use();<br>         glm::mat4 model;<br>         glm::mat4 view = camera.GetViewMatrix();<br>         glm::mat4 projection = glm::perspective(camera.Zoom, (float)screenWidth/(float)screenHeight, 0.1f, 100.0f);<br>         glUniformMatrix4fv(glGetUniformLocation(shader.Program, "view"), 1, GL_FALSE, glm::value_ptr(view));<br>         glUniformMatrix4fv(glGetUniformLocation(shader.Program, "projection"), 1, GL_FALSE, glm::value_ptr(projection));<br>  <br>         // Floor<br>         glBindVertexArray(floorVAO);<br>         glBindTexture(GL_TEXTURE_2D, floorTexture);<br>         model = glm::mat4();<br>         glUniformMatrix4fv(glGetUniformLocation(shader.Program, "model"), 1, GL_FALSE, glm::value_ptr(model));<br>         glDrawArrays(GL_TRIANGLES, 0, 6);        <br>         glBindVertexArray(0);    <br>         // Cubes<br>         glBindVertexArray(cubeVAO);<br>         glBindTexture(GL_TEXTURE_2D, cubeTexture);  <br>         model = glm::translate(model, glm::vec3(-1.0f, 0.0f, -1.0f));<br>         glUniformMatrix4fv(glGetUniformLocation(shader.Program, "model"), 1, GL_FALSE, glm::value_ptr(model));<br>         glDrawArrays(GL_TRIANGLES, 0, 36);<br>         model = glm::mat4();<br>         model = glm::translate(model, glm::vec3(2.0f, 0.0f, 0.0f));<br>         glUniformMatrix4fv(glGetUniformLocation(shader.Program, "model"), 1, GL_FALSE, glm::value_ptr(model));<br>         glDrawArrays(GL_TRIANGLES, 0, 36);<br>         glBindVertexArray(0);            <br>  <br>         /<br>         // Bind to default framebuffer again and draw the <br>         // quad plane with attched screen texture.<br>         // //<br>         glBindFramebuffer(GL_FRAMEBUFFER, 0);<br>         // Clear all relevant buffers<br>         glClearColor(1.0f, 1.0f, 1.0f, 1.0f); // Set clear color to white (not really necessery actually, since we won't be able to see behind the quad anyways)<br>         glClear(GL_COLOR_BUFFER_BIT);<br>         glDisable(GL_DEPTH_TEST); // We don't care about depth information when rendering a single quad<br>  <br>         // Draw Screen<br>         screenShader.Use();<br>         glBindVertexArray(quadVAO);<br>         glBindTexture(GL_TEXTURE_2D, textureColorbuffer);    // Use the color attachment texture as the texture of the quad plane<br>         glDrawArrays(GL_TRIANGLES, 0, 6);<br>         glBindVertexArray(0);<br>  <br>  <br>         // Swap the buffers<br>         glfwSwapBuffers(window);<br>  </p> 
+<p> </p> 
+<p>总结：<br> 以上就是关于帧缓冲的介绍，它主要的作用是可以获取到场景像素，后处理就是对场景像素作渲染处理的，所以该技术广泛的被应用在后处理开发中，这也是为读者揭示后处理渲染的本质，希望对大家有所帮助。。。。。</p> 
+<p> </p> 
+<p> </p> 
+<p> <br> ————————————————<br> 版权声明：本文为CSDN博主「海洋_」的原创文章，遵循CC 4.0 BY-SA版权协议，转载请附上原文出处链接及本声明。<br> 原文链接：https://blog.csdn.net/jxw167/article/details/54985183/</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/cf0c409f225554682e2216c3c113733b/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">HFM student Hyperion Financial Management</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2ac8c8577e5ff2484608be8fbb240165/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Python 的一万种用法：制作 Web 可视化页面</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

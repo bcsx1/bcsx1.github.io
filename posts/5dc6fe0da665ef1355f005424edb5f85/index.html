@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SpringBoot整合Canal1.1.6并同步数据到Redis（超详细和很多踩坑点） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="SpringBoot整合Canal1.1.6并同步数据到Redis（超详细和很多踩坑点）" />
+<meta property="og:description" content="SpringBoot整合Canal 一、使用背景二、什么是 Canal?三、准备工作1、准备MySql 8.x1)查看数据库版本2)查看BinLog日志是否开启3)如果未开启binlog4)为canal新建账号5)踩坑点 2、准备Canal1)[Canal1.1.4下载](https://github.com/alibaba/canal/releases/tag/canal-1.1.4)2)解压并配置Canal3)启动Canal4)踩坑点 3、准备项目测试1、构建SpringBoot项目，引入坐标2、新建监听类3、新建启动类 一、使用背景 最近公司新接了一个医院项目，主要是对接医院内营养处方数据，院内his部署在内网环境，因此仅提供一个外网数据库给我们（他们自己应该做了类似主从的方式将我们需要的数据同步一份到外网数据库），又因为落地的数据我们需要立马进行处理并在公众号推送给病人进行付款等一系列其他操作，所以我们需要实时监听数据库的变化。以下是当时能想到的方案：
+方案一：轮询数据库
+第一个想到的也第一个被pass。原因也不必多说
+方案二：数据库触发器
+数据库触发器公司内部的小伙伴使用的都极其的少，确实是我们自己学艺不精，而且维护起来不方便，对后面来的开发小伙伴也不友好，最终也被pass
+方案三：消息队列
+这应该是在没有提供外网数据库的时候想出的方案，也是最符合业务场景的方案之一，但由于甲方不想增加开发成本、业务代码被入侵以及使用第三方插件增加系统风险和不稳定性等一系列原因，这个方案也被pass
+方案四：Canal
+讨论很久以后才决定使用canal，主要原因第一个是我们需要实时监听院内处方的数据变化，第二个是推过来的处方数据我们需要展示给用户，每个人只能看到自己的处方数据，并且处方有时效性，利用redis的过期时间也能完美代替数据库条件查询。
+二、什么是 Canal? 这里简单介绍，具体就不从官网贴图了，啥都没有官网说的清楚，点击进入Canal官网
+1、了解什么是Canal之前我们应该首先了解以下MySql的主从复制原理
+MySQL master 将数据变更写入二进制日志( binary log, 其中记录叫做二进制日志事件binary log events，可以通过 show binlog events 进行查看)
+MySQL slave 将 master 的 binary log events 拷贝到它的中继日志(relay log)
+MySQL slave 重放 relay log 中事件，将数据变更反映它自己的数据。
+上述中涉及到两个重要的MySql事务日志 binlog和relaylog，简单介绍一下两种日志
+BinLog
+即binary log，二进制日志文件，也叫作变更日志（update log）。它记录了数据库所有执行的
+DDL 和 DML 等数据库更新事件的语句，但是不包含没有修改任何数据的语句（如数据查询语句select、 show等）。
+说白了就是MySql记录了除了查询语句之外的几乎任何增删改操作。MySql8以后默认开启。开启会损失约百分之一的性能。
+RelayLog
+中继日志只在主从服务器架构的从服务器上存在。从服务器为了与主服务器保持一致，要从主服务器读
+取二进制日志(binary log)的内容，并且把读取到的信息写入 本地的日志文件 中，这个从服务器本地的日志文件就叫
+中继日志 。然后，从服务器读取中继日志，并根据中继日志的内容对从服务器的数据进行更新，完成主
+从服务器的 数据同步 。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5dc6fe0da665ef1355f005424edb5f85/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-04-18T10:28:33+08:00" />
+<meta property="article:modified_time" content="2023-04-18T10:28:33+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">SpringBoot整合Canal1.1.6并同步数据到Redis（超详细和很多踩坑点）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>SpringBoot整合Canal</h4> 
+ <ul><li><a href="#_2" rel="nofollow">一、使用背景</a></li><li><a href="#_Canal_16" rel="nofollow">二、什么是 Canal?</a></li><li><a href="#_43" rel="nofollow">三、准备工作</a></li><li><ul><li><a href="#1MySql_8x_44" rel="nofollow">1、准备MySql 8.x</a></li><li><ul><li><a href="#1_46" rel="nofollow">1)查看数据库版本</a></li><li><a href="#2BinLog_50" rel="nofollow">2)查看BinLog日志是否开启</a></li><li><a href="#3binlog_57" rel="nofollow">3)如果未开启binlog</a></li><li><a href="#4canal_67" rel="nofollow">4)为canal新建账号</a></li><li><a href="#5_78" rel="nofollow">5)踩坑点</a></li></ul> 
+   </li><li><a href="#2Canal_103" rel="nofollow">2、准备Canal</a></li><li><ul><li><a href="#1Canal114httpsgithubcomalibabacanalreleasestagcanal114_105" rel="nofollow">1)[Canal1.1.4下载](https://github.com/alibaba/canal/releases/tag/canal-1.1.4)</a></li><li><a href="#2Canal_107" rel="nofollow">2)解压并配置Canal</a></li><li><a href="#3Canal_166" rel="nofollow">3)启动Canal</a></li><li><a href="#4_177" rel="nofollow">4)踩坑点</a></li></ul> 
+   </li><li><a href="#3_180" rel="nofollow">3、准备项目测试</a></li><li><ul><li><a href="#1SpringBoot_181" rel="nofollow">1、构建SpringBoot项目，引入坐标</a></li><li><a href="#2_223" rel="nofollow">2、新建监听类</a></li><li><ul><li><a href="#3_331" rel="nofollow">3、新建启动类</a></li></ul> 
+   </li></ul> 
+  </li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_2"></a>一、使用背景</h2> 
+<p>最近公司新接了一个医院项目，主要是对接医院内营养处方数据，院内his部署在内网环境，因此仅提供一个外网数据库给我们（他们自己应该做了类似主从的方式将我们需要的数据同步一份到外网数据库），又因为落地的数据我们需要立马进行处理并在公众号推送给病人进行付款等一系列其他操作，所以我们需要实时监听数据库的变化。以下是当时能想到的方案：</p> 
+<ul><li> <p>方案一：轮询数据库<br> 第一个想到的也第一个被pass。原因也不必多说</p> </li><li> <p>方案二：数据库触发器<br> 数据库触发器公司内部的小伙伴使用的都极其的少，确实是我们自己学艺不精，而且维护起来不方便，对后面来的开发小伙伴也不友好，最终也被pass</p> </li><li> <p>方案三：消息队列<br> 这应该是在没有提供外网数据库的时候想出的方案，也是最符合业务场景的方案之一，但由于甲方不想增加开发成本、业务代码被入侵以及使用第三方插件增加系统风险和不稳定性等一系列原因，这个方案也被pass</p> </li><li> <p>方案四：Canal<br> 讨论很久以后才决定使用canal，主要原因第一个是我们需要实时监听院内处方的数据变化，第二个是推过来的处方数据我们需要展示给用户，每个人只能看到自己的处方数据，并且处方有时效性，利用redis的过期时间也能完美代替数据库条件查询。</p> </li></ul> 
+<h2><a id="_Canal_16"></a>二、什么是 Canal?</h2> 
+<p><a href="https://github.com/alibaba/canal">这里简单介绍，具体就不从官网贴图了，啥都没有官网说的清楚，点击进入Canal官网</a><br> 1、了解什么是Canal之前我们应该首先了解以下MySql的主从复制原理</p> 
+<ul><li> <p>MySQL master 将数据变更写入二进制日志( binary log, 其中记录叫做二进制日志事件binary log events，可以通过 show binlog events 进行查看)</p> </li><li> <p>MySQL slave 将 master 的 binary log events 拷贝到它的中继日志(relay log)</p> </li><li> <p>MySQL slave 重放 relay log 中事件，将数据变更反映它自己的数据。</p> <p>上述中涉及到两个重要的MySql事务日志 binlog和relaylog，简单介绍一下两种日志</p> </li></ul> 
+<p><strong>BinLog</strong></p> 
+<blockquote> 
+ <p>即binary log，二进制日志文件，也叫作变更日志（update log）。它记录了数据库所有执行的<br> DDL 和 DML 等数据库更新事件的语句，但是不包含没有修改任何数据的语句（如数据查询语句select、 show等）。<br> 说白了就是MySql记录了除了查询语句之外的几乎任何增删改操作。MySql8以后默认开启。开启会损失约百分之一的性能。</p> 
+</blockquote> 
+<p><strong>RelayLog</strong></p> 
+<blockquote> 
+ <p>中继日志只在主从服务器架构的从服务器上存在。从服务器为了与主服务器保持一致，要从主服务器读<br> 取二进制日志(binary log)的内容，并且把读取到的信息写入 本地的日志文件 中，这个从服务器本地的日志文件就叫<br> 中继日志 。然后，从服务器读取中继日志，并根据中继日志的内容对从服务器的数据进行更新，完成主<br> 从服务器的 数据同步 。</p> 
+</blockquote> 
+<p>2、了解了主从复制的原理以后，就把Canal当成一个Slave，原理也就清晰了</p> 
+<ul><li>canal 模拟 MySQL slave 的交互协议，伪装自己为 MySQL slave ，向 MySQL master 发送dump 协议</li><li>MySQL master 收到 dump 请求，开始推送 binary log 给 slave (即 canal )</li><li>canal 解析 binary log 对象(原始为 byte 流)</li></ul> 
+<h2><a id="_43"></a>三、准备工作</h2> 
+<h3><a id="1MySql_8x_44"></a>1、准备MySql 8.x</h3> 
+<h4><a id="1_46"></a>1)查看数据库版本</h4> 
+<pre><code class="prism language-sql"><span class="token keyword">SELECT</span> VERSION<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">-- 查看数据库版本</span>
+</code></pre> 
+<h4><a id="2BinLog_50"></a>2)查看BinLog日志是否开启</h4> 
+<pre><code class="prism language-sql"><span class="token keyword">SHOW</span> VARIABLES <span class="token operator">LIKE</span> <span class="token string">'log_bin%'</span><span class="token punctuation">;</span>
+<span class="token comment">-- 如果log_bin的value为on则已开启，显示off则未开启。</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/0d/40/oQ3YXAUn_o.png" alt=""></p> 
+<h4><a id="3binlog_57"></a>3)如果未开启binlog</h4> 
+<ul><li>找到服务器上my.cnf,增加如下配置</li></ul> 
+<pre><code class="prism language-sql"><span class="token punctuation">[</span>mysqld<span class="token punctuation">]</span>  
+log<span class="token operator">-</span>bin<span class="token operator">=</span>mysql<span class="token operator">-</span>bin <span class="token comment">#添加这一行就ok  </span>
+binlog<span class="token operator">-</span>format<span class="token operator">=</span><span class="token keyword">ROW</span> <span class="token comment">#选择row模式  </span>
+server_id<span class="token operator">=</span><span class="token number">1</span> <span class="token comment">#配置mysql replaction需要定义，不能和canal的slaveId重复  </span>
+</code></pre> 
+<h4><a id="4canal_67"></a>4)为canal新建账号</h4> 
+<pre><code class="prism language-sql"><span class="token keyword">CREATE</span> <span class="token keyword">USER</span> canal IDENTIFIED <span class="token keyword">BY</span> <span class="token string">'canal'</span><span class="token punctuation">;</span>  
+<span class="token comment">-- 授权部分操作</span>
+<span class="token keyword">GRANT</span> <span class="token keyword">SELECT</span><span class="token punctuation">,</span> <span class="token keyword">REPLICATION</span> SLAVE<span class="token punctuation">,</span> <span class="token keyword">REPLICATION</span> CLIENT <span class="token keyword">ON</span> <span class="token operator">*</span><span class="token punctuation">.</span><span class="token operator">*</span> <span class="token keyword">TO</span> <span class="token string">'canal'</span><span class="token variable">@'%'</span><span class="token punctuation">;</span>
+<span class="token comment">-- 也可以使用下面的命令授权所有操作</span>
+<span class="token keyword">GRANT</span> <span class="token keyword">ALL</span> <span class="token keyword">PRIVILEGES</span> <span class="token keyword">ON</span> <span class="token operator">*</span><span class="token punctuation">.</span><span class="token operator">*</span> <span class="token keyword">TO</span> <span class="token string">'canal'</span><span class="token variable">@'%'</span> <span class="token punctuation">;</span>
+<span class="token comment">-- 需要刷新权限生效</span>
+FLUSH <span class="token keyword">PRIVILEGES</span><span class="token punctuation">;</span>
+</code></pre> 
+<h4><a id="5_78"></a>5)踩坑点</h4> 
+<p><font face="字体" color="red" size="5"> <strong>------------注意踩坑点------------</strong></font></p> 
+<p><em>注意点一：</em> log_bin 为只读变量，不能通过命令set global log_bin = on;临时生效。<br> <img src="https://images2.imgbox.com/64/65/EDC5QZSX_o.png" alt="在这里插入图片描述"><br> <em>注意点二：</em> 这是我刚开始学习Canal踩的坑，也是自己对binlog不够了解犯的错误。也是很多博主没有提到过的问题，所以自己照葫芦画瓢就容易出错。执行命令如下：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">SHOW</span> <span class="token keyword">BINARY</span> LOGS<span class="token punctuation">;</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/95/87/noZxebPE_o.png" alt="在这里插入图片描述"><br> 针对于已经运行的或者重启过很多次的MySql可以看到很多binlog日志文件（也有可能是几十几百个），这和binlog的配置有很大关系，同学们自己感兴趣的了解一下。因此canal在配置的时候要配置监听的文件名称，很多博主照搬照抄都设置为binlog.000001。导致后面监听不到数据便变化。所以后面设置的时候需要注意文件名称为当前MySql正在写入的binlog，如何确定具体是哪个呢？执行如下命令：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">SHOW</span> MASTER <span class="token keyword">STATUS</span><span class="token punctuation">;</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/ab/c3/6LXsSHid_o.png" alt="在这里插入图片描述"></p> 
+<p>正对于一些不重要的数据库可以直接使用下面命令删除所有binlog日志文件（慎用！！！）</p> 
+<pre><code class="prism language-sql">RESET MASTER<span class="token punctuation">;</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/ca/d8/wMpQolZG_o.png" alt="在这里插入图片描述"><br> 这样后面canal的配置文件名称就可以用binlog.000001，否则只能用上述的binlog.000054</p> 
+<h3><a id="2Canal_103"></a>2、准备Canal</h3> 
+<p>下载地址：</p> 
+<h4><a id="1Canal114httpsgithubcomalibabacanalreleasestagcanal114_105"></a>1)<a href="https://github.com/alibaba/canal/releases/tag/canal-1.1.4">Canal1.1.4下载</a></h4> 
+<p><img src="https://images2.imgbox.com/2f/62/XMlqi7SG_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="2Canal_107"></a>2)解压并配置Canal</h4> 
+<p>解压：<code>tar -zxvf canal.deployer-1.1.4.tar.gz </code><br> 解压后如图四个文件夹<br> <img src="https://images2.imgbox.com/dc/e0/rj9lyt4Z_o.png" alt="在这里插入图片描述"><br> 进入conf/example下<br> <img src="https://images2.imgbox.com/95/80/YhX8IVSl_o.png" alt="在这里插入图片描述"><br> 修改instance.properties,主要配置参考如下</p> 
+<pre><code class="prism language-yml"><span class="token comment">#################################################</span>
+<span class="token comment">#需要配置的地方都进行了中文描述，其他都为默认信息</span>
+canal.instance.gtidon=false
+
+<span class="token comment"># 这里是数据库地址信息，数据库账号密码在下面</span>
+canal.instance.master.address=124.111.11.111<span class="token punctuation">:</span><span class="token number">3306</span>
+<span class="token comment">#这里就是上面强调的binlog日志文件名称即mysql主库链接时起始的binlog文件</span>
+canal.instance.master.journal.name=binlog.000001
+<span class="token comment">#mysql主库链接时起始的binlog偏移量</span>
+canal.instance.master.position=157
+<span class="token comment">#mysql主库链接时起始的binlog的时间戳</span>
+canal.instance.master.timestamp=
+canal.instance.master.gtid=
+
+<span class="token comment"># rds oss binlog</span>
+canal.instance.rds.accesskey=
+canal.instance.rds.secretkey=
+canal.instance.rds.instanceId=
+
+<span class="token comment"># table meta tsdb info</span>
+canal.instance.tsdb.enable=false
+<span class="token comment">#这里为数据库账号</span>
+canal.instance.dbUsername=canal
+<span class="token comment">#这里为数据库密码</span>
+canal.instance.dbPassword=canal
+canal.instance.connectionCharset = UTF<span class="token punctuation">-</span><span class="token number">8</span>
+<span class="token comment"># enable druid Decrypt database password</span>
+canal.instance.enableDruid=false
+<span class="token comment">#canal.instance.pwdPublicKey=MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALK4BUxdDltRRE5/zXpVEVPUgunvscYFtEip3pmLlhrWpacX7y7GCMo2/JM6LeHmiiNdH1FWgGCpUfircSwlWKUCAwEAAQ==</span>
+
+<span class="token comment"># table regex</span>
+canal.instance.filter.regex=.<span class="token important">*\\..*</span>
+<span class="token comment"># table black regex</span>
+canal.instance.filter.black.regex=mysql\\.slave_.*
+<span class="token comment"># table field filter(format: schema1.tableName1:field1/field2,schema2.tableName2:field1/field2)</span>
+<span class="token comment">#canal.instance.filter.field=test1.t_product:id/subject/keywords,test2.t_company:id/name/contact/ch</span>
+<span class="token comment"># table field black filter(format: schema1.tableName1:field1/field2,schema2.tableName2:field1/field2)</span>
+<span class="token comment">#canal.instance.filter.black.field=test1.t_product:subject/product_image,test2.t_company:id/name/contact/ch</span>
+
+<span class="token comment"># mq config</span>
+canal.mq.topic=example
+<span class="token comment"># dynamic topic route by schema or table regex</span>
+<span class="token comment">#canal.mq.dynamicTopic=mytest1.user,mytest2\\..*,.*\\..*</span>
+canal.mq.partition=0
+<span class="token comment"># hash partition config</span>
+<span class="token comment">#canal.mq.partitionsNum=3</span>
+<span class="token comment">#canal.mq.partitionHash=test.table:id^name,.*\\..*</span>
+<span class="token comment">#################################################</span>
+
+</code></pre> 
+<h4><a id="3Canal_166"></a>3)启动Canal</h4> 
+<p>进入canal1.1.4/bin可以看以下脚本。<br> <img src="https://images2.imgbox.com/f5/75/zE1nz40p_o.png" alt="在这里插入图片描述"><br> 直接命令启动：<code>sh startup.sh</code>;<br> 因为canal-server本质上也是jar包在运行，直接通过jps命令查看运行状态<br> <img src="https://images2.imgbox.com/9b/59/fgVhK8Jh_o.png" alt="在这里插入图片描述"><br> 发现已经初步启动<br> 接下来进入/canal1.1.4/logs/example/查看日志观察是否报错<code>tail -f example.log</code>查看日志信息</p> 
+<p><img src="https://images2.imgbox.com/52/14/HmQ6HLOE_o.png" alt="在这里插入图片描述"><br> 如此便算是完全启动成功。</p> 
+<h4><a id="4_177"></a>4)踩坑点</h4> 
+<p><font face="字体" color="red" size="5"> <strong>------------注意踩坑点------------</strong></font><br> 注意点一：linux启动完成后，会在bin目录下生成canal.pid，stop.sh会读取canal.pid进行进程关闭。如果直接通过kill命令可能会导致canal不能完全关闭，这样下次执行<code>./startup.sh</code>命令可能会启动失败。</p> 
+<h3><a id="3_180"></a>3、准备项目测试</h3> 
+<h4><a id="1SpringBoot_181"></a>1、构建SpringBoot项目，引入坐标</h4> 
+<pre><code class="prism language-xml">	<span class="token prolog">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>project</span> <span class="token attr-name">xmlns</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>http://maven.apache.org/POM/4.0.0<span class="token punctuation">"</span></span>
+         <span class="token attr-name"><span class="token namespace">xmlns:</span>xsi</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>http://www.w3.org/2001/XMLSchema-instance<span class="token punctuation">"</span></span>
+         <span class="token attr-name"><span class="token namespace">xsi:</span>schemaLocation</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>modelVersion</span><span class="token punctuation">&gt;</span></span>4.0.0<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>modelVersion</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>com.<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>springcloud-alibaba<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>1.0-SNAPSHOT<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>parent</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>org.springframework.boot<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>spring-boot-starter-parent<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>2.3.4.RELEASE<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>relativePath</span><span class="token punctuation">/&gt;</span></span> <span class="token comment">&lt;!-- lookup parent from repository --&gt;</span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>parent</span><span class="token punctuation">&gt;</span></span>
+
+
+
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>properties</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>maven.compiler.source</span><span class="token punctuation">&gt;</span></span>8<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>maven.compiler.source</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>maven.compiler.target</span><span class="token punctuation">&gt;</span></span>8<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>maven.compiler.target</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>project.build.sourceEncoding</span><span class="token punctuation">&gt;</span></span>UTF-8<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>project.build.sourceEncoding</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>properties</span><span class="token punctuation">&gt;</span></span>
+
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependencies</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>org.springframework.boot<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>spring-boot-starter-web<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dependency</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>groupId</span><span class="token punctuation">&gt;</span></span>com.alibaba.otter<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>groupId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>artifactId</span><span class="token punctuation">&gt;</span></span>canal.client<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>artifactId</span><span class="token punctuation">&gt;</span></span>
+            <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>version</span><span class="token punctuation">&gt;</span></span>1.1.4<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>version</span><span class="token punctuation">&gt;</span></span>
+        <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependency</span><span class="token punctuation">&gt;</span></span>
+
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dependencies</span><span class="token punctuation">&gt;</span></span>
+
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>project</span><span class="token punctuation">&gt;</span></span>
+</code></pre> 
+<h4><a id="2_223"></a>2、新建监听类</h4> 
+<pre><code class="prism language-java">
+<span class="token keyword">import</span> <span class="token namespace">com<span class="token punctuation">.</span>alibaba<span class="token punctuation">.</span>otter<span class="token punctuation">.</span>canal<span class="token punctuation">.</span>client<span class="token punctuation">.</span></span><span class="token class-name">CanalConnector</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">com<span class="token punctuation">.</span>alibaba<span class="token punctuation">.</span>otter<span class="token punctuation">.</span>canal<span class="token punctuation">.</span>client<span class="token punctuation">.</span></span><span class="token class-name">CanalConnectors</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">com<span class="token punctuation">.</span>alibaba<span class="token punctuation">.</span>otter<span class="token punctuation">.</span>canal<span class="token punctuation">.</span>protocol<span class="token punctuation">.</span></span><span class="token class-name">CanalEntry</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">com<span class="token punctuation">.</span>alibaba<span class="token punctuation">.</span>otter<span class="token punctuation">.</span>canal<span class="token punctuation">.</span>protocol<span class="token punctuation">.</span></span><span class="token class-name">Message</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">org<span class="token punctuation">.</span>springframework<span class="token punctuation">.</span>stereotype<span class="token punctuation">.</span></span><span class="token class-name">Component</span><span class="token punctuation">;</span>
+
+<span class="token keyword">import</span> <span class="token namespace">javax<span class="token punctuation">.</span>annotation<span class="token punctuation">.</span></span><span class="token class-name">PostConstruct</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">java<span class="token punctuation">.</span>net<span class="token punctuation">.</span></span><span class="token class-name">InetSocketAddress</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">java<span class="token punctuation">.</span>util<span class="token punctuation">.</span></span><span class="token class-name">List</span><span class="token punctuation">;</span>
+
+<span class="token comment">/**
+ * @author zqf
+ * @desc
+ */</span>
+
+<span class="token annotation punctuation">@Component</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">CanalListener</span> <span class="token punctuation">{<!-- --></span>
+
+
+    <span class="token comment">/**
+     * 解析数据
+     *
+     * @param beforeColumns 修改、删除后的数据
+     * @param afterColumns  新增、修改、删除前的数据
+     * @param dbName        数据库名字
+     * @param tableName     表大的名字
+     * @param eventType     操作类型（INSERT,UPDATE,DELETE）
+     * @param timestamp     消耗时间
+     */</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">void</span> <span class="token function">dataDetails</span><span class="token punctuation">(</span><span class="token class-name">List</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Column</span><span class="token punctuation">&gt;</span></span> beforeColumns<span class="token punctuation">,</span> <span class="token class-name">List</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Column</span><span class="token punctuation">&gt;</span></span> afterColumns<span class="token punctuation">,</span> <span class="token class-name">String</span> dbName<span class="token punctuation">,</span> <span class="token class-name">String</span> tableName<span class="token punctuation">,</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>EventType</span> eventType<span class="token punctuation">,</span> <span class="token keyword">long</span> timestamp<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+        <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"数据库："</span> <span class="token operator">+</span> dbName<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"表名："</span> <span class="token operator">+</span> tableName<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"操作类型:"</span> <span class="token operator">+</span> eventType<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>EventType</span><span class="token punctuation">.</span>INSERT<span class="token punctuation">.</span><span class="token function">equals</span><span class="token punctuation">(</span>eventType<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"这是一条新增的数据"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>EventType</span><span class="token punctuation">.</span>DELETE<span class="token punctuation">.</span><span class="token function">equals</span><span class="token punctuation">(</span>eventType<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"删除数据："</span> <span class="token operator">+</span> afterColumns<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"更新数据：更新前数据--"</span> <span class="token operator">+</span> afterColumns<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"更新数据：更新后数据--"</span> <span class="token operator">+</span> beforeColumns<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token punctuation">}</span>
+        <span class="token class-name">System</span><span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"操作时间："</span> <span class="token operator">+</span> timestamp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token annotation punctuation">@PostConstruct</span>
+    <span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">Exception</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">CanalConnector</span> conn <span class="token operator">=</span> <span class="token class-name">CanalConnectors</span><span class="token punctuation">.</span><span class="token function">newSingleConnector</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">InetSocketAddress</span><span class="token punctuation">(</span><span class="token string">"124.111.11.111"</span><span class="token punctuation">,</span> <span class="token number">11111</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token string">"example"</span><span class="token punctuation">,</span> <span class="token keyword">null</span><span class="token punctuation">,</span> <span class="token keyword">null</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            conn<span class="token punctuation">.</span><span class="token function">connect</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            conn<span class="token punctuation">.</span><span class="token function">subscribe</span><span class="token punctuation">(</span><span class="token string">".*\\..*"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// 回滚到未进行ack的地方</span>
+            conn<span class="token punctuation">.</span><span class="token function">rollback</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// 获取数据 每次获取一百条改变数据</span>
+            <span class="token class-name">Message</span> message <span class="token operator">=</span> conn<span class="token punctuation">.</span><span class="token function">getWithoutAck</span><span class="token punctuation">(</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//获取这条消息的id</span>
+            <span class="token keyword">long</span> id <span class="token operator">=</span> message<span class="token punctuation">.</span><span class="token function">getId</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">int</span> size <span class="token operator">=</span> message<span class="token punctuation">.</span><span class="token function">getEntries</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">size</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>id <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> size <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 数据解析</span>
+                <span class="token function">analysis</span><span class="token punctuation">(</span>message<span class="token punctuation">.</span><span class="token function">getEntries</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">//暂停1秒防止重复链接数据库</span>
+                <span class="token class-name">Thread</span><span class="token punctuation">.</span><span class="token function">sleep</span><span class="token punctuation">(</span><span class="token number">1000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token comment">// 确认消费完成这条消息</span>
+            conn<span class="token punctuation">.</span><span class="token function">ack</span><span class="token punctuation">(</span>message<span class="token punctuation">.</span><span class="token function">getId</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">// 关闭连接</span>
+            conn<span class="token punctuation">.</span><span class="token function">disconnect</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/**
+     * 数据解析
+     */</span>
+    <span class="token keyword">private</span> <span class="token keyword">void</span> <span class="token function">analysis</span><span class="token punctuation">(</span><span class="token class-name">List</span><span class="token generics"><span class="token punctuation">&lt;</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Entry</span><span class="token punctuation">&gt;</span></span> entries<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>Entry</span> entry <span class="token operator">:</span> entries<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// 解析binlog</span>
+            <span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowChange</span> rowChange <span class="token operator">=</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+            <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+                rowChange <span class="token operator">=</span> <span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowChange</span><span class="token punctuation">.</span><span class="token function">parseFrom</span><span class="token punctuation">(</span>entry<span class="token punctuation">.</span><span class="token function">getStoreValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">throw</span> <span class="token keyword">new</span> <span class="token class-name">RuntimeException</span><span class="token punctuation">(</span><span class="token string">"解析出现异常 data:"</span> <span class="token operator">+</span> entry<span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> e<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>rowChange <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 获取操作类型</span>
+                <span class="token class-name">CanalEntry<span class="token punctuation">.</span>EventType</span> eventType <span class="token operator">=</span> rowChange<span class="token punctuation">.</span><span class="token function">getEventType</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 获取当前操作所属的数据库</span>
+                <span class="token class-name">String</span> dbName <span class="token operator">=</span> entry<span class="token punctuation">.</span><span class="token function">getHeader</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getSchemaName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 获取当前操作所属的表</span>
+                <span class="token class-name">String</span> tableName <span class="token operator">=</span> entry<span class="token punctuation">.</span><span class="token function">getHeader</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getTableName</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token comment">// 事务提交时间</span>
+                <span class="token keyword">long</span> timestamp <span class="token operator">=</span> entry<span class="token punctuation">.</span><span class="token function">getHeader</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getExecuteTime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token class-name">CanalEntry<span class="token punctuation">.</span>RowData</span> rowData <span class="token operator">:</span> rowChange<span class="token punctuation">.</span><span class="token function">getRowDatasList</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                    <span class="token function">dataDetails</span><span class="token punctuation">(</span>rowData<span class="token punctuation">.</span><span class="token function">getBeforeColumnsList</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> rowData<span class="token punctuation">.</span><span class="token function">getAfterColumnsList</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> dbName<span class="token punctuation">,</span> tableName<span class="token punctuation">,</span> eventType<span class="token punctuation">,</span> timestamp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="3_331"></a>3、新建启动类</h5> 
+<pre><code class="prism language-java"><span class="token keyword">import</span> <span class="token namespace">org<span class="token punctuation">.</span>springframework<span class="token punctuation">.</span>boot<span class="token punctuation">.</span></span><span class="token class-name">SpringApplication</span><span class="token punctuation">;</span>
+<span class="token keyword">import</span> <span class="token namespace">org<span class="token punctuation">.</span>springframework<span class="token punctuation">.</span>boot<span class="token punctuation">.</span>autoconfigure<span class="token punctuation">.</span></span><span class="token class-name">SpringBootApplication</span><span class="token punctuation">;</span>
+
+<span class="token comment">/**
+ * @author zqf
+ * @desc
+ */</span>
+<span class="token annotation punctuation">@SpringBootApplication</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">CanalApplication</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token keyword">public</span> <span class="token keyword">static</span> <span class="token keyword">void</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token class-name">String</span><span class="token punctuation">[</span><span class="token punctuation">]</span> args<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">SpringApplication</span><span class="token punctuation">.</span><span class="token function">run</span><span class="token punctuation">(</span><span class="token class-name">CanalApplication</span><span class="token punctuation">.</span><span class="token keyword">class</span><span class="token punctuation">,</span> args<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>如此即可，启动项目，并随意在监听的数据库增删改，查看控制台信息输出</p> 
+<pre><code class="prism language-log">数据库：linyi
+表名：tb_answer
+操作类型:UPDATE
+更新数据：更新前数据--[index: 0
+sqlType: -5
+name: "answer_no"
+isKey: true
+updated: false
+isNull: false
+value: "1638010372783263744"
+mysqlType: "bigint"
+, index: 1
+sqlType: 12
+name: "questionnaire_name"
+isKey: false
+updated: true
+isNull: false
+value: "\351\227\256\345\215\267\350\260\203\346\237\245\350\241\2501"
+mysqlType: "varchar(255)"
+, index: 2
+sqlType: -5
+name: "questionnaire_no"
+isKey: false
+updated: false
+isNull: false
+value: "1637737551628750848"
+mysqlType: "bigint"
+, index: 3
+sqlType: -5
+name: "goods_no"
+isKey: false
+updated: false
+isNull: false
+value: "1"
+mysqlType: "bigint"
+, index: 4
+sqlType: -5
+name: "patient_no"
+isKey: false
+updated: false
+isNull: false
+value: "1635614014201823232"
+mysqlType: "bigint"
+, index: 5
+sqlType: 12
+name: "answer_url"
+isKey: false
+updated: false
+isNull: false
+value: "questionnaire_answer/2023-03-21/1638010372783263745.jpg"
+mysqlType: "varchar(255)"
+, index: 6
+sqlType: 4
+name: "assess_score"
+isKey: false
+updated: false
+isNull: false
+value: "2"
+mysqlType: "int"
+, index: 7
+sqlType: 12
+name: "assess_result"
+isKey: false
+updated: false
+isNull: true
+mysqlType: "varchar(500)"
+, index: 8
+sqlType: 4
+name: "status"
+isKey: false
+updated: false
+isNull: false
+value: "0"
+mysqlType: "int"
+, index: 9
+sqlType: 93
+name: "create_time"
+isKey: false
+updated: false
+isNull: false
+value: "2023-03-21 10:51:20"
+mysqlType: "datetime"
+, index: 10
+sqlType: 93
+name: "update_time"
+isKey: false
+updated: false
+isNull: false
+value: "2023-03-21 10:51:20"
+mysqlType: "datetime"
+, index: 11
+sqlType: 4
+name: "is_del"
+isKey: false
+updated: false
+isNull: false
+value: "0"
+mysqlType: "int"
+]
+更新数据：更新后数据--[index: 0
+sqlType: -5
+name: "answer_no"
+isKey: true
+updated: false
+isNull: false
+value: "1638010372783263744"
+mysqlType: "bigint"
+, index: 1
+sqlType: 12
+name: "questionnaire_name"
+isKey: false
+updated: false
+isNull: false
+value: "\351\227\256\345\215\267\350\260\203\346\237\245\350\241\250"
+mysqlType: "varchar(255)"
+, index: 2
+sqlType: -5
+name: "questionnaire_no"
+isKey: false
+updated: false
+isNull: false
+value: "1637737551628750848"
+mysqlType: "bigint"
+, index: 3
+sqlType: -5
+name: "goods_no"
+isKey: false
+updated: false
+isNull: false
+value: "1"
+mysqlType: "bigint"
+, index: 4
+sqlType: -5
+name: "patient_no"
+isKey: false
+updated: false
+isNull: false
+value: "1635614014201823232"
+mysqlType: "bigint"
+, index: 5
+sqlType: 12
+name: "answer_url"
+isKey: false
+updated: false
+isNull: false
+value: "questionnaire_answer/2023-03-21/1638010372783263745.jpg"
+mysqlType: "varchar(255)"
+, index: 6
+sqlType: 4
+name: "assess_score"
+isKey: false
+updated: false
+isNull: false
+value: "2"
+mysqlType: "int"
+, index: 7
+sqlType: 12
+name: "assess_result"
+isKey: false
+updated: false
+isNull: true
+mysqlType: "varchar(500)"
+, index: 8
+sqlType: 4
+name: "status"
+isKey: false
+updated: false
+isNull: false
+value: "0"
+mysqlType: "int"
+, index: 9
+sqlType: 93
+name: "create_time"
+isKey: false
+updated: false
+isNull: false
+value: "2023-03-21 10:51:20"
+mysqlType: "datetime"
+, index: 10
+sqlType: 93
+name: "update_time"
+isKey: false
+updated: false
+isNull: false
+value: "2023-03-21 10:51:20"
+mysqlType: "datetime"
+, index: 11
+sqlType: 4
+name: "is_del"
+isKey: false
+updated: false
+isNull: false
+value: "0"
+mysqlType: "int"
+]
+操作时间：1681747515000
+
+</code></pre> 
+<p>至此，Canal整合完成</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/ce3a322b1d6a8da57caf21cb24984165/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">2014蓝桥杯国赛排列序数 C语言/C&#43;&#43;</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e28362c43ad985d9feac65244a482d35/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Python脚本实现云顶之弈自动挂机刷局数！这操作怎么说？</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

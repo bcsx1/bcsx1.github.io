@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>RocketMQ实践：确保消息不丢失与顺序性的高效策略 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="RocketMQ实践：确保消息不丢失与顺序性的高效策略" />
+<meta property="og:description" content="一、使用RocketMQ如何保证消息不丢失？ 这个是在面试时，关于MQ，面试官最喜欢问的问题。这个问题是所有MQ都需要面对的一个共性问
+题。大致的解决思路都是一致的，但是针对不同的MQ产品又有不同的解决方案。分析这个问题要从以 下几个角度入手：
+1、哪些环节会有丢消息的可能？ 我们考虑一个通用的MQ场景：
+其中，1,2,4三个场景都是跨网络的，而跨网络就肯定会有丢消息的可能。
+然后关于3这个环节，通常MQ 存盘时都会先写入操作系统的缓存page cache中，然后再由操作系统异 步的将消息写入硬盘。这个中间有个时间差，就可能会造成消息丢失。如果服务挂了，缓存中还没有来 得及写入硬盘的消息就会丢失。
+这个是MQ场景都会面对的通用的丢消息问题。那我们看看用Rocket 时要如何解决这个问题
+2、RocketMQ 消息零丢失方案 1》生产者使用事务消息机制保证消息零丢失 这个结论比较容易理解，因为RocketMQ 的事务消息机制就是为了保证零丢失来设计的，并且经过阿里 的验证，肯定是非常靠谱的。
+但是如果深入一点的话，我们还是要理解下这个事务消息到底是不是靠谱。我们以最常见的电商订单场 景为例，来简单分析下事务消息机制如何保证消息不丢失。我们看下下面这个流程图：
+1、 为 什 么 要 发 送 个half 消 息 ? 有 什 么 用 ?
+这个half消息是在订单系统进行下单操作前发送，并且对下游服务的消费者是不可见的。那这个消息的 作用更多的体现在确认RocketMQ的服务是否正常。相当于嗅探下RocketMQ服务是否正常，并且通知 RocketMQ，我马上就要发一个很重要的消息了，你做好准备。
+2.half消息如果写入失败了怎么办？
+如果没有half消息这个流程，那我们通常是会在订单系统中先完成下单，再发送消息给MQ。这时候写 入消息到MQ如果失败就会非常尴尬了。而half消息如果写入失败，我们就可以认为MQ的服务是有问题 的，这时，就不能通知下游服务了。我们可以在下单时给订单一个状态标记，然后等待MQ服务正常后 再进行补偿操作，等MQ服务正常后重新下单通知下游服务。
+3.订单系统写数据库失败了怎么办？
+这个问题我们同样比较下没有使用事务消息机制时会怎么办？如果没有使用事务消息，我们只能判断下 单失败，抛出了异常，那就不往MQ发消息了，这样至少保证不会对下游服务进行错误的通知。但是这 样的话，如果过一段时间数据库恢复过来了，这个消息就无法再次发送了。当然，也可以设计另外的补 偿机制，例如将订单数据缓存起来，再启动一个线程定时尝试往数据库写。而如果使用事务消息机制， 就可以有一种更优雅的方案。
+如果下单时，写数据库失败(可能是数据库崩了，需要等一段时间才能恢复)。那我们可以另外找个地方 把订单消息先缓存起来(Redis、文本或者其他方式)，然后给RocketMQ返回一个UNKNOWN状态。这样 RocketMQ就会过一段时间来回查事务状态。我们就可以在回查事务状态时再尝试把订单数据写入数据 库，如果数据库这时候已经恢复了，那就能完整正常的下单，再继续后面的业务。这样这个订单的消息 就不会因为数据库临时崩了而丢失。
+4.half消息写入成功后RocketMQ挂了怎么办？
+我们需要注意下，在事务消息的处理机制中，未知状态的事务状态回查是由RocketMQ的Broker主动发 起的。也就是说如果出现了这种情况，那RocketMQ就不会回调到事务消息中回查事务状态的服务。这 时，我们就可以将订单一直标记为&#34;新下单&#34;的状态。而等RocketMQ恢复后，只要存储的消息没有丢
+失， RocketMQ就会再次继续状态回查的流程。
+5.下单成功后如何优雅的等待支付成功？
+在订单场景下，通常会要求下单完成后，客户在一定时间内，例如10分钟，内完成订单支付，支付完成
+后才会通知下游服务进行进一步的营销补偿。
+如果不用事务消息，那通常会怎么办？
+最简单的方式是启动一个定时任务，每隔一段时间扫描订单表，比对未支付的订单的下单时间，将超过 时间的订单回收。这种方式显然是有很大问题的，需要定时扫描很庞大的一个订单信息，这对系统是个 不小的压力。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/cd39957fb5d5599ef567fe392eb406fa/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-23T22:18:03+08:00" />
+<meta property="article:modified_time" content="2023-12-23T22:18:03+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">RocketMQ实践：确保消息不丢失与顺序性的高效策略</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h3 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>一、使用</strong></span></strong><strong><span style="color:#333333;"><strong>RocketMQ</strong></span></strong><strong><span style="color:#333333;"><strong>如何保证消息不丢失？</strong></span></strong></span></h3> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">这个是在面试时，关于</span><span style="color:#333333;">MQ</span><span style="color:#333333;">，面试官最喜欢问的问题。这个问题是所有</span><span style="color:#333333;">MQ</span><span style="color:#333333;">都需要面对的一个共性问</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">题。大致的解决思路都是一致的，但是针对不同的</span><span style="color:#333333;">MQ</span><span style="color:#333333;">产品又有不同的解决方案。分析这个问题要从以</span> <span style="color:#333333;">下几个角度入手：</span></span></p> 
+<h4 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>1</strong></span></strong><strong><span style="color:#333333;"><strong>、哪些环节会有丢消息的可能？</strong></span></strong></span></h4> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">我们考虑一个通用的</span><span style="color:#333333;">MQ</span><span style="color:#333333;">场景：</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><img alt="" height="521" src="https://images2.imgbox.com/d0/0a/EzKeShAM_o.png" width="807"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">其中，1,2,4三个场景都是跨网络的，而跨网络就肯定会有丢消息的可能。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#000000;">然后关于3这个环节，通常</span><span style="color:#000000;">MQ </span><span style="color:#000000;">存盘时都会先写入操作系统的缓存</span><span style="color:#000000;">page</span> <span style="color:#000000;">cache</span><span style="color:#000000;">中，然后再由操作系统异</span> <span style="color:#000000;">步的将消息写入硬盘。这个中间有个时间差，就可能会造成消</span><span style="color:#000000;">息丢失。如果服务挂了，缓存中还没有来</span> <span style="color:#000000;">得及写入硬盘的消息就会丢失。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">这个是</span><span style="color:#000000;">MQ</span><span style="color:#000000;">场景都会面对的通用的丢消息问题。那我们看看用</span><span style="color:#000000;">Rocket</span> <span style="color:#000000;">时要如何解决这个问题</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h4 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>2、RocketMQ</strong></span></strong>  <strong><span style="color:#000000;"><strong>消息零丢失方案</strong></span></strong></span></h4> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h5 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>1》生产者使用事务消息机制保证消息零丢失</strong></span></strong></span></h5> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">这个结论比较容易理解，因为</span><span style="color:#000000;">RocketMQ</span> <span style="color:#000000;">的事务消息机制就是为了保证零丢失来设计的，并且经过阿里</span> <span style="color:#000000;">的验证，肯定是非常靠谱的。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">但是如果深入一点的话，我们还是要理解下这个事务消息到底是不是靠</span><span style="color:#000000;">谱。我们以最常见的电商订单场</span> <span style="color:#000000;">景为例，来简单分析下事务消息机制如何保证消</span><span style="color:#000000;">息不丢失。我们看下下面这个流程图：</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><img alt="" height="311" src="https://images2.imgbox.com/a8/42/MNSlRle9_o.png" width="746"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>1、</strong></span></strong> <strong><span style="color:#000000;"><strong>为</strong></span></strong> <strong><span style="color:#000000;"><strong>什</strong></span></strong> <strong><span style="color:#000000;"><strong>么</strong></span></strong> <strong><span style="color:#000000;"><strong>要</strong></span></strong> <strong><span style="color:#000000;"><strong>发</strong></span></strong> <strong><span style="color:#000000;"><strong>送</strong></span></strong> <strong><span style="color:#000000;"><strong>个</strong></span></strong><strong><span style="color:#000000;"><strong>half</strong></span></strong> <strong><span style="color:#000000;"><strong>消</strong></span></strong> <strong><span style="color:#000000;"><strong>息</strong></span></strong> <strong><span style="color:#000000;"><strong>?</strong></span></strong> <strong><span style="color:#000000;"><strong>有</strong></span></strong> <strong><span style="color:#000000;"><strong>什</strong></span></strong> <strong><span style="color:#000000;"><strong>么</strong></span></strong> <strong><span style="color:#000000;"><strong>用</strong></span></strong> <strong><span style="color:#000000;"><strong>?</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<div> 
+ <p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#333333;">这个</span><span style="color:#333333;">half</span><span style="color:#333333;">消息是在订单系统进行下单操作前发送，并且对下游服务的消费者是不可见的。</span><span style="color:#333333;">那这个消息的</span> <span style="color:#333333;">作用更多的体现在确认</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">的服务是否正常。相当于嗅探下</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">服务是否正常，并</span><span style="color:#333333;">且通知 </span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">，我马上就要发一个很重要的消息了，你做好</span><span style="color:#333333;">准备。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>2.half</strong></span></strong><strong><span style="color:#333333;"><strong>消息如果写入失败了怎么办？</strong></span></strong></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">如果没有</span><span style="color:#333333;">half</span><span style="color:#333333;">消息这个流程，那我们通常是会在订单系统中先完成下</span><span style="color:#333333;">单，再发送消息给</span><span style="color:#333333;">MQ</span><span style="color:#333333;">。这时候写   </span><span style="color:#333333;">入消息到</span><span style="color:#333333;">MQ</span><span style="color:#333333;">如果失败就会非常尴尬了。而</span><span style="color:#333333;">half</span><span style="color:#333333;">消息如果写入失败，我们就可以认为</span><span style="color:#333333;">MQ</span><span style="color:#333333;">的服务是有问题</span> <span style="color:#333333;">的，这时，就不能通知下游服务了。我们可以在下单时给订单一个状态标记，然后等待</span><span style="color:#333333;">MQ</span><span style="color:#333333;">服务正常后  </span><span style="color:#333333;">再进行补偿操作，等</span><span style="color:#333333;">MQ</span><span style="color:#333333;">服务正常后重新下单通知下游服务。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>3.</strong></span></strong><strong><span style="color:#333333;"><strong>订单系统写数据库失败了怎么办？</strong></span></strong></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">这个问题我们同样比较下没有使用事务消息机制时会怎么办？如果没有使用事务消息，我们只能判断下</span> <span style="color:#333333;">单失败，抛出了异常，那就不往</span><span style="color:#333333;">MQ</span><span style="color:#333333;">发消息了，这样至</span><span style="color:#333333;">少保证不会对下游服务进行错误的通知。但是这</span>  <span style="color:#333333;">样的话，如果过一段时间数据库恢复过来了，这个消息就无法再次发送了。当然，也可以设计另外的补</span> <span style="color:#333333;">偿机制，例如将订单数据缓存起来，再启动一个线程定时尝试往数据库写。而如果使用事务消息机制，</span>  <span style="color:#333333;">就可以有一种更优雅的方案。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">如果下单时，写数据库失败</span><span style="color:#333333;">(</span><span style="color:#333333;">可能是数据库崩了，需要等一段时间才能恢复</span><span style="color:#333333;">)</span><span style="color:#333333;">。那我们可以另外找个地方   </span><span style="color:#333333;">把订单消息先缓存起来</span><span style="color:#333333;">(</span><span style="color:#333333;">Redis</span><span style="color:#333333;">、文本或者其他方式</span><span style="color:#333333;">)</span><span style="color:#333333;">，然后给</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">返回一个</span><span style="color:#333333;">UNKNOWN</span><span style="color:#333333;">状态。这样</span> <span style="color:#333333;">RocketMQ</span><span style="color:#333333;">就会过一段时间来回查事务状态。我们就可以在回查事务状态时再尝试把订单数据写入数据  库，如果数据库这时候已经恢复了，那就能完整正常的下单，再继续后面的业务。这样这个订单的消息</span>  <span style="color:#333333;">就不会因为数据库临时崩了而丢失。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>4.</strong></span></strong><strong><span style="color:#333333;"><strong>half</strong></span></strong><strong><span style="color:#333333;"><strong>消息写入成功后</strong></span></strong><strong><span style="color:#333333;"><strong>RocketMQ</strong></span></strong><strong><span style="color:#333333;"><strong>挂了怎么办？</strong></span></strong></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">我们需要注意下，在事务消息的处理机制中，未知状态的事务状态回查是由</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">的</span><span style="color:#333333;">Broker</span><span style="color:#333333;">主动发</span> <span style="color:#333333;">起的。也就是说如果出现了这种情况，那</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">就不会回调到事务消息中回查事务状态的服务</span><span style="color:#333333;">。这</span> <span style="color:#333333;">时，我们就可以将订单一直标记为</span><span style="color:#333333;">"</span><span style="color:#333333;">新下单</span><span style="color:#333333;">"</span><span style="color:#333333;">的状态。而等</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">恢复后，只要存储的消息没有丢</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">失，</span> <span style="color:#333333;">RocketMQ</span><span style="color:#333333;">就会再次继续状态回查的流程。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>5.</strong></span></strong><strong><span style="color:#333333;"><strong>下单成功后如何优雅的等待支付成功？</strong></span></strong></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">在订单场景下，通常会要求下单完成后，客户在一定时间内，例如</span><span style="color:#333333;">10</span><span style="color:#333333;">分钟，内完成订单支付，支付完成</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">后才会通知下游服务进行进一步的营销补偿。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">如果不用事务消息，那通常会怎么办？</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#333333;">最简单的方式是启动一个定时任务，每隔一段时间扫描订单表，比对未支付的订单的下单时间，将超过</span> <span style="color:#333333;">时间的订单回收。这种方式显然是有很大问题的，需要定时扫描很庞大的一个订单信息，这对系统是个</span> <span style="color:#333333;">不小的压力。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">那更进一步的方案是什么呢？是不是就可以使用</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">提</span><span style="color:#333333;">供的延迟消息机制。往</span><span style="color:#333333;">MQ</span><span style="color:#333333;">发一个延迟</span><span style="color:#333333;">1</span><span style="color:#333333;">分</span> <span style="color:#333333;">钟的消息，消费到这个消息后去检查订单的支付状态，如果订单已经支付，就往下游发送下单的通知。</span>  <span style="color:#333333;">而如果没有支付，就再发一个延迟</span><span style="color:#333333;">1</span><span style="color:#333333;">分钟的消息。最终在第十个消息时把订单回收。这个方</span><span style="color:#333333;">案就不用对  </span><span style="color:#333333;">全部的订单表进行扫描，而只需要每次处理一个单独的订单消息。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#333333;">那如果使用上了事务消息呢？我们就可以用事务消息的状态回查机制来替代定时的任务。在下单时，给</span> <span style="color:#333333;">Broker</span><span style="color:#333333;">返回一个</span><span style="color:#333333;">UNKNOWN</span><span style="color:#333333;">的未知状态。而在状态回查的方法中去查询订单的支付状态。这样整个业</span>   <span style="color:#333333;">务逻辑就会简单很多。我们只需要配置</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">中的事务消息回查次数</span><span style="color:#333333;">(</span><span style="color:#333333;">默认</span><span style="color:#333333;">15</span><span style="color:#333333;">次</span><span style="color:#333333;">)</span><span style="color:#333333;">和事务回查间隔时  间</span><span style="color:#333333;">(</span><span style="color:#333333;">messageDelayLevel</span><span style="color:#333333;">)</span><span style="color:#333333;">，就可以更优雅的完成这个支付状态检查的需求。</span></span></p> 
+ <p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>6</strong></span></strong><strong><span style="color:#333333;"><strong>、事务消息机制的作用</strong></span></strong></span></p> 
+ <p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#333333;">整体来说，在订单这个场景下，消息不丢失的问题实际上就还是转化成了下单这个业务与下游服务的业</span> <span style="color:#333333;">务的分布式事务一致性问题。而事务一致性问题一直以来都是一个非常复杂的问题。而</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">的事</span>  <span style="color:#333333;">务消息机制，实际上只保证了整个事务消息的一半，他保证的是订单系统下单和发消息这两个事件的事</span> <span style="color:#333333;">务一致性，而对下游服务的事务并没有保证。但是即便如此，也是分布式事务的一个很好的降级方案。</span></span></p> 
+</div> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">目前来看，也是业内最好的降级方案。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h5 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">2》RocketMQ  </span><span style="color:#000000;">配置同步刷盘+</span><span style="color:#000000;">Dledger</span> <span style="color:#000000;">主从</span><span style="color:#000000;">架构保证</span><span style="color:#000000;">MQ</span> <span style="color:#000000;">自身不会丢</span></span><span style="color:#000000;"><span style="color:#000000;">消息</span></span></h5> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>1、同步刷盘</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">这个从我们之前的分析，就很好理解了。我们可以简单的把</span><span style="color:#000000;">RocketMQ</span> <span style="color:#000000;">的刷盘方式</span><span style="color:#000000;">flushDiskType</span><span style="color:#000000;">配置</span> <span style="color:#000000;">成同步刷盘就可以保证消息在刷盘过程中不会丢失了。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>2</strong></span></strong><strong><span style="color:#000000;"><strong>、</strong></span></strong><strong><span style="color:#000000;"><strong>Dledger</strong></span></strong><strong><span style="color:#000000;"><strong>的文件同步</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><img alt="" height="362" src="https://images2.imgbox.com/8e/e7/PV2o6ZEf_o.png" width="760"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">在使用</span><span style="color:#000000;">Dledger</span><span style="color:#000000;">技术搭建的</span><span style="color:#000000;">RocketMQ</span><span style="color:#000000;">集群中，</span><span style="color:#000000;">Dledger</span><span style="color:#000000;">会通</span><span style="color:#000000;">过两阶段提交的方式保证文件在主从之间成</span> <span style="color:#000000;">功同步。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">简单来说，数据同步会通过两个阶段，</span> <span style="color:#000000;">一个是</span><span style="color:#000000;">uncommitted </span><span style="color:#000000;">阶段，</span><span style="color:#000000;"> 一个是</span><span style="color:#000000;">commited</span> <span style="color:#000000;">阶段。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">Leader Broker</span><span style="color:#000000;">上的</span><span style="color:#000000;">Dledger</span> <span style="color:#000000;">收到一条数据后，会标记为</span><span style="color:#000000;">uncommi</span><span style="color:#000000;">tted  </span><span style="color:#000000;">状态，然后他通过自己的</span> <span style="color:#000000;">DledgerServer</span><span style="color:#000000;">组件把这个</span><span style="color:#000000;">uncommitted </span><span style="color:#000000;">数据发给</span><span style="color:#000000;">Fol</span><span style="color:#000000;">lower Broker</span><span style="color:#000000;">的</span><span style="color:#000000;">DledgerServer</span><span style="color:#000000;">组件。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">接着</span><span style="color:#000000;">Follower Broker</span><span style="color:#000000;">的</span><span style="color:#000000;">DledgerServer</span><span style="color:#000000;">收到</span><span style="color:#000000;">uncommitted</span>  <span style="color:#000000;">消息之后，必须返回一个</span><span style="color:#000000;">ack</span><span style="color:#000000;">给  </span><span style="color:#000000;">Leader Broker</span><span style="color:#000000;">的</span><span style="color:#000000;">Dledger</span><span style="color:#000000;">。</span><span style="color:#000000;">然后如果</span><span style="color:#000000;">Leader</span> <span style="color:#000000;">Broker</span><span style="color:#000000;">收到超过半数的</span><span style="color:#000000;">Follower Broker</span><span style="color:#000000;">返回的</span><span style="color:#000000;">ack</span> <span style="color:#000000;">之后，就会把消息标记为</span><span style="color:#000000;">committed </span><span style="color:#000000;">状态。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">再接下来， </span><span style="color:#000000;">Leader  Broker</span><span style="color:#000000;">上的</span><span style="color:#000000;">DledgerServer</span><span style="color:#000000;">就会发送</span><span style="color:#000000;">committed  </span><span style="color:#000000;">消息给</span><span style="color:#000000;">Follower  Broker    </span><span style="color:#000000;">上的</span><span style="color:#000000;">DledgerServer,  </span><span style="color:#000000;">让他们把消息也标记为</span><span style="color:#000000;">committed</span> <span style="color:#000000;">状态。这样，就基于</span><span style="color:#000000;">Raft</span> <span style="color:#000000;">协议完成了两阶</span> <span style="color:#000000;">段的数据同步。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h5 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>3》消费者端不要使用异步消费机制</strong></span></strong></span></h5> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">正常情况下，消费者端都是需要先处理本地事务，然后再给</span><span style="color:#000000;">MQ</span> <span style="color:#000000;">一个</span><span style="color:#000000;">ACK</span> <span style="color:#000000;">响应，</span><span style="color:#000000;">这时</span><span style="color:#000000;">MQ</span> <span style="color:#000000;">就会修改</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">Offset,</span><span style="color:#000000;">将消息标记为已消费，从而不</span><span style="color:#000000;">再往其他消费者推送消息。所以在</span><span style="color:#000000;">Broker</span><span style="color:#000000;">的这种重新推送机制</span> <span style="color:#000000;">下，消息是不会在传输过程中丢失的。但是也会有下面这种情况会造成服务端消息丢失：</span></span></p> 
+<pre><code class="hljs">       DefaultMQPushconsumer consumer =new
+DefaultMQPushConsumer("please_rename_unique_group_name_4");
+                  consumer.registerMessageListener(new            MessageListenerConcurrently)
+{
+                        @override
+                        public       Consumeconcurrentlystatus
+consumeMessage(List&lt;MessageExt&gt;msgs,
+ConsumeConcurrentlyContext context) {
+                   new Thread(){
+                       public void run(){
+                           //处理业务逻辑
+                          System.out.printf("%s Receive New Messages: %s %n",
+Thread.currentThread().getName(), msgs);
+                       }
+                    };
+                   return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+              }
+          });</code></pre> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">这种异步消费的方式，就有可能造成消息状态返回后消费者本地业务逻辑处理失败造成消息丢失的可</span> <span style="color:#333333;">能。</span></span></p> 
+<h5 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>4</strong></span></strong><strong><span style="color:#333333;"><strong>》</strong></span></strong><strong><span style="color:#333333;"><strong>RocketMQ</strong></span></strong><strong><span style="color:#333333;"><strong>特有的问题，</strong></span></strong><strong>  </strong><strong><span style="color:#333333;"><strong>NameServer</strong></span></strong><strong><span style="color:#333333;"><strong>挂了如何保证消息不丢 </strong></span></strong><strong><span style="color:#333333;"><strong>失？</strong></span></strong></span></h5> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">NameServer</span><span style="color:#333333;">在</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">中，是扮演的一个路由中心的角色，提供到</span><span style="color:#333333;">Broker</span><span style="color:#333333;">的路由功</span><span style="color:#333333;">能。但是其实路 </span><span style="color:#333333;">由中心这样的功能，在所有的</span><span style="color:#333333;">MQ</span><span style="color:#333333;">中都是需要的。</span><span style="color:#333333;">kafka</span><span style="color:#333333;">是用</span><span style="color:#333333;">zookeeper</span><span style="color:#333333;">和一个作为</span><span style="color:#333333;">Controller</span><span style="color:#333333;">的</span><span style="color:#333333;">Broker</span> <span style="color:#333333;">一起来提供路由服务，整个功能是相当复杂纠结的。而</span><span style="color:#333333;">RabbitMQ</span><span style="color:#333333;">是由每一个</span><span style="color:#333333;">Broker</span><span style="color:#333333;">来提供路由服务。</span>  <span style="color:#333333;">而只有</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">把这个路由中心单独抽取了出来，并独立</span><span style="color:#333333;">部署。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">这个</span><span style="color:#333333;">NameServer</span><span style="color:#333333;">之前都了解过，集群中任意多的节点挂掉，都不会</span><span style="color:#333333;">影响他提供的路由功能。那</span><strong><span style="color:#333333;"><strong>如果集</strong></span></strong><strong> </strong><strong><span style="color:#333333;"><strong>群中所有的</strong></span></strong><strong><span style="color:#333333;"><strong>NameServer</strong></span></strong><strong><span style="color:#333333;"><strong>节点都挂了呢？</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#333333;">有很多人就会认为在生产者和消费者中都会有全部路由信息的缓存副本，那整个服务可以正常工作一段</span> <span style="color:#333333;">时间。其实这个问题大家可以做一下实验，当</span><span style="color:#333333;">NameServer</span><span style="color:#333333;">全</span><span style="color:#333333;">部挂了后，生产者和消费者是立即就无法</span>  <span style="color:#333333;">工作了的。至于为什么，可以回顾一下我们之前的源码课程</span><span style="color:#333333;">去源码中找找答案。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>那再回到我们的消息不丢失的问题</strong></span></strong><span style="color:#333333;">，在这种情况下，</span>  <span style="color:#333333;">RocketMQ</span><span style="color:#333333;">相当于整个服务都不可用了，那他本身</span> <span style="color:#333333;">肯定无法给我们保证消息不丢失了。我们只能自己设计一个降级方案来处理这个问题了。例如在订单系</span> <span style="color:#333333;">统中，如果多次尝试发送</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">不成功，那就只能另外找给地方</span><span style="color:#333333;">(</span><span style="color:#333333;">Redis</span><span style="color:#333333;">、文件或者内存等</span><span style="color:#333333;">)</span><span style="color:#333333;">把订单消 </span><span style="color:#333333;">息缓存下来，然后起一个线程定时的扫描这些失败的订单消息，尝试往</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">发送。这样等</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">的服务恢复过来后，就能第一时间把这些消息重新</span><span style="color:#333333;">发送出去。整个这套降级的机制，在大型</span> <span style="color:#333333;">互联网项目中，都是必须要有的。</span></span></p> 
+<h5 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>5</strong></span></strong><strong><span style="color:#333333;"><strong>》</strong></span></strong><strong> </strong><strong><span style="color:#333333;"><strong>RocketMQ</strong></span></strong><strong><span style="color:#333333;"><strong>消息零丢失方案总结</strong></span></strong></span></h5> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">完整分析过后，整个</span><span style="color:#333333;">RocketMQ消息零丢失的方案其实挺简单</span></span></p> 
+<ul><li style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">生产者使用事务消息机制。</span></span></li><li style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">Broker</span><span style="color:#333333;">配置同步刷盘</span><span style="color:#333333;">+</span><span style="color:#333333;">Dledger主从架构</span></span></li><li style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">消费者不要使用异步消费。</span></span></li><li style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">整个</span><span style="color:#333333;">MQ</span><span style="color:#333333;">挂了之后准备降级方案</span></span></li></ul> 
+<p style="margin-left:.0001pt;text-align:justify;"><span style="color:#000000;"><span style="color:#333333;">那这套方案是不是就很完美呢？其实很明显，这整套的消息零丢失方案，在各个环节都大量的降低了系</span> <span style="color:#333333;">统的处理性能以及吞吐量。在很多场景下，这套方案带来的性能损失的代价可能远远大于部分消息丢失</span> <span style="color:#333333;">的代价。所以，我们在设计</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">使用方案时，要根据实际的业务情况来考虑。例如，如果针对所</span>  <span style="color:#333333;">有服务器都在同一个机房的场景，完全可以把</span><span style="color:#333333;">Broker</span><span style="color:#333333;">配置成异步刷盘来提升吞吐量。而在有些对消息可 </span><span style="color:#333333;">靠性要求没有那么高的场景，在生产者端就可以采用其他一些更简单的方案来提升吞吐，而采用定时对</span> <span style="color:#333333;">账、补偿的机制来提高消息的可靠性。而如果消费者不需要进行消息存盘，那使用异步消费的机制带来</span><span style="color:#333333;"> 的性能提升也是非常显著的。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">总之，这套消息零丢失方案的总结是为了在设计</span><span style="color:#333333;">RocketMQ</span><span style="color:#333333;">使用方案时的一个很好的参考。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h3 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#333333;"><strong>二、使用</strong></span></strong><strong><span style="color:#333333;"><strong>RocketMQ</strong></span></strong><strong><span style="color:#333333;"><strong>如何保证消息顺</strong></span></strong></span></h3> 
+<h4 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#333333;">1、为什么要保证消息有序？   </span></span></h4> 
+<p style="margin-left:.0001pt;text-align:left;"><br><span style="color:#000000;"><span style="color:#333333;">这个也是面试时最常见的问题，需要对MQ场景有一定的深入理解。例如如果我们有个大数据系统，需 要对业务系统的日志进行收集分析，这时候为了减少对业务系统的影响，通常都会通过MQ来做消息中 转。而这时候，对消息的顺序就有一定的要求了。例如我们考虑下面这一系列的操作。<br> 1. 用户的积分默认是0分，而新注册用户设置为默认的10分。<br> 2. 用户有奖励行为，积分+2分。<br> 3. 用户有不正当行为，积分-3分。<br> 这样一组操作，正常用户积分要变成9分。但是如果顺序乱了，这个结果就全部对不了。这时，就需要 对这一组操作，保证消息都是有序的。</span></span></p> 
+<h4 style="margin-left:.0001pt;text-align:left;"><br><span style="color:#000000;"><span style="color:#333333;">2、如何保证消息有序？</span></span></h4> 
+<h5>1. 消息队列顺序类型</h5> 
+<ul><li><strong>全局有序</strong>：在整个消息队列（MQ）系统中，所有消息都严格遵循队列的先入先出（FIFO）顺序进行消费。</li><li><strong>局部有序</strong>：只针对部分关键消息保证消费顺序。</li></ul> 
+<h5>2. 业务场景分析</h5> 
+<ul><li>在大多数MQ业务场景中，<strong>局部有序</strong>通常是足够的。例如，在聊天应用中，只需保证每个聊天窗口内的消息有序；同样，在电商订单处理中，只需保证单个订单的消息顺序。</li><li><strong>全局有序</strong>的需求较少，且在很多情况下，可以通过局部有序的方法来解决。例如，传统的聊天室需要全局有序，但实际上可以通过单个聊天窗口（局部有序）的方式来实现。</li></ul> 
+<h5>3. RocketMQ的应用</h5> 
+<ul><li><strong>发送消息时的分配</strong>：发送者通常通过轮询的方式将消息均匀分布到多个MessageQueue，而消费者从这些MessageQueue中消费消息。由于MessageQueue是RocketMQ存储消息的最小单元，且相互隔离，因此无法保证全局有序。</li><li><strong>实现局部有序</strong>：为了保证局部有序，可以将一组有序的消息存储在同一个MessageQueue中。RocketMQ允许发送者在发送消息时使用MessageSelector对象来决定消息存储在哪个MessageQueue，从而实现局部有序。</li><li><strong>实现全局有序的策略</strong>：一种常见的全局有序实现方式是将一个Topic配置为只有一个MessageQueue（默认为四个）。这种方法类似于将聊天室场景简化为单个聊天窗口。然而，这种方法会大幅影响整个Topic的消息吞吐能力，可能导致使用MQ变得不必要。</li></ul> 
+<h5>4. 总结</h5> 
+<ul><li>局部有序通常满足大多数业务需求，而全局有序更为复杂，对系统性能有较大影响。</li><li>RocketMQ通过灵活的MessageQueue管理，提供了高效的局部有序解决方案，同时也支持全局有序，但后者可能会对性能造成负面影响。</li></ul> 
+<h3 style="margin-left:.0001pt;text-align:left;"><br><span style="color:#000000;"><span style="color:#333333;">三、使用RocketMQ如何快速处理积压消息？</span></span></h3> 
+<p></p> 
+<h4><span style="color:#000000;"><span style="color:#333333;">1、如何确定RocketMQ有大量的消息积压？    </span></span></h4> 
+<h5>1. 消息生产与消费平衡</h5> 
+<ul><li>在正常情况下，消息队列（MQ）的目标是保持消息的生产速度和消费速度整体平衡。</li></ul> 
+<h5>2. 消息积压的原因</h5> 
+<ul><li><strong>系统故障</strong>：例如数据库故障或网络波动可能导致部分消费者系统出现故障，从而引发消息积累。</li><li><strong>隐蔽性</strong>：这类问题在实际工作中可能不易察觉，直至积压严重。</li></ul> 
+<h5>3. 消息积压的影响</h5> 
+<ul><li>在大型互联网项目中，消息积压的速度可能非常快。</li><li><strong>对MQ系统的影响</strong>： 
+  <ul><li><strong>RocketMQ和Kafka</strong>：消息积压对系统性能的影响较小。</li><li><strong>RabbitMQ</strong>：大量消息积压可能导致性能急剧下降。</li></ul></li></ul> 
+<h5>4. 监测消息积压</h5> 
+<ul><li><strong>RocketMQ监测方法</strong>： 
+  <ul><li><strong>Web控制台</strong>：可以直接查看消息积压情况。在主题页面通过Consumer管理按钮，可以实时监控消息积压。</li><li><strong>mqadmin指令</strong>：用于在后台检查各个Topic的消息延迟情况。</li><li><strong>配置文件检查</strong>：RocketMQ会在<code>${storePathRootDir}/config</code>目录下生成一系列json文件，这些文件也可用于追踪消息积压状况。</li></ul></li></ul> 
+<h5>5. 总结</h5> 
+<ul><li>消息队列的高效管理需要时刻关注消息的生产和消费平衡，特别是在面对系统故障时。</li><li>不同的MQ系统对消息积压的敏感度不同，RocketMQ提供了多种方式来有效监控和管理消息积压，以确保系统性能不受严重影响。</li></ul> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h4 style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>2、如何处理大量积压的消息?</strong></span></strong></span></h4> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<h5>1. 基于RocketMQ负载均衡的解决方案</h5> 
+<ul><li><strong>MessageQueue配置</strong>：当一个Topic下的MessageQueue数量足够多时，每个Consumer会分配到多个MessageQueue进行消费。</li><li><strong>增加Consumer节点</strong>：通过增加Consumer的服务节点数量可以加快消息的消费速度。在极限情况下，Consumer节点的数量可以与MessageQueue的数量相同。</li></ul> 
+<h5>2. 处理不足的MessageQueue配置</h5> 
+<ul><li>当Topic下的MessageQueue数量不足时，增加Consumer节点的方法不再有效。</li><li><strong>创建新的Topic</strong>：可以创建一个新的Topic，配置足够多的MessageQueue。</li><li><strong>转移和消费旧消息</strong>：将所有消费者节点的目标Topic转向新的Topic，并上线一组新的消费者专门负责消费旧Topic中的消息，并转储到新的Topic中。然后在新的Topic上通过增加消费者数量来提高消费速度。</li></ul> 
+<h5>3. 特殊情况处理：主从架构切换</h5> 
+<ul><li><strong>普通架构与Dledger高可用集群切换</strong>： 
+  <ul><li>当从普通主从架构切换到Dledger集群时，需要注意历史消息的处理。</li><li><strong>消费者消息对齐</strong>：在切换主从架构之前，消费者需要消费掉所有消息，以防历史消息丢失。</li><li><strong>CommitLog日志接管</strong>：Dledger集群会接管RocketMQ原有的CommitLog日志。如果在切换时仍有未消费的消息，这些消息将无法继续消费，因为它们存储在旧的CommitLog中。</li></ul></li></ul> 
+<h5>4. 总结</h5> 
+<ul><li>RocketMQ提供了灵活的负载均衡和消息处理机制，以应对不同的消息积压情况。</li><li>通过调整Consumer节点数量和MessageQueue配置，可以有效地处理消息积压。</li><li>在特殊情况下，如架构切换，需特别注意消息的完整消费以避免数据丢失。</li></ul> 
+<p style="margin-left:.0001pt;text-align:left;"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/650fb2e74e474b90c38837e5b30645d2/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">电子科大系统分析与设计学堂在线期末考试答案</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b4c7a2923a7e985570a7ff225a4758a1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">MATLAB遗传算法工具箱的三种使用方法</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

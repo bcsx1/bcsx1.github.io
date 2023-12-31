@@ -1,0 +1,1509 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Android应用启动全流程分析（源码深度剖析） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Android应用启动全流程分析（源码深度剖析）" />
+<meta property="og:description" content="1.前言 从用户手指点击桌面上的应用图标到屏幕上显示出应用主Activity界面而完成应用启动，快的话往往都不需要一秒钟，但是这整个过程却是十分复杂的，其中涉及了Android系统的几乎所有核心知识点。同时应用的启动速度也绝对是系统的核心用户体验指标之一，多少年来，无论是谷歌或是手机系统厂商们还是各个Android应用开发者，都在为实现应用打开速度更快一点的目标而不断努力。但是要想真正做好应用启动速度优化这件事情，我想是必须要对应用启动的整个流程有充分的认识和理解的，所以无论作为Android系统或应用开发者，都有必要好好的学习和了解一下这个过程的。网上有很多介绍应用启动流程源码的文章，但是总感觉大多数都不太全面，很多只是介绍了应用启动过程中的部分流程，而没有总体清晰的认识应用启动过程的总体脉络与系统架构设计思想。所以本文将结合笔者多年来的工作经历，结合systrace分析工具，基于最新Android R AOSP源码完整的分析一下这个从用户手指触控点击屏幕应用图标到应用界面展示到屏幕上的整个应用启动过程，也是对之前所做所学的一个总结与归纳。
+2.大纲 Android触控事件处理机制
+Zygote进程启动和应用进程创建流程
+Handler消息机制
+AMS的Activity组件管理
+应用Application和Activity组件创建与初始化
+应用UI布局与绘制
+RenderThread渲染
+SurfaceFlinger合成显示
+写在最后
+参考
+3. Input触控事件处理流程 3.1 系统机制分析 Android 系统是由事件驱动的，而 input 是最常见的事件之一，用户的点击、滑动、长按等操作，都属于 input 事件驱动，其中的核心就是 InputReader 和 InputDispatcher。InputReader 和 InputDispatcher 是跑在 SystemServer进程中的两个 native 循环线程，负责读取和分发 Input 事件。整个处理过程大致流程如下：
+InputReader负责从EventHub里面把Input事件读取出来，然后交给 InputDispatcher 进行事件分发；InputDispatcher在拿到 InputReader获取的事件之后，对事件进行包装后，寻找并分发到目标窗口;InboundQueue队列（“iq”）中放着InputDispatcher从InputReader中拿到的input事件；OutboundQueue（“oq”）队列里面放的是即将要被派发给各个目标窗口App的事件；WaitQueue队列里面记录的是已经派发给 App（“wq”），但是 App还在处理没有返回处理成功的事件；PendingInputEventQueue队列（“aq”）中记录的是应用需要处理的Input事件，这里可以看到input事件已经传递到了应用进程；deliverInputEvent 标识 App UI Thread 被 Input 事件唤醒；InputResponse 标识 Input 事件区域，这里可以看到一个 Input_Down 事件 &#43; 若干个 Input_Move 事件 &#43; 一个 Input_Up 事件的处理阶段都被算到了这里；App 响应处理Input 事件，内部会在其界面View树中传递处理。 用一张图描述整个过程大致如下
+3.2 结合Systrace分析 从桌面点击应用图标启动应用，system_server的native线程InputReader首先负责从EventHub中利用linux的epolle机制监听并从屏幕驱动读取上报的触控事件，然后唤醒另外一条native线程InputDispatcher负责进行进一步事件分发。InputDispatcher中会先将事件放到InboundQueue也就是“iq”队列中，然后寻找具体处理input事件的目标应用窗口，并将事件放入对应的目标窗口OutboundQueue也就是“oq”队列中等待通过SocketPair双工信道发送到应用目标窗口中。最后当事件发送给具体的应用目标窗口后，会将事件移动到WaitQueue也就是“wq”中等待目标应用处理事件完成，并开启倒计时，如果目标应用窗口在5S内没有处理完成此次触控事件，就会向system_server报应用ANR异常事件。以上整个过程在Android系统源码中都加有相应的systrace tag，如下systrace截图所示：" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5f49675d515a3d7b36fbf44992b32553/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-08-26T18:41:03+08:00" />
+<meta property="article:modified_time" content="2023-08-26T18:41:03+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Android应用启动全流程分析（源码深度剖析）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>1.前言</h2> 
+<p>从用户手指点击桌面上的应用图标到屏幕上显示出应用主Activity界面而完成应用启动，快的话往往都不需要一秒钟，但是这整个过程却是十分复杂的，其中涉及了Android系统的几乎所有核心知识点。同时应用的启动速度也绝对是系统的核心用户体验指标之一，多少年来，无论是谷歌或是手机系统厂商们还是各个Android应用开发者，都在为实现应用打开速度更快一点的目标而不断努力。但是要想真正做好应用启动速度优化这件事情，我想是必须要对应用启动的整个流程有充分的认识和理解的，所以无论作为Android系统或应用开发者，都有必要好好的学习和了解一下这个过程的。网上有很多介绍应用启动流程源码的文章，但是总感觉大多数都不太全面，很多只是介绍了应用启动过程中的部分流程，而没有总体清晰的认识应用启动过程的总体脉络与系统架构设计思想。所以本文将结合笔者多年来的工作经历，结合systrace分析工具，基于最新Android R AOSP源码完整的分析一下这个从用户手指触控点击屏幕应用图标到应用界面展示到屏幕上的整个应用启动过程，也是对之前所做所学的一个总结与归纳。</p> 
+<h2>2.大纲</h2> 
+<ul><li> <p><strong>Android触控事件处理机制</strong></p> </li><li> <p><strong>Zygote进程启动和应用进程创建流程</strong></p> </li><li> <p><strong>Handler消息机制</strong></p> </li><li> <p><strong>AMS的Activity组件管理</strong></p> </li><li> <p><strong>应用Application和Activity组件创建与初始化</strong></p> </li><li> <p><strong>应用UI布局与绘制</strong></p> </li><li> <p><strong>RenderThread渲染</strong></p> </li><li> <p><strong>SurfaceFlinger合成显示</strong></p> </li><li> <p><strong>写在最后</strong></p> </li><li> <p><strong>参考</strong></p> </li></ul> 
+<h2>3. Input触控事件处理流程</h2> 
+<h3>3.1 系统机制分析</h3> 
+<p><code>Android</code> 系统是由事件驱动的，而 <code>input</code> 是最常见的事件之一，用户的点击、滑动、长按等操作，都属于 <code>input</code> 事件驱动，其中的核心就是 <code>InputReader</code> 和 <code>InputDispatcher</code>。<code>InputReader</code> 和 <code>InputDispatcher</code> 是跑在 <code>SystemServer</code>进程中的两个 <code>native</code> 循环线程，负责读取和分发 <code>Input</code> 事件。整个处理过程大致流程如下：</p> 
+<ol><li><code>InputReader</code>负责从<code>EventHub</code>里面把<code>Input</code>事件读取出来，然后交给 <code>InputDispatcher</code> 进行事件分发；</li><li><code>InputDispatcher</code>在拿到 <code>InputReader</code>获取的事件之后，对事件进行包装后，寻找并分发到目标窗口;</li><li><code>InboundQueue</code>队列（“iq”）中放着<code>InputDispatcher</code>从<code>InputReader</code>中拿到的<code>input</code>事件；</li><li><code>OutboundQueue</code>（“oq”）队列里面放的是即将要被派发给各个目标窗口App的事件；</li><li><code>WaitQueue</code>队列里面记录的是已经派发给 <code>App</code>（“wq”），但是 <code>App</code>还在处理没有返回处理成功的事件；</li><li><code>PendingInputEventQueue</code>队列（“aq”）中记录的是应用需要处理的<code>Input</code>事件，这里可以看到<code>input</code>事件已经传递到了应用进程；</li><li><code>deliverInputEvent</code> 标识 <code>App</code> <code>UI Thread</code> 被 <code>Input</code> 事件唤醒；</li><li><code>InputResponse</code> 标识 <code>Input</code> 事件区域，这里可以看到一个 <code>Input_Down</code> 事件 + 若干个 <code>Input_Move</code> 事件 + 一个 <code>Input_Up</code> 事件的处理阶段都被算到了这里；</li><li><code>App</code> 响应处理<code>Input</code> 事件，内部会在其界面<code>View</code>树中传递处理。</li></ol> 
+<p>用一张图描述整个过程大致如下</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="686" src="https://images2.imgbox.com/a5/b0/07SpiPmW_o.png" width="1159"></p> 
+<p></p> 
+<p></p> 
+<h3>3.2 结合Systrace分析</h3> 
+<p>从桌面点击应用图标启动应用，<code>system_server</code>的<code>native</code>线程<code>InputReader</code>首先负责从<code>EventHub</code>中利用<code>linux</code>的<code>epolle</code>机制监听并从屏幕驱动读取上报的触控事件，然后唤醒另外一条native线程<code>InputDispatcher</code>负责进行进一步事件分发。<code>InputDispatcher</code>中会先将事件放到<code>InboundQueue</code>也就是“iq”队列中，然后寻找具体处理<code>input</code>事件的目标应用窗口，并将事件放入对应的目标窗口<code>OutboundQueue</code>也就是“oq”队列中等待通过<code>SocketPair</code>双工信道发送到应用目标窗口中。最后当事件发送给具体的应用目标窗口后，会将事件移动到<code>WaitQueue</code>也就是“wq”中等待目标应用处理事件完成，并开启倒计时，<strong>如果目标应用窗口在5S内没有处理完成此次触控事件，就会向<code>system_server</code>报应用ANR异常事件</strong>。以上整个过程在<code>Android</code>系统源码中都加有相应的systrace tag，如下systrace截图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1200" src="https://images2.imgbox.com/4c/9f/pCl1xvKb_o.png" width="900"></p> 
+<p></p> 
+<p>接着上面的流程继续往下分析：当<code>input</code>触控事件传递到桌面应用进程后，<code>Input</code>事件到来后先通过<code>enqueueInputEvent</code>函数放入“aq”本地待处理队列中，并唤醒应用的UI线程在<code>deliverInputEvent</code>的流程中进行<code>input</code>事件的具体分发与处理。具体会先交给在应用界面<code>Window</code>创建时的<code>ViewRootImpl#setView</code>流程中创建的多个不同类型的<code>InputStage</code>中依次进行处理（比如对输入法处理逻辑的封装<code>ImeInputStage</code>），<strong>整个处理流程是按照责任链的设计模式进行</strong>。最后会交给<code>ViewPostImeInputStage</code>中具体进行处理，这里面会从<code>View</code>布局树的根节点<code>DecorView</code>开始遍历整个<code>View</code>树上的每一个子<code>View</code>或<code>ViewGroup</code>界面进行事件的分发、拦截、处理的逻辑。最后触控事件处理完成后会调用<code>finishInputEvent</code>结束应用对触控事件处理逻辑，这里面会通过<code>JNI</code>调用到<code>native</code>层<code>InputConsumer</code>的<code>sendFinishedSignal</code>函数通知<code>InputDispatcher</code>事件处理完成，从触发从"wq"队列中及时移除待处理事件以免报<code>ANR</code>异常。</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="699" src="https://images2.imgbox.com/c7/0d/WcbXnpUD_o.png" width="887"></p> 
+<p></p> 
+<p>桌面应用界面View中在连续处理一个<code>ACTION_DOWN</code>的<code>TouchEvent</code>触控事件和多个<code>ACTION_MOVE</code>，直到最后出现一个<code>ACTION_UP</code>的<code>TouchEvent</code>事件后，判断属于<code>onClick</code>点击事件，然后透过<code>ActivityManager</code> <code>Binder</code>调用<code>AMS</code>的<code>startActivity</code>服务接口触发启动应用的逻辑。从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1200" src="https://images2.imgbox.com/e5/11/RzEjLXgi_o.png" width="856"></p> 
+<p></p> 
+<h2>4. 应用进程的创建与启动</h2> 
+<h3>4.1 Pause桌面应用</h3> 
+<p>接着上一节继续往下看，桌面进程收到input触控事件并处理后<code>binder</code>调用框架<code>AMS</code>的的<code>startActivity</code>接口启动应用，相关简化代码如下：</p> 
+<pre><code class="language-java">  /*frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java*/
+  private int startActivityUnchecked(final ActivityRecord r, ActivityRecord sourceRecord,
+                IVoiceInteractionSession voiceSession, IVoiceInteractor voiceInteractor,
+                int startFlags, boolean doResume, ActivityOptions options, Task inTask,
+                boolean restrictedBgActivity, NeededUriGrants intentGrants) {
+        ...
+        try {
+            ...
+            // 添加“startActivityInner”的systrace tag
+            Trace.traceBegin(Trace.TRACE_TAG_WINDOW_MANAGER, "startActivityInner");
+            // 执行startActivityInner启动应用的逻辑
+            result = startActivityInner(r, sourceRecord, voiceSession, voiceInteractor,
+                    startFlags, doResume, options, inTask, restrictedBgActivity, intentGrants);
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_WINDOW_MANAGER);
+            ...
+        }
+        ...
+    }</code></pre> 
+<p>在执行<code>startActivityInner</code>启动应用逻辑中，<code>AMS</code>中的<code>Activity</code>栈管理的逻辑，<strong>检查发现当前处于前台<code>Resume</code>状态的<code>Activity</code>是桌面应用，所以第一步需要通知桌面应用的<code>Activity</code>进入<code>Paused</code>状态</strong>，相关简化代码逻辑如下：</p> 
+<pre><code class="language-java">/*frameworks/base/services/core/java/com/android/server/wm/ActivityStack.java*/
+private boolean resumeTopActivityInnerLocked(ActivityRecord prev, ActivityOptions options) {
+   ...
+   // mResumedActivity不为null，说明当前存在处于resume状态的Activity且不是新需要启动的应用
+   if (mResumedActivity != null) {
+      // 执行startPausingLocked通知桌面应用进入paused状态
+      pausing |= startPausingLocked(userLeaving, false /* uiSleeping */, next);
+   }
+   ...
+}
+
+final boolean startPausingLocked(boolean userLeaving, boolean uiSleeping,
+            ActivityRecord resuming) {
+    ...
+    ActivityRecord prev = mResumedActivity;
+    ...
+    if (prev.attachedToProcess()) {
+        try {
+             ...
+             // 相关执行动作封装事务，binder通知mResumedActivity也就是桌面执行pause动作
+             mAtmService.getLifecycleManager().scheduleTransaction(prev.app.getThread(),
+                        prev.appToken, PauseActivityItem.obtain(prev.finishing, userLeaving,
+                        prev.configChangeFlags, pauseImmediately));
+        } catch (Exception e) {
+           ...
+        }
+     }
+     ...
+}</code></pre> 
+<p>桌面应用进程这边执行收到<code>pause</code>消息后执行<code>Activity</code>的<code>onPause</code>生命周期，并在执行完成后，会<code>binder</code>调用<code>AMS</code>的<code>activityPaused</code>接口通知系统执行完<code>activity</code>的<code>pause</code>动作，相关代码如下：</p> 
+<pre><code class="language-java">  /*frameworks/base/core/java/android/app/servertransaction/PauseActivityItem.java*/
+  @Override
+  public void postExecute(ClientTransactionHandler client, IBinder token,
+            PendingTransactionActions pendingActions) {
+        ...
+        try {
+            // binder通知AMS当前应用activity已经执行完pause的流程
+            ActivityTaskManager.getService().activityPaused(token);
+        } catch (RemoteException ex) {
+            throw ex.rethrowFromSystemServer();
+        }
+    }</code></pre> 
+<p><code>AMS</code>这边收到应用的<code>activityPaused</code>调用后，继续执行启动应用的逻辑，<strong>判断需要启动的应用<code>Activity</code>所在的进程不存在，所以接下来需要先<code>startProcessAsync</code>创建应用进程</strong>，相关简化代码如下：</p> 
+<pre><code class="language-java">/*frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java*/
+ void startSpecificActivity(ActivityRecord r, boolean andResume, boolean checkConfig) {
+        final WindowProcessController wpc =
+                mService.getProcessController(r.processName, r.info.applicationInfo.uid);
+        ...
+        // 1.如果wpc不为null且hasThread表示应用Activity所属进程存在，直接realStartActivityLocked启动Activity
+        if (wpc != null &amp;&amp; wpc.hasThread()) {
+            try {
+                realStartActivityLocked(r, wpc, andResume, checkConfig);
+                return;
+            } catch (RemoteException e) {
+                Slog.w(TAG, "Exception when starting activity "
+                        + r.intent.getComponent().flattenToShortString(), e);
+            }
+           ...
+        }
+        ...
+        // 2.否则，调用AMS的startProcessAsync正式开始创建应用进程 
+        mService.startProcessAsync(r, knownToBeDead, isTop, isTop ? "top-activity" : "activity");
+    }</code></pre> 
+<p>以上过程从systrace上看，如下图所示：</p> 
+<ol><li>通知pause桌面应用：</li></ol> 
+<p></p> 
+<p class="img-center"><img alt="" height="1155" src="https://images2.imgbox.com/f1/ed/hhdZK3Ug_o.png" width="900"></p> 
+<p>2.确认桌面<code>activityPaused</code>状态之后，开始创建应用进程：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1071" src="https://images2.imgbox.com/98/54/3Q3KCZY3_o.png" width="886"></p> 
+<p></p> 
+<h3>4.2 创建应用进程</h3> 
+<p>接上一小节的分析可以知道，<code>Android</code>应用进程的启动是<strong>被动式</strong>的，在桌面点击图标启动一个应用的组件如<code>Activity</code>时，如果<code>Activity</code>所在的进程不存在，就会创建并启动进程。<strong><code>Android</code>系统中一般应用进程的创建都是统一由<code>zygote</code>进程<code>fork</code>创建的，<code>AMS</code>在需要创建应用进程时，会通过<code>socket</code>连接并通知到到<code>zygote</code>进程在开机阶段就创建好的<code>socket</code>服务端，然后由<code>zygote</code>进程<code>fork</code>创建出应用进程。</strong>整体架构如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1131" src="https://images2.imgbox.com/02/50/r5cdQjOK_o.png" width="1200"></p> 
+<p>我们接着上节中的分析，继续从<code>AMS#startProcessAsync</code>创建进程函数入手，继续看一下应用进程创建相关简化流程代码：</p> 
+<p></p> 
+<h4>4.2.1 AMS 发送socket请求</h4> 
+<p></p> 
+<pre><code class="language-java">  /*frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java*/  
+   @GuardedBy("this")
+    final ProcessRecord startProcessLocked(...) {
+        return mProcessList.startProcessLocked(...);
+   }
+   
+   /*frameworks/base/services/core/java/com/android/server/am/ProcessList.java*/
+   private Process.ProcessStartResult startProcess(HostingRecord hostingRecord, String entryPoint,
+            ProcessRecord app, int uid, int[] gids, int runtimeFlags, int zygotePolicyFlags,
+            int mountExternal, String seInfo, String requiredAbi, String instructionSet,
+            String invokeWith, long startTime) {
+        try {
+            // 原生标识应用进程创建所加的systrace tag
+            Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "Start proc: " +
+                    app.processName);
+            ...
+            // 调用Process的start方法创建进程
+            startResult = Process.start(...);
+            ...
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+        }
+    }
+    
+    /*frameworks/base/core/java/android/os/Process.java*/
+    public static ProcessStartResult start(...) {
+        // 调用ZygoteProcess的start函数
+        return ZYGOTE_PROCESS.start(...);
+    }
+    
+    /*frameworks/base/core/java/android/os/ZygoteProcess.java*/
+    public final Process.ProcessStartResult start(...){
+        try {
+            return startViaZygote(...);
+        } catch (ZygoteStartFailedEx ex) {
+           ...
+        }
+    }
+    
+    private Process.ProcessStartResult startViaZygote(...){
+        ArrayList&lt;String&gt; argsForZygote = new ArrayList&lt;String&gt;();
+        ...
+        return zygoteSendArgsAndGetResult(openZygoteSocketIfNeeded(abi), argsForZygote);
+    }
+</code></pre> 
+<p>在<code>ZygoteProcess#startViaZygote</code>中，最后创建应用进程的逻辑：</p> 
+<ol><li><strong><code>openZygoteSocketIfNeeded</code>函数中打开本地<code>socket</code>客户端连接到<code>zygote</code>进程的<code>socket</code>服务端</strong>；</li><li><strong><code>zygoteSendArgsAndGetResult</code>发送<code>socket</code>请求参数，带上了创建的应用进程参数信息</strong>；</li><li><strong><code>return</code>返回的数据结构<code>ProcessStartResult</code>中会有新创建的进程的<code>pid</code>字段</strong>。</li></ol> 
+<p>从systrace上看这个过程如下：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="746" src="https://images2.imgbox.com/14/67/Yerhbjm3_o.png" width="1154"></p> 
+<p></p> 
+<h4>4.2.2 Zygote 处理socket请求</h4> 
+<p>其实早在系统开机阶段，<code>zygote</code>进程创建时，就会在<code>ZygoteInit#main</code>入口函数中创建服务端<code>socket</code>，<strong>并预加载系统资源和框架类（加速应用进程启动速度）</strong>，代码如下：</p> 
+<pre><code class="language-java"> /*frameworks/base/core/java/com/android/internal/os/ZygoteInit.java*/
+ public static void main(String[] argv) {
+        ZygoteServer zygoteServer = null;
+         ...
+        try {
+            ...
+            // 1.preload提前加载框架通用类和系统资源到进程，加速进程启动
+            preload(bootTimingsTraceLog);
+            ...
+            // 2.创建zygote进程的socket server服务端对象
+            zygoteServer = new ZygoteServer(isPrimaryZygote);
+            ...
+            // 3.进入死循环，等待AMS发请求过来
+            caller = zygoteServer.runSelectLoop(abiList);
+        } catch (Throwable ex) {
+            ...
+        } finally {
+            ...
+        }
+        ...
+    }</code></pre> 
+<p>继续往下看<code>ZygoteServer#runSelectLoop</code>如何监听并处理AMS客户端的请求：</p> 
+<pre><code class="language-java"> /*frameworks/base/core/java/com/android/internal/os/ZygoteServer.java*/
+ Runnable runSelectLoop(String abiList) {
+     // 进入死循环监听
+     while (true) {
+        while (--pollIndex &gt;= 0) {
+           if (pollIndex == 0) {
+             ...
+           } else if (pollIndex &lt; usapPoolEventFDIndex) {
+             // Session socket accepted from the Zygote server socket
+             // 得到一个请求连接封装对象ZygoteConnection
+             ZygoteConnection connection = peers.get(pollIndex);
+             // processCommand函数中处理AMS客户端请求
+             final Runnable command = connection.processCommand(this, multipleForksOK);
+           }
+        }
+     }
+ }
+ 
+ Runnable processCommand(ZygoteServer zygoteServer, boolean multipleOK) {
+         ...
+         // 1.fork创建应用子进程
+         pid = Zygote.forkAndSpecialize(...);
+         try {
+             if (pid == 0) {
+                 ...
+                 // 2.pid为0，当前处于新创建的子应用进程中，处理请求参数
+                 return handleChildProc(parsedArgs, childPipeFd, parsedArgs.mStartChildZygote);
+             } else {
+                 ...
+                 handleParentProc(pid, serverPipeFd);
+             }
+          } finally {
+             ...
+          }
+ }
+ 
+  private Runnable handleChildProc(ZygoteArguments parsedArgs,
+            FileDescriptor pipeFd, boolean isZygote) {
+        ...
+        // 关闭从父进程zygote继承过来的ZygoteServer服务端地址
+        closeSocket();
+        ...
+        if (parsedArgs.mInvokeWith != null) {
+           ...
+        } else {
+            if (!isZygote) {
+                // 继续进入ZygoteInit#zygoteInit继续完成子应用进程的相关初始化工作
+                return ZygoteInit.zygoteInit(parsedArgs.mTargetSdkVersion,
+                        parsedArgs.mDisabledCompatChanges,
+                        parsedArgs.mRemainingArgs, null /* classLoader */);
+            } else {
+                ...
+            }
+        }
+    }</code></pre> 
+<p>以上过程从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="716" src="https://images2.imgbox.com/3c/c7/28WNLdr1_o.png" width="1092"></p> 
+<p></p> 
+<h4>4.2.3 应用进程初始化</h4> 
+<p>接上一节中的分析，<code>zygote</code>进程监听接收<code>AMS</code>的请求，<code>fork</code>创建子应用进程，然后<code>pid</code>为0时进入子进程空间，然后在 <code>ZygoteInit#zygoteInit</code>中完成进程的初始化动作，相关简化代码如下：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/com/android/internal/os/ZygoteInit.java*/
+public static Runnable zygoteInit(int targetSdkVersion, long[] disabledCompatChanges,
+            String[] argv, ClassLoader classLoader) {
+        ...
+        // 原生添加名为“ZygoteInit ”的systrace tag以标识进程初始化流程
+        Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "ZygoteInit");
+        RuntimeInit.redirectLogStreams();
+        // 1.RuntimeInit#commonInit中设置应用进程默认的java异常处理机制
+        RuntimeInit.commonInit();
+        // 2.ZygoteInit#nativeZygoteInit函数中JNI调用启动进程的binder线程池
+        ZygoteInit.nativeZygoteInit();
+        // 3.RuntimeInit#applicationInit中反射创建ActivityThread对象并调用其“main”入口方法
+        return RuntimeInit.applicationInit(targetSdkVersion, disabledCompatChanges, argv,
+                classLoader);
+ }</code></pre> 
+<p>应用进程启动后，初始化过程中主要依次完成以下几件事情：</p> 
+<ol><li><strong>应用进程默认的<code>java</code>异常处理机制（可以实现监听、拦截应用进程所有的<code>Java crash</code>的逻辑）；</strong></li><li><strong><code>JNI</code>调用启动进程的<code>binder</code>线程池（注意应用进程的<code>binder</code>线程池资源是自己创建的并非从<code>zygote</code>父进程继承的）；</strong></li><li><strong>通过反射创建<code>ActivityThread</code>对象并调用其“<code>main</code>”入口方法。</strong></li></ol> 
+<p>我们继续看<code>RuntimeInit#applicationInit</code>简化的代码流程：</p> 
+<pre><code class="language-java"> /*frameworks/base/core/java/com/android/internal/os/RuntimeInit.java*/
+ protected static Runnable applicationInit(int targetSdkVersion, long[] disabledCompatChanges,
+            String[] argv, ClassLoader classLoader) {
+        ...
+        // 结束“ZygoteInit ”的systrace tag
+        Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+        // Remaining arguments are passed to the start class's static main
+        return findStaticMain(args.startClass, args.startArgs, classLoader);
+  }
+  
+  protected static Runnable findStaticMain(String className, String[] argv,
+            ClassLoader classLoader) {
+        Class&lt;?&gt; cl;
+        try {
+            // 1.反射加载创建ActivityThread类对象
+            cl = Class.forName(className, true, classLoader);
+        } catch (ClassNotFoundException ex) {
+            ...
+        }
+        Method m;
+        try {
+            // 2.反射调用其main方法
+            m = cl.getMethod("main", new Class[] { String[].class });
+        } catch (NoSuchMethodException ex) {
+            ...
+        } catch (SecurityException ex) {
+            ...
+        }
+        ...
+        // 3.触发执行以上逻辑
+        return new MethodAndArgsCaller(m, argv);
+    }</code></pre> 
+<p>我们继续往下看<code>ActivityThread</code>的<code>main</code>函数中又干了什么：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/ActivityThread.java*/
+public static void main(String[] args) {
+     // 原生添加的标识进程ActivityThread初始化过程的systrace tag，名为“ActivityThreadMain”
+     Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "ActivityThreadMain");
+     ...
+     // 1.创建并启动主线程的loop消息循环
+     Looper.prepareMainLooper();
+     ...
+     // 2.attachApplication注册到系统AMS中
+     ActivityThread thread = new ActivityThread();
+     thread.attach(false, startSeq);
+     ...
+     Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+     Looper.loop();
+     ...
+}
+
+private void attach(boolean system, long startSeq) {
+    ...
+    if (!system) {
+       ...
+       final IActivityManager mgr = ActivityManager.getService();
+       try {
+          // 通过binder调用AMS的attachApplication接口将自己注册到AMS中
+          mgr.attachApplication(mAppThread, startSeq);
+       } catch (RemoteException ex) {
+                throw ex.rethrowFromSystemServer();
+       }
+    }
+}</code></pre> 
+<p>可以看到进程<code>ActivityThread#main</code>函数初始化的主要逻辑是：</p> 
+<ol><li><strong>创建并启动主线程的<code>loop</code>消息循环；</strong></li><li><strong>通过<code>binder</code>调用<code>AMS</code>的<code>attachApplication</code>接口将自己<code>attach</code>注册到<code>AMS</code>中。</strong></li></ol> 
+<p>以上初始化过程。从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="740" src="https://images2.imgbox.com/f2/c1/aK5pOtgJ_o.png" width="1200"></p> 
+<p></p> 
+<h2>5. 应用主线程消息循环机制建立</h2> 
+<p>接上一节的分析，我们知道应用进程创建后会通过反射创建<code>ActivityThread</code>对象并执行其<code>main</code>函数，进行主线程的初始化工作：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/ActivityThread.java*/
+public static void main(String[] args) {
+     ...
+     // 1.创建Looper、MessageQueue
+     Looper.prepareMainLooper();
+     ...
+     // 2.启动loop消息循环，开始准备接收消息
+     Looper.loop();
+     ...
+}
+
+// 3.创建主线程Handler对象
+final H mH = new H();
+
+class H extends Handler {
+  ...
+}
+
+/*frameworks/base/core/java/android/os/Looper.java*/
+public static void prepareMainLooper() {
+     // 准备主线程的Looper
+     prepare(false);
+     synchronized (Looper.class) {
+          if (sMainLooper != null) {
+              throw new IllegalStateException("The main Looper has already been prepared.");
+          }
+          sMainLooper = myLooper();
+     }
+}
+
+private static void prepare(boolean quitAllowed) {
+      if (sThreadLocal.get() != null) {
+          throw new RuntimeException("Only one Looper may be created per thread");
+      }
+      // 创建主线程的Looper对象，并通过ThreadLocal机制实现与主线程的一对一绑定
+      sThreadLocal.set(new Looper(quitAllowed));
+}
+
+private Looper(boolean quitAllowed) {
+      // 创建MessageQueue消息队列
+      mQueue = new MessageQueue(quitAllowed);
+      mThread = Thread.currentThread();
+}</code></pre> 
+<p>主线程初始化完成后，<strong>主线程就有了完整的 <code>Looper</code>、<code>MessageQueue</code>、<code>Handler</code>，此时 <code>ActivityThread</code> 的 <code>Handler</code> 就可以开始处理 <code>Message</code>，包括 <code>Application</code>、<code>Activity</code>、<code>ContentProvider</code>、<code>Service</code>、<code>Broadcast</code> 等组件的生命周期函数，都会以 <code>Message</code> 的形式，在主线程按照顺序处理</strong>，这就是 <code>App</code> 主线程的初始化和运行原理，部分处理的 <code>Message</code> 如下</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/ActivityThread.java*/
+class H extends Handler {
+        public static final int BIND_APPLICATION        = 110;
+        @UnsupportedAppUsage
+        public static final int RECEIVER                = 113;
+        @UnsupportedAppUsage
+        public static final int CREATE_SERVICE          = 114;
+        @UnsupportedAppUsage
+        public static final int BIND_SERVICE            = 121;
+        
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case BIND_APPLICATION:
+                    Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "bindApplication");
+                    AppBindData data = (AppBindData)msg.obj;
+                    handleBindApplication(data);
+                    Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+                    break;
+                    ...
+            }
+         }
+         ...
+}</code></pre> 
+<p>主线程初始化完成后，主线程就进入阻塞状态，等待 <code>Message</code>，一旦有 <code>Message</code> 发过来，主线程就会被唤醒，处理 <code>Message</code>，处理完成之后，如果没有其他的 <code>Message</code> 需要处理，那么主线程就会进入休眠阻塞状态继续等待。可以说<code>Android</code>系统的运行是受消息机制驱动的，而整个消息机制是由上面所说的四个关键角色相互配合实现的（<strong><code>Handler</code></strong>、<strong><code>Looper</code></strong>、<strong><code>MessageQueue</code></strong>、<strong><code>Message</code></strong>），其运行原理如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="788" src="https://images2.imgbox.com/c9/26/9DAjvX9e_o.png" width="618"></p> 
+<p></p> 
+<ol><li><strong><code>Handler</code></strong> : <code>Handler</code> 主要是用来处理 <code>Message</code>，应用可以在任何线程创建 <code>Handler</code>，只要在创建的时候指定对应的 <code>Looper</code> 即可，如果不指定，默认是在当前 <code>Thread</code> 对应的 <code>Looper</code>。</li><li><strong><code>Looper</code> :</strong> <code>Looper</code> 可以看成是一个循环器，<strong>其 <code>loop</code> 方法开启后，不断地从 <code>MessageQueue</code> 中获取 <code>Message</code></strong>，对 <code>Message</code> 进行 <code>Delivery</code> 和 <code>Dispatch</code>，最终发给对应的 <code>Handler</code> 去处理。</li><li><code>**MessageQueue**：MessageQueue</code> 就是一个 <code>Message</code> 管理器，队列中是 <code>Message</code>，在没有 <code>Message</code> 的时候，<strong><code>MessageQueue</code> 借助 <code>Linux</code> 的 <code>ePoll</code>机制，阻塞休眠等待，直到有 <code>Message</code> 进入队列将其唤醒</strong>。</li><li><code>**Message**：Message</code> 是传递消息的对象，其内部包含了要传递的内容，最常用的包括 <code>what</code>、<code>arg</code>、<code>callback</code> 等。</li></ol> 
+<h2>6. 应用Application和Activity组件创建与初始化</h2> 
+<h3>6.1 Application的创建与初始化</h3> 
+<p>从前面4.2.3小结中的分析我们知道，应用进程启动初始化执行<code>ActivityThread#main</code>函数过程中，在开启主线程<code>loop</code>消息循环之前，会通过<code>Binder</code>调用系统核心服务<code>AMS</code>的<code>attachApplication</code>接口将自己注册到<code>AMS</code>中。下面我们接着这个流程往下看，我们先从systrace上看看<code>AMS</code>服务的<code>attachApplication</code>接口是如何处理应用进程的attach注册请求的：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="650" src="https://images2.imgbox.com/38/35/zQ0VYfc0_o.png" width="904"></p> 
+<p>我们继续来看相关代码的简化流程：</p> 
+<pre><code class="language-java">/*frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java*/
+@GuardedBy("this")
+private boolean attachApplicationLocked(@NonNull IApplicationThread thread,
+            int pid, int callingUid, long startSeq) {
+     ...
+     if (app.isolatedEntryPoint != null) {
+           ...
+     } else if (instr2 != null) {
+           // 1.通过oneway异步类型的binder调用应用进程ActivityThread#IApplicationThread#bindApplication接口
+           thread.bindApplication(...);
+     } else {
+           thread.bindApplication(...);
+     }
+     ...
+     // See if the top visible activity is waiting to run in this process...
+     if (normalMode) {
+          try {
+            // 2.继续执行启动应用Activity的流程
+            didSomething = mAtmInternal.attachApplication(app.getWindowProcessController());
+          } catch (Exception e) {
+                Slog.wtf(TAG, "Exception thrown launching activities in " + app, e);
+                badApp = true;
+          }
+      }
+}
+
+/*frameworks/base/core/java/android/app/ActivityThread.java*/
+private class ApplicationThread extends IApplicationThread.Stub {
+      @Override
+      public final void bindApplication(...) {
+            ...
+            AppBindData data = new AppBindData();
+            data.processName = processName;
+            data.appInfo = appInfo;
+            ...
+            // 向应用进程主线程Handler发送BIND_APPLICATION消息，触发在应用主线程执行handleBindApplication初始化动作
+            sendMessage(H.BIND_APPLICATION, data);
+      }
+      ...
+}
+
+class H extends Handler {
+      ...
+      public void handleMessage(Message msg) {
+           switch (msg.what) {
+                case BIND_APPLICATION:
+                    Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "bindApplication");
+                    AppBindData data = (AppBindData)msg.obj;
+                    // 在应用主线程执行handleBindApplication初始化动作
+                    handleBindApplication(data);
+                    Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+                    break;
+                    ...
+           }
+      }
+      ...
+}
+
+@UnsupportedAppUsage
+private void handleBindApplication(AppBindData data) {
+    ...
+}</code></pre> 
+<p></p> 
+<p>从上面的代码流程可以看出：<strong><code>AMS</code>服务在执行应用的<code>attachApplication</code>注册请求过程中，会通过<code>oneway</code>类型的<code>binder</code>调用应用进程<code>ActivityThread#IApplicationThread</code>的<code>bindApplication</code>接口，而<code>bindApplication</code>接口函数实现中又会通过往应用主线程消息队列post <code>BIND_APPLICATION</code>消息触发执行<code>handleBindApplication</code>初始化函数</strong>，从systrace看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="604" src="https://images2.imgbox.com/f5/ae/kavwmR64_o.png" width="1193"></p> 
+<p> 我们继续结合代码看看handleBindApplication的简化关键流程：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/ActivityThread.java*/
+@UnsupportedAppUsage
+private void handleBindApplication(AppBindData data) {
+    ...
+    // 1.创建应用的LoadedApk对象
+    data.info = getPackageInfoNoCheck(data.appInfo, data.compatInfo);
+    ...
+    // 2.创建应用Application的Context、触发Art虚拟机加载应用APK的Dex文件到内存中，并加载应用APK的Resource资源
+    final ContextImpl appContext = ContextImpl.createAppContext(this, data.info);
+    ...
+    // 3.调用LoadedApk的makeApplication函数，实现创建应用的Application对象
+    app = data.info.makeApplication(data.restrictedBackupMode, null);
+    ...
+    // 4.执行应用Application#onCreate生命周期函数
+    mInstrumentation.onCreate(data.instrumentationArgs);
+    ...
+}</code></pre> 
+<p>在<code>ActivityThread#**handleBindApplication</code>初始化过程中在应用主线程中主要完成如下几件事件**：</p> 
+<ol><li>根据框架传入的<code>ApplicationInfo</code>信息创建应用<code>APK</code>对应的<code>LoadedApk</code>对象;</li><li>创建应用<code>Application</code>的<code>Context</code>对象；</li><li><strong>创建类加载器<code>ClassLoader</code>对象并触发<code>Art</code>虚拟机执行<code>OpenDexFilesFromOat</code>动作加载应用<code>APK</code>的<code>Dex</code>文件</strong>；</li><li><strong>通过<code>LoadedApk</code>加载应用<code>APK</code>的<code>Resource</code>资源</strong>；</li><li>调用<code>LoadedApk</code>的<code>makeApplication</code>函数，创建应用的<code>Application</code>对象;</li><li><strong>执行应用<code>Application#onCreate</code>生命周期函数</strong>（<code>APP</code>应用开发者能控制的第一行代码）;</li></ol> 
+<p>下面我们结合代码重点看看<code>APK Dex</code>文件的加载和<code>Resource</code>资源的加载流程。</p> 
+<h4>6.1.1 应用APK的Dex文件加载</h4> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/ContextImpl.java*/
+static ContextImpl createAppContext(ActivityThread mainThread, LoadedApk packageInfo,
+            String opPackageName) {
+    if (packageInfo == null) throw new IllegalArgumentException("packageInfo");
+    // 1.创建应用Application的Context对象
+    ContextImpl context = new ContextImpl(null, mainThread, packageInfo, null, null, null, null,
+                0, null, opPackageName);
+    // 2.触发加载APK的DEX文件和Resource资源
+    context.setResources(packageInfo.getResources());
+    context.mIsSystemOrSystemUiContext = isSystemOrSystemUI(context);
+    return context;
+}
+
+/*frameworks/base/core/java/android/app/LoadedApk.java*/
+@UnsupportedAppUsage
+public Resources getResources() {
+     if (mResources == null) {
+         ...
+         // 加载APK的Resource资源
+         mResources = ResourcesManager.getInstance().getResources(null, mResDir,
+                    splitPaths, mOverlayDirs, mApplicationInfo.sharedLibraryFiles,
+                    Display.DEFAULT_DISPLAY, null, getCompatibilityInfo(),
+                    getClassLoader()/*触发加载APK的DEX文件*/, null);
+      }
+      return mResources;
+}
+
+@UnsupportedAppUsage
+public ClassLoader getClassLoader() {
+     synchronized (this) {
+         if (mClassLoader == null) {
+             createOrUpdateClassLoaderLocked(null /*addedPaths*/);
+          }
+          return mClassLoader;
+     }
+}
+
+private void createOrUpdateClassLoaderLocked(List&lt;String&gt; addedPaths) {
+     ...
+     if (mDefaultClassLoader == null) {
+          ...
+          // 创建默认的mDefaultClassLoader对象，触发art虚拟机加载dex文件
+          mDefaultClassLoader = ApplicationLoaders.getDefault().getClassLoaderWithSharedLibraries(
+                    zip, mApplicationInfo.targetSdkVersion, isBundledApp, librarySearchPath,
+                    libraryPermittedPath, mBaseClassLoader,
+                    mApplicationInfo.classLoaderName, sharedLibraries);
+          ...
+     }
+     ...
+     if (mClassLoader == null) {
+         // 赋值给mClassLoader对象
+         mClassLoader = mAppComponentFactory.instantiateClassLoader(mDefaultClassLoader,
+                    new ApplicationInfo(mApplicationInfo));
+     }
+}
+
+/*frameworks/base/core/java/android/app/ApplicationLoaders.java*/
+ClassLoader getClassLoaderWithSharedLibraries(...) {
+    // For normal usage the cache key used is the same as the zip path.
+    return getClassLoader(zip, targetSdkVersion, isBundled, librarySearchPath,
+                              libraryPermittedPath, parent, zip, classLoaderName, sharedLibraries);
+}
+
+private ClassLoader getClassLoader(String zip, ...) {
+        ...
+        synchronized (mLoaders) {
+            ...
+            if (parent == baseParent) {
+                ...
+                // 1.创建BootClassLoader加载系统框架类，并增加相应的systrace tag
+                Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, zip);
+                ClassLoader classloader = ClassLoaderFactory.createClassLoader(
+                        zip,  librarySearchPath, libraryPermittedPath, parent,
+                        targetSdkVersion, isBundled, classLoaderName, sharedLibraries);
+                Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+                ...
+                return classloader;
+            }
+            // 2.创建PathClassLoader加载应用APK的Dex类，并增加相应的systrace tag
+            Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, zip);
+            ClassLoader loader = ClassLoaderFactory.createClassLoader(
+                    zip, null, parent, classLoaderName, sharedLibraries);
+            Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+            return loader;
+        }
+}
+
+/*frameworks/base/core/java/com/android/internal/os/ClassLoaderFactory.java*/
+public static ClassLoader createClassLoader(...) {
+        // 通过new的方式创建ClassLoader对象，最终会触发art虚拟机加载APK的dex文件
+        ClassLoader[] arrayOfSharedLibraries = (sharedLibraries == null)
+                ? null
+                : sharedLibraries.toArray(new ClassLoader[sharedLibraries.size()]);
+        if (isPathClassLoaderName(classloaderName)) {
+            return new PathClassLoader(dexPath, librarySearchPath, parent, arrayOfSharedLibraries);
+        }
+        ...
+}</code></pre> 
+<p>从以上代码可以看出：在创建<code>Application</code>的<code>Context</code>对象后会立马尝试去加载<code>APK</code>的<code>Resource</code>资源，而在这之前需要通过<code>LoadedApk</code>去创建类加载器<code>ClassLoader</code>对象，而这个过程最终就会触发<code>Art</code>虚拟机加载应用<code>APK</code>的<code>dex</code>文件，从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="477" src="https://images2.imgbox.com/6a/60/KNZ1yGl5_o.png" width="1200"></p> 
+<p>具体art虚拟机加载dex文件的流程由于篇幅所限这里就不展开讲了，这边画了一张流程图可以参考一下，感兴趣的读者可以对照追一下源码流程： </p> 
+<p></p> 
+<p class="img-center"><img alt="" height="927" src="https://images2.imgbox.com/9f/c6/oTpb6Lvi_o.png" width="1200"></p> 
+<h4> 6.1.2 应用APK的Resource资源加载</h4> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/LoadedApk.java*/
+@UnsupportedAppUsage
+public Resources getResources() {
+     if (mResources == null) {
+         ...
+         // 加载APK的Resource资源
+         mResources = ResourcesManager.getInstance().getResources(null, mResDir,
+                    splitPaths, mOverlayDirs, mApplicationInfo.sharedLibraryFiles,
+                    Display.DEFAULT_DISPLAY, null, getCompatibilityInfo(),
+                    getClassLoader()/*触发加载APK的DEX文件*/, null);
+      }
+      return mResources;
+}
+
+/*frameworks/base/core/java/android/app/ResourcesManager.java*/
+public @Nullable Resources getResources(...) {
+      try {
+          // 原生Resource资源加载的systrace tag
+          Trace.traceBegin(Trace.TRACE_TAG_RESOURCES, "ResourcesManager#getResources");
+          ...
+          return createResources(activityToken, key, classLoader, assetsSupplier);
+      } finally {
+          Trace.traceEnd(Trace.TRACE_TAG_RESOURCES);
+      }
+}
+
+private @Nullable Resources createResources(...) {
+      synchronized (this) {
+            ...
+            // 执行创建Resources资源对象
+            ResourcesImpl resourcesImpl = findOrCreateResourcesImplForKeyLocked(key, apkSupplier);
+            if (resourcesImpl == null) {
+                return null;
+            }
+            ...
+     }
+}
+
+private @Nullable ResourcesImpl findOrCreateResourcesImplForKeyLocked(
+            @NonNull ResourcesKey key, @Nullable ApkAssetsSupplier apkSupplier) {
+      ...
+      impl = createResourcesImpl(key, apkSupplier);
+      ...
+}
+
+private @Nullable ResourcesImpl createResourcesImpl(@NonNull ResourcesKey key,
+            @Nullable ApkAssetsSupplier apkSupplier) {
+        ...
+        // 创建AssetManager对象，真正实现的APK文件加载解析动作
+        final AssetManager assets = createAssetManager(key, apkSupplier);
+        ...
+}
+
+private @Nullable AssetManager createAssetManager(@NonNull final ResourcesKey key,
+            @Nullable ApkAssetsSupplier apkSupplier) {
+        ...
+        for (int i = 0, n = apkKeys.size(); i &lt; n; i++) {
+            final ApkKey apkKey = apkKeys.get(i);
+            try {
+                // 通过loadApkAssets实现应用APK文件的加载
+                builder.addApkAssets(
+                        (apkSupplier != null) ? apkSupplier.load(apkKey) : loadApkAssets(apkKey));
+            } catch (IOException e) {
+                ...
+            }
+        }
+        ...   
+}
+
+private @NonNull ApkAssets loadApkAssets(@NonNull final ApkKey key) throws IOException {
+        ...
+        if (key.overlay) {
+            ...
+        } else {
+            // 通过ApkAssets从APK文件所在的路径去加载
+            apkAssets = ApkAssets.loadFromPath(key.path,
+                    key.sharedLib ? ApkAssets.PROPERTY_DYNAMIC : 0);
+        }
+        ...
+    }
+
+/*frameworks/base/core/java/android/content/res/ApkAssets.java*/
+public static @NonNull ApkAssets loadFromPath(@NonNull String path, @PropertyFlags int flags)
+            throws IOException {
+        return new ApkAssets(FORMAT_APK, path, flags, null /* assets */);
+}
+
+private ApkAssets(@FormatType int format, @NonNull String path, @PropertyFlags int flags,
+            @Nullable AssetsProvider assets) throws IOException {
+        ...
+        // 通过JNI调用Native层的系统system/lib/libandroidfw.so库中的相关C函数实现对APK文件压缩包的解析与加载
+        mNativePtr = nativeLoad(format, path, flags, assets);
+        ...
+}</code></pre> 
+<p>从以上代码可以看出：<strong>系统对于应用<code>APK</code>文件资源的加载过程其实就是创建应用进程中的<code>Resources</code>资源对象的过程，其中真正实现<code>APK</code>资源文件的<code>I/O</code>解析作，最终是借助于<code>AssetManager</code>中通过JNI调用系统<code>Native</code>层的相关<code>C</code>函数实现。</strong>整个过程从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="708" src="https://images2.imgbox.com/cf/00/R1HswoAM_o.png" width="1199"></p> 
+<p></p> 
+<h3>6.2 Activity的创建与初始化</h3> 
+<p>我们回到6.1小结中，看看<code>AMS</code>在收到应用进程的<code>attachApplication</code>注册请求后，先通过oneway类型的binder调用应用及进程的<code>IApplicationThread</code>#<code>bindApplication</code>接口，触发应用进程在主线程执行<code>handleBindeApplication</code>初始化操作，然后继续执行启动应用<code>Activity</code>的操作，下面我们来看看系统是如何启动创建应用<code>Activity</code>的，简化代码流程如下：</p> 
+<pre><code class="language-java">/*frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java*/
+@GuardedBy("this")
+private boolean attachApplicationLocked(...) {
+     ...
+     if (app.isolatedEntryPoint != null) {
+           ...
+     } else if (instr2 != null) {
+           // 1.通过oneway异步类型的binder调用应用进程ActivityThread#IApplicationThread#bindApplication接口
+           thread.bindApplication(...);
+     } else {
+           thread.bindApplication(...);
+     }
+     ...
+     // See if the top visible activity is waiting to run in this process...
+     if (normalMode) {
+          try {
+            // 2.继续执行启动应用Activity的流程
+            didSomething = mAtmInternal.attachApplication(app.getWindowProcessController());
+          } catch (Exception e) {
+                Slog.wtf(TAG, "Exception thrown launching activities in " + app, e);
+                badApp = true;
+          }
+      }
+}
+
+/*frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java*/
+public boolean attachApplication(WindowProcessController wpc) throws RemoteException {
+       synchronized (mGlobalLockWithoutBoost) {
+            if (Trace.isTagEnabled(TRACE_TAG_WINDOW_MANAGER)) {
+                // 原生标识attachApplication过程的systrace tag
+                Trace.traceBegin(TRACE_TAG_WINDOW_MANAGER, "attachApplication:" + wpc.mName);
+            }
+            try {
+                return mRootWindowContainer.attachApplication(wpc);
+            } finally {
+                Trace.traceEnd(TRACE_TAG_WINDOW_MANAGER);
+            }
+       }
+}
+
+/*frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java*/
+boolean attachApplication(WindowProcessController app) throws RemoteException {
+       ...
+       final PooledFunction c = PooledLambda.obtainFunction(
+                // startActivityForAttachedApplicationIfNeeded执行启动应用Activity流程
+                RootWindowContainer::startActivityForAttachedApplicationIfNeeded, this,
+                PooledLambda.__(ActivityRecord.class), app,
+                rootTask.topRunningActivity());
+       ...
+}
+ 
+private boolean startActivityForAttachedApplicationIfNeeded(ActivityRecord r,
+            WindowProcessController app, ActivityRecord top) {
+        ...
+        try {
+            // ActivityStackSupervisor的realStartActivityLocked真正实现启动应用Activity流程
+            if (mStackSupervisor.realStartActivityLocked(r, app,
+                    top == r &amp;&amp; r.isFocusable() /*andResume*/, true /*checkConfig*/)) {
+                ...
+            }
+        } catch (RemoteException e) {
+            ..
+        }
+}
+
+/*frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java*/
+boolean realStartActivityLocked(ActivityRecord r, WindowProcessController proc,
+            boolean andResume, boolean checkConfig) throws RemoteException {
+         ...
+        // 1.先通过LaunchActivityItem封装Binder通知应用进程执行Launch Activity动作       
+         clientTransaction.addCallback(LaunchActivityItem.obtain(...);
+         // Set desired final state.
+         final ActivityLifecycleItem lifecycleItem;
+         if (andResume) {
+                // 2.再通过ResumeActivityItem封装Binder通知应用进程执行Launch Resume动作        
+                lifecycleItem = ResumeActivityItem.obtain(dc.isNextTransitionForward());
+         }
+         ...
+         clientTransaction.setLifecycleStateRequest(lifecycleItem);
+         // 执行以上封装的Binder调用
+         mService.getLifecycleManager().scheduleTransaction(clientTransaction);
+         ...
+}</code></pre> 
+<p>从以上代码分析可以看到，框架<code>system_server</code>进程最终是通过<code>ActivityStackSupervisor</code>#<code>realStartActivityLocked</code>函数中，通过<code>LaunchActivityItem</code>和<code>ResumeActivityItem</code>两个类的封装，依次实现binder调用通知应用进程这边执行<code>Activity</code>的Launch和Resume动作的，我们继续往下看相关代码流程：</p> 
+<h4>6.2.1 Activity Create</h4> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/servertransaction/LaunchActivityItem.java*/
+@Override
+public void execute(ClientTransactionHandler client, IBinder token,
+            PendingTransactionActions pendingActions) {
+     // 原生标识Activity Launch的systrace tag
+     Trace.traceBegin(TRACE_TAG_ACTIVITY_MANAGER, "activityStart");
+     ActivityClientRecord r = new ActivityClientRecord(token, mIntent, mIdent, mInfo,
+                mOverrideConfig, mCompatInfo, mReferrer, mVoiceInteractor, mState, mPersistentState,
+                mPendingResults, mPendingNewIntents, mIsForward,
+                mProfilerInfo, client, mAssistToken, mFixedRotationAdjustments);
+     // 调用到ActivityThread的handleLaunchActivity函数在主线程执行应用Activity的Launch创建动作
+     client.handleLaunchActivity(r, pendingActions, null /* customIntent */);
+     Trace.traceEnd(TRACE_TAG_ACTIVITY_MANAGER);
+}
+
+/*frameworks/base/core/java/android/app/ActivityThread.java*/
+@Override
+public Activity handleLaunchActivity(ActivityClientRecord r,
+            PendingTransactionActions pendingActions, Intent customIntent) {
+     ...
+     final Activity a = performLaunchActivity(r, customIntent);
+     ...
+}
+
+/**  Core implementation of activity launch. */
+private Activity performLaunchActivity(ActivityClientRecord r, Intent customIntent) {
+        ...
+        // 1.创建Activity的Context
+        ContextImpl appContext = createBaseContextForActivity(r);
+        try {
+            //2.反射创建Activity对象
+            activity = mInstrumentation.newActivity(
+                    cl, component.getClassName(), r.intent);
+            ...
+        } catch (Exception e) {
+            ...
+        }
+        try {
+            ...
+            if (activity != null) {
+                ...
+                // 3.执行Activity的attach动作
+                activity.attach(...);
+                ...
+                // 4.执行应用Activity的onCreate生命周期函数,并在setContentView调用中创建DecorView对象
+                mInstrumentation.callActivityOnCreate(activity, r.state);
+                ...
+            }
+            ...
+        } catch (SuperNotCalledException e) {
+            ...
+        }
+}
+
+/*frameworks/base/core/java/android/app/Activity.java*/
+ @UnsupportedAppUsage
+ final void attach(...) {
+        ...
+        // 1.创建表示应用窗口的PhoneWindow对象
+        mWindow = new PhoneWindow(this, window, activityConfigCallback);
+        ...
+        // 2.为PhoneWindow配置WindowManager
+        mWindow.setWindowManager(
+                (WindowManager)context.getSystemService(Context.WINDOW_SERVICE),
+                mToken, mComponent.flattenToString(),
+                (info.flags &amp; ActivityInfo.FLAG_HARDWARE_ACCELERATED) != 0);
+        ...
+}</code></pre> 
+<p>从上面代码可以看出，应用进程这边在收到系统binder调用后，<strong>在主线程中创建<code>Activiy</code>的流程主要步骤如下</strong>：</p> 
+<ol><li>创建<code>Activity</code>的<code>Context</code>；</li><li>通过反射创建<code>Activity</code>对象；</li><li>执行<code>Activity</code>的<code>attach</code>动作，<strong>其中会创建应用窗口的<code>PhoneWindow</code>对象并设置<code>WindowManage</code></strong>；</li><li><strong>执行应用<code>Activity</code>的<code>onCreate</code>生命周期函数，并在<code>setContentView</code>中创建窗口的<code>DecorView</code>对象</strong>；</li></ol> 
+<p>从systrace上看整个过程如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="713" src="https://images2.imgbox.com/33/04/Gts4WPAb_o.png" width="1044"></p> 
+<h4>6.2.2 Activity Resume</h4> 
+<p></p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/app/servertransaction/ResumeActivityItem.java*/
+@Override
+public void execute(ClientTransactionHandler client, IBinder token,
+            PendingTransactionActions pendingActions) {
+   // 原生标识Activity Resume的systrace tag
+   Trace.traceBegin(TRACE_TAG_ACTIVITY_MANAGER, "activityResume");
+   client.handleResumeActivity(token, true /* finalStateRequest */, mIsForward,
+                "RESUME_ACTIVITY");
+   Trace.traceEnd(TRACE_TAG_ACTIVITY_MANAGER);
+}
+
+/*frameworks/base/core/java/android/app/ActivityThread.java*/
+ @Override
+public void handleResumeActivity(...){
+    ...
+    // 1.执行performResumeActivity流程,执行应用Activity的onResume生命周期函数
+    final ActivityClientRecord r = performResumeActivity(token, finalStateRequest, reason);
+    ...
+    if (r.window == null &amp;&amp; !a.mFinished &amp;&amp; willBeVisible) {
+            ...
+            if (a.mVisibleFromClient) {
+                if (!a.mWindowAdded) {
+                    ...
+                    // 2.执行WindowManager#addView动作开启视图绘制逻辑
+                    wm.addView(decor, l);
+                } else {
+                  ...
+                }
+            }
+     }
+    ...
+}
+
+public ActivityClientRecord performResumeActivity(...) {
+    ...
+    // 执行应用Activity的onResume生命周期函数
+    r.activity.performResume(r.startsNotResumed, reason);
+    ...
+}
+
+/*frameworks/base/core/java/android/view/WindowManagerGlobal.java*/
+public void addView(...) {
+     // 创建ViewRootImpl对象
+     root = new ViewRootImpl(view.getContext(), display);
+     ...
+     try {
+         // 执行ViewRootImpl的setView函数
+         root.setView(view, wparams, panelParentView, userId);
+     } catch (RuntimeException e) {
+         ...
+     } 
+}</code></pre> 
+<p>从上面代码可以看出，应用进程这边在接收到系统Binder调用请求后，<strong>在主线程中<code>Activiy</code> <code>Resume</code>的流程主要步骤如下</strong>：</p> 
+<ol><li><strong>执行应用<code>Activity</code>的<code>onResume</code>生命周期函数</strong>;</li><li>执行<code>WindowManager</code>的<code>addView</code>动作开启视图绘制逻辑;</li><li>创建<code>Activity</code>的<code>ViewRootImpl</code>对象;</li><li><strong>执行<code>ViewRootImpl</code>的<code>setView</code>函数开启UI界面绘制动作</strong>；</li></ol> 
+<p>从systrace上看整个过程如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="702" src="https://images2.imgbox.com/94/5a/awQKJs3d_o.png" width="1127"></p> 
+<p></p> 
+<h2>7. 应用UI布局与绘制</h2> 
+<p>接上一节的分析，应用主线程中在执行<code>Activity</code>的Resume流程的最后，会创建<code>ViewRootImpl</code>对象并调用其setView函数，从此并开启了应用界面UI布局与绘制的流程。在开始讲解这个过程之前，我们先来整理一下前面代码中讲到的这些概念，如<code>Activity</code>、<code>PhoneWindow</code>、<code>DecorView</code>、<code>ViewRootImpl</code>、<code>WindowManager</code>它们之间的关系与职责，因为这些核心类基本构成了Android系统的GUI显示系统在应用进程侧的核心架构，其整体架构如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="433" src="https://images2.imgbox.com/98/a1/337Smmvc_o.png" width="804"></p> 
+<ul><li><code>Window</code>是一个抽象类，<strong>通过控制<code>DecorView</code>提供了一些标准的UI方案，比如<code>背景、标题、虚拟按键等</code></strong>，而<code>PhoneWindow</code>是<code>Window</code>的唯一实现类，在<code>Activity</code>创建后的attach流程中创建，应用启动显示的内容装载到其内部的<code>mDecor</code>（<code>DecorView</code>）；</li><li><code>DecorView</code>是整个界面布局View控件树的根节点，通过它可以遍历访问到整个View控件树上的任意节点；</li><li><code>WindowManager</code>是一个接口，继承自<code>ViewManager</code>接口，提供了<code>View</code>的基本操作方法；<code>WindowManagerImp</code>实现了<code>WindowManager</code>接口，内部通过<code>组合</code>方式持有<code>WindowManagerGlobal</code>，用来操作<code>View</code>；<strong><code>WindowManagerGlobal</code>是一个全局单例，内部可以通过<code>ViewRootImpl</code>将<code>View</code>添加至<code>窗口</code>中</strong>；</li><li><strong><code>ViewRootImpl</code>是所有<code>View</code>的<code>Parent</code>，用来总体管理<code>View</code>的绘制以及与系统<code>WMS</code>窗口管理服务的IPC交互从而实现<code>窗口</code>的开辟</strong>；<code>ViewRootImpl</code>是应用进程运转的发动机，可以看到<code>ViewRootImpl</code>内部包含<code>mView</code>（就是<code>DecorView</code>）、<code>mSurface</code>、<code>Choregrapher</code>，<code>mView</code>代表整个控件树，<code>mSurfacce</code>代表画布，应用的UI渲染会直接放到<code>mSurface</code>中，<code>Choregorapher</code>使得应用请求<code>vsync</code>信号，接收信号后开始渲染流程；<br> 我们从<code>ViewRootImpl</code>的setView流程继续结合代码往下看：</li></ul> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/view/ViewRootImpl.java*/
+public void setView(View view, WindowManager.LayoutParams attrs, View panelParentView,
+            int userId) {
+      synchronized (this) {
+         if (mView == null) {
+             mView = view;
+         }
+         ...
+         // 开启绘制硬件加速，初始化RenderThread渲染线程运行环境
+         enableHardwareAcceleration(attrs);
+         ...
+         // 1.触发绘制动作
+         requestLayout();
+         ...
+         inputChannel = new InputChannel();
+         ...
+         // 2.Binder调用访问系统窗口管理服务WMS接口，实现addWindow添加注册应用窗口的操作,并传入inputChannel用于接收触控事件
+         res = mWindowSession.addToDisplayAsUser(mWindow, mSeq, mWindowAttributes,
+                            getHostVisibility(), mDisplay.getDisplayId(), userId, mTmpFrame,
+                            mAttachInfo.mContentInsets, mAttachInfo.mStableInsets,
+                            mAttachInfo.mDisplayCutout, inputChannel,
+                            mTempInsets, mTempControls);
+         ...
+         // 3.创建WindowInputEventReceiver对象，实现应用窗口接收触控事件
+         mInputEventReceiver = new WindowInputEventReceiver(inputChannel,
+                            Looper.myLooper());
+         ...
+         // 4.设置DecorView的mParent为ViewRootImpl
+         view.assignParent(this);
+         ...
+      }
+}</code></pre> 
+<p>从以上代码可以看出<code>ViewRootImpl</code>的setView内部关键流程如下：</p> 
+<ol><li><strong>requestLayout()通过一系列调用触发界面绘制（measure、layout、draw）动作</strong>，下文会详细展开分析；</li><li><strong>通过Binder调用访问系统窗口管理服务<code>WMS</code>的<code>addWindow</code>接口</strong>，<strong>实现添加、注册应用窗口的操作</strong>，并传入本地创建inputChannel对象用于后续接收系统的触控事件，这一步执行完我们的<code>View</code>就可以显示到屏幕上了。关于<code>WMS</code>的内部实现流程也非常复杂，由于篇幅有限本文就不详细展开分析了。</li><li>创建WindowInputEventReceiver对象，封装实现应用窗口接收系统触控事件的逻辑；</li><li>执行view.assignParent(this)，设置<code>DecorView</code>的mParent为<code>ViewRootImpl</code>。所以，<strong>虽然<code>ViewRootImpl</code>不是一个<code>View</code>,但它是所有<code>View</code>的顶层<code>Parent</code>。</strong></li></ol> 
+<p>我们顺着<code>ViewRootImpl</code>的<code>requestLayout</code>动作继续往下看界面绘制的流程代码：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/view/ViewRootImpl.java*/
+public void requestLayout() {
+    if (!mHandlingLayoutInLayoutRequest) {
+         // 检查当前UI绘制操作是否发生在主线程，如果发生在子线程则会抛出异常
+         checkThread();
+         mLayoutRequested = true;
+         // 触发绘制操作
+         scheduleTraversals();
+    }
+}
+
+@UnsupportedAppUsage
+void scheduleTraversals() {
+    if (!mTraversalScheduled) {
+         ...
+         // 注意此处会往主线程的MessageQueue消息队列中添加同步栏删，因为系统绘制消息属于异步消息，需要更高优先级的处理
+         mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+         // 通过Choreographer往主线程消息队列添加CALLBACK_TRAVERSAL绘制类型的待执行消息，用于触发后续UI线程真正实现绘制动作
+         mChoreographer.postCallback(
+                    Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+         ...
+     }
+}</code></pre> 
+<p><code>Choreographer</code> 的引入，主要是配合系统<code>Vsync</code>垂直同步机制（Android“黄油计划”中引入的机制之一，协调APP生成UI数据和<code>SurfaceFlinger</code>合成图像，避免Tearing画面撕裂的现象），给上层 App 的渲染提供一个稳定的 <code>Message</code> 处理的时机，也就是 <code>Vsync</code> 到来的时候 ，系统通过对 <code>Vsync</code> 信号周期的调整，来控制每一帧绘制操作的时机。<strong><code>Choreographer</code> 扮演 Android 渲染链路中承上启下的角色</strong>：</p> 
+<ol><li><strong>承上</strong>：负责接收和处理 App 的各种更新消息和回调，等到 <code>Vsync</code> 到来的时候统一处理。比如集中处理 Input(主要是 Input 事件的处理) 、Animation(动画相关)、Traversal(包括 <code>measure、layout、draw</code> 等操作) ，判断卡顿掉帧情况，记录 CallBack 耗时等；</li><li><strong>启下</strong>：负责请求和接收 Vsync 信号。接收 Vsync 事件回调(通过 <code>FrameDisplayEventReceiver</code>.<code>onVsync</code> )，请求 <code>Vsync</code>(<code>FrameDisplayEventReceiver</code>.<code>scheduleVsync</code>) 。</li></ol> 
+<p><code>Choreographer</code>在收到<code>CALLBACK_TRAVERSAL</code>类型的绘制任务后，其内部的工作流程如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1111" src="https://images2.imgbox.com/1c/7b/Y2cHG91P_o.png" width="1200"></p> 
+<p></p> 
+<p>从以上流程图可以看出：<code>ViewRootImpl</code>调用<code>Choreographer</code>的<code>postCallback</code>接口放入待执行的绘制消息后，<code>Choreographer</code>会先向系统申请<code>APP</code> 类型的<code>vsync</code>信号，然后等待系统<code>vsync</code>信号到来后，去回调到<code>ViewRootImpl</code>的<code>doTraversal</code>函数中执行真正的绘制动作（measure、layout、draw）。这个绘制过程从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="700" src="https://images2.imgbox.com/0b/42/DdWibF1u_o.png" width="1200"></p> 
+<p></p> 
+<p>我们接着<code>ViewRootImpl</code>的<code>doTraversal</code>函数的简化代码流程往下看：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/view/ViewRootImpl.java*/
+void doTraversal() {
+     if (mTraversalScheduled) {
+         mTraversalScheduled = false;
+         // 调用removeSyncBarrier及时移除主线程MessageQueue中的Barrier同步栏删，以避免主线程发生“假死”
+         mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+         ...
+         // 执行具体的绘制任务
+         performTraversals();
+         ...
+    }
+}
+
+private void performTraversals() {
+     ...
+     // 1.从DecorView根节点出发，遍历整个View控件树，完成整个View控件树的measure测量操作
+     windowSizeMayChange |= measureHierarchy(...);
+     ...
+     if (mFirst...) {
+    // 2.第一次执行traversals绘制任务时，Binder调用访问系统窗口管理服务WMS的relayoutWindow接口，实现WMS计算应用窗口尺寸并向系统surfaceflinger正式申请Surface“画布”操作
+         relayoutResult = relayoutWindow(params, viewVisibility, insetsPending);
+     }
+     ...
+     // 3.从DecorView根节点出发，遍历整个View控件树，完成整个View控件树的layout测量操作
+     performLayout(lp, mWidth, mHeight);
+     ...
+     // 4.从DecorView根节点出发，遍历整个View控件树，完成整个View控件树的draw测量操作
+     performDraw();
+     ...
+}
+
+private int relayoutWindow(WindowManager.LayoutParams params, int viewVisibility,
+            boolean insetsPending) throws RemoteException {
+        ...
+        // 通过Binder IPC访问系统WMS服务的relayout接口，申请Surface“画布”操作
+        int relayoutResult = mWindowSession.relayout(mWindow, mSeq, params,
+                (int) (mView.getMeasuredWidth() * appScale + 0.5f),
+                (int) (mView.getMeasuredHeight() * appScale + 0.5f), viewVisibility,
+                insetsPending ? WindowManagerGlobal.RELAYOUT_INSETS_PENDING : 0, frameNumber,
+                mTmpFrame, mTmpRect, mTmpRect, mTmpRect, mPendingBackDropFrame,
+                mPendingDisplayCutout, mPendingMergedConfiguration, mSurfaceControl, mTempInsets,
+                mTempControls, mSurfaceSize, mBlastSurfaceControl);
+        if (mSurfaceControl.isValid()) {
+            if (!useBLAST()) {
+                // 本地Surface对象获取指向远端分配的Surface的引用
+                mSurface.copyFrom(mSurfaceControl);
+            } else {
+               ...
+            }
+        }
+        ...
+}
+
+private void performMeasure(int childWidthMeasureSpec, int childHeightMeasureSpec) {
+        ...
+        // 原生标识View树的measure测量过程的trace tag
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "measure");
+        try {
+            // 从mView指向的View控件树的根节点DecorView出发，遍历访问整个View树，并完成整个布局View树的测量工作
+            mView.measure(childWidthMeasureSpec, childHeightMeasureSpec);
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+}
+
+private void performDraw() {
+     ...
+     boolean canUseAsync = draw(fullRedrawNeeded);
+     ...
+}
+
+private boolean draw(boolean fullRedrawNeeded) {
+    ...
+    if (mAttachInfo.mThreadedRenderer != null &amp;&amp; mAttachInfo.mThreadedRenderer.isEnabled()) {
+        ...
+        // 如果开启并支持硬件绘制加速，则走硬件绘制的流程（从Android 4.+开始，默认情况下都是支持跟开启了硬件加速的）
+        mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
+    } else {
+        // 否则走drawSoftware软件绘制的流程
+        if (!drawSoftware(surface, mAttachInfo, xOffset, yOffset,
+                        scalingRequired, dirty, surfaceInsets)) {
+                    return false;
+         }
+    }
+}</code></pre> 
+<p>从上面的代码流程可以看出，<strong><code>ViewRootImpl</code>中负责的整个应用界面绘制的主要流程如下</strong>：</p> 
+<ol><li>从界面View控件树的根节点<code>DecorView</code>出发，递归遍历整个View控件树，完成对整个<code>View</code>控件树的<code>measure</code>测量操作，由于篇幅所限，本文就不展开分析这块的详细流程；</li><li>界面第一次执行绘制任务时，会通过<code>Binder</code> <code>IPC</code>访问系统窗口管理服务WMS的relayout接口，实现窗口尺寸的计算并向系统申请用于本地绘制渲染的Surface“画布”的操作（<strong>具体由<code>SurfaceFlinger</code>负责创建应用界面对应的<code>BufferQueueLayer</code>对象，并通过内存共享的方式通过<code>Binder</code>将地址引用透过WMS回传给应用进程这边</strong>），由于篇幅所限，本文就不展开分析这块的详细流程；</li><li>从界面View控件树的根节点<code>DecorView</code>出发，递归遍历整个View控件树，完成对整个<code>View</code>控件树的<code>layout</code>测量操作；</li><li>从界面View控件树的根节点<code>DecorView</code>出发，递归遍历整个<code>View</code>控件树，完成对整个<code>View</code>控件树的<code>draw</code>测量操作，<strong>如果开启并支持硬件绘制加速（从Android 4.X开始谷歌已经默认开启硬件加速），则走<code>GPU</code>硬件绘制的流程，否则走<code>CPU</code>软件绘制的流程</strong>；</li></ol> 
+<p>以上绘制过程从systrace上看如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="686" src="https://images2.imgbox.com/28/4b/foXNQUbV_o.png" width="1200"></p> 
+<p></p> 
+<p class="img-center"><img alt="" height="560" src="https://images2.imgbox.com/43/43/s6de4qVo_o.png" width="1199"></p> 
+<p> 借用一张图来总结应用UI绘制的流程，如下所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="693" src="https://images2.imgbox.com/91/31/ab3AHNVP_o.png" width="1111"></p> 
+<p></p> 
+<h2>8. RenderThread渲染</h2> 
+<p>截止到目前，在<code>ViewRootImpl</code>中完成了对界面的measure、layout和draw等绘制流程后，用户依然还是看不到屏幕上显示的应用界面内容，因为整个<code>Android</code>系统的显示流程除了前面讲到的UI线程的绘制外，界面还需要经过<code>RenderThread</code>线程的渲染处理，渲染完成后，还需要通过<code>Binder</code>调用“上帧”交给<code>surfaceflinger</code>进程中进行合成后送显才能最终显示到屏幕上。本小节中，我们将接上一节中<code>ViewRootImpl</code>中最后draw的流程继续往下分析开启硬件加速情况下，<code>RenderThread</code>渲染线程的工作流程。由于目前Android 4.X之后系统默认界面是开启硬件加速的，所以本文我们重点分析硬件加速条件下的界面渲染流程，我们先分析一下简化的代码流程：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/view/ViewRootImpl.java*/
+private boolean draw(boolean fullRedrawNeeded) {
+    ...
+    if (mAttachInfo.mThreadedRenderer != null &amp;&amp; mAttachInfo.mThreadedRenderer.isEnabled()) {
+        ...
+        // 硬件加速条件下的界面渲染流程
+        mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
+    } else {
+        ...
+    }
+}
+
+/*frameworks/base/core/java/android/view/ThreadedRenderer.java*/
+void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
+    ...
+    // 1.从DecorView根节点出发，递归遍历View控件树，记录每个View节点的绘制操作命令，完成绘制操作命令树的构建
+    updateRootDisplayList(view, callbacks);
+    ...
+    // 2.JNI调用同步Java层构建的绘制命令树到Native层的RenderThread渲染线程，并唤醒渲染线程利用OpenGL执行渲染任务；
+    int syncResult = syncAndDrawFrame(choreographer.mFrameInfo);
+    ...
+}</code></pre> 
+<p>从上面的代码可以看出，<strong>硬件加速绘制主要包括两个阶段</strong>：</p> 
+<ol><li>从<code>DecorView</code>根节点出发，递归遍历<code>View</code>控件树，记录每个<code>View</code>节点的<code>drawOp</code>绘制操作命令，完成绘制操作命令树的构建；</li><li><code>JNI</code>调用同步<code>Java</code>层构建的绘制命令树到<code>Native</code>层的<code>RenderThread</code>渲染线程，并唤醒渲染线程利用<code>OpenGL</code>执行渲染任务；</li></ol> 
+<h3>8.1 构建绘制命令树</h3> 
+<p>我们先来看看第一阶段构建绘制命令树的代码简化流程：</p> 
+<pre><code class="language-java">/*frameworks/base/core/java/android/view/ThreadedRenderer.java*/
+private void updateRootDisplayList(View view, DrawCallbacks callbacks) {
+        // 原生标记构建View绘制操作命令树过程的systrace tag
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "Record View#draw()");
+        // 递归子View的updateDisplayListIfDirty实现构建DisplayListOp
+        updateViewTreeDisplayList(view);
+        ...
+        if (mRootNodeNeedsUpdate || !mRootNode.hasDisplayList()) {
+            // 获取根View的SkiaRecordingCanvas
+            RecordingCanvas canvas = mRootNode.beginRecording(mSurfaceWidth, mSurfaceHeight);
+            try {
+                ...
+                // 利用canvas缓存DisplayListOp绘制命令
+                canvas.drawRenderNode(view.updateDisplayListIfDirty());
+                ...
+            } finally {
+                // 将所有DisplayListOp绘制命令填充到RootRenderNode中
+                mRootNode.endRecording();
+            }
+        }
+        Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+}
+
+private void updateViewTreeDisplayList(View view) {
+        ...
+        // 从DecorView根节点出发，开始递归调用每个View树节点的updateDisplayListIfDirty函数
+        view.updateDisplayListIfDirty();
+        ...
+}
+
+/*frameworks/base/core/java/android/view/View.java*/
+public RenderNode updateDisplayListIfDirty() {
+     ...
+     // 1.利用`View`对象构造时创建的`RenderNode`获取一个`SkiaRecordingCanvas`“画布”；
+     final RecordingCanvas canvas = renderNode.beginRecording(width, height);
+     try {
+         ...
+         if ((mPrivateFlags &amp; PFLAG_SKIP_DRAW) == PFLAG_SKIP_DRAW) {
+              // 如果仅仅是ViewGroup，并且自身不用绘制，直接递归子View
+              dispatchDraw(canvas);
+              ...
+         } else {
+              // 2.利用SkiaRecordingCanvas，在每个子View控件的onDraw绘制函数中调用drawLine、drawRect等绘制操作时，创建对应的DisplayListOp绘制命令，并缓存记录到其内部的SkiaDisplayList持有的DisplayListData中；
+              draw(canvas);
+         }
+     } finally {
+         // 3.将包含有`DisplayListOp`绘制命令缓存的`SkiaDisplayList`对象设置填充到`RenderNode`中；
+         renderNode.endRecording();
+         ...
+     }
+     ...
+}
+
+public void draw(Canvas canvas) {
+    ...
+    // draw the content(View自己实现的onDraw绘制，由应用开发者自己实现)
+    onDraw(canvas);
+    ...
+    // draw the children
+    dispatchDraw(canvas);
+    ...
+}
+
+/*frameworks/base/graphics/java/android/graphics/RenderNode.java*/
+public void endRecording() {
+        ...
+        // 从SkiaRecordingCanvas中获取SkiaDisplayList对象
+        long displayList = canvas.finishRecording();
+        // 将SkiaDisplayList对象填充到RenderNode中
+        nSetDisplayList(mNativeRenderNode, displayList);
+        canvas.recycle();
+}</code></pre> 
+<p>从以上代码可以看出，<strong>构建绘制命令树的过程是从<code>View</code>控件树的根节点<code>DecorView</code>触发，递归调用每个子<code>View</code>节点的<code>updateDisplayListIfDirty</code>函数，最终完成绘制树的创建，简述流程如下</strong>：</p> 
+<ol><li>利用<code>View</code>对象构造时创建的<code>RenderNode</code>获取一个<code>SkiaRecordingCanvas</code>“画布”；</li><li>利用<code>SkiaRecordingCanvas</code>，<strong>在每个子<code>View</code>控件的<code>onDraw</code>绘制函数中调用<code>drawLine</code>、<code>drawRect</code>等绘制操作时，创建对应的<code>DisplayListOp</code>绘制命令，并缓存记录到其内部的<code>SkiaDisplayList</code>持有的<code>DisplayListData</code>中</strong>；</li><li>将包含有<code>DisplayListOp</code>绘制命令缓存的<code>SkiaDisplayList</code>对象设置填充到<code>RenderNode</code>中；</li><li>最后将根<code>View</code>的缓存<code>DisplayListOp</code>设置到<code>RootRenderNode</code>中，完成构建。</li></ol> 
+<p>以上整个构建绘制命令树的过程可以用如下流程图表示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1075" src="https://images2.imgbox.com/d5/9c/14wWyGI6_o.png" width="1200"></p> 
+<p>硬件加速下的整个界面的View树的结构如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="823" src="https://images2.imgbox.com/08/7a/qUry6fEf_o.png" width="1200"></p> 
+<p> 最后从systrace上看这个过程如下图所示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="632" src="https://images2.imgbox.com/ba/b0/spchTVtb_o.png" width="1144"></p> 
+<p></p> 
+<h3>8.2 执行渲染绘制任务</h3> 
+<p>经过上一小节中的分析，应用在<code>UI</code>线程中从根节点<code>DecorView</code>出发，递归遍历每个子<code>View</code>节点，搜集其<code>drawXXX</code>绘制动作并转换成<code>DisplayListOp</code>命令，将其记录到<code>DisplayListData</code>并填充到<code>RenderNode</code>中，最终完成整个<code>View</code>绘制命令树的构建。从此UI线程的绘制任务就完成了。下一步<code>UI</code>线程将唤醒<code>RenderThread</code>渲染线程，触发其利用<code>OpenGL</code>执行界面的渲染任务，本小节中我们将重点分析这个流程。我们还是先看看这块代码的简化流程：</p> 
+<pre><code class="language-java">/*frameworks/base/graphics/java/android/graphics/HardwareRenderer.java*/
+public int syncAndDrawFrame(@NonNull FrameInfo frameInfo) {
+    // JNI调用native层的相关函数
+    return nSyncAndDrawFrame(mNativeProxy, frameInfo.frameInfo, frameInfo.frameInfo.length);
+}
+
+/*frameworks/base/libs/hwui/jni/android_graphics_HardwareRenderer.cpp*/
+static int android_view_ThreadedRenderer_syncAndDrawFrame(JNIEnv* env, jobject clazz,
+        jlong proxyPtr, jlongArray frameInfo, jint frameInfoSize) {
+    ...
+    RenderProxy* proxy = reinterpret_cast&lt;RenderProxy*&gt;(proxyPtr);
+    env-&gt;GetLongArrayRegion(frameInfo, 0, frameInfoSize, proxy-&gt;frameInfo());
+    return proxy-&gt;syncAndDrawFrame();
+}
+
+/*frameworks/base/libs/hwui/renderthread/RenderProxy.cpp*/
+int RenderProxy::syncAndDrawFrame() {
+    // 唤醒RenderThread渲染线程，执行DrawFrame绘制任务
+    return mDrawFrameTask.drawFrame();
+}
+
+/*frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp*/
+int DrawFrameTask::drawFrame() {
+    ...
+    postAndWait();
+    ...
+}
+
+void DrawFrameTask::postAndWait() {
+    AutoMutex _lock(mLock);
+    // 向RenderThread渲染线程的MessageQueue消息队列放入一个待执行任务，以将其唤醒执行run函数
+    mRenderThread-&gt;queue().post([this]() { run(); });
+    // UI线程暂时进入wait等待状态
+    mSignal.wait(mLock);
+}
+
+void DrawFrameTask::run() {
+    // 原生标识一帧渲染绘制任务的systrace tag
+    ATRACE_NAME("DrawFrame");
+    ...
+    {
+        TreeInfo info(TreeInfo::MODE_FULL, *mContext);
+        //1.将UI线程构建的DisplayListOp绘制命令树同步到RenderThread渲染线程
+        canUnblockUiThread = syncFrameState(info);
+        ...
+    }
+    ...
+    // 同步完成后则可以唤醒UI线程
+    if (canUnblockUiThread) {
+        unblockUiThread();
+    }
+    ...
+    if (CC_LIKELY(canDrawThisFrame)) {
+        // 2.执行draw渲染绘制动作
+        context-&gt;draw();
+    } else {
+        ...
+    }
+    ...
+}
+
+bool DrawFrameTask::syncFrameState(TreeInfo&amp; info) {
+    ATRACE_CALL();
+    ...
+    // 调用CanvasContext的prepareTree函数实现绘制命令树同步的流程
+    mContext-&gt;prepareTree(info, mFrameInfo, mSyncQueued, mTargetNode);
+    ...
+}
+
+/*frameworks/base/libs/hwui/renderthread/CanvasContext.cpp*/
+void CanvasContext::prepareTree(TreeInfo&amp; info, int64_t* uiFrameInfo, int64_t syncQueued,
+                                RenderNode* target) {
+     ...
+     for (const sp&lt;RenderNode&gt;&amp; node : mRenderNodes) {
+        ...
+        // 递归调用各个子View对应的RenderNode执行prepareTree动作
+        node-&gt;prepareTree(info);
+        ...
+    }
+    ...
+}
+
+/*frameworks/base/libs/hwui/RenderNode.cpp*/
+void RenderNode::prepareTree(TreeInfo&amp; info) {
+    ATRACE_CALL();
+    ...
+    prepareTreeImpl(observer, info, false);
+    ...
+}
+
+void RenderNode::prepareTreeImpl(TreeObserver&amp; observer, TreeInfo&amp; info, bool functorsNeedLayer) {
+    ...
+    if (info.mode == TreeInfo::MODE_FULL) {
+        // 同步绘制命令树
+        pushStagingDisplayListChanges(observer, info);
+    }
+    if (mDisplayList) {
+        // 遍历调用各个子View对应的RenderNode的prepareTreeImpl
+        bool isDirty = mDisplayList-&gt;prepareListAndChildren(
+                observer, info, childFunctorsNeedLayer,
+                [](RenderNode* child, TreeObserver&amp; observer, TreeInfo&amp; info,
+                   bool functorsNeedLayer) {
+                    child-&gt;prepareTreeImpl(observer, info, functorsNeedLayer);
+                });
+        ...
+    }
+    ...
+}
+
+void RenderNode::pushStagingDisplayListChanges(TreeObserver&amp; observer, TreeInfo&amp; info) {
+    ...
+    syncDisplayList(observer, &amp;info);
+    ...
+}
+
+void RenderNode::syncDisplayList(TreeObserver&amp; observer, TreeInfo* info) {
+    ...
+    // 完成赋值同步DisplayList对象
+    mDisplayList = mStagingDisplayList;
+    mStagingDisplayList = nullptr;
+    ...
+}
+
+void CanvasContext::draw() {
+    ...
+    // 1.调用OpenGL库使用GPU，按照构建好的绘制命令完成界面的渲染
+    bool drew = mRenderPipeline-&gt;draw(frame, windowDirty, dirty, mLightGeometry, &amp;mLayerUpdateQueue,
+                                      mContentDrawBounds, mOpaque, mLightInfo, mRenderNodes,
+                                      &amp;(profiler()));
+    ...
+    // 2.将前面已经绘制渲染好的图形缓冲区Binder上帧给SurfaceFlinger合成和显示
+    bool didSwap =
+            mRenderPipeline-&gt;swapBuffers(frame, drew, windowDirty, mCurrentFrameInfo, &amp;requireSwap);
+    ...
+}</code></pre> 
+<p>从以上代码可以看出：<code>UI</code>线程利用<code>RenderProxy</code>向<code>RenderThread</code>线程发送一个<code>DrawFrameTask</code>任务请求，<strong><code>RenderThread</code>被唤醒，开始渲染，大致流程如下</strong>：</p> 
+<ol><li><code>syncFrameState</code>中遍历<code>View</code>树上每一个<code>RenderNode</code>，执行<code>prepareTreeImpl</code>函数，实现同步绘制命令树的操作；</li><li>调用<code>OpenGL</code>库<code>API</code>使用<code>GPU</code>，按照构建好的绘制命令完成界面的渲染（具体过程，由于本文篇幅所限，暂不展开分析）；</li><li>将前面已经绘制渲染好的图形缓冲区<code>Binder</code>上帧给<code>SurfaceFlinger</code>合成和显示；</li></ol> 
+<p>整个过程可以用如下流程图表示：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="885" src="https://images2.imgbox.com/43/49/U0l5xnak_o.png" width="1200"></p> 
+<p> 从systrace上这个过程如下图所示：</p> 
+<p class="img-center"><img alt="" height="601" src="https://images2.imgbox.com/37/06/Ygfa5P2N_o.png" width="1200"></p> 
+<h2>9. SurfaceFlinger合成显示</h2> 
+<p><code>SurfaceFlinger</code>合成显示部分完全属于<code>Android</code>系统<code>GUI</code>中图形显示的内容，逻辑结构也比较复杂，但不属于本文介绍内容的重点。所以本小节中只是总体上介绍一下其工作原理与思想，不再详细分析源码，感兴趣的读者可以关注笔者后续的文章再来详细分析讲解。简单的说<code>SurfaceFlinger</code>作为系统中独立运行的一个<code>Native</code>进程，<strong>借用<code>Android</code>官网的描述，其职责就是负责接受来自多个来源的数据缓冲区，对它们进行合成，然后发送到显示设备。</strong>如下图所示：</p> 
+<p class="img-center"><img alt="" height="262" src="https://images2.imgbox.com/b9/6d/38PM4GC6_o.png" width="537"></p> 
+<p>从上图可以看出，其实<code>SurfaceFlinger</code>在<code>Android</code>系统的整个图形显示系统中是起到一个<strong>承上启下的作用</strong>：</p> 
+<p></p> 
+<ul><li><strong>对上</strong>：通过Surface与不同的应用进程建立联系，接收它们写入Surface中的绘制缓冲数据，对它们进行统一合成。</li><li><strong>对下</strong>：通过屏幕的后缓存区与屏幕建立联系，发送合成好的数据到屏幕显示设备。</li></ul> 
+<p>图形的传递是通过<code>Buffer</code>作为载体，<code>Surface</code>是对<code>Buffer</code>的进一步封装，也就是说<code>Surface</code>内部具有多个<code>Buffer</code>供上层使用，如何管理这些<code>Buffer</code>呢？答案就是<code>BufferQueue</code> ，下面我们来看看<code>BufferQueue</code>的工作原理：</p> 
+<h3>9.1 BufferQueue机制</h3> 
+<p>借用一张经典的图来描述<code>BufferQueue</code>的工作原理：</p> 
+<p class="img-center"><img alt="" height="149" src="https://images2.imgbox.com/e9/dc/NATJLT5m_o.png" width="481"></p> 
+<p><code>BufferQueue</code>是一个<strong>典型的生产者-消费者模型中的数据结构</strong>。在<code>Android</code>应用的渲染流程中，应用扮演的就是“生产者”的角色，而<code>SurfaceFlinger</code>扮演的则是“消费者”的角色，<strong>其配合工作的流程如下</strong>：</p> 
+<p></p> 
+<ol><li>应用进程中在开始界面的绘制渲染之前，需要通过<code>Binder</code>调用<code>dequeueBuffer</code>接口从<code>SurfaceFlinger</code>进程中管理的<code>BufferQueue</code> 中申请一张处于<code>free</code>状态的可用<code>Buffer</code>，如果此时没有可用<code>Buffer</code>则阻塞等待；</li><li>应用进程中拿到这张可用的<code>Buffer</code>之后，选择使用<code>CPU</code>软件绘制渲染或<code>GPU</code>硬件加速绘制渲染，渲染完成后再通过<code>Binder</code>调用<code>queueBuffer</code>接口将缓存数据返回给应用进程对应的<code>BufferQueue</code>（如果是 <code>GPU</code> 渲染的话，这里还有个 <code>GPU</code>处理的过程，所以这个 <code>Buffer</code> 不会马上可用，需要等 <code>GPU</code> 渲染完成的<code>Fence</code>信号），并申请<code>sf</code>类型的<code>Vsync</code>以便唤醒“消费者”<code>SurfaceFlinger</code>进行消费；</li><li><code>SurfaceFlinger</code> 在收到 <code>Vsync</code> 信号之后，开始准备合成，使用 <code>acquireBuffer</code>获取应用对应的 <code>BufferQueue</code> 中的 <code>Buffer</code> 并进行合成操作；</li><li>合成结束后，<code>SurfaceFlinger</code> 将通过调用 <code>releaseBuffer</code>将 <code>Buffer</code> 置为可用的<code>free</code>状态，返回到应用对应的 <code>BufferQueue</code>中。</li></ol> 
+<h3>9.2 Vsync同步机制</h3> 
+<p><code>Vysnc</code>垂直同步是<code>Android</code>在“黄油计划”中引入的一个重要机制，本质上是为了协调<code>BufferQueue</code>的应用生产者生成UI数据动作和<code>SurfaceFlinger</code>消费者的合成消费动作，避免出现画面撕裂的<code>Tearing</code>现象。<code>Vysnc</code>信号分为两种类型：</p> 
+<ol><li><code>app</code>类型的<code>Vsync</code>：<strong><code>app</code>类型的<code>Vysnc</code>信号由上层应用中的<code>Choreographer</code>根据绘制需求进行注册和接收，用于控制应用UI绘制上帧的生产节奏</strong>。根据第7小结中的分析：应用在UI线程中调用invalidate刷新界面绘制时，需要先透过<code>Choreographer</code>向系统申请注册app类型的<code>Vsync</code>信号，待<code>Vsync</code>信号到来后，才能往主线程的消息队列放入待绘制任务进行真正UI的绘制动作；</li><li><code>sf</code>类型的<code>Vsync</code>:<strong><code>sf</code>类型的<code>Vsync</code>是用于控制<code>SurfaceFlinger</code>的合成消费节奏</strong>。应用完成界面的绘制渲染后，通过<code>Binder</code>调用<code>queueBuffer</code>接口将缓存数据返还给应用对应的<code>BufferQueue</code>时，会申请<code>sf</code>类型的<code>Vsync</code>，待<code>SurfaceFlinger</code> 在其UI线程中收到 <code>Vsync</code> 信号之后，便开始进行界面的合成操作。</li></ol> 
+<p><code>Vsync</code>信号的生成是参考屏幕硬件的刷新周期的，其架构如下图所示：</p> 
+<p class="img-center"><img alt="" height="239" src="https://images2.imgbox.com/f3/e0/KuDJfBm0_o.png" width="582"></p> 
+<p> 本小节所描述的流程，从systrace上看<code>SurfaceFlinger</code>处理应用上帧工作的流程如下图所示：</p> 
+<p class="img-center"><img alt="" height="1141" src="https://images2.imgbox.com/82/a7/Q9J4Ww48_o.png" width="856"></p> 
+<p class="img-center"><img alt="" height="704" src="https://images2.imgbox.com/49/24/wzDklfIN_o.png" width="1200"></p> 
+<h2>10.写在最后</h2> 
+<p>至此，本文结合源码和systrace完整的分析了从用户手指点击桌面上的应用图标到屏幕上显示出应用主<code>Activity</code>界面第一帧画面的完整流程，这其中涉及了<code>App</code>应用、<code>system_server</code>框架、<code>Art</code>虚拟机、<code>surfaceflinger</code>等一系列<code>Android</code>系统核心模块的相互配合，有很多的细节也由于篇幅所限无法完全展开分析，感兴趣的读者可以结合AOSP源码继续深入分析。而优化应用启动打开的速度这个系统核心用户体验的指标，也是多少年来谷歌、<code>SOC</code>芯片厂商、<code>ODM</code>手机厂商以及各个应用开发者共同努力优化的方向：</p> 
+<ul><li><strong>对于<code>SOC</code>芯片厂商而言</strong>：需要不断升级<code>CPU</code>和<code>GPU</code>的硬件算力；</li><li><strong>对于<code>Android</code>系统的维护者谷歌而言</strong>：在Android系统大版本升级过程中，不断的优化应用启动过程上的各个系统流程，比如进程创建的速度优化、<code>Art</code>虚拟机的引入与性能优化、View绘制流程的简化、硬件绘制加速机制的引入、系统核心AMS、WMS等核心服务的锁优化等；</li><li><strong>对于各个<code>ODM</code>手机厂商而言</strong>：会开发识别应用启动的场景，进行针对性的CPU主频的拉升调节、触控响应速度的优化等机制；</li><li><strong>对于各个应用开发者而言</strong>：会结合自己的业务对应用启动的场景进行优化，比如尽量减少或推迟在<code>Application</code>、<code>Activity</code>生命周期函数中的初始化逻辑、去除界面布局的过度绘制、异步化的布局<code>XML</code>文件解析等机制。</li></ul> 
+<p>本文只是分析了应用启动一般性流程，至于如何去优化应用启动的速度，可以关注笔者后续文章的更新，而本文则可以作为应用启动优化课题的一个基础认知。最后用一张流程图来概述一下应用启动流程的全貌：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1200" src="https://images2.imgbox.com/4f/2c/y94QNwab_o.png" width="1200"></p> 
+<p></p> 
+<h2>11.参考</h2> 
+<p>Systrace 流畅性实战 1 ：了解卡顿原理 <a href="https://links.jianshu.com/go?to=https%3A%2F%2Fwww.androidperformance.com%2F2021%2F04%2F24%2Fandroid-systrace-smooth-in-action-1%2F" rel="nofollow" title="https://www.androidperformance.com/2021/04/24/android-systrace-smooth-in-action-1/">https://www.androidperformance.com/2021/04/24/android-systrace-smooth-in-action-1/</a><br> 史上最全Android渲染机制讲解（长文源码深度剖析）<a href="https://links.jianshu.com/go?to=https%3A%2F%2Fmp.weixin.qq.com%2Fs%3F__biz%3DMzU2MTk0ODUxOQ%3D%3D%26mid%3D2247483782%26idx%3D1%26sn%3Df9eae167b217c83036b3a24cd4182cd1%26chksm%3Dfc71b38ecb063a9847f4518802fc541091d7f708b112399ec39827e68a6f590249748d643747%26mpshare%3D1%26scene%3D1%26srcid%3D0224RGsfWeG5GyMpxLwEhx7N%26sharer_sharetime%3D1582507745901%26sharer_shareid%3D2d76fc4769fc55b6ca84ec3820ba5821%23rd" rel="nofollow" title="https://mp.weixin.qq.com/s?__biz=MzU2MTk0ODUxOQ==&amp;mid=2247483782&amp;idx=1&amp;sn=f9eae167b217c83036b3a24cd4182cd1&amp;chksm=fc71b38ecb063a9847f4518802fc541091d7f708b112399ec39827e68a6f590249748d643747&amp;mpshare=1&amp;scene=1&amp;srcid=0224RGsfWeG5GyMpxLwEhx7N&amp;sharer_sharetime=1582507745901&amp;sharer_shareid=2d76fc4769fc55b6ca84ec3820ba5821#rd">https://mp.weixin.qq.com/s?__biz=MzU2MTk0ODUxOQ==&amp;mid=2247483782&amp;idx=1&amp;sn=f9eae167b217c83036b3a24cd4182cd1&amp;chksm=fc71b38ecb063a9847f4518802fc541091d7f708b112399ec39827e68a6f590249748d643747&amp;mpshare=1&amp;scene=1&amp;srcid=0224RGsfWeG5GyMpxLwEhx7N&amp;sharer_sharetime=1582507745901&amp;sharer_shareid=2d76fc4769fc55b6ca84ec3820ba5821#rd</a><br> 理解Android硬件加速原理的小白文 <a href="https://www.jianshu.com/p/40f660e17a73" rel="nofollow" title="理解Android硬件加速原理的小白文 - 简书">理解Android硬件加速原理的小白文 - 简书</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/093f225b8eaf921f59c82dca0110527c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">python语言中“缩进”说法,python中的缩进规则</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/1b3934c75e6910ff847ad842e025bab9/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">WebRTC线程介绍</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

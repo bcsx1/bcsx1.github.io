@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【FPGA】 十二、Vivado DDS IP核实现扫频信号 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【FPGA】 十二、Vivado DDS IP核实现扫频信号" />
+<meta property="og:description" content="文章目录
+前言
+一、DDS IP核概述
+二、DDS IP核配置
+三、调用DDS IP核
+总结
+前言 在我前面的工程中，都是一些比较通用的设计工程，没有用到哪一家的IP核，所以代码具有很好的移植性；今天我就来讲一下基于Xilinx厂家的芯片做一期DDS的设计与验证，这里我所采用的EDA工具是Vivado 2018.3，里面集成了DDS的IP核，我们直接进行调用即可。
+Xilinx公司是FPGA的主要生产商，即使在现在的FPGA领域它都有着很大的话语权，目前市面上的FPGA芯片主要有Xilinx和Altera两家，其中Xilinx占据主导地位，其产品在各个方面的应用更是炉火纯青。我们都知道FPGA的优点是基于它的可编程性，使得其开发周期短，但为了提升FPGA开发的周期性，各家都提供了一些通用功能的IP核，包括固化在芯片内的硬IP核和可编程调用的软IP核，并在开发工具中提供了IP和的实例化和调用功能，下面我就在Vivado中调用DDS IP核来进行设计。 一、DDS IP核概述 上图是DDS IP核的方案图，从图中我们可以看到DDS IP核主要由5部分组成，其中DDS IP核的核心是相位累加器和LUT查找表，它们可以独立使用，也可与一个可选的相位发生器一起使用。相位累加器实现查找表地址的产生，LUT查找表用来存储输出波形。还有泰勒级数矫正模块和抖动产生器，用来改善SFDR。最两边是AXI4接口，是基于AXI4总线协议的接口模块，用来实现相位累加字配置，多通道配置以及相位累加器输出和sin/cos波形输出。
+二、DDS IP核配置 1、首先创建一个工程文件，然后点击IP Catalog，直接在搜索框中搜索DDS，创建DDS IP核。
+2、 然后双击DDS Compiler，进行DDS IP核的配置界面。
+DDS IP核可以配置成三种模式，分别是相位累加器和SIN/COS LUT模式、仅相位产生器模式、仅SIN/COS LUT模式；这里我们选择第一种相位累加器和SIN/COS LUT模式。
+输入时钟：根据系统时钟定，我这里选择100MHz
+通道数：我这里选择单通道
+参数选择有系统参数（System Parameter）和硬件参数（Hardware Parameter）两种，当选择系统参数时，需要根据频率位宽来计算SFDR和FR(频率控制字）；当选择硬件参数时，直接定义输出的相位宽度和频率宽度即可，我这里选择硬件参数，相位位宽是32位，频率位宽是8位。
+根据Xilinx官方手册，phase width(相位位宽)，Frequency Resolution(频率分辨率)，channels(通道数)，output width(输出波形位宽)，SFDR之间的对于关系为：
+关于output width的位宽不同，输出的数据格式如下：
+3、进入第二页配置界面，配置频率控制字、相位控制字和输出波形。
+由于在本次实验中需要连续输出不同的频率信号，达到一个扫频的目的，所以这里将频率可控制字和相位控制字都设置为可编程模式，输出的波形为正余弦波形。如果你想输出固定频率的波形，就可以选择锁定模式。这个根据实验要求进行更改即可。
+4、第三页和第四页本次实验没有要求，保持默认即可。在第四页，由于频率控制字是可编程的，在代码中会进行改变，这里就不用做任何处理。
+5、第5页就是配置的总览界面了，在这里你可以看到你所配置的信息，方便查看配置是否有问题。
+6、最后点击OK就生成DDS IP核了，然后就将DDS IP核例化到我们所设计的工程当中，就可以直接使用了。
+三、调用DDS IP核 调用DDS IP核实现扫频信号，我这里设计的扫频范围是1KHz--10KHz，通过控制频率控制字来更改输出的波形的频率，让其在1KHz到10KHz直接变化，又让其从10KHz变化到1KHz，展现在频域中是三角波的形式。
+1、顶层模块
+`timescale 1ns / 1ps // // // Create Date: 2023/03/16 09:54:38 // Design Name: 卡夫卡与海 // Module Name: DDS_top // Project Name: DDS顶层模块 // // // module DDS_top( input sys_clk ,//系统时钟 100MHz input sys_rst_n ,//系统复位 output m_data_tvalid ,//数据有效标志 output [7:0] m_data_sin ,//sin波形 output [7:0] m_data_cos //cos波形 ); //中间信号定义 wire s_phase_tvalid ;//相位有效标志 wire [31:0] s_phase_tdata ;//相位控制字 wire s_config_tvalid ;//频率有效标志 wire [31:0] s_config_tdata ;//频率控制字 wire m_phase_tvalid ;//输出相位有效标志 wire [31:0] m_phase_tdata ;//输出相位 wire [15:0] m_data_tdata ;//输出为16位，高8位是sin波形，低8位是cos波形 //assign m_data_sin = m_data_tdata[15:8]; //assign m_data_cos = m_data_tdata[7:0]; assign m_data_sin = {~m_data_tdata[15],m_data_tdata[14:8]};//将输出转为有符号数据输出 sin assign m_data_cos = {~m_data_tdata[7],m_data_tdata[6:0]} ;//将输出转为有符号数据输出 cos //模块例化 //DDS_IP模块 dds_compiler_0 u_dds_0 ( ." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5e2fa877c51791df609d694d12b3fea7/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-03-17T15:57:37+08:00" />
+<meta property="article:modified_time" content="2023-03-17T15:57:37+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【FPGA】 十二、Vivado DDS IP核实现扫频信号</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p><strong>文章目录</strong></p> 
+<p id="%E5%89%8D%E8%A8%80-toc" style="margin-left:0px;"><a href="#%E5%89%8D%E8%A8%80" rel="nofollow">前言</a></p> 
+<p id="%E4%B8%80%E3%80%81DDS%20IP%E6%A0%B8%E6%A6%82%E8%BF%B0-toc" style="margin-left:0px;"><a href="#%E4%B8%80%E3%80%81DDS%20IP%E6%A0%B8%E6%A6%82%E8%BF%B0" rel="nofollow">一、DDS IP核概述</a></p> 
+<p id="%E4%BA%8C%E3%80%81DDS%20IP%E6%A0%B8%E9%85%8D%E7%BD%AE-toc" style="margin-left:0px;"><a href="#%E4%BA%8C%E3%80%81DDS%20IP%E6%A0%B8%E9%85%8D%E7%BD%AE" rel="nofollow">二、DDS IP核配置</a></p> 
+<p id="%E4%B8%89%E3%80%81%E8%B0%83%E7%94%A8DDS%20IP%E6%A0%B8-toc" style="margin-left:0px;"><a href="#%E4%B8%89%E3%80%81%E8%B0%83%E7%94%A8DDS%20IP%E6%A0%B8" rel="nofollow">三、调用DDS IP核</a></p> 
+<p id="%E6%80%BB%E7%BB%93-toc" style="margin-left:0px;"><a href="#%E6%80%BB%E7%BB%93" rel="nofollow">总结</a></p> 
+<div></div> 
+<hr> 
+<h2 id="%E5%89%8D%E8%A8%80"><a id="_7"></a>前言</h2> 
+<blockquote> 
+ <p>    <span style="color:#0d0016;">在我前面的工程中，都是一些比较通用的设计工程，没有用到哪一家的IP核，所以代码具有很好的移植性；今天我就来讲一下基于Xilinx厂家的芯片做一期DDS的设计与验证，这里我所采用的EDA工具是Vivado 2018.3，里面集成了DDS的IP核，我们直接进行调用即可。</span></p> 
+ <p><span style="color:#0d0016;">        Xilinx公司是FPGA的主要生产商，即使在现在的FPGA领域它都有着很大的话语权，目前市面上的FPGA芯片主要有Xilinx和Altera两家，其中Xilinx占据主导地位，其产品在各个方面的应用更是炉火纯青。我们都知道FPGA的优点是基于它的可编程性，使得其开发周期短，但为了提升FPGA开发的周期性，各家都提供了一些通用功能的IP核，包括固化在芯片内的硬IP核和可编程调用的软IP核，并在开发工具中提供了IP和的实例化和调用功能，下面我就在Vivado中调用DDS IP核来进行设计。</span> </p> 
+</blockquote> 
+<hr> 
+<h2 id="%E4%B8%80%E3%80%81DDS%20IP%E6%A0%B8%E6%A6%82%E8%BF%B0"><strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">一、DDS IP核概述</strong></h2> 
+<p><img alt="" height="393" src="https://images2.imgbox.com/2f/7e/JloxA7Qy_o.png" width="662"></p> 
+<blockquote> 
+ <p>        <span style="color:#0d0016;"> 上图是DDS IP核的方案图，从图中我们可以看到DDS IP核主要由5部分组成，其中DDS IP核的核心是相位累加器和LUT查找表，它们可以独立使用，也可与一个可选的相位发生器一起使用。相位累加器实现查找表地址的产生，LUT查找表用来存储输出波形。还有泰勒级数矫正模块和抖动产生器，用来改善SFDR。最两边是AXI4接口，是基于AXI4总线协议的接口模块，用来实现相位累加字配置，多通道配置以及相位累加器输出和sin/cos波形输出。</span></p> 
+</blockquote> 
+<hr> 
+<h2 id="%E4%BA%8C%E3%80%81DDS%20IP%E6%A0%B8%E9%85%8D%E7%BD%AE">二、DDS IP核配置</h2> 
+<p><span style="color:#0d0016;">1、首先创建一个工程文件，然后点击IP Catalog，直接在搜索框中搜索DDS，创建DDS IP核。</span></p> 
+<p><img alt="" height="442" src="https://images2.imgbox.com/2e/b6/IPS6Cefd_o.png" width="801"></p> 
+<p><span style="color:#0d0016;">2、 然后双击DDS Compiler，进行DDS IP核的配置界面。</span></p> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/6a/c4/I3VbRXgn_o.png"></p> 
+<p><img alt="" src="https://images2.imgbox.com/b6/5b/paNdFv1e_o.png"> </p> 
+<blockquote> 
+ <p>         <span style="color:#0d0016;">DDS IP核可以配置成三种模式，分别是相位累加器和SIN/COS LUT模式、仅相位产生器模式、仅SIN/COS LUT模式；这里我们选择第一种相位累加器和SIN/COS LUT模式。</span></p> 
+ <p><span style="color:#0d0016;">        输入时钟：根据系统时钟定，我这里选择100MHz</span></p> 
+ <p><span style="color:#0d0016;">        通道数：我这里选择单通道</span></p> 
+ <p><span style="color:#0d0016;">        参数选择有系统参数（System Parameter）和硬件参数（Hardware Parameter）两种，当选择系统参数时，需要根据频率位宽来计算SFDR和FR(频率控制字）；当选择硬件参数时，直接定义输出的相位宽度和频率宽度即可，我这里选择硬件参数，相位位宽是32位，频率位宽是8位。</span></p> 
+</blockquote> 
+<blockquote> 
+ <p>        <span style="color:#0d0016;">根据Xilinx官方手册，phase width(相位位宽)，Frequency Resolution(频率分辨率)，channels(通道数)，output width(输出波形位宽)，SFDR之间的对于关系为：</span></p> 
+</blockquote> 
+<p> <img alt="" height="224" src="https://images2.imgbox.com/80/b3/NSemJz95_o.png" width="654"></p> 
+<blockquote> 
+ <p><span style="color:#0d0016;">         关于output width的位宽不同，输出的数据格式如下：</span></p> 
+</blockquote> 
+<p class="img-center"><img alt="" height="334" src="https://images2.imgbox.com/f5/42/qvMRGFrk_o.png" width="574"></p> 
+<p><span style="color:#0d0016;"> 3、进入第二页配置界面，配置频率控制字、相位控制字和输出波形。</span></p> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/df/1f/94TDLF2g_o.png"></p> 
+<blockquote> 
+ <p>        <span style="color:#0d0016;"> 由于在本次实验中需要连续输出不同的频率信号，达到一个扫频的目的，所以这里将频率可控制字和相位控制字都设置为可编程模式，输出的波形为正余弦波形。如果你想输出固定频率的波形，就可以选择锁定模式。这个根据实验要求进行更改即可。</span></p> 
+</blockquote> 
+<p><span style="color:#0d0016;">4、第三页和第四页本次实验没有要求，保持默认即可。在第四页，由于频率控制字是可编程的，在代码中会进行改变，这里就不用做任何处理。</span></p> 
+<p><span style="color:#0d0016;">5、第5页就是配置的总览界面了，在这里你可以看到你所配置的信息，方便查看配置是否有问题。</span></p> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/25/06/QxBGaESD_o.png"></p> 
+<p><span style="color:#0d0016;">6、最后点击OK就生成DDS IP核了，然后就将DDS IP核例化到我们所设计的工程当中，就可以直接使用了。</span></p> 
+<hr> 
+<h2 id="%E4%B8%89%E3%80%81%E8%B0%83%E7%94%A8DDS%20IP%E6%A0%B8">三、调用DDS IP核</h2> 
+<blockquote> 
+ <p>        调用DDS IP核实现扫频信号，我这里设计的扫频范围是1KHz--10KHz，通过控制频率控制字来更改输出的波形的频率，让其在1KHz到10KHz直接变化，又让其从10KHz变化到1KHz，展现在频域中是三角波的形式。</p> 
+</blockquote> 
+<p><span style="color:#0d0016;">1、顶层模块</span></p> 
+<pre><code class="language-cpp">`timescale 1ns / 1ps
+//
+// 
+// Create Date: 2023/03/16 09:54:38
+// Design Name: 卡夫卡与海
+// Module Name: DDS_top
+// Project Name: DDS顶层模块
+//
+// 
+//
+
+
+module DDS_top(
+    input            sys_clk       ,//系统时钟   100MHz
+    input            sys_rst_n     ,//系统复位
+    
+    output           m_data_tvalid ,//数据有效标志
+    output   [7:0]   m_data_sin    ,//sin波形
+    output   [7:0]   m_data_cos     //cos波形
+);
+
+//中间信号定义
+wire           s_phase_tvalid  ;//相位有效标志
+wire   [31:0]  s_phase_tdata   ;//相位控制字
+
+wire           s_config_tvalid ;//频率有效标志
+wire   [31:0]  s_config_tdata  ;//频率控制字
+
+wire           m_phase_tvalid  ;//输出相位有效标志
+wire   [31:0]  m_phase_tdata   ;//输出相位
+
+wire   [15:0]  m_data_tdata    ;//输出为16位，高8位是sin波形，低8位是cos波形
+//assign m_data_sin = m_data_tdata[15:8];
+//assign m_data_cos = m_data_tdata[7:0];
+
+assign m_data_sin = {~m_data_tdata[15],m_data_tdata[14:8]};//将输出转为有符号数据输出  sin
+assign m_data_cos = {~m_data_tdata[7],m_data_tdata[6:0]}  ;//将输出转为有符号数据输出  cos
+
+
+//模块例化
+//DDS_IP模块
+dds_compiler_0 u_dds_0 (
+  .aclk                    (sys_clk        ),// input wire aclk
+  .s_axis_phase_tvalid     (s_phase_tvalid ),// input wire s_axis_phase_tvalid
+  .s_axis_phase_tdata      (s_phase_tdata  ),// input wire [31 : 0] s_axis_phase_tdata
+  .s_axis_config_tvalid    (s_config_tvalid),// input wire s_axis_config_tvalid
+  .s_axis_config_tdata     (s_config_tdata ),// input wire [31 : 0] s_axis_config_tdata
+  .m_axis_data_tvalid      (m_data_tvalid  ),// output wire m_axis_data_tvalid
+  .m_axis_data_tdata       (m_data_tdata   ),// output wire [15 : 0] m_axis_data_tdata
+  .m_axis_phase_tvalid     (m_phase_tvalid ),// output wire m_axis_phase_tvalid
+  .m_axis_phase_tdata      (m_phase_tdata  ) // output wire [31 : 0] m_axis_phase_tdata
+);
+
+//控制模块
+dds_control u_dds_control(
+    .clk             (sys_clk        ),//时钟
+    .rst_n           (sys_rst_n      ),//复位
+    
+    .phase_valid     (s_phase_tvalid ),//相位有效标志
+    .phase_data      (s_phase_tdata  ),//相位控制字
+    .config_valid    (s_config_tvalid),//频率有效标志
+    .config_data     (s_config_tdata ) //频率控制字
+);
+
+
+endmodule</code></pre> 
+<p><span style="color:#0d0016;">2、DDS IP核控制模块：控制频率控制字的变化</span></p> 
+<pre><code class="language-bash">`timescale 1ns / 1ps
+//
+// 
+// Create Date: 2023/03/16 10:26:29
+// Design Name: 卡夫卡与海
+// Module Name: dds_control
+// Project Name: DDS控制模块
+// 
+// 
+//
+
+
+module dds_control(
+    input             clk          ,//时钟
+    input             rst_n        ,//复位
+    
+    output            phase_valid  ,//相位有效标志
+    output   [31:0]   phase_data   ,//相位控制字
+    output            config_valid ,//频率有效标志
+    output   [31:0]   config_data   //频率控制字
+);
+
+//参数定义
+parameter F_word_1KHz   = 32'hA7C5  ;//1KHz频率控制字 M = 1_000*2^32/100_000_000
+parameter F_word_10KHz  = 32'h68DB8 ;//10KHz频率控制字 M = 10_000*2^32/100_000_000
+parameter F_word_change = 32'h1     ;//1KHz-10KHz变化精度
+
+//信号定义
+reg    [31:0]    config_data_reg    ;//频率控制字寄存器
+
+reg              max_flag           ;//当频率控制字最大时，拉高
+
+//max_flag
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        max_flag &lt;= 1'b0;
+    end
+    else if(config_data_reg &gt;= F_word_10KHz)begin
+        max_flag &lt;= 1'b1;
+    end
+    else if(config_data_reg == F_word_1KHz)begin
+        max_flag &lt;= 1'b0;
+    end
+end
+
+
+//控制频率控制字均匀变化
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        config_data_reg &lt;= F_word_1KHz;
+    end
+    else if(max_flag == 1'b1)begin
+        config_data_reg &lt;= config_data_reg - F_word_change;
+    end
+    else begin
+        config_data_reg &lt;= config_data_reg + F_word_change;
+    end
+end
+
+//输出
+assign phase_valid = 1'b1;
+assign phase_data = 32'h0;//设置相位控制字为0
+assign config_valid = 1'b1;
+assign config_data = config_data_reg;
+
+
+endmodule</code></pre> 
+<p><span style="color:#0d0016;">3、仿真模块</span></p> 
+<pre><code class="language-bash">`timescale 1ns / 1ps
+//
+// 
+// Create Date: 2023/03/16 14:04:09
+// Design Name: 卡夫卡与海
+// Module Name: DDS_top_tb
+// 
+// 
+//
+
+
+module DDS_top_tb();
+reg            sys_clk       ;
+reg            sys_rst_n     ;
+
+wire           m_data_tvalid ;
+wire   [7:0]   m_data_sin    ;
+wire   [7:0]   m_data_cos    ;
+
+//模块例化
+ DDS_top u_DDS_top(
+   .sys_clk         (sys_clk      ),//系统时钟   100MHz
+   .sys_rst_n       (sys_rst_n    ),//系统复位
+    
+   .m_data_tvalid   (m_data_tvalid),//数据有效标志
+   .m_data_sin      (m_data_sin   ),//sin波形
+   .m_data_cos      (m_data_cos   ) //cos波形
+);
+
+//产生激励
+initial begin
+    sys_clk = 1'b0;
+    sys_rst_n = 1'b0;
+    #20;
+    sys_rst_n = 1'b1;
+    
+    #20000000;
+    $stop;
+end
+
+always #5 sys_clk = ~sys_clk;
+
+
+endmodule</code></pre> 
+<p><span style="color:#0d0016;">4、仿真波形如下：</span></p> 
+<p><img alt="" height="457" src="https://images2.imgbox.com/90/ca/oTlDiodz_o.png" width="1200"></p> 
+<blockquote> 
+ <p>        <span style="color:#0d0016;">通过仿真波形，可以看到生成了一个连续变化的正弦波和余弦波，并且波形由慢到快再由快到慢，成周期性变化，满足设计要求。 </span></p> 
+</blockquote> 
+<h3></h3> 
+<hr> 
+<h2 id="%E6%80%BB%E7%BB%93"><a id="_45"></a>总结</h2> 
+<blockquote> 
+ <p>        DDS IP核的配置还是比较简单的，在使用封装好的IP核时，不论是Xilinx的还是Altera的，看官方手册还是很重要的，只不过是纯英文的，但是可以提升我们的英文阅读能力嘛！当你阅读了很多IP核的手册过后，你就会发现那些手册的排版基本上都是差不多的，这样阅读起来也就没那么费劲了。</p> 
+</blockquote>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/fe5b1b2df6d9397d15a5f604cef1dacc/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Centos镜像国内最全下载地址</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/31a2706418e8401b0bc6f1633b5b5546/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Unity 优化之灯光</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

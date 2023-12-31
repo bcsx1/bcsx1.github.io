@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>使用Elasticsearch，Kafka和Cassandra构建流式数据中心 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="使用Elasticsearch，Kafka和Cassandra构建流式数据中心" />
+<meta property="og:description" content="在过去的一年里，我遇到了一些软件公司讨论如何处理应用程序的数据（通常以日志和metrics的形式）。在这些讨论中，我经常会听到挫折感，他们不得不用一组零碎的工具，随着时间的推移将这些数据汇总起来。这些工具，如： - 运维人员使用的，用于监控和告警的工具 - 开发人员用于跟踪性能和定位问题的工具 - 一个完整独立的系统，商业智能(BI)和业务依赖其分析用户行为
+虽然这些工具使用不同的视角，适用不同的场景，但是他们同样都是关注数据来源和类型。因此，许多软件团队说，“如果时间充裕，我们可以建立一个更好的”，坦率地说，现在有很多出色的开源代码，自己重头建立一套是否更有意义值得商榷。在Jut我们就是这样做的。我们使用开源的大数据组件建立了一个流式数据分析系统，这篇文章描述了我们使用的片段以及我们如何把它们组合在一起。我们将介绍： - 数据摄取：如何引入不同类型的数据流 - 索引及保存数据：高效存储以及统一查询 - 串联：系统中的数据流过程 - 调优：让整个过程真正的快速，用户才会真的使用它
+我希望通过阅读这篇文章将有助于您的系统在一个理智的，可扩展的方式避免一些我们遇到的陷阱。
+数据摄取 当涉及到业务分析和监控，大部分相关的数据类型，格式和传输协议并不是固定的。你需要能够支持系统不同的数据来源和数据发送者。例如，您的数据可能包括下列任何一种： - 自定义的应用程序事件。 - 容器级指标和日志。 - statsd或收集的度量指标。 - 来自第三方的webhook事件，像GitHub或Stripe。 - 应用程序或服务器日志。 - 用户行为。
+虽然这些都有不同的格式和象征，他们在系统内部需要一个统一的格式。无论你选择哪一个格式，你都需要对输入的数据流做转换。
+我们选择了简单灵活的数据格式：每个记录（“点”）是一系列的键/值对，它可以方便地表示为一个JSON对象。所有的点都有一个“时间”字段，度量点也有一个数值型的“值”字段；其他点可以有任何的“形状”。前端HTTPS服务器（运行Nginx）接收数据，多路分配并发送到本地的每个数据类型“连接器”进程（运行Node.js）。这些进程将传入的数据转换为系统的内部格式，然后将它们发布到一个Kafka topic（可靠性），从中，它们可以被用于索引和/或处理。
+除了上面的数据类型，多考虑使用连接器，能使您自己的团队最容易将输入数据整合到您的数据总线。你可能不需要太多我在这里描述的通用性或灵活性，但设计一些灵活性总是好的，这使你系统能够摄取更多的数据类型，防止以后新数据到来要重新建造。
+索引及保存数据 所有这些数据都需要保存在某个地方。最好在一个数据库中，当您的数据需要的增长时，将很容易扩展。并且如果该数据库提供对分析类型的查询方式支持，那最好不过了。如果这个数据中心只是为了存储日志和事件，那么你可以选择Elasticsearch。如果这只是关于度量指标，你可以选择一个时间序列数据库（TSDB）。但是我们都需要处理。我们最终建立了一个系统，有多个本地数据存储，以便我们能够最有效地处理不同类型的数据。
+ElasticSearch保存日志以及Events 我们使用Elasticsearch作为事件数据库。这些事件可以有不同的“形状”，这取决于他们来自哪一个来源。我们使用了一些Elasticsearch API，效果很好，特别是查询和聚合API。
+Cassandra和ElasticSearch保存Metrics 而metrics，原则上，是完全存储在Elasticsearch（或任何其他数据库），使用一个专门的匹配metrics数据结构以及metrics冗余数据的数据库将更有效。
+最好的方法是使用现有的开源时间序列数据库（TSDB）。我们最初是这么使用的 —— 我使用开源TSDB并使用Cassandra作为后端。这种方法的挑战是，TSDB有自己的查询API，它不同于Elasticsearch的API。由于API之间的不同，为事件和指标提供一个统一的搜索和查询界面是很难的。
+这就是为什么我们最终决定写自己的TSDB，通过Casandra和Elasticsearch存储metrics。具体来说，我们在Cassandra中存储的时间/值的键值对，在Elasticsearch中存储元数据，并在顶部有一个查询和管理层。这样，搜索和查询事件以及metrics可以统一在Elasticsearch做。
+流式处理引擎 那么现在我们有一个摄取数据的途径和一些数据库。我们是否可以准备添加前端应用程序并使用我们的数据？并没有！尽管Elasticsearch本身可以做一些日志和事件分析，我们仍然还需要一个处理引擎。因为： - 我们需要一个统一的方式来访问事件和指标，包括实时或历史的数据。 - 对于某些情况（监控、报警），当它发生时，我们需要实时处理这些数据。 - 度量指标！我们想要做的不只是寻找度量指标并读出来 - 度量指标是为了优化现有的度量。 - 即使是事件，我们需要一个比Elasticsearch API更通用的处理能力。例如，join不同的来源和数据，或做字符串解析，或自定义聚合。
+从这里开始，事情变得非常有趣。你可以花一天（或更多）研究别人是如何建立数据管道，了解Lambda，Kappa等数据架构。实际上有很多非常好的资料在那里。我们就开门见山：我们达到的效果，是一个支持实时数据流和批处理计算的处理引擎。在这方面，我们完全支持，有兴趣的可以看这里以及这里
+在这里，不同于存储和摄取，我们从头建立了自己的处理引擎，- 不是因为没有其他的流处理引擎，而是由于我们看重查询的性能，我们将在下面的部分单独讨论。更具体地说，我们建立了一个流处理引擎，实现了数据流处理模型，计算表示被表示为一系列操作的有向图，将输入转化为输出的，这些操作包括聚合，窗口，过滤或join。这能很自然的将模型的查询和计算组合起来，适合实时和批量，且适合分布式运行。
+当然，除非你真的在寻找建立一个新的项目，然而我们推荐你使用一个开源的流处理引擎。我们建议你看看Riemann， Spark Streaming或者Apache Flink。
+查询和计算 我们使用流处理引擎，基于数据流模型的计算。但用户如何表达查询和创建这样的数据流图？一个方法是提供一个API或嵌入式DSL。该接口将需要提供查询和筛选数据、定义转换和其他处理操作的方法，而且最重要的是，提供一种将多个处理阶段组合并应用到流图的方法。上述每一个项目都有自己的API，而个人的偏好可能有所不同，API常见的一个挑战是，SQL分析师或Excel用户无法方便的使用。
+一个可能的解决问题的方案，在这一点上，可以让这些用户通过基于这些API构建的工具来访问系统（例如，一个简单的web应用程序）。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/3a7946b9accd11612f4b710823955476/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2015-12-03T21:08:22+08:00" />
+<meta property="article:modified_time" content="2015-12-03T21:08:22+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">使用Elasticsearch，Kafka和Cassandra构建流式数据中心</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>在过去的一年里，我遇到了一些软件公司讨论如何处理应用程序的数据（通常以日志和metrics的形式）。在这些讨论中，我经常会听到挫折感，他们不得不用一组零碎的工具，随着时间的推移将这些数据汇总起来。这些工具，如： <br> - 运维人员使用的，用于监控和告警的工具 <br> - 开发人员用于跟踪性能和定位问题的工具 <br> - 一个完整独立的系统，商业智能(BI)和业务依赖其分析用户行为</p> 
+<p>虽然这些工具使用不同的视角，适用不同的场景，但是他们同样都是关注数据来源和类型。因此，许多软件团队说，“如果时间充裕，我们可以建立一个更好的”，坦率地说，现在有很多出色的开源代码，自己重头建立一套是否更有意义值得商榷。在Jut我们就是这样做的。我们使用开源的大数据组件建立了一个流式数据分析系统，这篇文章描述了我们使用的片段以及我们如何把它们组合在一起。我们将介绍： <br> - 数据摄取：如何引入不同类型的数据流 <br> - 索引及保存数据：高效存储以及统一查询 <br> - 串联：系统中的数据流过程 <br> - 调优：让整个过程真正的快速，用户才会真的使用它</p> 
+<p>我希望通过阅读这篇文章将有助于您的系统在一个理智的，可扩展的方式避免一些我们遇到的陷阱。</p> 
+<p><img src="https://images2.imgbox.com/05/c6/0ONHFj04_o.png" alt="enter image description here" title=""></p> 
+<h4 id="数据摄取">数据摄取</h4> 
+<p>当涉及到业务分析和监控，大部分相关的数据类型，格式和传输协议并不是固定的。你需要能够支持系统不同的数据来源和数据发送者。例如，您的数据可能包括下列任何一种： <br> - 自定义的应用程序事件。 <br> - 容器级指标和日志。 <br> - statsd或收集的度量指标。 <br> - 来自第三方的webhook事件，像GitHub或Stripe。 <br> - 应用程序或服务器日志。 <br> - 用户行为。</p> 
+<p>虽然这些都有不同的格式和象征，他们在系统内部需要一个统一的格式。无论你选择哪一个格式，你都需要对输入的数据流做转换。</p> 
+<p>我们选择了简单灵活的数据格式：每个记录（“点”）是一系列的键/值对，它可以方便地表示为一个JSON对象。所有的点都有一个“时间”字段，度量点也有一个数值型的“值”字段；其他点可以有任何的“形状”。前端HTTPS服务器（运行Nginx）接收数据，多路分配并发送到本地的每个数据类型“连接器”进程（运行Node.js）。这些进程将传入的数据转换为系统的内部格式，然后将它们发布到一个Kafka topic（可靠性），从中，它们可以被用于索引和/或处理。</p> 
+<p>除了上面的数据类型，多考虑使用连接器，能使您自己的团队最容易将输入数据整合到您的数据总线。你可能不需要太多我在这里描述的通用性或灵活性，但设计一些灵活性总是好的，这使你系统能够摄取更多的数据类型，防止以后新数据到来要重新建造。</p> 
+<h4 id="索引及保存数据">索引及保存数据</h4> 
+<p>所有这些数据都需要保存在某个地方。最好在一个数据库中，当您的数据需要的增长时，将很容易扩展。并且如果该数据库提供对分析类型的查询方式支持，那最好不过了。如果这个数据中心只是为了存储日志和事件，那么你可以选择Elasticsearch。如果这只是关于度量指标，你可以选择一个时间序列数据库（TSDB）。但是我们都需要处理。我们最终建立了一个系统，有多个本地数据存储，以便我们能够最有效地处理不同类型的数据。</p> 
+<h5 id="elasticsearch保存日志以及events">ElasticSearch保存日志以及Events</h5> 
+<p>我们使用Elasticsearch作为事件数据库。这些事件可以有不同的“形状”，这取决于他们来自哪一个来源。我们使用了一些Elasticsearch API，效果很好，特别是查询和聚合API。</p> 
+<h5 id="cassandra和elasticsearch保存metrics">Cassandra和ElasticSearch保存Metrics</h5> 
+<p>而metrics，原则上，是完全存储在Elasticsearch（或任何其他数据库），使用一个专门的匹配metrics数据结构以及metrics冗余数据的数据库将更有效。</p> 
+<p>最好的方法是使用现有的开源时间序列数据库（TSDB）。我们最初是这么使用的 —— 我使用开源TSDB并使用Cassandra作为后端。这种方法的挑战是，TSDB有自己的查询API，它不同于Elasticsearch的API。由于API之间的不同，为事件和指标提供一个统一的搜索和查询界面是很难的。</p> 
+<p>这就是为什么我们最终决定写自己的TSDB，通过Casandra和Elasticsearch存储metrics。具体来说，我们在Cassandra中存储的时间/值的键值对，在Elasticsearch中存储元数据，并在顶部有一个查询和管理层。这样，搜索和查询事件以及metrics可以统一在Elasticsearch做。</p> 
+<h4 id="流式处理引擎">流式处理引擎</h4> 
+<p>那么现在我们有一个摄取数据的途径和一些数据库。我们是否可以准备添加前端应用程序并使用我们的数据？并没有！尽管Elasticsearch本身可以做一些日志和事件分析，我们仍然还需要一个处理引擎。因为： <br> - 我们需要一个统一的方式来访问事件和指标，包括实时或历史的数据。 <br> - 对于某些情况（监控、报警），当它发生时，我们需要实时处理这些数据。 <br> - 度量指标！我们想要做的不只是寻找度量指标并读出来 - 度量指标是为了优化现有的度量。 <br> - 即使是事件，我们需要一个比Elasticsearch API更通用的处理能力。例如，join不同的来源和数据，或做字符串解析，或自定义聚合。</p> 
+<p>从这里开始，事情变得非常有趣。你可以花一天（或更多）研究别人是如何建立数据管道，了解Lambda，Kappa等数据架构。实际上有很多非常好的资料在那里。我们就开门见山：我们达到的效果，是一个支持实时数据流和批处理计算的处理引擎。在这方面，我们完全支持，有兴趣的可以看<a href="http://radar.oreilly.com/2014/07/questioning-the-lambda-architecture.html" rel="nofollow">这里</a>以及<a href="http://radar.oreilly.com/2015/08/the-world-beyond-batch-streaming-101.html" rel="nofollow">这里</a></p> 
+<p><img src="https://images2.imgbox.com/22/ca/QSjadkqr_o.png" alt="Flow graph" title=""></p> 
+<p>在这里，不同于存储和摄取，我们从头建立了自己的处理引擎，- 不是因为没有其他的流处理引擎，而是由于我们看重查询的性能，我们将在下面的部分单独讨论。更具体地说，我们建立了一个流处理引擎，实现了数据流处理模型，计算表示被表示为一系列操作的有向图，将输入转化为输出的，这些操作包括聚合，窗口，过滤或join。这能很自然的将模型的查询和计算组合起来，适合实时和批量，且适合分布式运行。</p> 
+<p>当然，除非你真的在寻找建立一个新的项目，然而我们推荐你使用一个开源的流处理引擎。我们建议你看看<a href="http://riemann.io/" rel="nofollow">Riemann</a>， <a href="http://spark.apache.org/streaming/" rel="nofollow">Spark Streaming</a>或者<a href="https://flink.apache.org/" rel="nofollow">Apache Flink</a>。</p> 
+<h4 id="查询和计算">查询和计算</h4> 
+<p>我们使用流处理引擎，基于数据流模型的计算。但用户如何表达查询和创建这样的数据流图？一个方法是提供一个API或嵌入式DSL。该接口将需要提供查询和筛选数据、定义转换和其他处理操作的方法，而且最重要的是，提供一种将多个处理阶段组合并应用到流图的方法。上述每一个项目都有自己的API，而个人的偏好可能有所不同，API常见的一个挑战是，SQL分析师或Excel用户无法方便的使用。</p> 
+<p>一个可能的解决问题的方案，在这一点上，可以让这些用户通过基于这些API构建的工具来访问系统（例如，一个简单的web应用程序）。</p> 
+<p>另一种方法是提供一个简单的查询语言。这是我们<a href="http://www.jut.io/" rel="nofollow">Jut</a>在做的。因为目前没有现有的数据流的查询语言（如SQL之于关系查询），我们创建了一个数据流查询语言称为Juttle。它的核心，Juttle的流图查询语言可以用简单的语法，声明处理管道，如上图所示。它具有这些原语，search，window，join，aggregation和group-by，语法简单。当然，在处理一个流程图数据之前，你需要取得到数据 - Juttle允许您定义查询获取数据，通过事件和/或度量的任何组合，实时和/或历史的，都具有相同的语法和结构。下面是一个简单的例子，遵循一个模式…</p> 
+<pre class="prettyprint"><code class=" hljs smalltalk">query <span class="hljs-localvars">| analyze | view</span></code></pre> 
+<p>（注意链接使用管道操作符，语法类似shell）。</p> 
+<pre class="prettyprint"><code class=" hljs applescript"><span class="hljs-command">read</span> -<span class="hljs-keyword">from</span> :<span class="hljs-number">1</span> <span class="hljs-property">day</span> ago: data_type = 'web_log'
+
+| reduce -<span class="hljs-keyword">every</span> :minute: <span class="hljs-command">count</span>() <span class="hljs-keyword">by</span> status_code
+
+| @timechart</code></pre> 
+<h4 id="拼在一起一个异常检测的例子">拼在一起：一个异常检测的例子</h4> 
+<p>到目前为止，我们已经采取了一个组件为中心的视角-我们已经讨论了组成成分和它们的作用，但没怎么提到关于如何将它们组合在一起。现在我们将视角切换到以数据为中心，看看支持实时和历史查询需要哪些步骤。让我们使用一个异常检测算法的实例来解说。这是一个很好的例子，因为我们需要查询历史数据来训练潜在的统计模型，实时流数据来测试异常，然后我们需要把结果写回系统，同时异常告警。</p> 
+<p>但是，在我们做任何查询之前，我们需要串联下摄取的整个过程，传入的数据是如何写入索引存储。这是由import服务完成的，服务完成了包括写入时间序列数据库，将指标数据和元数据存储在Elasticsearch和Cassandra。</p> 
+<p><img src="https://images2.imgbox.com/db/a4/pB1cYrRf_o.png" alt="Indexing incoming data" title=""></p> 
+<p>现在一个用户来了，启动了一个异常检测的job。这需要读取历史数据，通过任务处理引擎直接查询底层数据库来进行的。不同的查询和数据可以进一步做性能优化（下面讨论），和/或实施度量数据库的读取路径（查询Elasticsearch中的元数据，获取Cassandra中的度量值，并结合结果产生实际的度量点）。</p> 
+<p><img src="https://images2.imgbox.com/34/9a/mmW6JeGn_o.png" alt="Historical, live and write-back flows with an anomaly detection query." title=""></p> 
+<p>历史数据涵盖了一些过去范围内的数据，处理引擎将历史数据转换成流向图的实时数据。为了做到这一点，处理引擎直接将数据导入import服务的入口点。请注意，这种切换必须小心，以免数据丢弃或者数据重复。</p> 
+<p>在这一点上，我们有一个训练有素的异常检测流图运行在实时数据上。当检测到异常时，我们希望它将警报发送给一些外部的系统，这可以通过处理引擎向外部的HTTP服务POST数据。除了发送警报，我们还希望保持对内部系统的跟踪。换句话说，我们希望能够将数据流写回系统中。从概念上讲这是通过处理引擎管道返回数据到摄取途径。</p> 
+<h4 id="调优">调优</h4> 
+<p>那么我们已有了一个摄取数据的工作系统的和一些数据库以及处理引擎。我们可以准备添加前端应用程序并分析我们的数据了吗？还没有！</p> 
+<p>嗯，我们实际上可以这样做，但问题是我们的查询性能仍然会非常慢。而缓慢的查询意味着……没有人会使用我们的系统。</p> 
+<p>因此，让我们重新审视一下“统一处理引擎”的概念。按照我们的解释，它是同一个系统使用相同结构，抽象和查询来处理历史或实时的数据。</p> 
+<p>性能挑战来自于这样的一个事实，历史数据比实时数据要多的多。例如，假设我们有一百万点/秒的速度输入到系统，并有一个是足够快处理过程，可以在数据录入时进行实时查询。现在采取相同的查询语义查询过去一天的数据 - 这将需要一次性处理数百亿点（或者，至少，必须能跟的上从存储点读取的速度）。假设计算是分布式的，我们可以通过增加计算节点来解决，但在最好的情况下，这将是低效和昂贵的。</p> 
+<p>所以这就是优化的所在。有许多方法可以优化数据查询。其中一些包括对查询本身进行转换 - 例如，上游数据的filters或aggregations尽可能不改变查询语义。我们说的这种优化，是将数据的filter和处理尽量由数据库去做。这需要做以下的： <br> - 自动识别可以由数据库处理查询的部分 <br> - 将对应的部分转换成目标数据库的查询语言 <br> - 运行后端查询并将结果注入到数据流图的正确位置</p> 
+<h4 id="结语">结语</h4> 
+<p>我们做到了！当然，如果不需要一个可视化层，我们就完成了。只能通过API来查询系统。建立一个客户端应用程序来创建查询，流和可视化数据，组合仪表板是另外一个棘手的问题，所以我们将改天讨论这个。</p> 
+<p>现在，让我们来总结一下我们在建设这个数据中心过程中的所见所闻： <br> - 一个摄取途径，可以接受不同来源的输入数据，并将其转换为统一的格式，并储存起来供以后消费。（在Jut，这是基于Kafka建立的）。 <br> - 事件和度量的数据库。在Jut，Events使用Elasticsearch，自己构建的度量数据库则基于Cassandra。 <br> - 一个处理引擎（或是两个，如果你要用lambda ISH架构）。 <br> - 在系统上运行查询的API或查询语言。</p> 
+<p>唷。建立这套系统，是一个漫长而有趣的旅程。即便你要建立你自己的系统，可以先试试<a href="http://www.jut.io/" rel="nofollow">Jut</a>。你可能会觉得很好用。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/9bcfea154a79c86a2fb3fb74ddfd574c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">ajax请求中传递的参数中如果含有特殊字符怎么处理？</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/a0098e31a9dc301f969581cf843d9a97/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">inno使用常见问题</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ios中的锁 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ios中的锁" />
+<meta property="og:description" content="代码测试可参考，只有实际写过才能更好的理解：
+在平时开发中我们经常会使用多线程，多线程为我们带来了很大便利，也提高了程序的执行效率，但同时也带来数据风险：当至少有两个线程同时访问同一个变量，而且至少其中有一个是写操作时，就发生了Data race。所以这是就要利用一些同步机制来确保数据的准确性，锁就是同步机制中的一种。
+什么是锁？锁 – 是保证线程安全常见的同步工具。锁是一种非强制的机制，每一个线程在访问数据或者资源前，要先获取(Acquire) 锁，并在访问结束之后释放(Release)锁。如果锁已经被占用，其它试图获取锁的线程会等待，直到锁重新可用。
+怎么检测项目中的Data race？ 只需要在设置中勾选Thread Sanitizer 即可，顺便可以勾选Pause on issues 就可以断点到相应的代码。
+简单的性能测试 下图是针对iOS中的锁测试得出的，图中数字代表每次加解锁需要消耗的时间，单位为ns。
+值得注意的是：1.这个数字仅仅代表每次加解锁的耗时，并不能全方面的代表性能。2.不同的机型和系统，不同的循环次数可能结果会略微有些差异。
+但是还是可以看出@synchronized:是表现最差的。
+在具体说这些锁之前，先来说几个概念定义：
+临界区：指的是一块对公共资源进行访问的代码，并非一种机制或是算法。 通俗点理解, 就是一段代码.
+自旋锁：是用于多线程同步的一种锁，线程反复检查锁变量是否可用。由于线程在这一过程中保持执行，因此是一种忙等待。一旦获取了自旋锁，线程会一直保持该锁，直至显式释放自旋锁。自旋锁是比较耗费 cpu 的，然而在互斥临界区计算量较小的场景下，它的效率远高于其它的锁。因为它是一直处于 running 状态，减少了线程切换上下文的消耗。
+OSSpinLock（已废弃，不推荐，虽然效率最高，使用os_unfair_lock替代）
+互斥锁（Mutex）：在编程中，来保证共享数据操作的完整性。每个对象都对应于一个可称为 互斥锁 的标记，这个标记用来保证在任一时刻，只能有一个线程访问该对象。通过将代码切片成一个一个的临界区而达成.NSLock, NSConditionLock, NSRecursiveLock, NSCondition，pthread_mutex，@synchronized，os_unfair_lock
+读写锁：是计算机程序的并发控制的一种同步机制，也称“共享-互斥锁”、多读者-单写者锁) 用于解决多线程对公共资源读写问题。读操作可并发重入，写操作是互斥的。比如pthread_rwlock，读写锁通常用dispatch_barrier_async 实现
+信号量（semaphore）：是一种更高级的同步机制，互斥锁可以说是semaphore在仅取值0/1时的特例。信号量可以有更多的取值空间，用来实现更加复杂的同步，而不单单是线程间互斥。
+条件锁：就是条件变量，可以自己设置一个条件来定义加锁 与 释放锁的时机. NSCondition ， NSConditionLock中注意条件并不是bool类型的，而是一个固定的数字，加锁或者解锁，都会把condition修改为参数 。
+递归锁 ：递归锁允许同一个线程多次请求锁，而不会出现死锁的情况。 属于对互斥锁的一种。@synchronized NSRecursiveLock ， pthread_mutex
+互斥锁 1.NSLock：是Foundation框架中以对象形式暴露给开发者的一种锁，（Foundation框架同时提供了NSConditionLock，NSRecursiveLock，NSCondition）NSLock定义如下：
+@protocol NSLocking - (void)lock; - (void)unlock; @end @interface NSLock : NSObject &lt;NSLocking&gt; { @private void *_priv; } - (BOOL)tryLock; - (BOOL)lockBeforeDate:(NSDate *)limit; @property (nullable, copy) NSString *name API_AVAILABLE(macos(10." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/9dd6b50224c39698d9cece11f25e7340/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-05-04T17:12:57+08:00" />
+<meta property="article:modified_time" content="2023-05-04T17:12:57+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ios中的锁</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>代码测试可参考，只有实际写过才能更好的理解：</p> 
+<p>在平时开发中我们经常会使用多线程，多线程为我们带来了很大便利，也提高了程序的执行效率，但同时也带来数据风险：<strong>当至少有两个线程同时访问同一个变量，而且至少其中有一个是写操作时，就发生了<code>Data race</code>。</strong>所以这是就要利用一些同步机制来确保数据的准确性，锁就是同步机制中的一种。</p> 
+<p>什么是锁？锁 – 是保证线程安全常见的同步工具。锁是一种非强制的机制，每一个线程在访问数据或者资源前，要先获取(Acquire) 锁，并在访问结束之后释放(Release)锁。如果锁已经被占用，其它试图获取锁的线程会等待，直到锁重新可用。</p> 
+<h4>怎么检测项目中的<code>Data race</code>？</h4> 
+<h4><img alt="" class="has" height="461" src="https://images2.imgbox.com/c8/cd/WUhiywAc_o.png" width="888"></h4> 
+<p>只需要在设置中勾选<code>Thread Sanitizer</code> 即可，顺便可以勾选<code>Pause on issues</code> 就可以断点到相应的代码。</p> 
+<h4>简单的性能测试</h4> 
+<p>下图是针对iOS中的锁测试得出的，图中数字代表每次加解锁需要消耗的时间，单位为ns。</p> 
+<p><img alt="" class="has" height="250" src="https://images2.imgbox.com/20/2b/bTnEGRH1_o.png" width="888"></p> 
+<p>值得注意的是：1.这个数字仅仅代表每次加解锁的耗时，并不能全方面的代表性能。2.不同的机型和系统，不同的循环次数可能结果会略微有些差异。<br> 但是还是可以看出<code>@synchronized:</code>是表现最差的。</p> 
+<p><strong>在具体说这些锁之前，先来说几个概念定义：</strong></p> 
+<ol><li> <p><strong>临界区：</strong>指的是一块对公共资源进行访问的代码，并非一种机制或是算法。 通俗点理解, <strong>就是一段代码.</strong></p> </li><li> <p><strong>自旋锁：</strong>是用于多线程同步的一种锁，线程反复检查锁变量是否可用。由于线程在这一过程中保持执行，因此是一种<code>忙等待</code>。一旦获取了自旋锁，线程会一直保持该锁，直至显式释放自旋锁。自旋锁是比较耗费 cpu 的，然而在互斥临界区计算量较小的场景下，它的效率远高于其它的锁。因为它是一直处于 running 状态，减少了线程切换上下文的消耗。</p> <p>OSSpinLock（已废弃，不推荐，虽然效率最高，使用os_unfair_lock替代）</p> </li><li> <p><strong>互斥锁（Mutex）：</strong>在编程中，来保证共享数据操作的完整性。每个对象都对应于一个可称为 互斥锁 的标记，这个标记用来保证在任一时刻，只能有一个线程访问该对象。通过将代码切片成一个一个的临界区而达成.NSLock, NSConditionLock, NSRecursiveLock, NSCondition，pthread_mutex，@synchronized，os_unfair_lock</p> </li><li> <p><strong>读写锁：</strong>是计算机程序的并发控制的一种同步机制，也称“共享-互斥锁”、多读者-单写者锁) 用于解决多线程对公共资源读写问题。读操作可并发重入，写操作是互斥的。比如pthread_rwlock，读写锁通常用dispatch_barrier_async 实现</p> </li><li> <p><strong>信号量（semaphore）：</strong>是一种更高级的同步机制，<code>互斥锁</code>可以说是semaphore在仅取值0/1时的特例。<code>信号量</code>可以有更多的取值空间，用来实现更加复杂的同步，而不单单是线程间互斥。</p> </li><li> <p><strong>条件锁：</strong>就是条件变量，可以自己设置一个条件来定义加锁 与 释放锁的时机. NSCondition  ， NSConditionLock中注意条件并不是bool类型的，而是一个固定的数字，加锁或者解锁，都会把condition修改为参数 。</p> </li><li> <p><strong>递归锁</strong> ：递归锁允许同一个线程多次请求锁，而不会出现死锁的情况。 属于对互斥锁的一种。@synchronized  NSRecursiveLock  ， pthread_mutex</p> </li></ol> 
+<h3>互斥锁</h3> 
+<p><strong>1.NSLock：</strong>是Foundation框架中以对象形式暴露给开发者的一种锁，（Foundation框架同时提供了<code>NSConditionLock</code>，<code>NSRecursiveLock</code>，<code>NSCondition</code>）<code>NSLock</code>定义如下：</p> 
+<pre class="has"><code>@protocol NSLocking
+
+- (void)lock;
+- (void)unlock;
+
+@end
+
+@interface NSLock : NSObject &lt;NSLocking&gt; {
+@private
+    void *_priv;
+}
+
+- (BOOL)tryLock;
+- (BOOL)lockBeforeDate:(NSDate *)limit;
+
+@property (nullable, copy) NSString *name API_AVAILABLE(macos(10.5), ios(2.0), watchos(2.0), tvos(9.0));
+
+@end
+</code></pre> 
+<p>tryLock 和 lock 方法都会请求加锁，唯一不同的是trylock在没有获得锁的时候可以继续做一些任务和处理。lockBeforeDate方法也比较简单，就是在limit时间点之前获得锁，没有拿到返回NO。<br><strong>实际项目中：</strong>NSLock在<a href="https://github.com/AFNetworking/AFNetworking/blob/master/AFNetworking/AFURLSessionManager.m" title="AFNetworking的AFURLSessionManager.m">AFNetworking的AFURLSessionManager.m</a>中应用如下：</p> 
+<pre class="has"><code>- (instancetype)initWithSessionConfiguration:(NSURLSessionConfiguration *)configuration {
+    ...
+    self.lock = [[NSLock alloc] init];
+    self.lock.name = AFURLSessionManagerLockName;
+    ...
+}
+- (void)setDelegate:(AFURLSessionManagerTaskDelegate *)delegate
+            forTask:(NSURLSessionTask *)task
+{
+    ...
+    [self.lock lock];
+    self.mutableTaskDelegatesKeyedByTaskIdentifier[@(task.taskIdentifier)] = delegate;
+    [delegate setupProgressForTask:task];
+    [self addNotificationObserverForTask:task];
+    [self.lock unlock];
+}
+</code></pre> 
+<p><strong>2.pthread_mutex： </strong>NSLock实际是封装了一下 <code>pthread_mutex</code> ， 因为NSLock加入了错误处理，所以性能会比 pthread_mutex有所下降。</p> 
+<pre class="has"><code>pthread_mutexattr_t attr;
+pthread_mutexattr_init(&amp;attr);pthread_mutexattr_settype(&amp;attr, PTHREAD_MUTEX_NORMAL);  // 定义锁的属性
+pthread_mutex_t mutex;
+pthread_mutex_init(&amp;mutex, &amp;attr); // 创建锁
+pthread_mutex_lock(&amp;mutex); // 申请锁
+NSLog(@"pthread_mutexattr_t互斥锁");
+ pthread_mutex_unlock(&amp;mutex); // 释放锁
+</code></pre> 
+<p><strong>实际项目中：</strong> 在<a href="https://github.com/ibireme/YYKit/blob/3869686e0e560db0b27a7140188fad771e271508/YYKit/Cache/YYMemoryCache.m" title="YYKit的YYMemoryCach中可以看到">YYKit的YYMemoryCach中可以看到</a></p> 
+<pre class="has"><code>- (instancetype)init {
+    ...
+    pthread_mutex_init(&amp;_lock, NULL);
+    ...
+}
+- (void)_trimToCost:(NSUInteger)costLimit {
+    BOOL finish = NO;
+    pthread_mutex_lock(&amp;_lock);
+    if (costLimit == 0) {
+        [_lru removeAll];
+        finish = YES;
+    } else if (_lru-&gt;_totalCost &lt;= costLimit) {
+        finish = YES;
+    }
+    pthread_mutex_unlock(&amp;_lock);
+    if (finish) return;
+    
+    NSMutableArray *holder = [NSMutableArray new];
+    while (!finish) {
+        if (pthread_mutex_trylock(&amp;_lock) == 0) {
+            if (_lru-&gt;_totalCost &gt; costLimit) {
+                _YYLinkedMapNode *node = [_lru removeTailNode];
+                if (node) [holder addObject:node];
+            } else {
+                finish = YES;
+            }
+            pthread_mutex_unlock(&amp;_lock);
+        } else {
+            usleep(10 * 1000); //10 ms
+        }
+    }
+   ...
+}
+</code></pre> 
+<h3>自旋锁</h3> 
+<p><strong>1.OSSpinLock:</strong></p> 
+<pre class="has"><code>@import Darwin.os.lock;
+
+/*
+ // 初始化
+ os_unfair_lock_t unfairLock = &amp;(OS_UNFAIR_LOCK_INIT);
+ // 加锁
+ os_unfair_lock_lock(unfairLock);
+ // 尝试加锁
+ BOOL b = os_unfair_lock_trylock(unfairLock);
+ // 解锁
+ os_unfair_lock_unlock(unfairLock);
+ os_unfair_lock 用法和 OSSpinLock 基本一致，就不一一列出了。
+ */
+- (void)osspinlock {
+    __block OSSpinLock theLock = OS_SPINLOCK_INIT;//在iOS10之后被ns_unfair_lock替换
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        OSSpinLockLock(&amp;theLock);
+        NSLog(@"线程1开始");
+        [self Test];
+        NSLog(@"线程1结束");
+        OSSpinLockUnlock(&amp;theLock);
+        
+    });
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        OSSpinLockLock(&amp;theLock);
+        NSLog(@"线程2开始");
+        [self Test];
+        NSLog(@"线程2结束");
+        OSSpinLockUnlock(&amp;theLock);
+        
+    });
+}</code></pre> 
+<p>上面是OSSpinLock使用方式，编译会报警告，已经废弃了，OSSpinLock大家也已经不再用它了，因为它在某一些场景下已经不安全了，可以参考 YY大神的<a href="https://blog.ibireme.com/2016/01/16/spinlock_is_unsafe_in_ios/" rel="nofollow" title="不再安全的 OSSpinLock">不再安全的 OSSpinLock</a>，在Protocol Buffers项目中你可以看到这样的注释，大家已经用新的方案替换了。</p> 
+<blockquote> 
+ <p>在iOS 中，系统维护了 5 个不同的线程优先级/QoS: background，utility，default，user-initiated，user-interactive。高优先级线程始终会在低优先级线程前执行，一个线程不会受到比它更低优先级线程的干扰。这种线程调度算法会产生潜在的优先级反转问题，从而破坏了 spin lock。</p> 
+ <p>具体来说，如果一个低优先级的线程获得锁并访问共享资源，这时一个高优先级的线程也尝试获得这个锁，它会处于 spin lock 的忙等状态从而占用大量 CPU。此时低优先级线程无法与高优先级线程争夺 CPU 时间，从而导致任务迟迟完不成、无法释放 lock。这并不只是理论上的问题，libobjc 已经遇到了很多次这个问题了，于是苹果的工程师停用了 OSSpinLock。</p> 
+ <p>优先级高的持续占有cpu，直到获取到资源。低优先级的竞争不过cpu，但是拿着资源，无法使用。导致死锁。</p> 
+</blockquote> 
+<p><strong>os_unfair_lock:</strong>(互斥锁)<br> os_unfair_lock 是苹果官方推荐的替换OSSpinLock的方案，但是它在iOS10.0以上的系统才可以调用。os_unfair_lock是一种互斥锁，它不会向自旋锁那样忙等，而是等待线程会休眠。</p> 
+<pre class="has"><code>os_unfair_lock_t unfairLock;
+ unfairLock = &amp;(OS_UNFAIR_LOCK_INIT);
+os_unfair_lock_lock(unfairLock);
+NSLog(@"os_unfair_lock_t");
+os_unfair_lock_unlock(unfairLock);
+</code></pre> 
+<h3>读写锁</h3> 
+<p>上文有说到，读写锁又称共享-互斥锁，实际中大部分是通过gcd实现读写锁的,在AFN上有体现, <a href="https://blog.csdn.net/u014600626/article/details/102884794" title="ios实现读写锁,AFN的实现_想名真难的博客-CSDN博客_ios 读写锁">ios实现读写锁,AFN的实现_想名真难的博客-CSDN博客_ios 读写锁</a><br><strong>pthread_rwlock：</strong></p> 
+<p><img alt="" src="https://images2.imgbox.com/b2/32/sa16UOnY_o.png"></p> 
+<pre><code>// 导入头文件
+#import &lt;pthread.h&gt;
+
+// 声明属性
+@property (nonatomic, assign) pthread_rwlock_t rwlock;
+
+
+// 初始化
+pthread_rwlock_init(&amp;_rwlock, NULL);
+ 
+// 读加锁
+- (void)read {
+    pthread_rwlock_rdlock(&amp;_rwlock);
+    NSLog(@"read");
+    pthread_rwlock_unlock(&amp;_rwlock);
+}
+ 
+// 写加锁
+- (void)wtite {
+    pthread_rwlock_wrlock(&amp;_rwlock);
+    NSLog(@"write");
+    pthread_rwlock_unlock(&amp;_rwlock);
+}
+
+// 销毁锁
+- (void)dealloc {
+    pthread_rwlock_destroy(&amp;_rwlock);
+}
+</code></pre> 
+<h3>递归锁</h3> 
+<p>递归锁有一个特点，就是同一个线程可以加锁N次而不会引发死锁。<br><strong>1.NSRecursiveLock:</strong></p> 
+<pre class="has"><code>NSRecursiveLock *recursiveLock = [[NSRecursiveLock alloc]init];  
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        
+        static void (^RecursiveMethod)(int);
+        RecursiveMethod = ^(int value) {
+            
+            [recursiveLock lock];
+            if (value &gt; 0) {
+                
+                NSLog(@"value = %d", value);
+                sleep(2);
+                RecursiveMethod(value - 1);
+            }
+            [recursiveLock unlock];
+        };
+        
+        RecursiveMethod(5);
+    });
+</code></pre> 
+<p>NSRecursiveLock在<a href="https://github.com/ibireme/YYKit/blob/4e1bd1cfcdb3331244b219cbd37cc9b1ccb62b7a/YYKit/Image/YYWebImageOperation.m" title="YYKit中YYWebImageOperation.m">YYKit中YYWebImageOperation.m</a>中有用到：</p> 
+<pre class="has"><code>_lock = [NSRecursiveLock new];
+- (void)dealloc {
+    [_lock lock];
+    ...
+    ...
+    [_lock unlock];
+}</code></pre> 
+<p><strong>2.pthread_mutex(recursive):</strong><br> pthread_mutex锁也支持递归，只需要设置PTHREAD_MUTEX_RECURSIVE即可</p> 
+<pre class="has"><code>pthread_mutex_t lock;
+pthread_mutexattr_t attr;
+pthread_mutexattr_init(&amp;attr);
+pthread_mutexattr_settype(&amp;attr, PTHREAD_MUTEX_RECURSIVE);
+pthread_mutex_init(&amp;lock, &amp;attr);
+pthread_mutexattr_destroy(&amp;attr);
+pthread_mutex_lock(&amp;lock);
+pthread_mutex_unlock(&amp;lock);
+</code></pre> 
+<p><strong>3.@synchronized也属于递归锁, 用传入的对象关联一个递归锁, 详细看</strong><a href="https://blog.csdn.net/u014600626/article/details/107915866" title="@synchronized 递归锁详解_想名真难的博客-CSDN博客_递归锁原理">@synchronized 递归锁详解_想名真难的博客-CSDN博客_递归锁原理</a><strong>:</strong><br><strong>实际项目中：</strong>AFNetworking中 isNetworkActivityOccurring属性的getter方法</p> 
+<pre class="has"><code>- (BOOL)isNetworkActivityOccurring {
+    @synchronized(self) {
+        return self.activityCount &gt; 0;
+    }
+}
+</code></pre> 
+<h3>条件锁</h3> 
+<p><strong>1. NSCondition:</strong><br><strong>定义：</strong></p> 
+<pre class="has"><code>@interface NSCondition : NSObject &lt;NSLocking&gt; {
+@private
+    void *_priv;
+}
+
+- (void)wait;
+- (BOOL)waitUntilDate:(NSDate *)limit;
+- (void)signal;
+- (void)broadcast;
+</code></pre> 
+<p>遵循NSLocking协议，使用的时候同样是lock,unlock加解锁，wait是傻等，waitUntilDate:方法是等一会，都会阻塞掉线程，signal是唤起一个在等待的线程, 被唤起的线程会开始工作, ,，broadcast是广播全部唤起。</p> 
+<pre class="has"><code>NSCondition *lock = [[NSCondition alloc] init];
+//Son 线程
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    [lock lock];
+    if (No Money) {
+        // wait会使线程进入休眠,同时释放掉锁; 
+        // 当有signal或者broadcast的时候, 线程会开始工作,同时再次加锁,
+        [lock wait]; 
+
+    }
+    NSLog(@"The money has been used up.");
+    [lock unlock];
+});
+    
+ //Father线程
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    [lock lock];
+    NSLog(@"Work hard to make money.");
+    [lock signal];
+    [lock unlock];
+ });
+</code></pre> 
+<p><strong>2.NSConditionLock:</strong><br><strong>定义：</strong></p> 
+<pre class="has"><code>@interface NSConditionLock : NSObject &lt;NSLocking&gt; {
+@private
+    void *_priv;
+}
+
+- (instancetype)initWithCondition:(NSInteger)condition NS_DESIGNATED_INITIALIZER;
+
+@property (readonly) NSInteger condition;
+- (void)lockWhenCondition:(NSInteger)condition;
+- (BOOL)tryLock;
+- (BOOL)tryLockWhenCondition:(NSInteger)condition;
+- (void)unlockWithCondition:(NSInteger)condition;
+- (BOOL)lockBeforeDate:(NSDate *)limit;
+- (BOOL)lockWhenCondition:(NSInteger)condition beforeDate:(NSDate *)limit;
+</code></pre> 
+<p>当我们在使用多线程的时候，只有一把会lock和unlock的锁就不能满足我们的需要了。因为普通的锁只关心锁与不锁，但是并不在乎什么时候才能开锁，而在处理资源共享场景的时候，多数情况下只有满足一定条件下才能打开这把锁。（Condition： 条件）<br> NSConditionLock实现步骤：<br> NSConditionLock实现了NSLocking协议，一个线程会等待另一个线程unlock或者unlockWithCondition:之后再走lock或者lockWhenCondition:之后的代码。<br> 锁定和解锁的调用可以随意组合，也就是说 lock、lockWhenCondition:与unlock、unlockWithCondition: 是可以按照自己的需求随意组合的。</p> 
+<p>1、只有 condition 参数与初始化时候的 condition 相等，lock 才能正确进行加锁操作。<br> 2、unlockWithCondition: 并不是当 condition 符合条件时才解锁，而是解锁之后，修改 condition 的值。</p> 
+<p> 在来个例子</p> 
+<pre class="has"><code class="language-objectivec">- (void)nsconditionlock {
+    NSConditionLock * cjlock = [[NSConditionLock alloc] initWithCondition:0];
+    
+    //1、线程 1 解锁成功
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [cjlock lock];
+        NSLog(@"线程1加锁成功");
+        sleep(1);//线程休眠一秒
+        [cjlock unlock];
+        NSLog(@"线程1解锁成功");
+    });
+    
+    //2、初始化时候的 condition 参数为0，所以此处加锁失败，返回NO，此处线程阻塞。全部现成执行完毕后执行此处锁
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        sleep(1);//线程休眠一秒
+        [cjlock lockWhenCondition:1];
+        NSLog(@"线程2加锁成功");
+        [cjlock unlock];
+        NSLog(@"线程2解锁成功");
+    });
+    
+    //3、tryLockWhenCondition尝试加锁  初始化时候的 condition 参数为0，所以此处加锁成功。方法就算条件不满足，也会返回 NO，不会阻塞当前线程。
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        sleep(2);
+        
+        if ([cjlock tryLockWhenCondition:0]) {
+            NSLog(@"线程3加锁成功");
+            sleep(2);
+            /*
+             A：成功案例
+             这里会先解锁当前的锁，之后修改condition的值为100.在下一个condition为100的线程中会加解锁成功，如果下个锁中的condition等待的值不是100，那么就会导致加锁失败。
+             */
+            [cjlock unlockWithCondition:100];
+            NSLog(@"线程3解锁成功");
+            
+            /*
+             B：失败案例
+             [cjlock unlockWithCondition:4];
+             NSLog(@"线程3仍然会解锁成功，之后修改condition的值为4");
+             */
+            
+        } else {
+            NSLog(@"线程3尝试加锁失败");
+        }
+    });
+    
+    //4、lockWhenCondition:beforeDate:方法会在约定的时间内一直等待 condition 变为 2，并阻塞当前线程，直到超时后返回 NO。
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if ([cjlock lockWhenCondition:100 beforeDate:[NSDate dateWithTimeIntervalSinceNow:10]]) {
+            NSLog(@"线程100加锁成功");
+            [cjlock unlockWithCondition:1];
+            NSLog(@"线程100解锁成功");
+        } else {
+            NSLog(@"线程100尝试加锁失败");
+        }
+    });
+}</code></pre> 
+<h3> 信号量  </h3> 
+<p><strong>dispatch_semaphore:</strong><br> 信号量在初始化时要指定 value，随后内部将这个 value 存储起来。实际操作时会存两个 value，一个是当前的 value，一个是记录初始 value。信号的 wait 和 signal 是互逆的两个操作。如果 value 大于 0，wait将 value 减一,然后做事情，此时如果 value 小于零就一直等待。signal会使value+1，所以wait 和 signal必须是成对出现的.<br> 初始 value 必须大于等于 0，如果为 0 并随后调用 wait 方法，线程将被阻塞直到别的线程调用了 signal 方法。用法如下</p> 
+<pre class="has"><code>-(void)test_semaphore{
+       dispatch_queue_t queque = dispatch_queue_create("queue", DISPATCH_QUEUE_CONCURRENT);
+       //异步执行
+       dispatch_async(queque, ^{
+           dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+           [self getToken:semaphore];
+           dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+           [self request];
+       });
+       
+       NSLog(@"main thread");
+}
+-(void)getToken:(dispatch_semaphore_t)semaphore{
+   NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+   NSURLSessionTask *task = [session dataTaskWithRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://www.baidu.com"]] completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+       NSLog(@"get Token");
+       //成功拿到token，发送信号量:
+       dispatch_semaphore_signal(semaphore);
+   }];
+   [task resume];
+}
+-(void)request{
+   dispatch_async(dispatch_get_main_queue(), ^{
+       NSLog(@"刷新数据");
+   });
+}
+</code></pre> 
+<p>信号量不止可以用于加锁,  还可以把异步执行任务转换为同步执行任务. 本来方法是异步的, 但是想要同步的知道结果,就可以是线程阻塞,等到有结果了,在return;  注意如果主线程这么操作会造成卡顿哦~</p> 
+<p>比如说：AFNetworking 中 AFURLSessionManager.m 里面的 tasksForKeyPath: 方法。通过引入信号量的方式，等待异步执行任务结果，获取到 tasks，然后再返回该 tasks。</p> 
+<p><img alt="" height="356" src="https://images2.imgbox.com/99/83/bFMAdOmw_o.png" width="888"></p> 
+<h4>总结：</h4> 
+<p>其实本文写的都是一些再基础不过的内容，在平时阅读一些开源项目的时候经常会遇到一些保持线程同步的方式，因为场景不同可能选型不同，这篇就做一下简单的记录吧。一定要动手试试哦</p> 
+<p></p> 
+<p><a href="https://www.jianshu.com/p/6d6832e42936" rel="nofollow" title="iOS中的多种锁（Lock）">iOS中的多种锁（Lock）</a></p> 
+<p><a href="https://www.jianshu.com/p/b1edc6b0937a" rel="nofollow" title="iOS开发中的11种锁以及性能对比">iOS开发中的11种锁以及性能对比</a></p> 
+<p><a href="https://www.jianshu.com/p/c1caeccb9202" rel="nofollow" title="进阶：iOS 锁和源码">进阶：iOS 锁和源码</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/71a4a79e0961173e272586ca51f26ef4/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">按钮循环波动</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/d091296a32228ab1174fa2877e820933/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">【C&#43;&#43;】实现两个线程交替打印1-100</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

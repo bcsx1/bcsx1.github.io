@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>DSO 系列文章(2)——DSO点帧管理策略 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="DSO 系列文章(2)——DSO点帧管理策略" />
+<meta property="og:description" content="文章目录 1.点所构成的残差Residual的管理1.1.前端残差的状态1.2.后端点的残差的状态1.3.点的某个残差的删除 2.点Point的管理2.1.如何删除点——点Point的删除2.2.边缘化时删除哪些点？ 3.帧FrameHessian的管理 DSO代码注释：https://github.com/Cc19245/DSO-CC_Comments
+1.点所构成的残差Residual的管理 1.1.前端残差的状态 PointFrameResidual的状态有三种：
+IN——内点。表示这个残差状态正常，可以参与优化；
+OOB——Out Of Boundary，出界点。表示把host帧上的点通过线性化点或最新状态的相机位姿投影到target帧之后，这个点不在图像范围内，表示这个点出界了，那么这个残差不能参与优化。
+注意：一个残差只要被判断为出界，后面就再也不用他了，作者代码中也有一句注释叫做can never go back from OOB。这个确实也是有道理的，因为前端已经跟踪得到了一个初始位姿了，有投影匹配的点是不太可能出界的。
+OUTLIER——外点，表示这个残差能量超过了阈值，注意和OOB区分。外点类似于特征点法中的无匹配，也就是找到了匹配关系，但是误差太大，如果使用它优化会造成不好的影响，干脆就不用这个残差。
+注意：随着优化的进行，外点的残差能量有可能会慢慢降低到小于阈值，此时它就可以恢复成内点，然后继续参与优化。因此外点是可以恢复的。
+为了让OOB起到一票否决的作用，在代码中使用了state_state变量表示这个残差上次的状态，一旦它上次的状态是OOB，那么函数都会直接跳过或返回，从而这个残差永远不可能再次参与到优化中。
+1.2.后端点的残差的状态 EFResidual的状态就比较简单了，只有一个变量bool isActiveAndIsGoodNEW来表示这个点能量残差是否在后端优化中使用。这个变量是由前端残差的状态来设置的，只有前端残差的状态是IN，这个变量才是true，否则全都是false。
+那么什么时候设定后端残差的状态呢？就是调用applyRes把前端雅克比传递给后端的时候，此时会一并把前端残差的状态传递给后端，让后端残差的状态得到更新。下面对几个函数进行说明：
+PointFrameResidual::linearize
+（1）前端残差进行线性化求雅克比。注意这个过程中有两部分雅克比， 一个是像素点关于相机位姿、内参、逆深度部分雅克比，它们使用线性化点的状态，保持不变；另一个是像素梯度和残差，它们使用最新的状态，因此是变化的。
+（2）在此过程中会判断前端残差的状态，存储到前端残差的类成员变量中。
+``PointFrameResidual::applyRes`
+把前端残差更新到后端，同时把前端残差的状态也更新到后端（这个很正常，因为残差都给后端了，自然也要告诉后端这个残差是否有效）
+FullSystem::linearizeAll_Reductor(true/false)
+（1）一定会调用PointFrameResidual::linearize计算最新的雅克比，并且判断前端残差状态。
+（2）如果传入true，会把前端雅克比和残差状态更新到后端，并且把前端非IN状态的残差放到toRemove数组中。
+FullSystem::linearizeAll(true/false)
+（1）一定会调用FullSystem::linearizeAll_Reductor(true/false)。
+（2）如果传入true，那么会把linearizeAll_Reductor函数里统计出来的非IN状态的残差，从PointHessian和后端优化的大bossEnergyFunctional中丢弃，也就是这个残差不再存在了。
+注意：什么时候这个函数会传入true呢？答案是只有在完成迭代优化的循环之后才会传入true，因为此时已经得到了本次滑窗优化的最终结果，可以把使用这个最终结果判断的非IN状态的残差从前端和后端删掉了。但是其他任何时候，比如迭代优化之前或迭代优化过程中，我们只能对残差求雅克比、判断它们状态，如果不是IN那么后端优化就不使用，但是我们不能把这些残差删掉，因为优化还没开始或者还没完成，可能这次是OUTLIER的残差，优化几次就变成了IN，所以我们不能删掉这些残差。
+1.3.点的某个残差的删除 如上所述，在FullSystem::optimize中后端迭代优化完成后，会调用FullSystem::linearizeAll(true)根据最新的状态把所有残差重新线性化一次，由于传入了true所以会筛选出非IN状态的残差，并把他们删除掉，该函数中实现的删除残差的步骤如下：
+EnergyFunctional::dropResidual删除后端残差：先把这个残差从后端能量点的残差数组中弹出，然后把前端对应的残差持有的这个后端残差指针置零，最后delete释放内存。FullSystem::deleteOut删除前端残差：先把前端点的残差数组中要删除位置的残差的指针delete释放到，然后把数组最后一个残差赋值到这个位置。其实本质上和删除后端残差的操作一致，只不过释放指针和弹出数组的先后顺序不同。 2.点Point的管理 2.1.如何删除点——点Point的删除 如上所述，在FullSystem::optimize中后端迭代优化完成后，会根据最新的状态把所有残差重新线性化一次，同时筛选出非IN状态的残差，并把他们删除掉。出了FullSystem::optimize函数之后，执行FullSystem::removeOutliers函数，把Point的外点删除。
+此函数中就是判断所有帧上的所有点，如果这个点的残差个数为0，那么他就要被删除掉了。所以从这里删除的判断条件来看，叫removeOutliers可能不是太恰当，可能叫removePointsNonRes，即删除没有残差的点更好一点。
+下面细看这个函数中的实现步骤：
+先把这个PointHessian加入到帧的前端点删除数组pointHessiansOut中，等待后面统一删除。设置这个前端PointHessian对应的后端EFPoint状态为PS_DROP，给后面后端删除EFPoint使用。然后把这个点从帧的点数组中删掉，注意这里还没有delete释放这个PointHessian的内存，只是把它加入到了外点数组中。调用EnergyFunctional::dropPointsF把后端的点删掉。此函数中调用removePoint，该函数中会先把这个EFPoint对应的所有EFResidual删掉，然后把这个点从能量帧的点能量数组中删掉，最后把这个delete这个能量点释放内存。 注意：从上面两步可以看出来，这里的代码设计还是有点瑕疵的，因为删除前端的点之后没有释放内存，而是等待后面统一释放。而删除后端的点则释放了内存，前后端的操作不统一了。
+7.28最新想法：可能作者是故意这样设计的，因为看代码中显示部分好像有删除点的数组相关的内容，所以就是把这些点存到数组中来显示历史上的所有点？
+7.29最新想法：这个其实是没有问题的，确实是作者有意为之，而且原因也就是删除的点还要被使用。因为上面也说了，要删除的PointHessian指针被放到了前端点的删除数组pointHessiansOut中，后面要给显示线程使用。即然被放到了这个数组中，自然这个指针就不能释放了，否则这个数组中存的就都是野指针了。而把这些点从正常使用的前端点数组pointHessians中弹出，就意味着以后肯定无法再使用这个点了，因此从系统功能上已经实现了删除这个点的目的。而对于后端来说，既然这个点被删除了，那么我后端优化肯定就不会使用它构造H/b了，因此完全可以把这个点能量EFPoint完全从内存中抹去。
+2.2.边缘化时删除哪些点？ 如上述所说，在FullSystem::optimize中后端迭代优化完成后，会根据最新的状态把所有残差重新线性化一次，同时筛选出非IN状态的残差，并把他们删除掉。出了FullSystem::optimize函数之后，执行FullSystem::removeOutliers函数，把哪些没有残差的Point删除掉。
+接下来系统就进入了边缘化的阶段，首先是判断哪些点要边缘化掉，这样就会利用这些点构成的残差计算一个H/b，然后把这些点的逆深度Schur消元掉，只保留68x68的相机状态。然后下面对关键帧进行边缘化，再把这个H/b消掉一个相机帧得到维度缩减的HM/bM，从而给下一帧使用。
+那么如何判断哪些点要被边缘化掉或者直接丢掉呢？在函数FullSystem::flagPointsForRemoval中实现这些功能。这个函数中选择要边缘化或者删除的点，只有两个根据：
+（1）即将被边缘化的帧上的点：显然帧都没了，帧上的点肯定也不能再存在了。所以如果这个点性质比较好（比如多次构成的残差足够多、优化的逆深度协方差足够小），那么就把它边缘化掉，从而给后面的帧形成约束；如果这个点的性质不好，那么就直接把它丢掉，而不能边缘化，因为这样可能会引入错误的约束；
+（2）其他帧上的点根据性质判断：即代码中的PointHessian::isOOB函数，内部会判断非边缘化帧上的点是否要被选择边缘化或者丢弃，这部分判断准则还不是很明白。
+筛选出来这些点之后，在代码中就是对这些点进行处理，要么边缘化，要么直接丢掉。而如果一个点既不是外点，也不是要边缘化/丢掉的点，那么它就是正常的点，会继续存在于滑窗中，因此对它不进行任何处理，这就是为什么 代码 中elseif后面没有else了，也就相当于一个空的else，即如果是else则什么也不干。
+最后注意：跟优化之后接着删除点一样，也上面的函数里面也是只把要丢掉的前端点PointHessian放到了删除数组中，并且从使用数组中弹出，这样就是完成了前端点的删除。而后端的对应的能量点在这个函数中没有释放，所以还要再释放后端的能量点，但是这个释放放在了FullSystem::flagPointsForRemoval函数外面去调用，这是我觉得不太好的地方，放在该函数里面调用更好。而且这个函数命名也不准确，我觉得命名为MarginOrDropPoints更好，也就是边缘化或者丢掉点。同理应该把后面的ef-&gt;marginalizePointsF();函数也一并放进里面调用，实际就完成了整个点的边缘化。这样拆开反而逻辑没有那么清晰了。
+3.帧FrameHessian的管理 在上一步边缘化掉点之后，得到了这些点的残差构成的HM/bM矩阵，但是这个矩阵中仍然是含有要被边缘化掉的帧的状态的，因此还要对这个HM/bM进行Schur消元得到消元之后维度缩减的HM/bM，给下次滑窗优化使用。
+在后端对边缘化的帧进行Schur消元之后，还有一个步骤需要做，那就是把其他帧上以被边缘化掉的帧为target帧的那些点的残差删掉，这个也是很正常的，因为这帧没有了，自然其他帧上的点和这帧关联的残差也就没有了。注意这个不是说其他帧上的点也不用了，这些点还是和别的帧可以构成残差的，所以这个和边缘化/丢掉点是不同的，这个是对仍然存在于滑窗中的点的残差进行处理。
+而删除点的某个残差，则跟上面1.3节讲述的一样了，那就是先dropResidual删掉后端残差，再deleteOut删除前端残差。
+把残差处理完了，就要删除这个帧了，调用deleteOutOrder函数把这个帧从FullSystem的帧数组中弹出，这就保证了它不会在FullSystem中再被调用参与滑窗优化了，但是不会释放它的内存。这个跟PointHessian的删除逻辑是一样的，本质上是因为这个FrameHessian的指针在优化之前已经被加入到allFrameHistory里面了，如果在这里把指针释放了，那么allFrameHistory里面存的就是野指针了。
+由于删除了滑窗中的一个关键帧，所以需要调用setPrecalcValues函数重新计算各个帧的线性化点状态、最新状态、状态增量等变量，然后还要调用ef-&gt;setAdjointsF重新计算各个帧之间的伴随矩阵。至此，帧边缘化的操作全部完成。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/b7301ada216e32473a019e1ebf5d73ba/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-08-20T15:36:17+08:00" />
+<meta property="article:modified_time" content="2023-08-20T15:36:17+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">DSO 系列文章(2)——DSO点帧管理策略</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><a href="#1Residual_10" rel="nofollow">1.点所构成的残差Residual的管理</a></li><li><ul><li><a href="#11_12" rel="nofollow">1.1.前端残差的状态</a></li><li><a href="#12_28" rel="nofollow">1.2.后端点的残差的状态</a></li><li><a href="#13_58" rel="nofollow">1.3.点的某个残差的删除</a></li></ul> 
+  </li><li><a href="#2Point_67" rel="nofollow">2.点Point的管理</a></li><li><ul><li><a href="#21Point_69" rel="nofollow">2.1.如何删除点——点Point的删除</a></li><li><a href="#22_86" rel="nofollow">2.2.边缘化时删除哪些点？</a></li></ul> 
+  </li><li><a href="#3FrameHessian_104" rel="nofollow">3.帧FrameHessian的管理</a></li></ul> 
+</div> 
+<p></p> 
+<p><font face="黑体" color="red" size="5">DSO代码注释：<a href="https://github.com/Cc19245/DSO-CC_Comments">https://github.com/Cc19245/DSO-CC_Comments</a></font></p> 
+<p><img src="https://images2.imgbox.com/06/6b/MvLWv9UX_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-gmYqG2MA-1692516884313)(DSO点帧管理策略.assets/image-20220728175932117.png)]"></p> 
+<h2><a id="1Residual_10"></a>1.点所构成的残差Residual的管理</h2> 
+<h3><a id="11_12"></a>1.1.前端残差的状态</h3> 
+<p><code>PointFrameResidual</code>的状态有三种：</p> 
+<ul><li> <p><code>IN</code>——内点。表示这个残差状态正常，可以参与优化；</p> </li><li> <p><code>OOB</code>——<code>Out Of Boundary</code>，出界点。表示把<code>host</code>帧上的点通过线性化点<strong>或</strong>最新状态的相机位姿投影到<code>target</code>帧之后，这个点不在图像范围内，表示这个点出界了，那么这个残差不能参与优化。</p> <p><mark>注意</mark>：一个残差只要被判断为出界，后面就再也不用他了，作者代码中也有一句注释叫做<code>can never go back from OOB</code>。这个确实也是有道理的，因为前端已经跟踪得到了一个初始位姿了，有投影匹配的点是不太可能出界的。</p> </li><li> <p><code>OUTLIER</code>——外点，表示这个残差能量超过了阈值，注意和<code>OOB</code>区分。外点类似于特征点法中的无匹配，也就是找到了匹配关系，但是误差太大，如果使用它优化会造成不好的影响，干脆就不用这个残差。</p> <p><mark>注意</mark>：随着优化的进行，外点的残差能量有可能会慢慢降低到小于阈值，此时它就可以恢复成内点，然后继续参与优化。因此外点是可以恢复的。</p> </li></ul> 
+<p>为了让<code>OOB</code>起到一票否决的作用，在代码中使用了<code>state_state</code>变量表示这个残差上次的状态，一旦它上次的状态是<code>OOB</code>，那么函数都会直接跳过或返回，从而这个残差永远不可能再次参与到优化中。</p> 
+<h3><a id="12_28"></a>1.2.后端点的残差的状态</h3> 
+<p><code>EFResidual</code>的状态就比较简单了，只有一个变量<code>bool isActiveAndIsGoodNEW</code>来表示这个点能量残差是否在后端优化中使用。这个变量是由前端残差的状态来设置的，只有前端残差的状态是<code>IN</code>，这个变量才是<code>true</code>，否则全都是<code>false</code>。</p> 
+<p>那么什么时候设定后端残差的状态呢？就是调用<code>applyRes</code>把前端雅克比传递给后端的时候，此时会一并把前端残差的状态传递给后端，让后端残差的状态得到更新。下面对几个函数进行说明：</p> 
+<ul><li> <p><code>PointFrameResidual::linearize</code></p> <p>（1）前端残差进行线性化求雅克比。注意这个过程中有两部分雅克比， 一个是像素点关于相机位姿、内参、逆深度部分雅克比，它们使用线性化点的状态，保持不变；另一个是像素梯度和残差，它们使用最新的状态，因此是变化的。</p> <p>（2）在此过程中会判断前端残差的状态，存储到前端残差的类成员变量中。</p> </li><li> <p>``PointFrameResidual::applyRes`</p> <p>把前端残差更新到后端，同时把前端残差的状态也更新到后端（这个很正常，因为残差都给后端了，自然也要告诉后端这个残差是否有效）</p> </li><li> <p><code>FullSystem::linearizeAll_Reductor(true/false)</code></p> <p>（1）一定会调用<code>PointFrameResidual::linearize</code>计算最新的雅克比，并且判断前端残差状态。</p> <p>（2）如果传入<code>true</code>，会把前端雅克比和残差状态更新到后端，并且把前端非<code>IN</code>状态的残差放到<code>toRemove</code>数组中。</p> </li><li> <p><code>FullSystem::linearizeAll(true/false)</code></p> <p>（1）一定会调用<code>FullSystem::linearizeAll_Reductor(true/false)</code>。</p> <p>（2）如果传入<code>true</code>，那么会把<code>linearizeAll_Reductor</code>函数里统计出来的非<code>IN</code>状态的残差，从<code>PointHessian</code>和后端优化的大boss<code>EnergyFunctional</code>中丢弃，也就是这个残差不再存在了。</p> <p><mark>注意</mark>：什么时候这个函数会传入<code>true</code>呢？答案是<strong>只有</strong>在完成迭代优化的循环之后才会传入<code>true</code>，因为此时已经得到了本次滑窗优化的最终结果，可以把使用这个最终结果判断的非<code>IN</code>状态的残差从前端和后端删掉了。但是其他任何时候，比如迭代优化之前或迭代优化过程中，我们只能对残差求雅克比、判断它们状态，如果不是<code>IN</code>那么后端优化就不使用，但是我们不能把这些残差删掉，因为优化还没开始或者还没完成，可能这次是<code>OUTLIER</code>的残差，优化几次就变成了<code>IN</code>，所以我们不能删掉这些残差。</p> </li></ul> 
+<h3><a id="13_58"></a>1.3.点的某个残差的删除</h3> 
+<p>如上所述，在<code>FullSystem::optimize</code>中后端迭代优化完成后，会调用<code>FullSystem::linearizeAll(true)</code>根据最新的状态把所有残差重新线性化一次，由于传入了<code>true</code>所以会筛选出非<code>IN</code>状态的残差，并把他们删除掉，该函数中实现的删除残差的步骤如下：</p> 
+<ol><li><code>EnergyFunctional::dropResidual</code>删除后端残差：先把这个残差从后端能量点的残差数组中弹出，然后把前端对应的残差持有的这个后端残差指针置零，最后<code>delete</code>释放内存。</li><li><code>FullSystem::deleteOut</code>删除前端残差：先把前端点的残差数组中要删除位置的残差的指针<code>delete</code>释放到，然后把数组最后一个残差赋值到这个位置。其实本质上和删除后端残差的操作一致，只不过释放指针和弹出数组的先后顺序不同。</li></ol> 
+<h2><a id="2Point_67"></a>2.点Point的管理</h2> 
+<h3><a id="21Point_69"></a>2.1.如何删除点——点Point的删除</h3> 
+<p>如上所述，在<code>FullSystem::optimize</code>中后端迭代优化完成后，会根据最新的状态把所有残差重新线性化一次，同时筛选出非<code>IN</code>状态的残差，并把他们删除掉。出了<code>FullSystem::optimize</code>函数之后，执行<code>FullSystem::removeOutliers</code>函数，把<code>Point</code>的外点删除。</p> 
+<p>此函数中就是判断所有帧上的所有点，如果这个点的残差个数为0，那么他就要被删除掉了。所以从这里删除的判断条件来看，叫<code>removeOutliers</code>可能不是太恰当，可能叫<code>removePointsNonRes</code>，<strong>即删除没有残差的点更好一点</strong>。</p> 
+<p>下面细看这个函数中的实现步骤：</p> 
+<ol><li>先把这个<code>PointHessian</code>加入到帧的前端点删除数组<code>pointHessiansOut</code>中，等待后面统一删除。设置这个前端<code>PointHessian</code>对应的后端<code>EFPoint</code>状态为<code>PS_DROP</code>，给后面后端删除<code>EFPoint</code>使用。然后把这个点从帧的点数组中删掉，<strong>注意这里还没有<code>delete</code>释放这个<code>PointHessian</code>的内存，只是把它加入到了外点数组中</strong>。</li><li>调用<code>EnergyFunctional::dropPointsF</code>把后端的点删掉。此函数中调用<code>removePoint</code>，该函数中会先把这个<code>EFPoint</code>对应的所有<code>EFResidual</code>删掉，然后把这个点从能量帧的点能量数组中删掉，<strong>最后把这个<code>delete</code>这个能量点释放内存</strong>。</li></ol> 
+<p><mark>注意</mark>：从上面两步可以看出来，这里的代码设计还是有点瑕疵的，因为删除前端的点之后没有释放内存，而是等待后面统一释放。而删除后端的点则释放了内存，前后端的操作不统一了。</p> 
+<p><mark>7.28最新想法</mark>：可能作者是故意这样设计的，因为看代码中显示部分好像有删除点的数组相关的内容，所以就是把这些点存到数组中来显示历史上的所有点？</p> 
+<p><mark>7.29最新想法</mark>：这个其实是没有问题的，确实是作者有意为之，而且原因也就是删除的点还要被使用。因为上面也说了，要删除的<code>PointHessian</code>指针被放到了前端点的删除数组<code>pointHessiansOut</code>中，后面要给显示线程使用。即然被放到了这个数组中，自然这个指针就不能释放了，否则这个数组中存的就都是野指针了。而把这些点从正常使用的前端点数组<code>pointHessians</code>中弹出，就意味着以后肯定无法再使用这个点了，因此从系统功能上已经实现了删除这个点的目的。而对于后端来说，既然这个点被删除了，那么我后端优化肯定就不会使用它构造<code>H/b</code>了，因此完全可以把这个点能量<code>EFPoint</code>完全从内存中抹去。</p> 
+<h3><a id="22_86"></a>2.2.边缘化时删除哪些点？</h3> 
+<p>如上述所说，在<code>FullSystem::optimize</code>中后端迭代优化完成后，会根据最新的状态把所有残差重新线性化一次，同时筛选出非<code>IN</code>状态的残差，并把他们删除掉。出了<code>FullSystem::optimize</code>函数之后，执行<code>FullSystem::removeOutliers</code>函数，把哪些没有残差的<code>Point</code>删除掉。</p> 
+<p>接下来系统就进入了边缘化的阶段，首先是判断哪些点要边缘化掉，这样就会利用这些点构成的残差计算一个<code>H/b</code>，然后把这些点的逆深度Schur消元掉，只保留<code>68x68</code>的相机状态。然后下面对关键帧进行边缘化，再把这个<code>H/b</code>消掉一个相机帧得到维度缩减的<code>HM/bM</code>，从而给下一帧使用。</p> 
+<p>那么如何判断哪些点要被边缘化掉或者直接丢掉呢？在函数<code>FullSystem::flagPointsForRemoval</code>中实现这些功能。这个函数中选择要边缘化或者删除的点，只有两个根据：</p> 
+<p>（1）<strong>即将被边缘化的帧上的点</strong>：显然帧都没了，帧上的点肯定也不能再存在了。所以如果这个点性质比较好（比如多次构成的残差足够多、优化的逆深度协方差足够小），那么就把它边缘化掉，从而给后面的帧形成约束；如果这个点的性质不好，那么就直接把它丢掉，而不能边缘化，因为这样可能会引入错误的约束；</p> 
+<p>（2）<strong>其他帧上的点根据性质判断</strong>：即代码中的<code>PointHessian::isOOB</code>函数，内部会判断非边缘化帧上的点是否要被选择边缘化或者丢弃，<mark>这部分判断准则还不是很明白</mark>。</p> 
+<p>筛选出来这些点之后，在代码中就是对这些点进行处理，要么边缘化，要么直接丢掉。而如果一个点既不是外点，也不是要边缘化/丢掉的点，那么它就是正常的点，会继续存在于滑窗中，因此对它不进行任何处理，这就是为什么 <a href="https://github.com/JakobEngel/dso/blob/master/src/FullSystem/FullSystem.cpp#L741">代码</a> 中<code>elseif</code>后面没有<code>else</code>了，也就相当于一个空的<code>else</code>，即如果是<code>else</code>则什么也不干。</p> 
+<p><mark>最后注意</mark>：跟优化之后接着删除点一样，也上面的函数里面也是只把要丢掉的前端点<code>PointHessian</code>放到了删除数组中，并且从使用数组中弹出，这样就是完成了前端点的删除。而后端的对应的能量点在这个函数中没有释放，所以还要再释放后端的能量点，但是这个释放放在了<code>FullSystem::flagPointsForRemoval</code>函数外面去调用，这是我觉得不太好的地方，放在该函数里面调用更好。而且这个函数命名也不准确，我觉得命名为<code>MarginOrDropPoints</code>更好，也就是边缘化或者丢掉点。同理应该把<a href="https://github.com/JakobEngel/dso/blob/master/src/FullSystem/FullSystem.cpp#L1166">后面</a>的<code>ef-&gt;marginalizePointsF();</code>函数也一并放进里面调用，实际就完成了整个点的边缘化。这样拆开反而逻辑没有那么清晰了。</p> 
+<h2><a id="3FrameHessian_104"></a>3.帧FrameHessian的管理</h2> 
+<ol><li> <p>在上一步边缘化掉点之后，得到了这些点的残差构成的<code>HM/bM</code>矩阵，但是这个矩阵中仍然是含有要被边缘化掉的帧的状态的，因此还要对这个<code>HM/bM</code>进行Schur消元得到消元之后维度缩减的<code>HM/bM</code>，给下次滑窗优化使用。</p> </li><li> <p>在后端对边缘化的帧进行Schur消元之后，还有一个步骤需要做，那就是把其他帧上以被边缘化掉的帧为<code>target</code>帧的那些点的残差删掉，这个也是很正常的，因为这帧没有了，自然其他帧上的点和这帧关联的残差也就没有了。注意这个不是说其他帧上的点也不用了，这些点还是和别的帧可以构成残差的，所以这个和边缘化/丢掉点是不同的，这个是<strong>对仍然存在于滑窗中的点的残差进行处理</strong>。</p> </li><li> <p>而删除点的某个残差，则跟上面<strong>1.3节</strong>讲述的一样了，那就是先<code>dropResidual</code>删掉后端残差，再<code>deleteOut</code>删除前端残差。</p> </li><li> <p>把残差处理完了，就要删除这个帧了，调用<code>deleteOutOrder</code>函数把这个帧从<code>FullSystem</code>的帧数组中弹出，这就保证了它不会在<code>FullSystem</code>中再被调用参与滑窗优化了，但是不会释放它的内存。这个跟<code>PointHessian</code>的删除逻辑是一样的，本质上是因为这个<code>FrameHessian</code>的指针在优化之前已经被加入到<code>allFrameHistory</code>里面了，如果在这里把指针释放了，那么<code>allFrameHistory</code>里面存的就是野指针了。</p> </li><li> <p>由于删除了滑窗中的一个关键帧，所以需要调用<code>setPrecalcValues</code>函数重新计算各个帧的线性化点状态、最新状态、状态增量等变量，然后还要调用<code>ef-&gt;setAdjointsF</code>重新计算各个帧之间的伴随矩阵。<strong>至此，帧边缘化的操作全部完成。</strong></p> </li></ol>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/99b1bc8d032c313aeb07059f66847e2d/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">【前端｜JS实战第1篇】使用JS来实现属于自己的贪吃蛇游戏！</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2703e6686398542c408796e375a376c5/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">冯诺依曼体系结构</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

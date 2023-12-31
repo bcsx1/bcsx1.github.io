@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ES索引优化方案 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ES索引优化方案" />
+<meta property="og:description" content="定期Forcemerge 由于单个分片的开销取决于segment数量和segment大小,segment个数越多，单个shard内的搜索将会消耗更多的时间和内存，通过对索引进行forcemerge将shard里面的多个较小的segment合并为segment，减少segment个数有效的提升查询性能，降低时延。同时段合并也能够清除已经被标记为删除的文档，减少空间。
+操作语句为 POST /index_name/_forcemerge?max_num_segments=1 注意：forcemerge是一个极其耗费资源的操作，建议在业务量降低的时候进行。
+段合并过程中会占用磁盘IO，影响检索性能，如果系统已经查询比较慢了，此时进行段合并会加剧问题。
+另外，段合并不是一锤子买卖，如果索引还有持续的数据写入或者更新，shard内的segment也会继续的多起来，这个时候就要进行例行的段合并操作了，可以定时的在业务低峰期自动执行。
+如果集群负载比较重，可以只处理含删除数据的segment，不合并segment
+POST /index_name/_forcemerge?only_expunge_deletes=true 数据删除时，Lucene只做标记删除，不实际删除segment的数据，设置only_expunge_deletes为true时，ES会创建一个新的不含删除数据的segment替换当前含删除数据的segment。
+segment 归并的过程，需要先读取 segment，归并计算，再写一遍 segment，最后还要保证刷到磁盘。可以说，这是一个非常消耗磁盘 IO 和 CPU 的任务。所以，ES 提供了对归并线程的限速机制，确保这个任务不会过分影响到其他任务。
+链接: 官方说明
+Forcemerge提速 在 5.0 之前，归并线程的限速配置 indices.store.throttle.max_bytes_per_sec 是 20MB。对于写入量较大，磁盘转速较高，甚至使用 SSD 盘的服务器来说，这个限速是明显过低的。对于 Elastic Stack 应用，社区广泛的建议是可以适当调大到 100MB或者更高。
+PUT /_cluster/settings { &#34;&#34;persistent&#34;&#34; : { &#34;&#34;indices.store.throttle.max_bytes_per_sec&#34;&#34; : &#34;&#34;200mb&#34;&#34; } } 链接: 官方说明
+索引拆分或重构shard 查询结果匹配命中的数据越多，性能越差，时延耗时越高。
+索引拆分主要是要从业务方面入手，缩小搜索的数据范围，降低查询结果匹配命中的数据。比如对于大索引，通过业务层次划分，每个业务数据独立为一个索引。对于时序数据，可以通过按照时间进行索引拆分，每天一个索引，搜索的时候默认只搜索最近几天的数据。
+重构shard的主要目的是为了解决shard个数过多影响查询的场景，这种方案适合数据量小，基本没有写入的场景，比如索引的数据量比较小10GB，之前设置了10个shard，10个节点，其实可以通过reindex，将索引的shard调整为1个，配置9个副本来达到更好地效果。&#34;
+索引字段尽量用keyword 能够用keyword替换的数值型字段（byte, short, integer, long, float, double, ip and date）尽量用keyword替换
+keyword类型的term query，ES使用的是倒排索引。倒排索引在内存中维护了词典和文档列表（Posting list）的关系，倒排索引本身是想通过精确匹配从词典中找到term，然后找到词的posting list合并。
+数值类型为了能有效的支持范围查询，它的存储结构并不是倒排索引。从lucene6开始。数值型的存储结构使用的是一种BKD tree的结构，类似于mysql中的B&#43;索引结构，但是BKD是针对多维空间的。如果是BKD tree，精确匹配需要通过树的查找算法进行查询，然后文档结果集合进行排序再返回，相比倒排索引的词典树&#43;posting list&#43;跳表还是要差不少。树形数据结构对范围查找非常友好，如果业务上使用了数值型字段但是又不使用范围查找，可以使用keyword替代。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/02206f2ac64b5fc79ba503def69ce59d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-10-21T21:02:00+08:00" />
+<meta property="article:modified_time" content="2022-10-21T21:02:00+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ES索引优化方案</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h6><a id="Forcemerge_0"></a>定期Forcemerge</h6> 
+<p>由于单个分片的开销取决于segment数量和segment大小,segment个数越多，单个shard内的搜索将会消耗更多的时间和内存，通过对索引进行forcemerge将shard里面的多个较小的segment合并为segment，减少segment个数有效的提升查询性能，降低时延。同时段合并也能够清除已经被标记为删除的文档，减少空间。</p> 
+<pre><code class="prism language-java">操作语句为
+POST <span class="token operator">/</span>index_name<span class="token operator">/</span>_forcemerge<span class="token operator">?</span>max_num_segments<span class="token operator">=</span><span class="token number">1</span>
+</code></pre> 
+<p>注意：forcemerge是一个极其耗费资源的操作，建议在业务量降低的时候进行。<br> 段合并过程中会占用磁盘IO，影响检索性能，如果系统已经查询比较慢了，此时进行段合并会加剧问题。<br> 另外，段合并不是一锤子买卖，如果索引还有持续的数据写入或者更新，shard内的segment也会继续的多起来，这个时候就要进行例行的段合并操作了，可以定时的在业务低峰期自动执行。<br> 如果集群负载比较重，可以只处理含删除数据的segment，不合并segment</p> 
+<pre><code class="prism language-java">POST <span class="token operator">/</span>index_name<span class="token operator">/</span>_forcemerge<span class="token operator">?</span>only_expunge_deletes<span class="token operator">=</span><span class="token boolean">true</span>
+</code></pre> 
+<p>数据删除时，Lucene只做标记删除，不实际删除segment的数据，设置only_expunge_deletes为true时，ES会创建一个新的不含删除数据的segment替换当前含删除数据的segment。<br> segment 归并的过程，需要先读取 segment，归并计算，再写一遍 segment，最后还要保证刷到磁盘。可以说，这是一个非常消耗磁盘 IO 和 CPU 的任务。所以，ES 提供了对归并线程的限速机制，确保这个任务不会过分影响到其他任务。<br> 链接: <a href="https://www.elastic.co/guide/en/elasticsearch/reference/7.9/indices-forcemerge.html" rel="nofollow">官方说明</a></p> 
+<h6><a id="Forcemerge_17"></a>Forcemerge提速</h6> 
+<p>在 5.0 之前，归并线程的限速配置 indices.store.throttle.max_bytes_per_sec 是 20MB。对于写入量较大，磁盘转速较高，甚至使用 SSD 盘的服务器来说，这个限速是明显过低的。对于 Elastic Stack 应用，社区广泛的建议是可以适当调大到 100MB或者更高。</p> 
+<pre><code class="prism language-java">PUT <span class="token operator">/</span>_cluster<span class="token operator">/</span>settings 
+<span class="token punctuation">{<!-- --></span>
+    <span class="token string">""</span>persistent<span class="token string">""</span> <span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token string">""</span>indices<span class="token punctuation">.</span>store<span class="token punctuation">.</span>throttle<span class="token punctuation">.</span>max_bytes_per_sec<span class="token string">""</span> <span class="token operator">:</span> <span class="token string">""</span><span class="token number">200</span>mb<span class="token string">""</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>链接: <a href="https://www.elastic.co/guide/en/elasticsearch/guide/current/indexing-performance.html" rel="nofollow">官方说明</a></p> 
+<h6><a id="shard_29"></a>索引拆分或重构shard</h6> 
+<p>查询结果匹配命中的数据越多，性能越差，时延耗时越高。<br> 索引拆分主要是要从业务方面入手，缩小搜索的数据范围，降低查询结果匹配命中的数据。比如对于大索引，通过业务层次划分，每个业务数据独立为一个索引。对于时序数据，可以通过按照时间进行索引拆分，每天一个索引，搜索的时候默认只搜索最近几天的数据。<br> 重构shard的主要目的是为了解决shard个数过多影响查询的场景，这种方案适合数据量小，基本没有写入的场景，比如索引的数据量比较小10GB，之前设置了10个shard，10个节点，其实可以通过reindex，将索引的shard调整为1个，配置9个副本来达到更好地效果。"</p> 
+<h6><a id="keyword_34"></a>索引字段尽量用keyword</h6> 
+<p>能够用keyword替换的数值型字段（byte, short, integer, long, float, double, ip and date）尽量用keyword替换<br> keyword类型的term query，ES使用的是倒排索引。倒排索引在内存中维护了词典和文档列表（Posting list）的关系，倒排索引本身是想通过精确匹配从词典中找到term，然后找到词的posting list合并。<br> 数值类型为了能有效的支持范围查询，它的存储结构并不是倒排索引。从lucene6开始。数值型的存储结构使用的是一种BKD tree的结构，类似于mysql中的B+索引结构，但是BKD是针对多维空间的。如果是BKD tree，精确匹配需要通过树的查找算法进行查询，然后文档结果集合进行排序再返回，相比倒排索引的词典树+posting list+跳表还是要差不少。树形数据结构对范围查找非常友好，如果业务上使用了数值型字段但是又不使用范围查找，可以使用keyword替代。<br> boolean类型需要替换吗？ boolean类型的储存和数值型不一样，在lucene底层，boolean类型的存储其实是用F替代false，T替代true，是有倒排索引的，默认情况下（index为true的时候）不需要用keyword替换boolean，另外boolean类型的docvalue字段是用0,1表示false和true的，在用script获取docvalue计算的时候要注意。</p> 
+<h6><a id="_40"></a>少用模糊匹配</h6> 
+<p>ES中的模糊匹配主要包括 wildcard通配符，fuzzy查询两种。模糊匹配耗时会随着数据量线性增长，很多时候一个模糊查询下去，可以通过监控看见集群的资源使用率快速升高，比较坏的情况下还会触发GC，当查询并发上去后会导致CPU和load也一并上升。ES是通过倒排索引来加速查找的，模糊查询的语句会命中大量的term词，特别是前后*的查询，命中的倒排term更多，意味着更多的倒排链参与搜索，将会消耗的更多的磁盘IO、CPU、内存资源，严重的情况下，查询会导致集群不可用，中断业务。</p> 
+<p>要怎么优化，使用模糊的语句查询的业务需要深入分析。是否一定要通过模糊的方式才能命中自己想要的文档。一种好的做法是通过分词来达到模糊查找的效果，比如使用match，通过分词的方式能够充分的利用倒排索引的优势，减少命中不相关的term。另外如果一定要用模糊查询，尽量减少前后<em>或者前</em>的这种查询，使用后*的匹配。</p> 
+<h6><a id="Filter_45"></a>尽量使用Filter过滤器</h6> 
+<p>ES中有query context和filter context两种查询，query主要关注文档的相关性匹配度，需要计算得分来评估文档和查询子句的相关度。filter主要关注文档是否匹配，只要回答“是”或“否”的问题。<br> 官网也对于这两种context进行详细的介绍地址，<br> 链接: <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/query-filter-context.html" rel="nofollow">官方说明</a><br> 有这样一个数据结构：有四个字段 年龄，姓名，城市，地址</p> 
+<pre><code class="prism language-java">PUT test <span class="token punctuation">{<!-- --></span>
+	<span class="token string">"mappings"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token string">"propertles"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token string">"age"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token string">"type"</span><span class="token operator">:</span> <span class="token string">"Integer"</span>
+			<span class="token punctuation">}</span><span class="token punctuation">,</span>
+			<span class="token string">"name"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token string">"type"</span><span class="token operator">:</span> <span class="token string">"keyword"</span>
+			<span class="token punctuation">}</span><span class="token punctuation">,</span>
+			<span class="token string">"city"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token string">"type"</span><span class="token operator">:</span> <span class="token string">"keyword"</span>
+			<span class="token punctuation">}</span><span class="token punctuation">,</span>
+			<span class="token string">"address"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+				<span class="token string">"type"</span><span class="token operator">:</span> <span class="token string">"text"</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+</code></pre> 
+<p>现在要查询姓名等于某一个值的查询语句<br> 使用query 子句进行查询:</p> 
+<pre><code class="prism language-java">POST test <span class="token operator">/</span> _search <span class="token punctuation">{<!-- --></span>
+	<span class="token string">"query"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token string">"bool"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token string">"should"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>
+					<span class="token string">"term"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+						"name<span class="token operator">:</span><span class="token punctuation">{<!-- --></span>
+						<span class="token string">"value"</span><span class="token operator">:</span> <span class="token string">"lisi"</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">]</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>使用的是filter 子句进行查询:</p> 
+<pre><code class="prism language-java">POST test <span class="token operator">/</span> _search <span class="token punctuation">{<!-- --></span>
+	<span class="token string">"query"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token string">"bool"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token string">"filter"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>
+					<span class="token string">"term"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+						"name<span class="token operator">:</span><span class="token punctuation">{<!-- --></span>
+						<span class="token string">"value"</span><span class="token operator">:</span> <span class="token string">"lisi"</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">]</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>使用filter也能够得到想要的结果，要看业务场景是否需要打分排序。Filter是对结果集合的简单检查，filter、must_not计算速度相对打分bool子句中的should、 must更快，并且es将会缓存常用的filter结果集，提高过滤性能。对比之下，query子句中的shoud、must不仅要查找匹配的文档，还要计算每个文档的相关程度，这通常会使其比非评分文档更复杂，另外，查询结果不可缓存。"</p> 
+<h6><a id="_106"></a>固定查询范围</h6> 
+<p>固定查询范围的核心是通过查询缓存来加速。有如下的查询语句，可以看下面的filter中的range语句，查询点击时刻一小时内的数据，因为每一个点击的时间不可控，这样相当于filter的条件一直在变。</p> 
+<pre><code class="prism language-java">GET product <span class="token operator">*</span> <span class="token operator">/</span>_search <span class="token punctuation">{<!-- --></span>
+	<span class="token string">"query"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token string">"bool"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token string">"must"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>
+				<span class="token string">"match"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token string">"code"</span><span class="token operator">:</span> <span class="token string">"xxxxx"</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+			<span class="token string">"filter"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>
+				<span class="token string">"range"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token string">"@timestamp"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+						<span class="token string">"gte"</span><span class="token operator">:</span> <span class="token string">"2021-02-01 10:00:24"</span><span class="token punctuation">,</span>
+						<span class="token string">"lt"</span><span class="token operator">:</span> <span class="token string">"2021-02-01 11:00:24"</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span><span class="token punctuation">]</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>在业务允许的范围内，如果能够固定时间范围，这样能够利用filter的缓存能力，加速查找，改成如下语句：</p> 
+<pre><code class="prism language-java">GET product <span class="token operator">*</span> <span class="token operator">/</span>_search <span class="token punctuation">{<!-- --></span>
+	<span class="token string">"query"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token string">"bool"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token string">"must"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>
+				<span class="token string">"match"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token string">"code"</span><span class="token operator">:</span> <span class="token string">"xxxxx"</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+			<span class="token string">"filter"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span>
+				<span class="token string">"range"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+					<span class="token string">"@timestamp"</span><span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+						<span class="token string">"gte"</span><span class="token operator">:</span> <span class="token string">"2021-02-01 10:00:00"</span><span class="token punctuation">,</span>
+						<span class="token string">"lt"</span><span class="token operator">:</span> <span class="token string">"2021-02-01 11:00:00"</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span><span class="token punctuation">]</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h6><a id="_151"></a>开启慢日志，定位慢请求语句</h6> 
+<p>链接: <a href="https://support.huaweicloud.com/css_faq/css_02_0096.html" rel="nofollow">link</a></p> 
+<h6><a id="profile_Api_154"></a>通过profile Api查看查询语句执行信息</h6> 
+<p>链接: <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-profile.html" rel="nofollow">官方说明</a></p> 
+<h6><a id="_157"></a>硬件优化</h6> 
+<p>影响查询的主要资源包括CPU、内存、磁盘IO三大资源，网络带宽一般不会成为瓶颈（云上都是10GE的网卡）。如果已经尝试了业务层面以及查询语句等等优化都不能达到业务期望的效果，可以尝试进行硬件升级。</p> 
+<p>硬件升级前，首先得找到影响查询性能的瓶颈点，对症下药。<br> 如果是CPU或者内存资源不够，可以通过节点纵向扩容来解决（比如从2u16g节点变更到4u32g的节点）或者横向扩容来解决（5个节点扩容成10个也能够扩大集群的计算和内存资源），如果是磁盘性能不够，因为磁盘不能够直接变更类型，需要重新更换机器。一般是通过备份恢复功能，将集群数据迁入到磁盘更好地集群，比如从云盘到本地盘SSD的超高IO系列或者鲲鹏超高IO系列。"</p> 
+<h6><a id="_163"></a>缓存优化</h6> 
+<p>预加载数据到文件缓存中<br> 链接: <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/preload-data-to-file-system-cache.html" rel="nofollow">官方说明</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/821a858502b7b7265774fed9a195207d/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Ansible的安装</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b92c0cccfbae43ed95fa6ce5186972e8/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">C中printf()的常用输出</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

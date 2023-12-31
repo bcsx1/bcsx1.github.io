@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>从Oracle日志解析学习数据库内核原理 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="从Oracle日志解析学习数据库内核原理" />
+<meta property="og:description" content="前言 不管现阶段美国和中国对峙到何种程度，不管桀傲不驯拉里.埃里森如何不看好中国，Oracle 仍是数据库中的一枝独秀。然而，他山之石可以攻玉，多个国产数据库在关键技术攻关方面的整体水平也已达到国际先进。
+国内越来越多的 Oracle 数据库开始下线，迁移到开源或者国产数据上，o2k 支持实时增量的将 Oracle 数据库增量变化抽取出来，助力国产化数据库无缝接管 Oracle。
+笔者作为数据库内核的负责人参与实现了 o2k 来解析 Oracle 日志，并于 2022 年 2 月 15 号把它开放出来给社区免费使用，期间经历了各种迷茫，获得了众多大佬的指导，最终总算是交出了一份还算不错的试卷。
+作为一个 DBA 兼开发人员，在整个 o2k 的实现过程中，对于 Oracle 数据库的数据库理论和工程能力学习了很多，也进一步对数据库原理有了进一步了解。
+借助 Oracle 的设计理念和实现，我们也看看是否能对新一代的数据库从业者有一定的帮助和借鉴作用。
+国内软件由于美国的打压，数据库作为基础软件赢来了一个难得的蓬勃发展期。
+曾几何时，数据库从业人员只是公司 IT 团队-&gt;运维团队里的一个小小部门，而今一个能指导开发正确使用数据库，选择数据库来适配业务来适应业务的数据架构师供不应求。
+如果能掌握着数据库原理，甚至能主动改造数据库适配相关应用场景的人才年薪至少百万。
+作为计算机皇冠上的其中一粒明珠，数据库上承业务在线离线之责，下接硬件内核之妙，看到越来越多的人才加入数据库及数据库内核队伍，不胜欣慰！
+本系列文章中我们将由浅入深以 Oracle 日志解析遇到的重重阻塞为例，来介绍在数据库中常见，而又关键的概念，了解数据库设计思路及工程实现中需要注意的事项。
+本文以浅为主，我们先简单介绍一下数据库的背景和 Oracle 日志解析的基础知识
+前置知识了解 数据库日志 类似于银行账户系统一样，张三存入 100 块钱会&#39;先&#39;被记录为&#39;张三增加 100&#39;的流水账，然后再把张三的账户从 1000 块修改为 1100 块。 数据库为了保证原子性和持久化，也会&#39;先&#39;在 redo 日志中记录一笔或者多笔 redo record，然后再修改数据库实际的行记录 注意，这里的“修改账户/修改行记录”都是在“写流水账/写日志”之后完成的。也就是说 redo 先于“数据写入”，这也就是著名的数据库 write-ahead logging (WAL) 。 Oracle 写数据库日志采用的是物理日志方式，记录的是内部数据块的变化；MySQL 在 Server 层的 binlog 是逻辑日志，记录的是逻辑行数据的变化。所以对 Oracle 的日志解析不仅需要理解日志本身 filespace、redo record，change vector 的变化，还需要理解 Oracle 内部数据存储的格式。 怎么查看 Oracle 日志中记录的内容 Oracle 中有专门的命令，支持将指定的二进制 redo 日志解析为逻辑的文本文件，类似于 MySQL 提供的 mysqlbinlog 工具，方便用户查看和诊断数据库问题。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/e0f4ba0cd818c6b96d37a8cf4914ef90/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-07-06T11:13:35+08:00" />
+<meta property="article:modified_time" content="2022-07-06T11:13:35+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">从Oracle日志解析学习数据库内核原理</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h3>前言</h3> 
+<p></p> 
+<p>不管现阶段美国和中国对峙到何种程度，不管桀傲不驯拉里.埃里森如何不看好中国，Oracle 仍是数据库中的一枝独秀。然而，他山之石可以攻玉，多个国产数据库在关键技术攻关方面的整体水平也已达到国际先进。</p> 
+<p>国内越来越多的 Oracle 数据库开始下线，迁移到开源或者国产数据上，o2k 支持实时增量的将 Oracle 数据库增量变化抽取出来，助力国产化数据库无缝接管 Oracle。</p> 
+<p>笔者作为数据库内核的负责人参与实现了 o2k 来解析 Oracle 日志，并于 2022 年 2 月 15 号把它开放出来给社区免费使用，期间经历了各种迷茫，获得了众多大佬的指导，最终总算是交出了一份还算不错的试卷。</p> 
+<p>作为一个 DBA 兼开发人员，在整个 o2k 的实现过程中，对于 Oracle 数据库的数据库理论和工程能力学习了很多，也进一步对数据库原理有了进一步了解。</p> 
+<p>借助 Oracle 的设计理念和实现，我们也看看是否能对新一代的数据库从业者有一定的帮助和借鉴作用。</p> 
+<p>国内软件由于美国的打压，数据库作为基础软件赢来了一个难得的蓬勃发展期。</p> 
+<p>曾几何时，数据库从业人员只是公司 IT 团队-&gt;运维团队里的一个小小部门，而今一个能指导开发正确使用数据库，选择数据库来适配业务来适应业务的数据架构师供不应求。</p> 
+<p>如果能掌握着数据库原理，甚至能主动改造数据库适配相关应用场景的人才年薪至少百万。</p> 
+<p>作为计算机皇冠上的其中一粒明珠，数据库上承业务在线离线之责，下接硬件内核之妙，看到越来越多的人才加入数据库及数据库内核队伍，不胜欣慰！</p> 
+<p>本系列文章中我们将由浅入深以 Oracle 日志解析遇到的重重阻塞为例，来介绍在数据库中常见，而又关键的概念，了解数据库设计思路及工程实现中需要注意的事项。</p> 
+<p>本文以浅为主，我们先简单介绍一下数据库的背景和 Oracle 日志解析的基础知识</p> 
+<p></p> 
+<h3>前置知识了解</h3> 
+<h4>数据库日志</h4> 
+<ul><li>类似于银行账户系统一样，张三存入 100 块钱会'先'被记录为'张三增加 100'的流水账，然后再把张三的账户从 1000 块修改为 1100 块。</li></ul> 
+<p></p> 
+<ul><li>数据库为了保证原子性和持久化，也会'先'在 redo 日志中记录一笔或者多笔 redo record，然后再修改数据库实际的行记录</li></ul> 
+<p></p> 
+<ul><li>注意，这里的“修改账户/修改行记录”都是在“写流水账/写日志”之后完成的。也就是说 redo 先于“数据写入”，这也就是著名的数据库 write-ahead logging (WAL) 。</li></ul> 
+<p></p> 
+<ul><li>Oracle 写数据库日志采用的是物理日志方式，记录的是内部数据块的变化；MySQL 在 Server 层的 binlog 是逻辑日志，记录的是逻辑行数据的变化。所以对 Oracle 的日志解析不仅需要理解日志本身 filespace、redo record，change vector 的变化，还需要理解 Oracle 内部数据存储的格式。</li></ul> 
+<p></p> 
+<p></p> 
+<div class="img-center"> 
+ <img alt="" src="https://images2.imgbox.com/30/9c/oKT1HuYE_o.jpg"> 
+</div> 
+<h3>怎么查看 Oracle 日志中记录的内容</h3> 
+<p>Oracle 中有专门的命令，支持将指定的二进制 redo 日志解析为逻辑的文本文件，类似于 MySQL 提供的 mysqlbinlog 工具，方便用户查看和诊断数据库问题。</p> 
+<p></p> 
+<p>ALTER SYSTEM DUMP LOGFILE '/opt/oracle/oradata/master1/redo01.log';</p> 
+<p></p> 
+<p>当然，这个解析出来的文本文件也并不是那么容易理解，下文中我们会对关键信息进行解读。</p> 
+<p></p> 
+<p>另外，这个逻辑的文本文件也并不是把所有的二进制 redo 日志中的信息都解析并输出出来，例如 supplement log 这种，就没有输出</p> 
+<p></p> 
+<h3>supplemental log</h3> 
+<p>Oracle 默认只记录变化的信息，类似于 MySQL 中 binlog_row_image=minimal 的情况。</p> 
+<p></p> 
+<p>也就是说，你执行了 update t1 set c2=3 where id=2，它只会记录 c2=3 的后镜像数据和 c2=2 修改之前的前镜像数据。</p> 
+<p></p> 
+<p>对于主备物理块同步，这些信息已经足够了，但是对于数据仓库或者大数据平台，不知道到底更新的是<strong>哪一行（id=2）的数据</strong>，是无法保持跟 Oracle 的数据一致的。</p> 
+<p></p> 
+<p>通过 alter database add supplemental log data (primary key) columns;可以让 Oracle 在记录日志的时候顺便把 primary key 主键也记录下来，方便同步工具将变化对应到具体哪一行，这些额外增加的日志称为 supplemental log。</p> 
+<p></p> 
+<p>OGG，O2K 等同步工具都会要求源端 Oracle 开启 supplemental log。</p> 
+<p></p> 
+<h3>日志组织形式</h3> 
+<ul><li>WAL 日志是逻辑的日志表现形式，一个 update 的事务更新了 5 行数据，会产生多个 redo record（begin,5 行记录的前镜像和后镜像，commit），而这些日志记录到日志文件中是以一个 block 一个 block(默认为 512 字节)写到文件中的</li></ul> 
+<p></p> 
+<ul><li>逻辑上，数据库日志是由一个一个的 redo record 组成的；</li></ul> 
+<p></p> 
+<ul><li>物理上，数据库日志文件中每个 block 都有 Header 和 Tail，逻辑的 redo record 记录到物理文件中对应关系如下：</li></ul> 
+<p></p> 
+<p></p> 
+<div class="img-center"> 
+ <img alt="" src="https://images2.imgbox.com/b1/a4/megYmzMV_o.png"> 
+</div> 
+<h3>redo 和 undo</h3> 
+<h4>日志记录内容</h4> 
+<p>说了这么多理论的、务虚的东西，我们来点干货。</p> 
+<p></p> 
+<p>首先，我们看看我们做一个 update 一行数据到底会生成哪些日志信息，为了排除其他的干扰，我们在做 update 之前和之后都 switch logfile，保证我们查询的 redo log 中只有 update 一个变更</p> 
+<p></p> 
+<p>在 Oracle 上执行的语句如下</p> 
+<pre><code>## 这里新建一个表用于测试
+create table test1 (id number primary key, name varchar2(15) not null, hiredate date default(sysdate) );
+insert into test1 (id, name) values (1, 'o2k1');
+insert into test1 (id, name, hiredate) values (2, 'o2k2', sysdate);
+commit
+
+## 为了排除其他的干扰，我们在做update之前和之后都switch logfile，保证我们查询的redo log中只有update一个变更
+ALTER SYSTEM SWITCH LOGFILE;
+update test1 set name='o2k3' where id=2;
+commit;
+ALTER SYSTEM SWITCH LOGFILE;
+
+## 查询到底应该从那个归档日志中获取update的变更
+select * from v$archived_log;
+
+## 将二进制日志反解析出来
+ALTER SYSTEM DUMP LOGFILE '+SSDDG1/chenmm/archivelog/2022_05_12/thread_2_seq_114.1017.1104513037';
+
+## 查看日志被导入到哪个trace文件了
+select value from v$diag_info where name='Default Trace File';    # 返回ora_6130.trc</code></pre> 
+<p></p> 
+<p>这里我们得到两个文件：</p> 
+<ol><li>二进制的 redo 日志文件"thread_2_seq_114.1017.1104513037"</li><li>根据这个二进制日志解析出来的文本文件 ora_6130.trc</li></ol> 
+<p></p> 
+<p>相关的内容我都放到了文末的附录中了，大家可以自行查看。</p> 
+<p></p> 
+<h3>redo 逻辑结构</h3> 
+<p></p> 
+<p>我们先从文本文件 ora_6130.trc 入手查看一下 redo 文件的逻辑形式。参考 <u>redo 逻辑格式</u>（见附录），可以看到</p> 
+<p></p> 
+<ul><li>FILE HEADER：日志文件有日志文件的头，记录了 Db Id，Db Name 的数据库信息，也记录了文件大小、文件类型以及 Blksiz=512（也就是说，redo 物理块大小为 512 字节），对比 <u>redo 物理格式</u>（见附录）FILE HEADER 是放到第一个 512 字节的 BLOCK 中。这里的文件号对应的就是日志序号 Seq#</li></ul> 
+<pre><code>FILE HEADER:
+File Number=3, Blksiz=512, File Type=2 LOG</code></pre> 
+<ul><li>REDO HEADER：另外这里还记录了这是 RAC 的哪个节点，是那个序号的 redo 日志，scn 的范围，"Thread 0002, Seq# 0000000114, SCN 0x0000004f1aa1-0x0000004f1aa8"。对比 <u>redo 物理格式 </u>REDO HEADER 是放到第二个 512 字节的 BLOCK 中</li></ul> 
+<pre><code> descrip:"Thread 0002, Seq# 0000000114, SCN 0x0000004f1aa1-0x0000004f1aa8"
+ thread: 2 nab: 0x4 seq: 0x00000072 hws: 0x2 eot: 0 dis: 0</code></pre> 
+<ul><li>REDO Record：redo record 是 redo 逻辑日志的最重要的组成部分，数据库的更新都会记录到一个一个的 Redo Record 中，我们执行的 update 和 commit 就被记录成了两个 Redo Record。一个长度为 0x0244，一个长度 0x00a4</li></ul> 
+<pre><code>REDO RECORD - Thread:2 RBA: 0x000072.00000002.0010 LEN: 0x0244 VLD: 0x05
+...
+REDO RECORD - Thread:2 RBA: 0x000072.00000003.0064 LEN: 0x00a4 VLD: 0x01</code></pre> 
+<p></p> 
+<h3>redo record</h3> 
+<p>进一步分解 redo record，可以看到 redo record 又是由一个 redo header 和多个 change vector('CHANGE #?')组成</p> 
+<ul><li>Redo Header：记录了 Redo 的长度 LEN: 0x0244，redo record 的地址 RBA: 0x000072.00000002.0010，SCN：0x0000.004f1aa1 等信息</li></ul> 
+<pre><code>REDO RECORD - Thread:2 RBA: 0x000072.00000002.0010 LEN: 0x0244 VLD: 0x05
+SCN: 0x0000.004f1aa1 SUBSCN:  1 05/12/2022 17:10:35
+(LWN RBA: 0x000072.00000002.0010 LEN: 0002 NST: 0001 SCN: 0x0000.004f1aa1)</code></pre> 
+<ul><li>Change Vector：它是数据变化的原子结构，观察第一个 Redo Record，我们可以看到 CHANGE #1 记录了事务开始；CHANGE #2 记录了 update 的 undo 前镜像；CHANGE #3 记录了 update 的 redo 后镜像；CHANGE #4 记录了 session 信息；而第二个 Redo Record 的 CHANGE #1 记录了事务提交的信息</li></ul> 
+<pre><code>CHANGE #1 TYP:0 CLS:17 AFN:3 DBA:0x00c00080 OBJ:4294967295 SCN:0x0000.004f1121 SEQ:1 OP:5.2 ENC:0 RBL:0
+ktudh redo: slt: 0x0013 sqn: 0x00000648 flg: 0x0012 siz: 200 fbi: 0
+            uba: 0x00c00e4c.0209.23    pxid:  0x0000.000.00000000</code></pre> 
+<p></p> 
+<h3>change vector</h3> 
+<p>在进一步分解 change vector，它也是有 Change Vector 的 header 和可变数据组成，在 Lewis《oracle core》中被称为“唯一最重要的特性”。header 和可变数据的具体信息我们在以后的文章中再详细介绍。</p> 
+<p></p> 
+<p>这里仅介绍几个最关键的信息：</p> 
+<p></p> 
+<ul><li>opcode：OP:5.2 记录的是事务开始，OP:5.4 记录的是事务结束，OP:5.1 记录的是前镜像，OP:11.5 记录的是 update 的后镜像，有兴趣的同学可以参考<a href="https://link.zhihu.com/?target=https%3A//xie.infoq.cn/link%3Ftarget%3Dhttps%253A%252F%252Fjonathanlewis.wordpress.com%252F2017%252F07%252F25%252Fredo-op-codes%252F" rel="nofollow" title="lewis记录的opcode">lewis记录的opcode</a>详细列表。</li><li>xid：事务号，Oracle 事务管理起始于 undo 段，并依此为中心。这也是你看到为什么事务开始 5.2、事务结束 5.4 和 undo 记录 5.1 都是对 Layer 5 : Transaction Undo 的操作的原因。xid 记录的信息从某种程度上来说记录的就是在 undo 上占据了哪个 slot。阿里巴巴的 GalaxyEngine 使用的 lizard 事务优化跟 Oracle 的事务异曲同工</li></ul> 
+<pre><code>CHANGE #1 TYP:0 CLS:17 AFN:3 DBA:0x00c00080 OBJ:4294967295 SCN:0x0000.004f1121 SEQ:1 OP:5.2 ENC:0 RBL:0
+CHANGE #2 TYP:0 CLS:18 AFN:3 DBA:0x00c00e4c OBJ:4294967295 SCN:0x0000.004f1120 SEQ:1 OP:5.1 ENC:0 RBL:0
+  xid:  0x0001.013.00000648  
+CHANGE #3 TYP:2 CLS:1 AFN:4 DBA:0x010000ad OBJ:98733 SCN:0x0000.004f1a8c SEQ:1 OP:11.5 ENC:0 RBL:0
+CHANGE #1 TYP:0 CLS:17 AFN:3 DBA:0x00c00080 OBJ:4294967295 SCN:0x0000.004f1aa1 SEQ:1 OP:5.4 ENC:0 RBL:0
+</code></pre> 
+<p></p> 
+<h3>undo 和 redo</h3> 
+<p></p> 
+<p>这里要专门说一下 undo 和 redo，由于 MVCC 多版本的设计：</p> 
+<ul><li>对所有数据的修改，都需要记录这个数据修改前的值，即在 undo 里面记录前镜像。对于我们的 update 就是要记录 name='o2k2'</li><li>同时，对所有数据的修改又必须先以 Redo 的方式记录到 WAL 日志中，也出现了在 redo 中记录 undo 信息的情况，即第一个 Redo Record 的 CHANGE #2 记录了 update 的 undo 前镜像。</li><li>如果在数据库做恢复前滚的时候，undo 跟表数据一样也需要恢复</li></ul> 
+<p>也就是说，张三存了 100 块钱，流水账里面记录的不是"张三 +100"，而是“ 前镜像：张三 1000；后镜像：张三 1100”，修改一行数据，可能只是几个字节的变化，但是数据库为了保证数据恢复、读一致性多写了这么多日志，多做了这么多事情。而如果你深入做数据库内核，你会发现这个是一个天才的设计。由于文章篇幅问题，这里不细讲。</p> 
+<p></p> 
+<h3>表和行</h3> 
+<p>进一步细看的话，你可以看到前镜像和后镜像里面具体改的数据，例如，前镜像数据如下：</p> 
+<pre><code>ncol: 3 nnew: 1 size: 0
+col  1: [ 4]  6f 32 6b 32
+</code></pre> 
+<p>这里表示这个表有 3 列，修改了一个列，大小变化为 0，修改的是 col1，对应的四个字节为 6f 32 6b 32，也就是 o2k2 6f 32 6b 32 是 Oracle 的数据存储格式，跟 redo 的存储结构关系不大。</p> 
+<p></p> 
+<h3>小结</h3> 
+<p>从上面的逻辑日志可以看出来，Oracle 想要对表更新：</p> 
+<ul><li>首先要在程序中构建一个 Redo Record</li><li>然后构建几个 Change Vector，包括事务开始、修改数据的前镜像、修改事务的后镜像等等</li><li>将 Redo Record 和 Change Vector 序列化到 Redo Buffer （Oracle 有专门的 LGWR 来刷新 Redo Buffer 到日志文件中）</li><li>最后才是将 Change Vector 应用到数据块上去，这里来说，应用的是表还是 undo，并没有太大区别</li></ul> 
+<p></p> 
+<div class="img-center"> 
+ <img alt="" src="https://images2.imgbox.com/0a/82/Jrf4p05J_o.jpg"> 
+</div> 
+<p></p> 
+<p></p> 
+<h3>redo 物理结构</h3> 
+<p></p> 
+<p>上面主要介绍的是 redo 的逻辑结构，是 Oracle 帮我们解析出来的，一般的疑难问题排查到这一步应该够了，但是如果你要做日志解析或者想要进一步深入排查，你可能会关注到底他在二进制层面是怎么落地的。</p> 
+<p></p> 
+<p>这个章节仅面向 1%的读者，如果你对这块不感兴趣，可以直接跳过这个章节:)</p> 
+<p></p> 
+<p>参考附录 <u>redo 物理格式</u>，这里是将 redo 文件拷贝出来以后用 Hexdump 以十六进制格式输出的 Oracle redo 日志</p> 
+<p></p> 
+<h3>redo file &amp; block header</h3> 
+<p>首先看第一个 block，是 file header 的 block 第一行，是 block header，每个 block 的开头 16 个字节记录的都是这个 block 的 header。</p> 
+<p></p> 
+<p>对比下面的普通 block，可以看到 0x0022 是 logfile header, 0x0122 是 logfile block 第二行开始是 redo 文件头 file header，这里记录了几个比较关键的信息：“00 02 00 00”表示 0x00 00 02 00 = 512 即这个 redo log 一个 block 到底有多大（在 oracle 11.2 以后 BLOCKSIZE 可以设置为 512，1024 或者 4096）， “03 00 00 00”表示 0x00 00 00 03 = 3 表示一共有 3 个 block。</p> 
+<pre><code>00000000  00 22 00 00 00 00 c0 ff  00 00 00 00 00 00 00 00  |."....��........|
+00000010  65 58 00 00 00 02 00 00  03 00 00 00 7d 7c 7b 7a  |eX..........}|{z|</code></pre> 
+<p>注意：由于我们的 Oracle 是安装在 little endian 小端 x86 的 linux 服务器上的，所以“00 02 00 00”表示 0x00 00 02 00 = 512 需要倒过来一下，如果你的 Oracle 跑在 Big Endian 大端的 IBM AIX 上的时候，“00 02 00 00”表示 0x00 02 00 00 = 131072 就不用倒过来了</p> 
+<p></p> 
+<h3>redo record &amp; redo block</h3> 
+<p></p> 
+<p>既然知道了一个 block 的大小为 0x00000200，那第一个真正的 redo block 的起始位置开始的 block 就是 00000000+00000200=00000200，第二个就是 00000400，第三个就是 00000600</p> 
+<pre><code>00000200  01 22 00 00 01 00 00 00  72 00 00 00 00 80 25 cd  |."......r.....%�|
+
+00000400  01 22 00 00 02 00 00 00  72 00 00 00 10 80 66 66  |."......r.....ff|
+
+00000600  01 22 00 00 03 00 00 00  72 00 00 00 64 80 1b 9a  |."......r...d...|
+</code></pre> 
+<p>这里“01 00 00 00”, “02 00 00 00” 和“03 00 00 00”就是 block 序号，表示这是第几个块；"72 00 00 00"=0x00000072=114 是日志序号，对应的就是 redo 日志空间中的 Seq#号；而"00 80", "10 80", "64 80"对应的是该 block 中第一个 redo record 相对 block 起始地址的偏移量。</p> 
+<p></p> 
+<p>00000400 起始的 redo block 的 redo record 是从“10 80”=0x8010-0x8000=0x10=16 即从 00000410"44 02 00 00..."开始就是 redo record 的字节信息了。</p> 
+<pre><code>00000400  01 22 00 00 02 00 00 00  72 00 00 00 10 80 66 66  |."......r.....ff|
+00000410  44 02 00 00 05 6e 00 00  a1 1a 4f 00 01 00 00 23  |D....n..�.O....#|
+</code></pre> 
+<p>00000600 起始的 redo block 的 redo record 是从“64 80”=0x8064-0x8000=0x64=100 即从 00000664"a4 00 00 00..."开始就是 redo record 的字节信息了。</p> 
+<pre><code>00000600  01 22 00 00 03 00 00 00  72 00 00 00 64 80 1b 9a  |."......r...d...|
+00000610  01 00 03 01 00 00 00 00  00 1a 4f 00 01 00 70 72  |..........O...pr|
+00000620  6f 32 6b 33 05 14 00 00  00 00 00 00 00 00 00 00  |o2k3............|
+00000630  00 00 00 00 00 00 00 00  00 06 00 00 12 00 04 00  |................|
+00000640  00 00 02 00 04 00 04 00  00 00 00 00 03 00 4f f0  |..............O�|
+00000650  2a 00 37 00 00 00 00 00  00 04 20 0b ff ff ff ff  |*.7....... .����|
+00000660  53 59 53 00 a4 00 00 00  01 06 00 00 a2 1a 4f 00  |SYS.�.......�.O.|
+</code></pre> 
+<p>我们可以明显看到一个 redo record 是可以跨两个 block 的。也就是前面我们介绍的逻辑的 redo record 是可能包含在一个物理 redo block 中的，也有可能跨多个物理 redo block。</p> 
+<p></p> 
+<h3>log redo header</h3> 
+<p>第一个 redo block 比较特殊，"00 80"的起始 redo record 为 0。起始这个 redo block 中并没有 redo record。而是包含了这个 redo file 的所属实例信息，起止 SCN 等信息，甚至部分信息是以纯文本来记录的“Thread 0002, Seq# 0000000114, SCN 0x0000004f1aa1-0x0000004f1aa8”</p> 
+<p></p> 
+<h3>总结</h3> 
+<p></p> 
+<p>综上所述，本文简略的介绍了 Oracle redo 的物理和逻辑格式。</p> 
+<p></p> 
+<p>一条 update 语句实际执行时，在 Oracle 上经历的写 undo、记录 WAL，修改数据块的过程；介绍了 Oracle 在二进制 redo 日志中把逻辑的 redo record 对应记录到 redo block 中的。</p> 
+<p></p> 
+<p>文末一张图，简要总结一下他们的关系：</p> 
+<p></p> 
+<p></p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/2f/76/NIH0DNqJ_o.png"></p> 
+<p></p> 
+<p></p> 
+<h3>｜附录</h3> 
+<p></p> 
+<h3>redo 逻辑格式 = redo 的 trace 文件</h3> 
+<pre><code>DUMP OF REDO FROM FILE '+SSDDG1/chenmm/archivelog/2022_05_12/thread_2_seq_114.1017.1104513037'
+ Opcodes *.*
+ RBAs: 0x000000.00000000.0000 thru 0xffffffff.ffffffff.ffff
+ SCNs: scn: 0x0000.00000000 thru scn: 0xffff.ffffffff
+ Times: creation thru eternity
+ FILE HEADER:
+	Compatibility Vsn = 186647552=0xb200400
+	Db ID=2935349816=0xaef5e238, Db Name='CHENMM'
+	Activation ID=2935307061=0xaef53b35
+	Control Seq=18659=0x48e3, File size=102400=0x19000
+	File Number=3, Blksiz=512, File Type=2 LOG
+ descrip:"Thread 0002, Seq# 0000000114, SCN 0x0000004f1aa1-0x0000004f1aa8"
+ thread: 2 nab: 0x4 seq: 0x00000072 hws: 0x2 eot: 0 dis: 0
+ resetlogs count: 0x41a5ccfa scn: 0x0000.000e2006 (925702)
+ prev resetlogs count: 0x3121c97a scn: 0x0000.00000001 (1)
+ Low  scn: 0x0000.004f1aa1 (5184161) 05/12/2022 17:10:35
+ Next scn: 0x0000.004f1aa8 (5184168) 05/12/2022 17:10:36
+ Enabled scn: 0x0000.001f0753 (2033491) 04/07/2022 12:21:09
+ Thread closed scn: 0x0000.004f1aa1 (5184161) 05/12/2022 17:10:35
+ Disk cksum: 0xcd25 Calc cksum: 0xcd25
+ Terminal recovery stop scn: 0x0000.00000000
+ Terminal recovery  01/01/1988 00:00:00
+ Most recent redo scn: 0x0000.00000000
+ Largest LWN: 2 blocks
+ End-of-redo stream : No
+ Unprotected mode
+ Miscellaneous flags: 0x800011
+ Thread internal enable indicator: thr: 0, seq: 0 scn: 0x0000.00000000
+ Zero blocks: 8
+ Format ID is 2
+ redo log key is 5732c0d413f33575933d9e64c4ff5c6
+ redo log key flag is 5
+ Enabled redo threads: 1 2 
+ 
+REDO RECORD - Thread:2 RBA: 0x000072.00000002.0010 LEN: 0x0244 VLD: 0x05
+SCN: 0x0000.004f1aa1 SUBSCN:  1 05/12/2022 17:10:35
+(LWN RBA: 0x000072.00000002.0010 LEN: 0002 NST: 0001 SCN: 0x0000.004f1aa1)
+CHANGE #1 TYP:0 CLS:17 AFN:3 DBA:0x00c00080 OBJ:4294967295 SCN:0x0000.004f1121 SEQ:1 OP:5.2 ENC:0 RBL:0
+ktudh redo: slt: 0x0013 sqn: 0x00000648 flg: 0x0012 siz: 200 fbi: 0
+            uba: 0x00c00e4c.0209.23    pxid:  0x0000.000.00000000
+CHANGE #2 TYP:0 CLS:18 AFN:3 DBA:0x00c00e4c OBJ:4294967295 SCN:0x0000.004f1120 SEQ:1 OP:5.1 ENC:0 RBL:0
+ktudb redo: siz: 200 spc: 2574 flg: 0x0012 seq: 0x0209 rec: 0x23
+            xid:  0x0001.013.00000648  
+ktubl redo: slt: 19 rci: 0 opc: 11.1 [objn: 98733 objd: 98733 tsn: 4]
+Undo type:  Regular undo        Begin trans    Last buffer split:  No 
+Temp Object:  No 
+Tablespace Undo:  No 
+             0x00000000  prev ctl uba: 0x00c00e4c.0209.20 
+prev ctl max cmt scn:  0x0000.004ebaab  prev tx cmt scn:  0x0000.004ebaea 
+txn start scn:  0xffff.ffffffff  logon user: 0  prev brb: 12586531  prev bcl: 0 BuExt idx: 0 flg2: 0
+KDO undo record:
+KTB Redo 
+op: 0x04  ver: 0x01  
+compat bit: 4 (post-11) padding: 1
+op: L  itl: xid:  0x000a.013.00006307 uba: 0x00c0025b.072e.0b
+                      flg: C---    lkc:  0     scn: 0x0000.004f1a39
+KDO Op code: URP row dependencies Disabled
+  xtype: XA flags: 0x00000000  bdba: 0x010000ad  hdba: 0x010000aa
+itli: 2  ispac: 0  maxfr: 4858
+tabn: 0 slot: 1(0x1) flag: 0x2c lock: 0 ckix: 0
+ncol: 3 nnew: 1 size: 0
+col  1: [ 4]  6f 32 6b 32
+CHANGE #3 TYP:2 CLS:1 AFN:4 DBA:0x010000ad OBJ:98733 SCN:0x0000.004f1a8c SEQ:1 OP:11.5 ENC:0 RBL:0
+KTB Redo 
+op: 0x11  ver: 0x01  
+compat bit: 4 (post-11) padding: 1
+op: F  xid:  0x0001.013.00000648    uba: 0x00c00e4c.0209.23
+Block cleanout record, scn:  0x0000.004f1aa1 ver: 0x01 opt: 0x02, entries follow...
+  itli: 1  flg: 2  scn: 0x0000.004f1a8c
+KDO Op code: URP row dependencies Disabled
+  xtype: XA flags: 0x00000000  bdba: 0x010000ad  hdba: 0x010000aa
+itli: 2  ispac: 0  maxfr: 4858
+tabn: 0 slot: 1(0x1) flag: 0x2c lock: 2 ckix: 0
+ncol: 3 nnew: 1 size: 0
+col  1: [ 4]  6f 32 6b 33
+CHANGE #4 MEDIA RECOVERY MARKER SCN:0x0000.00000000 SEQ:0 OP:5.20 ENC:0
+session number   = 42
+serial  number   = 55
+transaction name = 
+version 186647552
+audit sessionid 4294967295
+Client Id = 
+login   username = SYS
+ 
+REDO RECORD - Thread:2 RBA: 0x000072.00000003.0064 LEN: 0x00a4 VLD: 0x01
+SCN: 0x0000.004f1aa2 SUBSCN:  1 05/12/2022 17:10:35
+CHANGE #1 TYP:0 CLS:17 AFN:3 DBA:0x00c00080 OBJ:4294967295 SCN:0x0000.004f1aa1 SEQ:1 OP:5.4 ENC:0 RBL:0
+ktucm redo: slt: 0x0013 sqn: 0x00000648 srt: 0 sta: 9 flg: 0x2 ktucf redo: uba: 0x00c00e4c.0209.23 ext: 2 spc: 2372 fbi: 0 
+CHANGE #2 MEDIA RECOVERY MARKER SCN:0x0000.00000000 SEQ:0 OP:24.4 ENC:0
+END OF REDO DUMP
+</code></pre> 
+<p></p> 
+<h4>redo 物理格式 = hexdump -C redo 文件</h4> 
+<pre><code>(base) pickupli@pickupli1 ~ % hexdump -C ~/Downloads/114.redo
+00000000  00 22 00 00 00 00 c0 ff  00 00 00 00 00 00 00 00  |."....��........|
+00000010  65 58 00 00 00 02 00 00  03 00 00 00 7d 7c 7b 7a  |eX..........}|{z|
+00000020  a0 81 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |�...............|
+00000030  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00000200  01 22 00 00 01 00 00 00  72 00 00 00 00 80 25 cd  |."......r.....%�|
+00000210  00 00 00 00 00 04 20 0b  38 e2 f5 ae 43 48 45 4e  |...... .8��CHEN|
+00000220  4d 4d 00 00 e3 48 00 00  00 90 01 00 00 02 00 00  |MM..�H..........|
+00000230  03 00 02 00 35 3b f5 ae  00 00 00 00 00 00 00 00  |....5;�........|
+00000240  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000250  00 00 00 00 00 00 00 00  00 00 00 00 54 68 72 65  |............Thre|
+00000260  61 64 20 30 30 30 32 2c  20 53 65 71 23 20 30 30  |ad 0002, Seq# 00|
+00000270  30 30 30 30 30 31 31 34  2c 20 53 43 4e 20 30 78  |00000114, SCN 0x|
+00000280  30 30 30 30 30 30 34 66  31 61 61 31 2d 30 78 30  |0000004f1aa1-0x0|
+00000290  30 30 30 30 30 34 66 31  61 61 38 00 04 00 00 00  |000004f1aa8.....|
+000002a0  fa cc a5 41 06 20 0e 00  00 00 00 00 02 00 00 00  |�̥A. ..........|
+000002b0  02 00 00 00 a1 1a 4f 00  00 00 00 00 0b 88 d5 41  |....�.O.......�A|
+000002c0  a8 1a 4f 00 00 00 00 00  0c 88 d5 41 00 00 08 02  |�.O.......�A....|
+000002d0  53 07 1f 00 00 00 00 00  35 ce a5 41 a1 1a 4f 00  |S.......5ΥA�.O.|
+000002e0  00 00 00 00 0b 88 d5 41  00 00 00 00 11 00 80 00  |......�A........|
+000002f0  00 00 00 00 00 00 00 00  00 00 00 00 06 00 00 00  |................|
+00000300  00 00 00 00 00 00 00 00  00 00 00 00 02 00 00 00  |................|
+00000310  00 00 00 00 00 00 00 00  00 00 00 00 01 00 00 00  |................|
+00000320  00 00 00 00 7a c9 21 31  00 00 00 00 00 00 00 00  |....z�!1........|
+00000330  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+000003c0  57 32 c0 0d 41 3f 33 57  59 33 d9 e6 4c 4f f5 c6  |W2�.A?3WY3��LO��|
+000003d0  27 f7 6c 1f 74 8a 40 20  48 9c 47 0b 46 31 76 e0  |'�l.t.@ H.G.F1v�|
+000003e0  05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000003f0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000400  01 22 00 00 02 00 00 00  72 00 00 00 10 80 66 66  |."......r.....ff|
+00000410  44 02 00 00 05 6e 00 00  a1 1a 4f 00 01 00 00 23  |D....n..�.O....#|
+00000420  06 c5 1e 24 23 63 11 03  00 00 01 00 02 00 00 00  |.�.$#c..........|
+00000430  02 00 00 00 0a 65 6c 5f  a1 1a 4f 00 00 00 72 76  |.....el_�.O...rv|
+00000440  65 72 73 00 00 00 80 f4  a3 1a 4f 00 00 00 00 00  |ers....�.O.....|
+00000450  0b 88 d5 41 05 02 11 00  03 00 ff ff 80 00 c0 00  |..�A......��..�.|
+00000460  21 11 4f 00 00 00 7c 99  01 00 ff ff 04 00 20 00  |!.O...|...��.. .|
+00000470  13 00 00 00 48 06 00 00  4c 0e c0 00 09 02 23 00  |....H...L.�...#.|
+00000480  12 00 c8 00 00 63 82 41  00 00 00 00 00 00 00 00  |..�..c.A........|
+00000490  05 01 12 00 03 00 ff ff  4c 0e c0 00 20 11 4f 00  |......��L.�. .O.|
+000004a0  00 00 00 00 01 00 ff ff  16 00 14 00 4c 00 20 00  |......��....L. .|
+000004b0  1d 00 02 00 04 00 14 00  02 00 02 00 02 00 00 00  |................|
+000004c0  c8 00 0e 0a 12 00 00 00  01 00 13 00 48 06 00 00  |�...........H...|
+000004d0  09 02 23 00 ad 81 01 00  ad 81 01 00 04 00 00 00  |..#.�...�.......|
+000004e0  00 00 00 00 0b 01 13 00  08 0c 01 00 00 00 00 00  |................|
+000004f0  4c 0e c0 00 09 02 20 00  ab ba 4e 00 00 00 00 00  |L.�... .��N.....|
+00000500  ea ba 4e 00 00 00 41 bc  40 08 00 00 ff ff ff ff  |�N...A�@...����|
+00000510  ff ff 00 00 23 0e c0 00  00 00 00 00 00 00 00 00  |��..#.�.........|
+00000520  04 0d 00 00 00 00 00 00  0a 00 13 00 07 63 00 00  |.............c..|
+00000530  5b 02 c0 00 2e 07 0b 00  00 80 00 00 39 1a 4f 00  |[.�.........9.O.|
+00000540  ad 00 00 01 aa 00 00 01  fa 12 25 01 02 00 00 00  |�...�...�.%.....|
+00000550  2c 00 00 00 01 00 03 01  00 00 00 00 00 00 00 00  |,...............|
+00000560  01 00 00 00 6f 32 6b 32  01 1c 01 00 01 00 02 00  |....o2k2........|
+00000570  02 00 00 00 00 10 00 00  00 00 00 00 01 00 00 00  |................|
+00000580  02 00 00 00 c1 03 00 00  0b 05 01 00 04 00 01 00  |....�...........|
+00000590  ad 00 00 01 8c 1a 4f 00  00 00 00 00 01 02 ad 81  |�.....O.......�.|
+000005a0  0a 00 40 00 1d 00 02 00  04 00 00 00 11 0d 00 00  |..@.............|
+000005b0  00 00 00 00 01 00 13 00  48 06 00 00 4c 0e c0 00  |........H...L.�.|
+000005c0  09 02 23 00 00 00 00 00  00 00 00 00 00 00 00 00  |..#.............|
+000005d0  00 00 00 00 ad 81 01 00  02 01 01 00 a1 1a 4f 00  |....�.......�.O.|
+000005e0  00 00 00 00 01 02 00 00  8c 1a 4f 00 ad 00 00 01  |..........O.�...|
+000005f0  aa 00 00 01 fa 12 05 01  02 00 00 00 2c 02 00 00  |�...�.......,...|
+00000600  01 22 00 00 03 00 00 00  72 00 00 00 64 80 1b 9a  |."......r...d...|
+00000610  01 00 03 01 00 00 00 00  00 1a 4f 00 01 00 70 72  |..........O...pr|
+00000620  6f 32 6b 33 05 14 00 00  00 00 00 00 00 00 00 00  |o2k3............|
+00000630  00 00 00 00 00 00 00 00  00 06 00 00 12 00 04 00  |................|
+00000640  00 00 02 00 04 00 04 00  00 00 00 00 03 00 4f f0  |..............O�|
+00000650  2a 00 37 00 00 00 00 00  00 04 20 0b ff ff ff ff  |*.7....... .����|
+00000660  53 59 53 00 a4 00 00 00  01 06 00 00 a2 1a 4f 00  |SYS.�.......�.O.|
+00000670  01 00 00 00 00 00 00 00  00 00 00 00 05 04 11 00  |................|
+00000680  03 00 ff ff 80 00 c0 00  a1 1a 4f 00 00 00 00 00  |..��..�.�.O.....|
+00000690  01 00 ff ff 08 00 14 00  10 00 04 00 13 00 00 00  |..��............|
+000006a0  48 06 00 00 00 00 00 00  09 00 00 00 02 00 00 00  |H...............|
+000006b0  4c 0e c0 00 09 02 23 00  02 00 44 09 00 7f 00 00  |L.�...#...D.....|
+000006c0  0b cf 7c 62 18 04 00 00  00 00 00 00 00 00 00 00  |.�|b............|
+000006d0  00 00 00 00 00 00 00 00  00 06 00 00 0a 00 10 00  |................|
+000006e0  04 00 02 00 08 00 00 00  28 23 00 00 01 00 13 00  |........(#......|
+000006f0  48 06 00 00 ff 00 0e 00  01 0a 09 00 00 00 00 00  |H...�...........|
+00000700  a1 1a 4f 00 00 00 00 00  00 00 00 00 00 00 00 00  |�.O.............|
+00000710  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00000800
+</code></pre> 
+<p></p> 
+<h3>参考文章和 blog</h3> 
+<p></p> 
+<ul><li>juliandyke 大神 blog 介绍 redo 日志的文章：<a href="https://link.zhihu.com/?target=https%3A//xie.infoq.cn/link%3Ftarget%3Dhttp%253A%252F%252Fwww.juliandyke.com%252FInternals%252FRedo%252FRedo.php" rel="nofollow" title="http://www.juliandyke.com/Internals/Redo/Redo.php">http://www.juliandyke.com/Internals/Redo/Redo.php</a></li><li>Lewis 大神写的《Oracle Core: Essential Internals for DBAs and Developers (Expert's Voice in Databases) 》数据库内核人员都奉为经典的书:<a href="https://link.zhihu.com/?target=https%3A//xie.infoq.cn/link%3Ftarget%3Dhttps%253A%252F%252Fwww.amazon.com%252FOracle-Core-Essential-Internals-Developers-ebook%252Fdp%252FB006C9EN1U" rel="nofollow" title="https://www.amazon.com/Oracle-Core-Essential-Internals-Developers-ebook/dp/B006C9EN1U">https://www.amazon.com/Oracle-Core-Essential-Internals-Developers-ebook/dp/B006C9EN1U</a></li><li>lewis blog 中记录的 Oracle 的 opcode：<a href="https://link.zhihu.com/?target=https%3A//xie.infoq.cn/link%3Ftarget%3Dhttps%253A%252F%252Fjonathanlewis.wordpress.com%252F2017%252F07%252F25%252Fredo-op-codes%252F" rel="nofollow" title="https://jonathanlewis.wordpress.com/2017/07/25/redo-op-codes/">https://jonathanlewis.wordpress.com/2017/07/25/redo-op-codes/</a></li><li>阿里开源的 GalaxyEngine 也使用了 lizard 事务：<a href="https://link.zhihu.com/?target=https%3A//xie.infoq.cn/link%3Ftarget%3Dhttps%253A%252F%252Fgithub.com%252FApsaraDB%252Fgalaxyengine%252Fwiki%252F1-GalaxyEngine-Overview" title="https://github.com/ApsaraDB/galaxyengine/wiki/1-GalaxyEngine-Overview">https://github.com/ApsaraDB/galaxyengine/wiki/1-GalaxyEngine-Overview</a></li><li>WAL 日志先行机制：<a href="https://link.zhihu.com/?target=https%3A//xie.infoq.cn/link%3Ftarget%3Dhttps%253A%252F%252Fen.wikipedia.org%252Fwiki%252FWrite-ahead_logging" rel="nofollow" title="https://en.wikipedia.org/wiki/Write-ahead_logging">https://en.wikipedia.org/wiki/Write-ahead_logging</a></li></ul>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/5c11008a42645e89b71c5f0a501e508c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">（萌新向很详细！）在Anaconda下安装Pytorch环境流程及问题总结</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/a3a557b19996e5315a125778364cc2b4/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Windows版的Nginx服务的启动和停止命令重新载入</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

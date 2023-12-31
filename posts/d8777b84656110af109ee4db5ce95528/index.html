@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【FPGA】八、UART串口通信 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【FPGA】八、UART串口通信" />
+<meta property="og:description" content="文章目录
+前言
+一、UART简介
+1、基本概念
+2、UART协议
+3、波特率简介
+二、UART串口回环实验
+1、设计思路
+2、程序代码
+① 串口接收模块
+② 串口发送模块
+③ 串口顶层模块
+④ 串口仿真模块
+3、仿真验证
+总结
+前言
+在我们进行FPGA设计时，常常会用到一些数据通信接口，这些通信接口都是有着特定的功能以及协议的，其中最常见的莫过于串口uart了，它对于每一个做硬件和嵌入式软件的人来说，几乎就是一个必备的工具，用来调试一个带MCU或者CPU的系统。
+串口uart是一种非常通用的设备接口，可以实现不同硬件间的通信，对于FPGA开发来说，串口也同样可以实现FPGA开发板与电脑PC端的通信，下面我们就来简单介绍一下串口uart的基本协议及功能。
+一、UART简介 1、基本概念 通用异步收发传输器，英文全称为Universal Asynchronous Receiver/Transmitter，简称UART，是一种异步收发传输器，在发送数据通过将并行数据转换成串行数据进行传输，在接收数据时将串行数据转换成并行数据。
+串行通信分为同步串行通信和异步串行通信。同步串行通信即需要时钟的参与，通信双方需要在同一时钟的控制下，同步传输数据；异步串行通信则不需要时钟的干预，通信双方使用各种的时钟来控制数据的发送和接收。uart属于异步串行通信，即没有时钟信号来同步或验证从发送器发送并由接收器接收的数据，这就要求发送器和接收器必须事先就时序参数达成一致。
+UART是通用异步收发器的简称，它包括了RS232、RS422、RS423、RS449以及RS485等接口标准和总线规范标准，UART是异步串行通信接口的总称。而RS323、RS422、RS423、RS449和RS485等是对应各种异步串行通信的接口标准和总线标准，它规定了通信接口的电器特性、传输速率以及接口的机械特性等内容。
+2、UART协议 UART串口通信需要两根信号线来实现，一根用于串口发送数据，一根用于串口接收数据。UART串口传输的数据被组织成数据包，每个数据包包含了一个起始位，5至9个数据位，可选的奇偶校验位和1或者2个停止位，如下图所示。
+UART串口协议规定，当总线处于空闲状态时信号线的状态为高电平，表示当前线路上没有数据传输。
+起始位：开始进行数据传输时发送方要先发送一个低电平来表示传输字符的开始。
+数据位：起始位之后就需要传输数据，数据位可以是5~9位，构成一个字符，一般是8位，先发送最低位后发送最高位。
+奇偶校验位：奇偶校验位是用来检验数据在传输过程中是否出错。在奇校验时，发送方应使数据位中1的个数与校验位中1的个数为奇数，接收方在接收数据时，对1的个数进行检测，若1的个数不为奇数个，则说明数据在传输过程中存在差错。偶校验则相反。
+停止位：数据结束标志，可以是1位或者2位的高电平。由于数据在传输线上是定时传输的，并且每一个设备有自己的时钟，很可能在通信中两台设备之间出现了小小的不同步，因此停止位不仅仅是表示数据传输的结束，并且提供计算机校正时钟的机会。停止位越多，数据传输月稳定，但是数据传输速度越慢。
+3、波特率简介 在电子通信领域，波特（Baud）即调制速率，指的是有效数据讯号调制载波的速率，即单位时间内载波调制状态变化的次数。
+波特率表示每秒钟传送码元符号的个数，它是对符号传输速率的一种度量，用单位时间内载波调制状态改变的次数来表示，1波特指每秒传输1个字符。
+数据传输速率使用波特率来表示，单位bps（bits per second），常见的波特率有9600、19200、38400、57600、115200等。例如将串口波特率设置位115200bps，那么传输一个bit需要的时间是1/115200 ≈ 8.68us。
+二、UART串口回环实验 1、设计思路 实验任务：通过电脑端的串口调试助手向FPGA发送数据，FPGA通过串口接收数据并将接受到的数据发送给上位机，实现串口回环功能。
+接收模块（RX）：通过检测起始位来表示数据传输的开始，在波特率中间时刻去采样总线上的数据，最后将数据进行串并转换。
+发送模块（TX）：将并行数据转换成串行数据，然后在串行数据帧头加上起始位，帧尾加上停止位，发送给上位机。
+2、程序代码 本次程序设计中没有用到奇偶校验位，一帧数据为8bit，停止位为1位，波特率可供选择（代码为115200），FPGA的系统晶振时钟为50MHZ。
+① 串口接收模块 /*===============================* filename : uart_rx.v description : 串口接收模块 time : 2022-12-22 author : 卡夫卡与海 *================================*/ module uart_rx( input clk ,//时钟 50MHZ input rst_n ,//复位 input uart_rx ,//rx数据线 input [2:0] baud_sel ,//波特率选择 output reg [7:0] po_data ,//接收的数据 output reg po_flag //数据使能 ); //参数定义 parameter SCLK = 50_000_000;//系统时钟 50MHZ //波特率选择 parameter BAUD_9600 = SCLK/9600 , BAUD_19200 = SCLK/19200 , BAUD_38400 = SCLK/38400 , BAUD_57600 = SCLK/57600 , BAUD_115200 = SCLK/115200; //信号定义 reg uart_rx_1 ;//同步、打拍 reg uart_rx_2 ; wire rx_nedge ;//下降沿检测 reg start_flag ;//起始标志 reg work_en ;//工作使能 reg [15:0] cnt_baud ;//波特率计数器 reg [15:0] BAUD_NUM ; reg bit_flag ;//接收数据使能 reg [3:0] cnt_bit ;//bit计数器 reg [7:0] rx_data ;//数据 reg rx_flag ;//数据标志 //同步、打拍 检测下降沿 always @(posedge clk or negedge rst_n)begin if(!" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/d8777b84656110af109ee4db5ce95528/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-12-23T12:10:18+08:00" />
+<meta property="article:modified_time" content="2022-12-23T12:10:18+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【FPGA】八、UART串口通信</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p id="main-toc"><strong>文章目录</strong></p> 
+<p id="%E5%89%8D%E8%A8%80-toc" style="margin-left:0px;"><a href="#%E5%89%8D%E8%A8%80" rel="nofollow">前言</a></p> 
+<p id="%E4%B8%80%E3%80%81UART%E7%AE%80%E4%BB%8B-toc" style="margin-left:0px;"><a href="#%E4%B8%80%E3%80%81UART%E7%AE%80%E4%BB%8B" rel="nofollow">一、UART简介</a></p> 
+<p id="1%E3%80%81%E5%9F%BA%E6%9C%AC%E6%A6%82%E5%BF%B5-toc" style="margin-left:40px;"><a href="#1%E3%80%81%E5%9F%BA%E6%9C%AC%E6%A6%82%E5%BF%B5" rel="nofollow">1、基本概念</a></p> 
+<p id="2%E3%80%81UART%E5%8D%8F%E8%AE%AE-toc" style="margin-left:40px;"><a href="#2%E3%80%81UART%E5%8D%8F%E8%AE%AE" rel="nofollow">2、UART协议</a></p> 
+<p id="3%E3%80%81%E6%B3%A2%E7%89%B9%E7%8E%87%E7%AE%80%E4%BB%8B-toc" style="margin-left:40px;"><a href="#3%E3%80%81%E6%B3%A2%E7%89%B9%E7%8E%87%E7%AE%80%E4%BB%8B" rel="nofollow">3、波特率简介</a></p> 
+<p id="%E4%BA%8C%E3%80%81UART%E4%B8%B2%E5%8F%A3%E5%9B%9E%E7%8E%AF%E5%AE%9E%E9%AA%8C-toc" style="margin-left:0px;"><a href="#%E4%BA%8C%E3%80%81UART%E4%B8%B2%E5%8F%A3%E5%9B%9E%E7%8E%AF%E5%AE%9E%E9%AA%8C" rel="nofollow">二、UART串口回环实验</a></p> 
+<p id="1%E3%80%81%E8%AE%BE%E8%AE%A1%E6%80%9D%E8%B7%AF-toc" style="margin-left:40px;"><a href="#1%E3%80%81%E8%AE%BE%E8%AE%A1%E6%80%9D%E8%B7%AF" rel="nofollow">1、设计思路</a></p> 
+<p id="2%E3%80%81%E7%A8%8B%E5%BA%8F%E4%BB%A3%E7%A0%81-toc" style="margin-left:40px;"><a href="#2%E3%80%81%E7%A8%8B%E5%BA%8F%E4%BB%A3%E7%A0%81" rel="nofollow">2、程序代码</a></p> 
+<p id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A0%20%E4%B8%B2%E5%8F%A3%E6%8E%A5%E6%94%B6%E6%A8%A1%E5%9D%97-toc" style="margin-left:80px;"><a href="#%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A0%20%E4%B8%B2%E5%8F%A3%E6%8E%A5%E6%94%B6%E6%A8%A1%E5%9D%97" rel="nofollow">        ① 串口接收模块</a></p> 
+<p id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A1%20%E4%B8%B2%E5%8F%A3%E5%8F%91%E9%80%81%E6%A8%A1%E5%9D%97-toc" style="margin-left:80px;"><a href="#%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A1%20%E4%B8%B2%E5%8F%A3%E5%8F%91%E9%80%81%E6%A8%A1%E5%9D%97" rel="nofollow">        ② 串口发送模块</a></p> 
+<p id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A2%20%E4%B8%B2%E5%8F%A3%E9%A1%B6%E5%B1%82%E6%A8%A1%E5%9D%97-toc" style="margin-left:80px;"><a href="#%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A2%20%E4%B8%B2%E5%8F%A3%E9%A1%B6%E5%B1%82%E6%A8%A1%E5%9D%97" rel="nofollow">        ③ 串口顶层模块</a></p> 
+<p id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A3%20%E4%B8%B2%E5%8F%A3%E4%BB%BF%E7%9C%9F%E6%A8%A1%E5%9D%97-toc" style="margin-left:80px;"><a href="#%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A3%20%E4%B8%B2%E5%8F%A3%E4%BB%BF%E7%9C%9F%E6%A8%A1%E5%9D%97" rel="nofollow">        ④ 串口仿真模块</a></p> 
+<p id="3%E3%80%81%E4%BB%BF%E7%9C%9F%E9%AA%8C%E8%AF%81-toc" style="margin-left:40px;"><a href="#3%E3%80%81%E4%BB%BF%E7%9C%9F%E9%AA%8C%E8%AF%81" rel="nofollow">3、仿真验证</a></p> 
+<p id="%C2%A0%E6%80%BB%E7%BB%93-toc" style="margin-left:0px;"><a href="#%C2%A0%E6%80%BB%E7%BB%93" rel="nofollow"> 总结</a></p> 
+<hr id="hr-toc"> 
+<p><strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">前言</strong></p> 
+<blockquote> 
+ <p>        在我们进行FPGA设计时，常常会用到一些数据通信接口，这些通信接口都是有着特定的功能以及协议的，其中最常见的莫过于串口uart了，它对于每一个做硬件和嵌入式软件的人来说，几乎就是一个必备的工具，用来调试一个带MCU或者CPU的系统。</p> 
+ <p>        串口uart是一种非常通用的设备接口，可以实现不同硬件间的通信，对于FPGA开发来说，串口也同样可以实现FPGA开发板与电脑PC端的通信，下面我们就来简单介绍一下串口uart的基本协议及功能。</p> 
+</blockquote> 
+<hr> 
+<h2 id="%E4%B8%80%E3%80%81UART%E7%AE%80%E4%BB%8B"><strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">一、UART简介</strong></h2> 
+<h3 id="1%E3%80%81%E5%9F%BA%E6%9C%AC%E6%A6%82%E5%BF%B5"><strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">1、基本概念</strong></h3> 
+<blockquote> 
+ <p>        通用异步收发传输器，英文全称为Universal Asynchronous Receiver/Transmitter，简称UART，是一种异步收发传输器，在发送数据通过将并行数据转换成串行数据进行传输，在接收数据时将串行数据转换成并行数据。</p> 
+ <p>        串行通信分为同步串行通信和异步串行通信。同步串行通信即需要时钟的参与，通信双方需要在同一时钟的控制下，同步传输数据；异步串行通信则不需要时钟的干预，通信双方使用各种的时钟来控制数据的发送和接收。uart属于异步串行通信，即没有时钟信号来同步或验证从发送器发送并由接收器接收的数据，这就要求发送器和接收器必须事先就时序参数达成一致。</p> 
+ <p>     UART是通用异步收发器的简称，它包括了RS232、RS422、RS423、RS449以及RS485等接口标准和总线规范标准，UART是异步串行通信接口的总称。而RS323、RS422、RS423、RS449和RS485等是对应各种异步串行通信的接口标准和总线标准，它规定了通信接口的电器特性、传输速率以及接口的机械特性等内容。</p> 
+</blockquote> 
+<h3 id="2%E3%80%81UART%E5%8D%8F%E8%AE%AE"><strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">2、UART协议</strong></h3> 
+<blockquote> 
+ <p>        UART串口通信需要两根信号线来实现，一根用于串口发送数据，一根用于串口接收数据。UART串口传输的数据被组织成数据包，每个数据包包含了一个起始位，5至9个数据位，可选的奇偶校验位和1或者2个停止位，如下图所示。</p> 
+</blockquote> 
+<p class="img-center"><img alt="" height="75" src="https://images2.imgbox.com/6f/2c/oygTA2YP_o.png" width="529"></p> 
+<blockquote> 
+ <p>        UART串口协议规定，当总线处于空闲状态时信号线的状态为高电平，表示当前线路上没有数据传输。</p> 
+ <p>        起始位：开始进行数据传输时发送方要先发送一个低电平来表示传输字符的开始。</p> 
+ <p>        数据位：起始位之后就需要传输数据，数据位可以是5~9位，构成一个字符，一般是8位，先发送最低位后发送最高位。</p> 
+ <p>        奇偶校验位：奇偶校验位是用来检验数据在传输过程中是否出错。在奇校验时，发送方应使数据位中1的个数与校验位中1的个数为奇数，接收方在接收数据时，对1的个数进行检测，若1的个数不为奇数个，则说明数据在传输过程中存在差错。偶校验则相反。</p> 
+ <p>        停止位：数据结束标志，可以是1位或者2位的高电平。由于数据在传输线上是定时传输的，并且每一个设备有自己的时钟，很可能在通信中两台设备之间出现了小小的不同步，因此停止位不仅仅是表示数据传输的结束，并且提供计算机校正时钟的机会。停止位越多，数据传输月稳定，但是数据传输速度越慢。</p> 
+</blockquote> 
+<p class="img-center"><img alt="" height="163" src="https://images2.imgbox.com/ec/43/tevzHu7p_o.png" width="477"></p> 
+<h3 id="3%E3%80%81%E6%B3%A2%E7%89%B9%E7%8E%87%E7%AE%80%E4%BB%8B"><strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">3、波特率简介</strong></h3> 
+<blockquote> 
+ <p>        在电子通信领域，波特（Baud）即调制速率，指的是有效数据讯号调制载波的速率，即单位时间内载波调制状态变化的次数。</p> 
+ <p>        波特率表示每秒钟传送码元符号的个数，它是对符号传输速率的一种度量，用单位时间内载波调制状态改变的次数来表示，1波特指每秒传输1个字符。</p> 
+ <p>        数据传输速率使用波特率来表示，单位bps（bits per second），常见的波特率有9600、19200、38400、57600、115200等。例如将串口波特率设置位115200bps，那么传输一个bit需要的时间是1/115200 ≈ 8.68us。</p> 
+</blockquote> 
+<h2></h2> 
+<hr> 
+<h2 id="%E4%BA%8C%E3%80%81UART%E4%B8%B2%E5%8F%A3%E5%9B%9E%E7%8E%AF%E5%AE%9E%E9%AA%8C">二、UART串口回环实验</h2> 
+<h3 id="1%E3%80%81%E8%AE%BE%E8%AE%A1%E6%80%9D%E8%B7%AF"><a id="1_20"></a>1、设计思路</h3> 
+<blockquote> 
+ <p>        实验任务：通过电脑端的串口调试助手向FPGA发送数据，FPGA通过串口接收数据并将接受到的数据发送给上位机，实现串口回环功能。</p> 
+ <p>        接收模块（RX）：通过检测起始位来表示数据传输的开始，在波特率中间时刻去采样总线上的数据，最后将数据进行串并转换。</p> 
+ <p>        发送模块（TX）：将并行数据转换成串行数据，然后在串行数据帧头加上起始位，帧尾加上停止位，发送给上位机。</p> 
+</blockquote> 
+<h3 id="2%E3%80%81%E7%A8%8B%E5%BA%8F%E4%BB%A3%E7%A0%81">2、程序代码</h3> 
+<blockquote> 
+ <p>        本次程序设计中没有用到奇偶校验位，一帧数据为8bit，停止位为1位，波特率可供选择（代码为115200），FPGA的系统晶振时钟为50MHZ。</p> 
+</blockquote> 
+<h4 id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A0%20%E4%B8%B2%E5%8F%A3%E6%8E%A5%E6%94%B6%E6%A8%A1%E5%9D%97">        ① 串口接收模块</h4> 
+<pre><code class="language-bash">/*===============================*
+    filename    : uart_rx.v
+    description : 串口接收模块
+    time        : 2022-12-22 
+    author      : 卡夫卡与海
+*================================*/
+
+module uart_rx(
+    input              clk       ,//时钟  50MHZ
+    input              rst_n     ,//复位
+
+    input              uart_rx   ,//rx数据线
+    input       [2:0]  baud_sel  ,//波特率选择
+
+    output reg  [7:0]  po_data   ,//接收的数据
+    output reg         po_flag    //数据使能
+);
+
+//参数定义
+parameter   SCLK = 50_000_000;//系统时钟  50MHZ
+
+//波特率选择
+parameter   BAUD_9600   = SCLK/9600  ,
+            BAUD_19200  = SCLK/19200 ,
+            BAUD_38400  = SCLK/38400 ,
+            BAUD_57600  = SCLK/57600 ,
+            BAUD_115200 = SCLK/115200;
+
+//信号定义
+reg           uart_rx_1    ;//同步、打拍
+reg           uart_rx_2    ;
+wire          rx_nedge     ;//下降沿检测
+
+reg           start_flag   ;//起始标志
+reg           work_en      ;//工作使能
+
+reg   [15:0]  cnt_baud     ;//波特率计数器
+reg   [15:0]  BAUD_NUM     ;
+
+reg           bit_flag     ;//接收数据使能
+reg   [3:0]   cnt_bit      ;//bit计数器
+
+reg   [7:0]   rx_data      ;//数据
+reg           rx_flag      ;//数据标志
+
+
+//同步、打拍  检测下降沿
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        uart_rx_1 &lt;= 1'b1;
+        uart_rx_2 &lt;= 1'b1;
+    end
+    else begin
+        uart_rx_1 &lt;= uart_rx;
+        uart_rx_2 &lt;= uart_rx_1;
+    end
+end
+assign rx_nedge = uart_rx_2 &amp;&amp; ~uart_rx_1;
+
+//start_flag  
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        start_flag &lt;= 1'b0;
+    end
+    else if(rx_nedge &amp;&amp; work_en == 1'b0)begin
+        start_flag &lt;= 1'b1;
+    end
+    else begin
+        start_flag &lt;= 1'b0;
+    end
+end
+
+//work_en
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        work_en &lt;= 1'b0;
+    end
+    else if(start_flag == 1'b1)begin
+        work_en &lt;= 1'b1;
+    end
+    else if(cnt_bit == 4'd8 &amp;&amp; bit_flag == 1'b1)begin
+        work_en &lt;= 1'b0;
+    end
+    else begin
+        work_en &lt;= work_en;
+    end
+end
+
+//cnt_baud
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        cnt_baud &lt;= 16'd0;
+    end
+    else if((cnt_baud == BAUD_NUM - 1) || (work_en == 1'b0))begin
+        cnt_baud &lt;= 16'd0;
+    end
+    else if(work_en == 1'b1)begin
+        cnt_baud &lt;= cnt_baud + 1'b1;
+    end
+end
+
+//BAUD_NUM
+always @(*)begin
+    case(baud_sel)
+        3'd0 : BAUD_NUM = BAUD_9600  ;
+        3'd1 : BAUD_NUM = BAUD_19200 ;
+        3'd2 : BAUD_NUM = BAUD_38400 ;
+        3'd3 : BAUD_NUM = BAUD_57600 ;
+        3'd4 : BAUD_NUM = BAUD_115200;
+        default : BAUD_NUM = BAUD_115200;
+    endcase
+end
+
+//bit_flag
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        bit_flag &lt;= 1'b0;
+    end
+    else if(cnt_baud == (BAUD_NUM &gt;&gt; 1) - 1)begin
+        bit_flag &lt;= 1'b1;
+    end
+    else begin
+        bit_flag &lt;= 1'b0;
+    end
+end
+
+//cnt_bit
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        cnt_bit &lt;= 4'd0;
+    end
+    else if((cnt_bit == 4'd8) &amp;&amp; (bit_flag == 1'b1))begin
+        cnt_bit &lt;= 4'd0;
+    end
+    else if(bit_flag == 1'b1)begin
+        cnt_bit &lt;= cnt_bit + 1'b1;
+    end
+end
+
+//rx_data
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        rx_data &lt;= 8'b0;
+    end
+    else if((cnt_bit&gt;=4'd1)&amp;&amp;(cnt_bit&lt;=4'd8)&amp;&amp;(bit_flag==1'b1))begin
+        rx_data &lt;= {uart_rx_2,rx_data[7:1]};
+    end
+end
+
+//rx_flag
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        rx_flag &lt;= 1'b0;
+    end
+    else if((cnt_bit == 4'd8) &amp;&amp; (bit_flag == 1'b1))begin
+        rx_flag &lt;= 1'b1;
+    end
+    else begin
+        rx_flag &lt;= 1'b0;
+    end
+end
+
+//输出
+//po_data
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        po_data &lt;= 8'b0;
+    end
+    else if(rx_flag == 1'b1)begin
+        po_data &lt;= rx_data;
+    end
+end
+
+//po_flag
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        po_flag &lt;= 1'b0;
+    end
+    else begin
+        po_flag &lt;= rx_flag;
+    end
+end
+
+
+endmodule</code></pre> 
+<h4 id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A1%20%E4%B8%B2%E5%8F%A3%E5%8F%91%E9%80%81%E6%A8%A1%E5%9D%97">        ② 串口发送模块</h4> 
+<pre><code class="language-bash">/*===============================*
+    filename    : uart_tx.v
+    description : 串口发送模块
+    time        : 2022-12-22 
+    author      : 卡夫卡与海
+*================================*/
+
+module uart_tx(
+    input         clk      ,//时钟  50MHZ
+    input         rst_n    ,//复位
+
+    input  [2:0]  baud_sel ,//波特率选择
+    input  [7:0]  pi_data  ,//数据
+    input         pi_flag  ,//数据使能
+
+    output  reg   uart_tx   //tx数据线
+);
+
+//参数定义
+parameter   SCLK = 50_000_000;//系统时钟  50MHZ
+
+//波特率选择
+parameter   BAUD_9600   = SCLK/9600  ,
+            BAUD_19200  = SCLK/19200 ,
+            BAUD_38400  = SCLK/38400 ,
+            BAUD_57600  = SCLK/57600 ,
+            BAUD_115200 = SCLK/115200;
+
+//信号定义
+reg            work_en    ;//工作使能
+
+reg   [15:0]   cnt_baud   ;//波特率计数器
+reg   [15:0]   BAUD_NUM   ;
+
+reg            bit_flag   ;//bit标志信号
+reg   [3:0]    cnt_bit    ;//bit计数器
+
+
+//work_en
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        work_en &lt;= 1'b0;
+    end
+    else if(pi_flag == 1'b1)begin
+        work_en &lt;= 1'b1;
+    end
+    else if((cnt_bit == 4'd9) &amp;&amp; (bit_flag == 1'b1))begin
+        work_en &lt;= 1'b0;
+    end
+end
+
+//cnt_baud
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        cnt_baud &lt;= 16'd0;
+    end
+    else if((work_en == 1'b0) || (cnt_baud == BAUD_NUM - 1))begin
+        cnt_baud &lt;= 16'd0;
+    end
+    else if(work_en == 1'b1)begin
+        cnt_baud &lt;= cnt_baud + 1'b1;
+    end
+end
+
+//BAUD_NUM
+always @(*)begin
+    case(baud_sel)
+        3'd0 : BAUD_NUM = BAUD_9600  ;
+        3'd1 : BAUD_NUM = BAUD_19200 ;
+        3'd2 : BAUD_NUM = BAUD_38400 ;
+        3'd3 : BAUD_NUM = BAUD_57600 ;
+        3'd4 : BAUD_NUM = BAUD_115200;
+        default : BAUD_NUM = BAUD_115200;
+    endcase
+end
+
+//bit_flag 
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        bit_flag &lt;= 1'b0;
+    end
+    else if(cnt_baud == 16'd1)begin
+        bit_flag &lt;= 1'b1;
+    end
+    else begin
+        bit_flag &lt;= 1'b0;
+    end
+end
+
+//cnt_bit
+always @(posedge clk or negedge rst_n) begin
+    if(!rst_n)begin
+        cnt_bit &lt;= 4'd0;
+    end
+    else if((cnt_bit == 4'd9)&amp;&amp;(bit_flag == 1'b1))begin
+        cnt_bit &lt;= 4'd0;
+    end
+    else if((work_en == 1'b1)&amp;&amp;(bit_flag == 1'b1))begin
+        cnt_bit &lt;= cnt_bit + 1'b1;
+    end
+end
+
+//输出  uart_tx
+always @(posedge clk or negedge rst_n)begin
+    if(!rst_n)begin
+        uart_tx &lt;= 1'b1;
+    end
+    else if(bit_flag == 1'b1)begin
+        case(cnt_bit)
+            0 : uart_tx &lt;= 1'b0;//起始位
+            1 : uart_tx &lt;= pi_data[0];
+            2 : uart_tx &lt;= pi_data[1];
+            3 : uart_tx &lt;= pi_data[2];
+            4 : uart_tx &lt;= pi_data[3];
+            5 : uart_tx &lt;= pi_data[4];
+            6 : uart_tx &lt;= pi_data[5];
+            7 : uart_tx &lt;= pi_data[6];
+            8 : uart_tx &lt;= pi_data[7];
+            9 : uart_tx &lt;= 1'b1;//停止位
+            default : uart_tx &lt;= 1'b1;
+        endcase
+    end
+end
+
+
+endmodule</code></pre> 
+<h4 id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A2%20%E4%B8%B2%E5%8F%A3%E9%A1%B6%E5%B1%82%E6%A8%A1%E5%9D%97">        ③ 串口顶层模块</h4> 
+<pre><code class="language-bash">/*==============================*
+    filename    : uart_top.v
+    description : 串口顶层模块
+    time        : 2022-12-22 
+    author      : 卡夫卡与海
+*================================*/
+
+module uart_top(
+    input       clk      ,
+    input       rst_n    ,
+
+    input       uart_rx  ,
+    output      uart_tx  
+);
+//波特率选择
+/*常用波特率选择：
+baud_sel == 3'd0 :波特率为：9600
+baud_sel == 3'd1 :波特率为：19200
+baud_sel == 3'd2 :波特率为：38400
+baud_sel == 3'd3 :波特率为：57600
+baud_sel == 3'd4 :波特率为：115200   */
+wire   [2:0]    baud_sel ;//波特率选择
+
+assign baud_sel = 3'd4;//波特率 = 115200
+
+//信号定义
+wire   [7:0]    data     ;
+wire            flag     ;
+
+//模块例化
+//串口接收模块
+uart_rx u_uart_rx(
+    /*input              */.clk       (clk     ),
+    /*input              */.rst_n     (rst_n   ),
+    /*input              */.uart_rx   (uart_rx ),
+    /*input       [2:0]  */.baud_sel  (baud_sel),
+    /*output reg  [7:0]  */.po_data   (data    ),
+    /*output reg         */.po_flag   (flag    ) 
+);
+
+//串口发送模块
+uart_tx u_uart_tx(
+    /*input              */.clk       (clk     ),
+    /*input              */.rst_n     (rst_n   ),
+    /*input   [2:0]      */.baud_sel  (baud_sel),
+    /*input   [7:0]      */.pi_data   (data    ),
+    /*input              */.pi_flag   (flag    ),
+    /*output  reg        */.uart_tx   (uart_tx )
+);
+
+
+endmodule</code></pre> 
+<h4 id="%C2%A0%20%C2%A0%20%C2%A0%20%C2%A0%20%E2%91%A3%20%E4%B8%B2%E5%8F%A3%E4%BB%BF%E7%9C%9F%E6%A8%A1%E5%9D%97">        ④ 串口仿真模块</h4> 
+<pre><code class="language-bash">/*========================================*
+    filename    : uart_top_tb.v
+    description : 串口顶层模块仿真文件
+    time        : 2022-12-22 
+    author      : 卡夫卡与海
+*========================================*/
+`timescale 1ns/1ns 
+
+module uart_top_tb();
+    reg       clk   ;
+    reg       rst_n ;
+    reg       rx    ;
+    wire      tx    ;
+
+
+//产生时钟
+initial begin
+    clk = 1'b1;
+    rx  = 1'b1;
+    forever 
+    #10
+    clk = ~clk;
+end
+
+//产生复位
+initial begin
+    rst_n = 1'b0;
+    #20;
+    rst_n = 1'b1;
+end
+
+//产生激励
+task rx_bit(
+    input   [7:0]   data
+);
+
+integer i;
+for(i = 0 ; i &lt; 10 ; i = i + 1)begin
+    case(i)
+        0:rx &lt;= 1'b0;//起始位
+        1:rx &lt;= data[0];
+        2:rx &lt;= data[1];
+        3:rx &lt;= data[2];
+        4:rx &lt;= data[3];
+        5:rx &lt;= data[4];
+        6:rx &lt;= data[5];
+        7:rx &lt;= data[6];
+        8:rx &lt;= data[7];
+        9:rx &lt;= 1'b1;//停止位
+    endcase
+    #(434*20);//根据不同的波特率，延时的时间不同
+end
+endtask
+
+task rx_byte();
+    integer j;
+        for(j = 0 ; j &lt; 8 ; j = j + 1)
+            rx_bit(j);
+endtask
+
+initial begin
+    #200
+    rx_byte();
+end
+
+
+//模块例化
+uart_top u_uart_top(
+    /*input       */.clk       (clk  ),
+    /*input       */.rst_n     (rst_n),
+    /*input       */.uart_rx   (rx   ),
+    /*output      */.uart_tx   (tx   )
+);
+
+
+endmodule</code></pre> 
+<h3 id="3%E3%80%81%E4%BB%BF%E7%9C%9F%E9%AA%8C%E8%AF%81">3、仿真验证</h3> 
+<p><img alt="" height="728" src="https://images2.imgbox.com/89/f9/rHGTn3vx_o.png" width="1200"></p> 
+<blockquote> 
+ <p>        通过对我们项目工程的仿真来看，显示接收到的数据为0~7共八个字节的数据，发送给上位机的数据也为0~7，说明我们的功能能够正确的接收并发送数据。</p> 
+ <p>        通过放大波形图可以看到，波特率计数器总共计数434次，波特率为115200，系统时钟为50MHZ，则50_000_000/115200≈434，波特率计数器正确。我们的采样时刻是在波特率计数器的中间时刻去采样，这样能够保证采样到的数据的稳定性，这里的bit标志信号在波特率计数器计数到217时拉高，表示此刻进行数据的采样操作。</p> 
+ <p>        最后就是进行串并转换了，接收模块将串行数据转换成并行数据传给发送模块，而发送模块将接收模块传入的并行数据转换成串行数据通过uart_tx信号线发送给上位机，而上位机通过串口调试助手将接收到的数据串并转换并打印出来显示在屏幕上。</p> 
+</blockquote> 
+<hr> 
+<h2 id="%C2%A0%E6%80%BB%E7%BB%93"> <strong style="color:#4f4f4f;font-size:24px;font-weight:bold;">总结</strong></h2> 
+<blockquote> 
+ <p>        UART串口通信协议还是比较简单的，在编写代码时最重要的是思路的完整性，要有一个全局的概念，不能写了一部分就不知道接下来要干嘛了。实现UART串口通信的思路还有很大，也可以通过前面讲过的状态机的方法来实现，还可以在中间调用FIFO IP核，我这里这个算是一个简单的串口回环实现方式了，在后续的项目中还得加以改进和优化。</p> 
+</blockquote>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3eb23fb7fa9674a8545132de93b74b40/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">SpringCloud学习笔记(一) Spring循环依赖问题</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/47823f5403e9262bf8466207e0d57bc7/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">思科模拟器：路由器dhcp配置(详细解说)</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Flink Checkpoint机制分析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Flink Checkpoint机制分析" />
+<meta property="og:description" content="原创作品，转载请标明：http://blog.csdn.net/xiejingfa/article/details/105439802
+可靠性是分布式系统实现必须考虑的因素之一。Flink基于Chandy-Lamport分布式快照算法实现了一套可靠的Checkpoint机制，可以保证集群中某些节点出现故障时，能够将整个作业恢复到故障之前某个状态。同时，Checkpoint机制也是Flink实现Exactly-Once语义的基础。
+本文将介绍Flink的Checkpoint机制的原理，并从源码层面了解Checkpoint机制是如何实现的（基于Flink 1.10）。
+1. 为什么需要Checkpoint Flink是有状态的流计算处理引擎，每个算子Operator可能都需要记录自己的运行数据，并在接收到新流入的元素后不断更新自己的状态数据。当分布式系统引入状态计算后，为了保证计算结果的正确性（特别是对于流处理系统，不可能每次系统故障后都从头开始计算），就必然要求系统具有容错性。对于Flink来说，Flink作业运行在多个节点上，当出现节点宕机、网络故障等问题，需要一个机制保证节点保存在本地的状态不丢失。流处理中Exactly-Once语义的实现也要求作业从失败恢复后的状态要和失败前的状态一致。
+那么怎么保证分布式环境下各节点状态的容错呢？通常这是通过定期对作业状态和数据流进行快照实现的，常见的检查点算法有比如Sync-and-Stop（SNS）算法、Chandy-Lamport（CL）算法。
+Flink的Checkpoint机制是基于Chandy-Lamport算法的思想改进而来，引入了Checkpoint Barrier的概念，可以在不停止整个流处理系统的前提下，让每个节点独立建立检查点保存自身快照，并最终达到整个作业全局快照的状态。有了全局快照，当我们遇到故障或者重启的时候就可以直接从快照中恢复，这就是Flink容错的核心。
+2. Checkpoint执行流程 Barrier是Flink分布式快照的核心概念之一，称之为屏障或者数据栅栏（可以理解为快照的分界线）。Barrier是一种特殊的内部消息，在进行Checkpoint的时候Flink会在数据流源头处周期性地注入Barrier，这些Barrier会作为数据流的一部分，一起流向下游节点并且不影响正常的数据流。Barrier的作用是将无界数据流从时间上切分成多个窗口，每个窗口对应一系列连续的快照中的一个，每个Barrier都带有一个快照ID，一个Barrier生成之后，在这之前的数据都进入此快照，在这之后的数据则进入下一个快照。
+如上图，Barrier-n跟随着数据流一起流动，当算子从输入流接收到Barrier-n后，就会停止接收数据并对当前自身的状态做一次快照，快照完成后再将Barrier-n以广播的形式传给下游节点。一旦作业的Sink算子接收到Barrier n后，会向JobMnager发送一个消息，确认Barrier-n对应的快照完成。当作业中的所有Sink算子都确认后，意味一次全局快照也就完成。
+当一个算子有多个上游节点时，会接收到多个Barrier，这时候需要进行Barrier Align对齐操作。
+如上图，一个算子有两个输入流，当算子从一个上游数据流接收到一个Barrier-n后，它不会立即向下游广播，而是先暂停对该数据流的处理，将到达的数据先缓存在Input Buffer中（因为这些数据属于下一次快照而不是当前快照，缓存数据可以不阻塞该数据流），直到从另外一个数据流中接收到Barrier-n，才会进行快照处理并将Barrier-n向下游发送。从这个流程可以看出，如果开启Barrier对齐后，算子由于需要等待所有输入节点的Barrier到来出现暂停，对整体的性能也会有一定的影响。
+综上，Flink Checkpoint机制的核心思想实质上是通过Barrier来标记触发快照的时间点和对应需要进行快照的数据集，将数据流处理和快照操作解耦开来，从而最大程度降低快照对系统性能的影响。
+Flink的一致性和Checkpoint机制有紧密的关系：
+当不开启Checkpoint时，节点发生故障时可能会导致数据丢失，这就是At-Most-Once当开启Checkpoint但不进行Barrier对齐时，对于有多个输入流的节点如果发生故障，会导致有一部分数据可能会被处理多次，这就是At-Least-Once当开启Checkpoint并进行Barrier对齐时，可以保证每条数据在故障恢复时只会被重放一次，这就是Exactly-Once 3. Checkpoint相关配置 StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(); env.enableCheckpointing(1000); env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE); env.getCheckpointConfig().setMinPauseBetweenCheckpoints(500); env.getCheckpointConfig().setCheckpointTimeout(60000); env.getCheckpointConfig().setMaxConcurrentCheckpoints(1); env.getCheckpointConfig().enableExternalizedCheckpoints(ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION); 默认情况下，Checkpoint机制是关闭的，需要通过enableCheckpointing(interval)来开启，并指定每interval毫秒进行一次Checkpoint。Checkpoint模式支持Exactly-Once和At-Least-Once，可以通过setCheckpointingMode来设置。如果两次Checkpoint的时间很短，会导致整个系统大部分资源都用于执行Checkpoint，影响正常作业的执行。可以通过setMinPauseBetweenCheckpoints来设置两次Checkpoint之间的最小间隔。setCheckpointTimeout可以给Checkpoint设置一个超时时间，当一次Checkpoint超过一定时间没有完成，直接终止掉。默认情况下，当一个Checkpoint还在执行时，不会触发另一个Checkpoint，通过setMaxConcurrentCheckpoints可以设置最大并发Checkpoint数量。enableExternalizedCheckpoints可以设置当用户取消了作业后，是否保留远程存储上的Checkpoint数据，一般设置为RETAIN_ON_CANCELLATION。 4. Checkpoint过程源码分析 4.1 Client端生成Checkpoint配置 Client端在向JobManger提交作业前会根据用户代码生成StreamGraph，再转化为JobGraph，在构建JobGraph时会调用configureCheckpointing生成JobCheckpointingSettings配置并保存在JobGraph中。这里要注意到triggerVertices这个集合，它表示Flink通过这些节点触发Checkpoint。在构建JobGraph时只会将Source节点加入到triggerVertices，决定Flink之后发起Checkpoint时只针对Source节点注入Barrier。
+private void configureCheckpointing() { CheckpointConfig cfg = streamGraph.getCheckpointConfig(); ...（省略部分代码，只展示核心流程，下同） // --- configure the participating vertices --- // collect the vertices that receive &#34;trigger checkpoint&#34; messages. // currently, these are all the sources List&lt;JobVertexID&gt; triggerVertices = new ArrayList&lt;&gt;(); // collect the vertices that need to acknowledge the checkpoint // currently, these are all vertices List&lt;JobVertexID&gt; ackVertices = new ArrayList&lt;&gt;(jobVertices." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/67ea98a65d394ba99339c05872cfffa3/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-04-10T18:48:53+08:00" />
+<meta property="article:modified_time" content="2020-04-10T18:48:53+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Flink Checkpoint机制分析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p><font color="#ff0000"><strong>原创作品，转载请标明：</strong></font><strong>http://blog.csdn.net/xiejingfa/article/details/105439802</strong></p> 
+<p>可靠性是分布式系统实现必须考虑的因素之一。Flink基于Chandy-Lamport分布式快照算法实现了一套可靠的Checkpoint机制，可以保证集群中某些节点出现故障时，能够将整个作业恢复到故障之前某个状态。同时，Checkpoint机制也是Flink实现Exactly-Once语义的基础。</p> 
+<p>本文将介绍Flink的Checkpoint机制的原理，并从源码层面了解Checkpoint机制是如何实现的（基于Flink 1.10）。</p> 
+<h2><a id="1_Checkpoint_6"></a>1. 为什么需要Checkpoint</h2> 
+<p>Flink是有状态的流计算处理引擎，每个算子Operator可能都需要记录自己的运行数据，并在接收到新流入的元素后不断更新自己的状态数据。当分布式系统引入状态计算后，为了保证计算结果的正确性（特别是对于流处理系统，不可能每次系统故障后都从头开始计算），就必然要求系统具有容错性。对于Flink来说，Flink作业运行在多个节点上，当出现节点宕机、网络故障等问题，需要一个机制保证节点保存在本地的状态不丢失。流处理中Exactly-Once语义的实现也要求作业从失败恢复后的状态要和失败前的状态一致。</p> 
+<p>那么怎么保证分布式环境下各节点状态的容错呢？通常这是通过定期对作业状态和数据流进行快照实现的，常见的检查点算法有比如Sync-and-Stop（SNS）算法、Chandy-Lamport（CL）算法。</p> 
+<p>Flink的Checkpoint机制是基于Chandy-Lamport算法的思想改进而来，引入了Checkpoint Barrier的概念，可以在不停止整个流处理系统的前提下，让每个节点独立建立检查点保存自身快照，并最终达到整个作业全局快照的状态。有了全局快照，当我们遇到故障或者重启的时候就可以直接从快照中恢复，这就是Flink容错的核心。</p> 
+<h2><a id="2_Checkpoint_14"></a>2. Checkpoint执行流程</h2> 
+<p>Barrier是Flink分布式快照的核心概念之一，称之为屏障或者数据栅栏（可以理解为快照的分界线）。Barrier是一种特殊的内部消息，在进行Checkpoint的时候Flink会在数据流源头处周期性地注入Barrier，这些Barrier会作为数据流的一部分，一起流向下游节点并且不影响正常的数据流。Barrier的作用是将无界数据流从时间上切分成多个窗口，每个窗口对应一系列连续的快照中的一个，每个Barrier都带有一个快照ID，一个Barrier生成之后，在这之前的数据都进入此快照，在这之后的数据则进入下一个快照。</p> 
+<p><img src="https://images2.imgbox.com/ad/10/GAX89vdf_o.png" alt="图片摘自官网"></p> 
+<p>如上图，Barrier-n跟随着数据流一起流动，当算子从输入流接收到Barrier-n后，就会停止接收数据并对当前自身的状态做一次快照，快照完成后再将Barrier-n以广播的形式传给下游节点。一旦作业的Sink算子接收到Barrier n后，会向JobMnager发送一个消息，确认Barrier-n对应的快照完成。当作业中的所有Sink算子都确认后，意味一次全局快照也就完成。</p> 
+<p>当一个算子有多个上游节点时，会接收到多个Barrier，这时候需要进行Barrier Align对齐操作。</p> 
+<p><img src="https://images2.imgbox.com/e9/72/M8N9yoap_o.png" alt="图片摘自官网"></p> 
+<p>如上图，一个算子有两个输入流，当算子从一个上游数据流接收到一个Barrier-n后，它不会立即向下游广播，而是先暂停对该数据流的处理，将到达的数据先缓存在Input Buffer中（因为这些数据属于下一次快照而不是当前快照，缓存数据可以不阻塞该数据流），直到从另外一个数据流中接收到Barrier-n，才会进行快照处理并将Barrier-n向下游发送。从这个流程可以看出，如果开启Barrier对齐后，算子由于需要等待所有输入节点的Barrier到来出现暂停，对整体的性能也会有一定的影响。</p> 
+<p>综上，Flink Checkpoint机制的核心思想实质上是通过Barrier来标记触发快照的时间点和对应需要进行快照的数据集，将数据流处理和快照操作解耦开来，从而最大程度降低快照对系统性能的影响。</p> 
+<p>Flink的一致性和Checkpoint机制有紧密的关系：</p> 
+<ul><li>当不开启Checkpoint时，节点发生故障时可能会导致数据丢失，这就是At-Most-Once</li><li>当开启Checkpoint但不进行Barrier对齐时，对于有多个输入流的节点如果发生故障，会导致有一部分数据可能会被处理多次，这就是At-Least-Once</li><li>当开启Checkpoint并进行Barrier对齐时，可以保证每条数据在故障恢复时只会被重放一次，这就是Exactly-Once</li></ul> 
+<h2><a id="3_Checkpoint_36"></a>3. Checkpoint相关配置</h2> 
+<pre><code>StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.enableCheckpointing(1000);
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+env.getCheckpointConfig().setMinPauseBetweenCheckpoints(500);
+env.getCheckpointConfig().setCheckpointTimeout(60000);
+env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+env.getCheckpointConfig().enableExternalizedCheckpoints(ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+</code></pre> 
+<ul><li>默认情况下，Checkpoint机制是关闭的，需要通过enableCheckpointing(interval)来开启，并指定每interval毫秒进行一次Checkpoint。</li><li>Checkpoint模式支持Exactly-Once和At-Least-Once，可以通过setCheckpointingMode来设置。</li><li>如果两次Checkpoint的时间很短，会导致整个系统大部分资源都用于执行Checkpoint，影响正常作业的执行。可以通过setMinPauseBetweenCheckpoints来设置两次Checkpoint之间的最小间隔。</li><li>setCheckpointTimeout可以给Checkpoint设置一个超时时间，当一次Checkpoint超过一定时间没有完成，直接终止掉。</li><li>默认情况下，当一个Checkpoint还在执行时，不会触发另一个Checkpoint，通过setMaxConcurrentCheckpoints可以设置最大并发Checkpoint数量。</li><li>enableExternalizedCheckpoints可以设置当用户取消了作业后，是否保留远程存储上的Checkpoint数据，一般设置为RETAIN_ON_CANCELLATION。</li></ul> 
+<h2><a id="4_Checkpoint_55"></a>4. Checkpoint过程源码分析</h2> 
+<h3><a id="41_ClientCheckpoint_57"></a>4.1 Client端生成Checkpoint配置</h3> 
+<p>Client端在向JobManger提交作业前会根据用户代码生成StreamGraph，再转化为JobGraph，在构建JobGraph时会调用configureCheckpointing生成JobCheckpointingSettings配置并保存在JobGraph中。这里要注意到triggerVertices这个集合，它表示Flink通过这些节点触发Checkpoint。在构建JobGraph时只会将Source节点加入到triggerVertices，决定Flink之后发起Checkpoint时只针对Source节点注入Barrier。</p> 
+<pre><code>private void configureCheckpointing() {
+    CheckpointConfig cfg = streamGraph.getCheckpointConfig();
+    ...（省略部分代码，只展示核心流程，下同）
+    
+    //  --- configure the participating vertices ---
+    
+    // collect the vertices that receive "trigger checkpoint" messages.
+    // currently, these are all the sources
+    List&lt;JobVertexID&gt; triggerVertices = new ArrayList&lt;&gt;();
+    
+    // collect the vertices that need to acknowledge the checkpoint
+    // currently, these are all vertices
+    List&lt;JobVertexID&gt; ackVertices = new ArrayList&lt;&gt;(jobVertices.size());
+    
+    // collect the vertices that receive "commit checkpoint" messages
+    // currently, these are all vertices
+    List&lt;JobVertexID&gt; commitVertices = new ArrayList&lt;&gt;(jobVertices.size());
+    
+    for (JobVertex vertex : jobVertices.values()) {
+        // 这里只会将Source节点加入到triggerVertices
+    	if (vertex.isInputVertex()) {  
+    		triggerVertices.add(vertex.getID());
+    	}
+    	commitVertices.add(vertex.getID());
+    	ackVertices.add(vertex.getID());
+    }
+	
+    // settings将所有Checkpoint配置封装在一起
+    jobGraph.setSnapshotSettings(settings);  
+}
+</code></pre> 
+<h3><a id="42_JobManagerCheckpoint_93"></a>4.2 JobManager发起Checkpoint</h3> 
+<p>CheckpointCoordinator是Flink执行Checkpoint的核心组件，JobManager在接收到Client端的SubmitJob请求后将JobGraph转化为ExecutionGraph，并调用enableCheckpointing方法初始化CheckpointCoordinator，然后为CheckpointCoordinator注册一个Job状态变化的监听器CheckpointCoordinatorDeActivator。</p> 
+<pre><code>public void enableCheckpointing() {
+    ... 
+    
+    // create the coordinator that triggers and commits checkpoints and holds the state
+    checkpointCoordinator = new CheckpointCoordinator(
+    jobInformation.getJobId(),
+    	chkConfig,
+    	tasksToTrigger,
+    	tasksToWaitFor,
+    	tasksToCommitTo,
+    	checkpointIDCounter,
+    	checkpointStore,
+    	checkpointStateBackend,
+    	ioExecutor,
+    	new ScheduledExecutorServiceAdapter(checkpointCoordinatorTimer),
+    	SharedStateRegistry.DEFAULT_FACTORY,
+    	failureManager);
+    
+    if (chkConfig.getCheckpointInterval() != Long.MAX_VALUE) {
+    	// the periodic checkpoint scheduler is activated and deactivated as a result of
+    	// job status changes (running -&gt; on, all other states -&gt; off)
+    	registerJobStatusListener(checkpointCoordinator.createActivatorDeactivator());
+    }
+}
+</code></pre> 
+<p>CheckpointCoordinatorDeActivator实现了JobStatusListener接口，当job状态变成Running时，调用startCheckpointScheduler方法开启CheckpointScheduler，当job变成其他状态时，调用stopCheckpointScheduler方法停止CheckpointScheduler。</p> 
+<pre><code>public class CheckpointCoordinatorDeActivator implements JobStatusListener {
+
+    private final CheckpointCoordinator coordinator;
+    
+    public CheckpointCoordinatorDeActivator(CheckpointCoordinator coordinator) {
+    	this.coordinator = checkNotNull(coordinator);
+    }
+    
+    @Override
+    public void jobStatusChanges(JobID jobId, JobStatus newJobStatus, long timestamp, Throwable error) {
+    	if (newJobStatus == JobStatus.RUNNING) {
+    		// start the checkpoint scheduler
+    		coordinator.startCheckpointScheduler();
+    	} else {
+    		// anything else should stop the trigger for now
+    		coordinator.stopCheckpointScheduler();
+    	}
+    }
+}
+</code></pre> 
+<p>接下来我们来看下startCheckpointScheduler，startCheckpointScheduler首先调用stopCheckpointScheduler确保之前的Checkpoint Scheduler已经停止，然后再创建一个新的ScheduledTrigger放到线程池中定时执行triggerCheckpoint方法触发Checkpoint。第3小节中提到的enableCheckpointing(interval)方法可以设置Checkpoint执行的时间间隔，背后的原理就在这里。</p> 
+<pre><code>public void startCheckpointScheduler() {
+    synchronized (lock) {
+    	if (shutdown) {
+    		throw new IllegalArgumentException("Checkpoint coordinator is shut down");
+    	}
+    
+    	// make sure all prior timers are cancelled
+    	stopCheckpointScheduler();
+    
+    	periodicScheduling = true;
+    	currentPeriodicTrigger = scheduleTriggerWithDelay(getRandomInitDelay());
+    }
+}
+
+private ScheduledFuture&lt;?&gt; scheduleTriggerWithDelay(long initDelay) {
+    return timer.scheduleAtFixedRate(
+    	new ScheduledTrigger(),
+    	    initDelay, baseInterval, TimeUnit.MILLISECONDS);
+}
+
+private final class ScheduledTrigger implements Runnable {
+
+    @Override
+    public void run() {
+    	try {
+    		triggerCheckpoint(System.currentTimeMillis(), true);
+    	}
+    	catch (Exception e) {
+    		LOG.error("Exception while triggering checkpoint for job {}.", job, e);
+    	}
+    }
+}
+</code></pre> 
+<p>triggerCheckpoint是触发Checkpoint的核心方法，下面介绍一些它主要做了哪些工作。</p> 
+<ul><li>检查当前正在处理的并发Checkpoint数是否超过阈值和距离上一次Checkpoint是否小于设置的最小间隔。如果条件不满足，直接返回。</li></ul> 
+<pre><code>// preCheckBeforeTriggeringCheckpoint是在triggerCheckpoint中调用的方法
+private void preCheckBeforeTriggeringCheckpoint(boolean isPeriodic, boolean forceCheckpoint) throws CheckpointException {
+    // abort if the coordinator has been shutdown in the meantime
+    if (shutdown) {
+    	throw new CheckpointException(CheckpointFailureReason.CHECKPOINT_COORDINATOR_SHUTDOWN);
+    }
+    
+    // Don't allow periodic checkpoint if scheduling has been disabled
+    if (isPeriodic &amp;&amp; !periodicScheduling) {
+    	throw new CheckpointException(CheckpointFailureReason.PERIODIC_SCHEDULER_SHUTDOWN);
+    }
+    
+    if (!forceCheckpoint) {
+    	if (triggerRequestQueued) {
+    		throw new CheckpointException(CheckpointFailureReason.ALREADY_QUEUED);
+    	}
+    
+    	checkConcurrentCheckpoints();
+    
+    	checkMinPauseBetweenCheckpoints();
+    }
+}
+</code></pre> 
+<ul><li>检查所有需要被trigger和ack的Task是否都处于运行状态，只要有一个Task不满足条件，就没有必要触发本次Checkpoint了。</li></ul> 
+<pre><code>// check if all tasks that we need to trigger are running.
+// if not, abort the checkpoint
+Execution[] executions = new Execution[tasksToTrigger.length];
+for (int i = 0; i &lt; tasksToTrigger.length; i++) {
+    Execution ee = tasksToTrigger[i].getCurrentExecutionAttempt();
+    if (ee == null) {
+        throw new CheckpointException(CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
+    } else if (ee.getState() == ExecutionState.RUNNING) {
+        executions[i] = ee;
+    } else {
+        throw new CheckpointException(CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
+    }
+}
+
+// next, check if all tasks that need to acknowledge the checkpoint are running.
+// if not, abort the checkpoint
+Map&lt;ExecutionAttemptID, ExecutionVertex&gt; ackTasks = new HashMap&lt;&gt;(tasksToWaitFor.length);
+for (ExecutionVertex ev : tasksToWaitFor) {
+    Execution ee = ev.getCurrentExecutionAttempt();
+    if (ee != null) {
+        ackTasks.put(ee.getAttemptId(), ev);
+    } else {
+        throw new CheckpointException(CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
+    }
+}
+</code></pre> 
+<ul><li>只有上面两次检查都通过后，才会正在进入Checkpoint的处理流程。首先生成一个新的CheckpointID，再创建一个PendingCheckpoint对象。PendingCheckpoint是一个启动但还未被确认的Checkpoint。等到所有Task都确认后又会转化为CompletedCheckpoint。</li></ul> 
+<pre><code>// we will actually trigger this checkpoint!
+final CheckpointStorageLocation checkpointStorageLocation;
+final long checkpointID;
+
+try {
+    // this must happen outside the coordinator-wide lock, because it communicates
+    // with external services (in HA mode) and may block for a while.
+    checkpointID = checkpointIdCounter.getAndIncrement();
+}
+catch (Throwable t) {
+    ...
+}
+
+final PendingCheckpoint checkpoint = new PendingCheckpoint(
+    job,
+    checkpointID,
+    timestamp,
+    ackTasks,
+    masterHooks.keySet(),
+    props,
+    checkpointStorageLocation,
+    executor);
+</code></pre> 
+<ul><li>为了防止Checkpoint长时间未完成而占用资源，CheckpointCoordinator还会创建一个取消器用于清理超时的Checkpoint。</li></ul> 
+<pre><code>// schedule the timer that will clean up the expired checkpoints
+final Runnable canceller = () -&gt; {
+    synchronized (lock) {
+        // only do the work if the checkpoint is not discarded anyways
+        // note that checkpoint completion discards the pending checkpoint object
+        if (!checkpoint.isDiscarded()) {
+        	failPendingCheckpoint(checkpoint, CheckpointFailureReason.CHECKPOINT_EXPIRED);
+        	pendingCheckpoints.remove(checkpointID);
+        	rememberRecentCheckpointId(checkpointID);
+        
+        	triggerQueuedRequests();
+        }
+    }
+};
+</code></pre> 
+<pre><code>ScheduledFuture&lt;?&gt; cancellerHandle = timer.schedule(canceller, checkpointTimeout, TimeUnit.MILLISECONDS);
+</code></pre> 
+<ul><li>最后向Source节点发送消息，触发Checkpoint。</li></ul> 
+<pre><code>// send the messages to the tasks that trigger their checkpoint
+for (Execution execution: executions) {
+    if (props.isSynchronous()) {
+        execution.triggerSynchronousSavepoint(checkpointID, timestamp, checkpointOptions, advanceToEndOfTime);
+    } else {
+        execution.triggerCheckpoint(checkpointID, timestamp, checkpointOptions);
+    }
+}
+</code></pre> 
+<h3><a id="43_TaskManagerCheckpoint_303"></a>4.3 TaskManager执行Checkpoint</h3> 
+<p>TaskManager执行Checkpoint操作要分以下两种情况来讨论：</p> 
+<ul><li>Source节点接收到JobManager发送的TriggerCheckpoint消息后触发本节点Checkpoint。</li><li>非Source节点从上游接收到Barrier后触发本节点Checkpoint，这里可能还会涉及到Barrier对齐操作。</li></ul> 
+<h4><a id="431_SourceCheckpoint_310"></a>4.3.1 Source节点执行Checkpoint</h4> 
+<p>下面先来看看Source节点是如何执行Checkpoint的。</p> 
+<p>TaskManager接收到JobManager的TriggerCheckpoint消息后，经过层层调用最后使用AbstractInvokable的triggerCheckpointAsync方法来处理。AbstractInvokable是对在TaskManager中可执行任务的抽象。triggerCheckpointAsync的具体实现在AbstractInvokable的子类StreamTask中，其核心逻辑就是使用线程池异步调用triggerCheckpoint方法。</p> 
+<pre><code>public Future&lt;Boolean&gt; triggerCheckpointAsync(
+		CheckpointMetaData checkpointMetaData,
+		CheckpointOptions checkpointOptions,
+		boolean advanceToEndOfEventTime) {
+
+    return mailboxProcessor.getMainMailboxExecutor().submit(
+    		() -&gt; triggerCheckpoint(checkpointMetaData, checkpointOptions, advanceToEndOfEventTime),
+    		"checkpoint %s with %s",
+    	checkpointMetaData,
+    	checkpointOptions);
+}
+
+private boolean triggerCheckpoint(
+		CheckpointMetaData checkpointMetaData,
+		CheckpointOptions checkpointOptions,
+		boolean advanceToEndOfEventTime) throws Exception {
+    try {
+        ...
+        
+        boolean success = performCheckpoint(checkpointMetaData, checkpointOptions, checkpointMetrics, advanceToEndOfEventTime);
+        if (!success) {
+        	declineCheckpoint(checkpointMetaData.getCheckpointId());
+        }
+        return success;
+    } catch (Exception e) {
+    	...
+    }
+}
+</code></pre> 
+<p>StreamTask的triggerCheckpoint会调用performCheckpoint方法，该方法主要工作包括：</p> 
+<ul><li>创建Checkpoint Barrier并向下游节点广播。</li><li>触发本节点的快照操作。</li></ul> 
+<pre><code>private boolean performCheckpoint(
+		CheckpointMetaData checkpointMetaData,
+		CheckpointOptions checkpointOptions,
+		CheckpointMetrics checkpointMetrics,
+		boolean advanceToEndOfTime) throws Exception {
+    ...
+    
+    final long checkpointId = checkpointMetaData.getCheckpointId();
+    
+    if (isRunning) {
+        actionExecutor.runThrowing(() -&gt; {
+            ...
+            // All of the following steps happen as an atomic step from the perspective of barriers and
+            // records/watermarks/timers/callbacks.
+            // We generally try to emit the checkpoint barrier as soon as possible to not affect downstream
+            // checkpoint alignments
+            
+            // Step (1): Prepare the checkpoint, allow operators to do some pre-barrier work.
+            //           The pre-barrier work should be nothing or minimal in the common case.
+            operatorChain.prepareSnapshotPreBarrier(checkpointId);
+            
+            // Step (2): Send the checkpoint barrier downstream
+            operatorChain.broadcastCheckpointBarrier(
+            		checkpointId,
+            		checkpointMetaData.getTimestamp(),
+            		checkpointOptions);
+            
+            // Step (3): Take the state snapshot. This should be largely asynchronous, to not
+            //           impact progress of the streaming topology
+            checkpointState(checkpointMetaData, checkpointOptions, checkpointMetrics);
+        });
+    
+    	return true;
+    } else {
+    	...
+    	return false;
+    }
+}
+</code></pre> 
+<p>checkpointState方法进一步调用executeCheckpointing对本地的State进行保存，该方法被封装在CheckpointingOperation类中，其核心工作包括：</p> 
+<ul><li>调用每一个StreaOperator的snapshotState方法生成快照并存储到状态后端。</li><li>检查Checkpoint结果并告诉JobManager。</li></ul> 
+<pre><code>public void executeCheckpointing() throws Exception {
+    startSyncPartNano = System.nanoTime();
+    
+    try {
+        // 调用每一个算子的snapshotState方法
+        for (StreamOperator&lt;?&gt; op : allOperators) {
+        	checkpointStreamOperator(op);
+        }
+        
+        startAsyncPartNano = System.nanoTime();
+        
+        checkpointMetrics.setSyncDurationMillis((startAsyncPartNano - startSyncPartNano) / 1_000_000);
+        
+        // we are transferring ownership over snapshotInProgressList for cleanup to the thread, active on submit
+        AsyncCheckpointRunnable asyncCheckpointRunnable = new AsyncCheckpointRunnable(
+        	owner,
+        	operatorSnapshotsInProgress,
+        	checkpointMetaData,
+        	checkpointMetrics,
+        	startAsyncPartNano);
+        
+        owner.cancelables.registerCloseable(asyncCheckpointRunnable);
+        // 检查结果并报告JobManager
+        owner.asyncOperationsThreadPool.execute(asyncCheckpointRunnable);
+    } catch (Exception ex) {
+    	...
+    }
+}
+
+private void checkpointStreamOperator(StreamOperator&lt;?&gt; op) throws Exception {
+    if (null != op) {
+        OperatorSnapshotFutures snapshotInProgress = op.snapshotState(
+        		checkpointMetaData.getCheckpointId(),
+        		checkpointMetaData.getTimestamp(),
+        		checkpointOptions,
+        		storageLocation);
+        operatorSnapshotsInProgress.put(op.getOperatorID(), snapshotInProgress);
+    }
+}
+</code></pre> 
+<p>如果Checkpoint执行成功，AsyncCheckpointRunnable最后会调用TaskStateManagerImpl的reportTaskStateSnapshots方法向JobManager发送AcknowledgeCheckpoint消息。</p> 
+<pre><code>public void reportTaskStateSnapshots(
+        @Nonnull CheckpointMetaData checkpointMetaData,
+        @Nonnull CheckpointMetrics checkpointMetrics,
+        @Nullable TaskStateSnapshot acknowledgedState,
+        @Nullable TaskStateSnapshot localState) {
+
+    long checkpointId = checkpointMetaData.getCheckpointId();
+    
+    localStateStore.storeLocalState(checkpointId, localState);
+    
+    checkpointResponder.acknowledgeCheckpoint(
+    	jobId,
+    	executionAttemptID,
+    	checkpointId,
+    	checkpointMetrics,
+    	acknowledgedState);
+}
+</code></pre> 
+<h4><a id="431_SourceCheckpoint_462"></a>4.3.1 非Source节点执行Checkpoint</h4> 
+<p>下游的非Source节点接收到Barrier后，调用CheckpointBarrierAligner的processBarrier方法来处理。processBarrier会分别处理单个Input Channel和多个Input Channel两个不同场景，具体为：</p> 
+<ul><li>如果只有一个Input Channel，收到Barrier后直接调用notifyCheckpoint触发快照。</li><li>如果包含多个Input Channel， 先执行Barrier对齐，收到所有Input Channel发送的Barrier后再调用notifyCheckpoint触发快照。</li></ul> 
+<pre><code>public boolean processBarrier(CheckpointBarrier receivedBarrier, int channelIndex, long bufferedBytes) throws Exception {
+    final long barrierId = receivedBarrier.getId();
+    
+    // fast path for single channel cases
+    if (totalNumberOfInputChannels == 1) {
+    	if (barrierId &gt; currentCheckpointId) {
+    		// new checkpoint
+    		currentCheckpointId = barrierId;
+    		notifyCheckpoint(receivedBarrier, bufferedBytes, latestAlignmentDurationNanos);
+    	}
+    	return false;
+    }
+    
+    boolean checkpointAborted = false;
+    
+    // -- general code path for multiple input channels --
+    
+    if (numBarriersReceived &gt; 0) {
+    	// this is only true if some alignment is already progress and was not canceled
+    
+    	if (barrierId == currentCheckpointId) {
+    		// regular case
+    		onBarrier(channelIndex);
+    	}
+    	else if (barrierId &gt; currentCheckpointId) {
+    		...
+    
+    		// abort the current checkpoint
+    		releaseBlocksAndResetBarriers();
+    		checkpointAborted = true;
+    
+    		// begin a the new checkpoint
+    		beginNewAlignment(barrierId, channelIndex);
+    	}
+    	else {
+    		// ignore trailing barrier from an earlier checkpoint (obsolete now)
+    		return false;
+    	}
+    }
+    else if (barrierId &gt; currentCheckpointId) {
+    	// first barrier of a new checkpoint
+    	beginNewAlignment(barrierId, channelIndex);
+    }
+    else {
+    	// either the current checkpoint was canceled (numBarriers == 0) or
+    	// this barrier is from an old subsumed checkpoint
+    	return false;
+    }
+    
+    // check if we have all barriers - since canceled checkpoints always have zero barriers
+    // this can only happen on a non canceled checkpoint
+    if (numBarriersReceived + numClosedChannels == totalNumberOfInputChannels) {
+    	// actually trigger checkpoint
+    	releaseBlocksAndResetBarriers();
+    	notifyCheckpoint(receivedBarrier, bufferedBytes, latestAlignmentDurationNanos);
+    	return true;
+    }
+    return checkpointAborted;
+}
+</code></pre> 
+<p>toNotifyOnCheckpoint是AbstractInvokable实例，triggerCheckpointOnBarrier方法最终调用了performCheckpoint方法，这后面的逻辑就跟Source节点一样了。可以看出：Source节点和非Source节点执行快照的逻辑是一致的，不同的是触发快照的机制。Source节点接收到JobManager发送的TriggerCheckpoint消息触发快照，非Source节点接收到上游节点的Barrier后触发快照。</p> 
+<pre><code>// CheckpointBarrierHandler
+protected void notifyCheckpoint(CheckpointBarrier checkpointBarrier, long bufferedBytes, long alignmentDurationNanos) throws Exception {
+    if (toNotifyOnCheckpoint != null) {
+        CheckpointMetaData checkpointMetaData =
+        	new CheckpointMetaData(checkpointBarrier.getId(), checkpointBarrier.getTimestamp());
+        ...
+        toNotifyOnCheckpoint.triggerCheckpointOnBarrier(
+        	checkpointMetaData,
+        	checkpointBarrier.getCheckpointOptions(),
+        	checkpointMetrics);
+    }
+}
+</code></pre> 
+<pre><code>// StreamTask
+public void triggerCheckpointOnBarrier(
+		CheckpointMetaData checkpointMetaData,
+		CheckpointOptions checkpointOptions,
+		CheckpointMetrics checkpointMetrics) throws Exception {
+    try {
+        if (performCheckpoint(checkpointMetaData, checkpointOptions, checkpointMetrics, false)) {
+            if (isSynchronousSavepointId(checkpointMetaData.getCheckpointId())) {
+            	runSynchronousSavepointMailboxLoop();
+            }
+        }
+    }
+    catch (Exception e) {
+    	...
+    }
+}
+</code></pre> 
+<h3><a id="44_JobManagerCheckpoint_566"></a>4.4 JobManager确认Checkpoint</h3> 
+<p>JobManager收到Task的AcknowledgeCheckpoint消息后，会调用CheckpointCoordinator的receiveAcknowledgeMessage方法来处理。PendingCheckPoint中记录了本次Checkpoint中有哪些Task需要Ack，如果JobManager已经收到所有的Task的Ack消息，则调用completePendingCheckpoint向Task发送notifyCheckpointComplete消息通知Task本次Checkpoint已经完成。</p> 
+<pre><code>final PendingCheckpoint checkpoint = pendingCheckpoints.get(checkpointId);
+
+if (checkpoint != null &amp;&amp; !checkpoint.isDiscarded()) {
+	switch (checkpoint.acknowledgeTask(message.getTaskExecutionId(), message.getSubtaskState(), message.getCheckpointMetrics())){
+        case SUCCESS:
+            if (checkpoint.areTasksFullyAcknowledged()) {
+            	completePendingCheckpoint(checkpoint);
+            }
+            break;
+        ...
+	}
+}
+</code></pre> 
+<pre><code>private void completePendingCheckpoint(PendingCheckpoint pendingCheckpoint) throws CheckpointException {
+    ...
+    
+    // send the "notify complete" call to all vertices
+    final long timestamp = completedCheckpoint.getTimestamp();
+    
+    for (ExecutionVertex ev : tasksToCommitTo) {
+    	Execution ee = ev.getCurrentExecutionAttempt();
+    	if (ee != null) {
+    		ee.notifyCheckpointComplete(checkpointId, timestamp);
+    	}
+    }
+}
+</code></pre> 
+<p>TaskManager收到notifyCheckpointComplete消息后，最终调用Task的notifyCheckpointComplete方法回调每一个算子的notifyCheckpointComplete方法。</p> 
+<pre><code>// TaskExecutor
+public CompletableFuture&lt;Acknowledge&gt; confirmCheckpoint(
+		ExecutionAttemptID executionAttemptID,
+		long checkpointId,
+		long checkpointTimestamp) {
+    final Task task = taskSlotTable.getTask(executionAttemptID);
+    
+    if (task != null) {
+    	task.notifyCheckpointComplete(checkpointId);
+    
+    	return CompletableFuture.completedFuture(Acknowledge.get());
+    } else {
+    	...
+    }
+}
+</code></pre> 
+<pre><code>// StreamTask
+private void notifyCheckpointComplete(long checkpointId) {
+    try {
+        boolean success = actionExecutor.call(() -&gt; {
+            if (isRunning) {
+                for (StreamOperator&lt;?&gt; operator : operatorChain.getAllOperators()) {
+                	if (operator != null) {
+                		operator.notifyCheckpointComplete(checkpointId);
+                	}
+                }
+                return true;
+            } 
+            ...
+        });
+    } catch (Exception e) {
+        ...
+    }
+}
+</code></pre> 
+<p>至此，一次完整的Checkpoint过程就完成了。</p> 
+<p>参考：</p> 
+<ol><li><a href="https://arxiv.org/abs/1506.08603" rel="nofollow">Lightweight Asynchronous Snapshots for Distributed Dataflows</a></li><li><a href="https://ci.apache.org/projects/flink/flink-docs-release-1.10/internals/stream_checkpointing.html" rel="nofollow">Data Streaming Fault Tolerance</a></li><li><a href="https://ci.apache.org/projects/flink/flink-docs-release-1.10/dev/stream/state/checkpointing.html" rel="nofollow">Flink Checkpointing</a></li><li><a href="https://www.dazhuanlan.com/2019/10/17/5da7fc061b337/" rel="nofollow">Flink 轻量级异步快照ABS实现原理</a></li></ol>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/49f8aabb24860a36ec783e4fbf91c40c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">elementUI el-input 只能输入正整数验证</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2bccd98b489552c7947ca8152241a4a1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">pggan学习笔记</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

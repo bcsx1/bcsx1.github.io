@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>erlang中如何写PORT驱动 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="erlang中如何写PORT驱动" />
+<meta property="og:description" content="Supervision Trees and Ports in Erlang 08:31PM Sep 03, 2007 in category Erlang by David King Erlang provides a whole lot of infrastructure for doing tasks commonly associated with building giant fault-tolerant systems. But what about when you have to talk to an external non-Erlang program? Can we make our communication to that program fault-tolerant using only native Erlang/OTP components? The problem I&#39;m writing a blogging engine using Erlyweb and Mnesia, and one of my tasks is to pass the user&#39;s blog entry through a formatter." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/9e5c800dcf7a028281e80a7b333b7b49/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2009-04-09T16:25:17+08:00" />
+<meta property="article:modified_time" content="2009-04-09T16:25:17+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">erlang中如何写PORT驱动</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>Supervision Trees and Ports in Erlang <br><br>08:31PM Sep 03, 2007 in category Erlang by David King <br><br>Erlang provides a whole lot of infrastructure for doing tasks commonly associated with building giant fault-tolerant systems. But what about when you have to talk to an external non-Erlang program? Can we make our communication to that program fault-tolerant using only native Erlang/OTP components? <br>The problem <br><br>I'm writing a blogging engine using Erlyweb and Mnesia, and one of my tasks is to pass the user's blog entry through a formatter. I use two: one for Markdown, and one to sanitise for XSS attacks. Since there's no Markdown or HTML-sanitiser implementation for Erlang, we need to communicate with the Perl implementations (markdown, HTML-TagFilter). <br><br>We'll want some fault-tolerance (in case one of our external programs crash, we want to re-launch it), and we don't want to introduce a bottleneck by serialising access to our external programs, so we'll launch several copies of it to spread the load and allow some concurrency. In addition, we'll want to leave room to move all of the processing to its own node in the event that our blog gets very popular. <br><br>We'll communicate using an Erlang Port. A Port is a connection to an external program, implemented using Unix pipes. So our external program just has to know how to read/write to stdout/stdin. We're going to keep this all pretty generic to the actual external program. You should be able to do the same for any other program that can take data in length-encoded packets (or can be wrapped in one that does, like our Perl wrapper) for which you want to launch mutliple workers. <br><br>To launch our workers, we'll use Erlang's gen_server interface, which is a way to write a generic server without having to write the implementation details of the server, keeping state, message-handling and responding, etc. Instead, you write a gen_server with a set of callbacks, and all you write is the code to actually handle the messages that you want to respond to. Bascially, gen_server is a module that can take another module with appropriate callbacks and handle all of the tasks of making it a server that looks more or less like (psuedo-code) <br><br>    loop(State) -&gt; <br>      Message=receive Some_Message <br>      if Message is an internal message, like shutdown or startup or code-replacement <br>        let gen_server handle it <br>        loop(State) <br>      else it's a message that the programmer wants to respond to <br>        pass it to the programmer, let them handle it, get new state <br>        loop(NewState) <br>  <br><br>Our gen_server will have to keep track of its connection to our external program, and on request it will have to send data to the external program and retrieve the result. It will also keep track of its process group (pg2) and adding itself to it <br><br>Erlang does something similar for supervisors. A supervisor is a process whose entire job is to watch another process or set of processes. In our case, we just want it to make sure that our external processes are up and running, and to re-launch them in case they crash, and to bring up all of our workers at once so that we don't have to launch them individually. We'll have one supervisor for Markdown which will watch all of our Markdown gen_servers, and another for all of our sanitiser gen_servers. To make managing them easier, we'll use another supervisor that will watch those two supervisors, re-launching them if they crash, and enabling us to bring both up, and all of the associated gen_servers, at once. So the plan is to have a formatter supervisor that will launch a markdown supervisor and a sanitiser supervisor, each of which will launch N workers, like this: <br><br>I'll show you working code, and try to explain the fuzzy bits, but I encourage you to research the functions that compose it in Erlang's own docs so that you really know what is going on. <br>external_program.pl <br><br>Since all of this relies on an actual external program, here's a shell to use for a Perl program:</p> 
+<pre><code class="language-java">1 #!/usr/bin/env perl -w 
+2 
+3 # turn on auto-flushing 
+4 $cfh = select (STDOUT); 
+5 $| = 1; 
+6 select ($cfh); 
+7 
+8 sub process { 
+9   return $_[0]; 
+10 } 
+11 
+12 until(eof(STDIN)) { 
+13   my ($length_bytes,$length,$data,$return); 
+14 
+15   read STDIN,$length_bytes,4; # four-byte length-header 
+16   $length=unpack("N",$length_bytes); 
+17 
+18   read STDIN,$data,$length; 
+19 
+20   $return=&amp;process($data); 
+21 
+22   print STDOUT pack("N",length($return)); 
+23   print STDOUT $return; 
+24 } </code></pre> 
+<p> <br><br>It communicates with Erlang via stdin/stdout, and handles packets with 4-byte length headers (with network byte-order, since that's how Erlang sends it). That is just a stub program that returns the data coming in to it, but you can replace process with whatever you want to process/format the data. I have two versions of this, one that applies markdown, and one that sanitises input with HTML-TagFilter. <br>external_program.erl <br><br>Now the for the Erlang bits. First, we'll construct the gen_server to actually communicate with the Perl program. We'll communicate using a Port (which uses a unix pipe). We want to send data in atomic packets so that the Perl program knows when we're done sending data and so that we know when the Perl program is done responding. To do this, we'll send and receive data in packets of up to 232 bytes. That is, we'll send our Perl program a four-byte header (in network byte-order) indicating how much data is to be sent, then we'll send the data, and Perl will send back a four-byte header indicating how much data it is about to send, and then it will send that data. Erlang will handle the packets and headers on its side with the {packet,4} option to open_port/2, but we'll have to handle the packetising ourselves from the Perl side (already done in the above Perl program). This one is pretty generic, so you could use it to communicate with any outside program that can send data in packets, not just a formatter. Here's the code: <br></p> 
+<pre><code class="language-java">1 -module(external_program). 
+2 -behaviour(gen_server). 
+3 
+4 % API 
+5 -export([start_link/3, 
+6          filter/2]). 
+7 
+8 % gen_server callbacks 
+9 -export([init/1, 
+10          handle_call/3, 
+11          handle_cast/2, 
+12          handle_info/2, 
+13          code_change/3, 
+14          terminate/2]). 
+15 
+16 -record(state,{port}). 
+17 
+18 start_link(Type,Id,ExtProg) -&gt; 
+19   gen_server:start_link({local,Id},?MODULE,{Type,ExtProg},_Options=[]). 
+20 
+21 handle_info({'EXIT', Port, Reason}, #state{port = Port} = State) -&gt; 
+22   {stop, {port_terminated, Reason}, State}. 
+23 terminate({port_terminated, _Reason}, _State) -&gt; 
+24   ok; 
+25 terminate(_Reason, #state{port = Port} = _State) -&gt; 
+26   port_close(Port). 
+27 handle_cast(_Msg, State) -&gt; 
+28   {noreply, State}. 
+29 code_change(_OldVsn, State, _Extra) -&gt; 
+30   {ok, State}. 
+31 
+32 init({Type,ExtProg}) -&gt; 
+33   process_flag(trap_exit, true), 
+34   ok=pg2:create(Type), % idempotent 
+35   ok=pg2:join(Type,self()), 
+36   Port = open_port({spawn, ExtProg}, [binary,{packet,4}]), 
+37   {ok, #state{port = Port}}. 
+38 
+39 handle_call(_Command={filter,Data},_From,#state{port=Port}=State) -&gt; 
+40   port_command(Port,Data), 
+41   receive {Port,{data,Data2}} -&gt; 
+42       {reply,Data2,State} 
+43     end. 
+44 
+45 filter(Type,Data) -&gt; 
+46   gen_server:call(pg2:get_closest_pid(Type),{filter,Data}). 
+</code></pre> 
+<p> <br>And here's the blow-by-blow. Skip ahead to externalprogram_supervisor.erl if you understand it. First, we start our module with <br><br>     2 -behaviour(gen_server) <br><br>This tells the compiler to warn us if we forget any functions for call-back that gen_server is expecting to find. I won't introduce the exports here, I'll introduce the functions we come to them. <br><br>We use a record to encode our state, even though the only item in our state is the connection to the external program <br><br>    16 -record(state,{port}). <br><br>We do this in case we later decide to add anything to the state, it will save us from modifying all of the function headers that refer to the state. Remember that our entire state between calls must go into this record, so if we want to later add information like the time the program was launched (for statistical tracking), or the system user that launched it, this is where it goes. <br><br>start_link/3 is how we'll start our gen_server. It's the function that we call from another module (our supervisor), not one called as a gen_server callback, so it can look however we want, but our supervisor is expecting it to return {ok,Pid}. <br><br>    18 start_link(Type,Id,ExtProg) -&gt; <br>    19   gen_server:start_link({local,Id},?MODULE,{Type,ExtProg},_Options=[]). <br><br>It calls gen_server:start_link/4, which takes: <br><br>    * {local,Id}: This is how gen_server will register the PID of the server. local means that it will only be registered on the local node, and Id is an atom passed to us by our supervisor that will appear in process listings. We don't use this anywhere, it's just nice to have for viewing in appmon and other tools, and it's optional (gen_server:start_link/3 takes only the other three arguments) <br>    * the call-back module (i.e. this module) <br>    * the arguments to the gen_server's init/1 function (which we'll get to) <br>    * any special options to gen_server (we don't use any) <br><br>It returns {ok,Pid}, where Pid is the Pid of the launched process. While we used gen_server:start_link/4, which takes registered name for the gen_server, we don't use it to address the gen_server. Instead, we're going to use the pg2 group name that we set in init/1 below. This is because we're going to launch several copies of this gen_server, so communicating directly with it isn't practical. <br><br>handle_info/2 is a callback function that is called whenever our server receives a message that gen_server doesn't understand. <br><br>    21 handle_info({'EXIT', Port, Reason}, #state{port = Port} = State) -&gt; <br>    22   {stop, {port_terminated, Reason}, State}. <br><br>The only message that we handle is the Port indicating that it has shut down (for instance, if it crashes). In this case, there's nothing that we can do anymore (since our whole reason for being is to communicate with this Port), so we signal to our caller that we intend to shut down, and gen_server will shut us down, which includes calling our terminate/2 function and do other shutdown tasks. <br><br>terminate/2 is a callback function that gen_server calls whenever it is shutting us down for any reason so that we can free up any resources that we have (like our Port). It passes us the Reason for shutdown and the last State of the server <br><br>    23 terminate({port_terminated, _Reason}, _State) -&gt; <br>    24   ok; <br>    25 terminate(_Reason, #state{port = Port} = _State) -&gt; <br>    26   port_close(Port). <br><br>We have two clauses to handle a shutdown. If we are shutting down because our port terminated (because handle_info said so), then we just let gen_server finish shutting us down. If we shut down for any other reason, then we close the Port before we die so that it's not left open forever. terminate's return value is ignored. <br><br>handle_cast/2 handles asynchronous messages to our server <br><br>    27 handle_cast(_Msg, State) -&gt; <br>    28   {noreply, State}. <br><br>gen_servers can handle two types of in-band messages: synchronous messages generated by calls to gen_server:call/2, and asynchronous messages generated by gen_server:cast/2. (gen_server handles the difference.) Since we're only handling synchronous messages, we just don't return a reply if we receive any asynchronous messages, but if you really wanted you could make a synchronous call and send it as a response <br><br>code_change/3 is called when our code is being dynamically replaced <br><br>    29 code_change(_OldVsn, State, _Extra) -&gt; <br>    30   {ok, State}. <br><br>Erlang supports replacing code while the server is running, with no downtime. In the event that the code is replaced, a gen_server temporarily stops responding to messages (enqueueing them as they come in), waits for the code to be replaced, calls the call-back module's new code_change function, picks up the new state, and starts running again. This could be used if we were to upgrade our code to one that required a new member of the state record, for instance, to upgrade the running state to the state that the new version uses. (If the function returns anything but {ok,NewState}, the gen_server crashes, which would be fine in our case since our supervisor would just restart it under the new code anyway.) Unless we plan to convert the state of the server, which for now we don't, we just return {ok,State} <br><br>init/1 is called by gen_server just before the server-loop is run. <br><br>    32 init({Type,ExtProg}) -&gt; <br>    33   process_flag(trap_exit, true), <br>    34   ok=pg2:create(Type), % idempotent <br>    35   ok=pg2:join(Type,self()), <br>    36   Port = open_port({spawn, ExtProg}, [binary,{packet,4}]), <br>    37   {ok, #state{port = Port}}. <br><br>Its argument comes from gen_server:start_link, which we called in our own start_link/3 function, and is our Type (which becomes our pg2 group name) and the path to the external program that we want to launch (the Perl programs mentioned above). We first indicate that we want to trap exits, so that we can receive 'EXIT' messages from our Port in case it dies. These messages are not recognised by gen_server, so they get passed to our handle_info/2 callback function. Then we create our pg2 group (this operation is idempotent, which means that doing it several times has the same effect as doing it once), and join this process to the group. Then we open up the external program itself using open_port. It takes a tuple of {Type,Path}, which we use to indicate that we are launching an external program (the spawn type) and where to find it, and a list of options, which we use to tell it that we want to communicate using binaries instead of lists, and that we want it to handle communication to our Port with packets with a length-header of four bytes. Then we tell gen_server that all is well and to start the server with a state record containing a reference to our Port. <br><br>handle_call/2 is called whenever we receive a synchronous request from an outside caller, this is the actual guts of our server. <br><br>    39 handle_call(_Command={filter,Data},_From,#state{port=Port}=State) -&gt; <br>    40   port_command(Port,Data), <br>    41   receive {Port,{data,Data2}} -&gt; <br>    42       {reply,Data2,State} <br>    43     end. <br><br>We just receive the command (which is a {filter,Data} tuple; it doesn't have to be, but that's how we're going to call it later), send it to the Port, get the reply from the Port, and tell gen_server to reply that back to the caller. We didn't have to write any of the server code, just the implementation of our code. <br><br>Finally, here's how we actually communicate with our server after it's launched: <br><br>    45 filter(Type,Data) -&gt; <br>    46   gen_server:call(pg2:get_closest_pid(Type),{filter,Data}). <br><br>We make a synchronous call to the "closest" Pid that is a member of the pg2 group that our programs join when launching. ("Closest" just means that pg2 will first look on the local node before looking on other nodes.) pg2:get_closest_pid randomises which worker it returns within a group, so this should spread the load if we get many simultaneous requests. This could be expanded to try again in the event of a timeout (assuming that the timed-out server will crash and be re-launched, or that pg2:get_closest_pid will return a different Pid next time) <br><br>At this point you should be able to create and call a gen_server <br>externalprogram_supervisor.erl <br><br>Now for the supervisor. Again, we'll keep this generic. It handles multiple external_program workers, launching NumWorkers (passed to start_link/3). We'll use the (aptly named) supervisor behaviour. supervisor launches a group of processes, watches them, and re-launches them if they die. It also provides a way to bring up or down a group of processes all at once, just by launching or shutting down the supervisor. I'm going to explain the functions of order for clarity. <br></p> 
+<pre><code class="language-java">1 -module(externalprogram_supervisor). 
+2 -behavior(supervisor). 
+3 
+4 % API 
+5 -export([start_link/3]). 
+6 
+7 % supervisor callbacks 
+8 -export([init/1]). 
+9 
+10 start_link(Type,NumWorkers,ExtProg) -&gt; 
+11   supervisor:start_link({local, 
+12                           list_to_atom(atom_to_list(Type) ++ "_supervisor")}, 
+13                         ?MODULE, 
+14                         {Type,NumWorkers,ExtProg}). 
+15 
+16 init({Type, NumWorkers,ExtProg}) -&gt; 
+17   {ok, 
+18    {<!-- -->{one_for_one, 
+19      3, 
+20      10}, 
+21     [begin 
+22          Id=list_to_atom(atom_to_list(Type) ++ integer_to_list(Which)), 
+23          {Id, 
+24           {external_program, 
+25            start_link, 
+26            [Type,Id,ExtProg]}, 
+27           permanent, 
+28           _Timeout=10*1000, 
+29           worker, 
+30           [external_program]} 
+31        end 
+32      || Which &lt;- lists:seq(1,NumWorkers)]}}. 
+33 
+</code></pre> 
+<p> <br>Again, -behaviour(supervisor). tells the compiler to warn us if we forget any callback functions required by supervisor. <br><br>supervisor only has one callback, init/1: <br><br>    16 init({Type, NumWorkers,ExtProg}) -&gt; <br>    17   {ok, <br>    18    {<!-- -->{one_for_one, <br>    19      3, <br>    20      10}, <br>    21     [begin <br>    22          Id=list_to_atom(atom_to_list(Type) ++ integer_to_list(Which)), <br>    23          {Id, <br>    24           {external_program, <br>    25            start_link, <br>    26            [Type,Id,ExtProg]}, <br>    27           permanent, <br>    28           _Timeout=10*1000, <br>    29           worker, <br>    30           [external_program]} <br>    31        end <br>    32      || Which &lt;- lists:seq(1,NumWorkers)]}}. <br><br>It's only called once when the supervisor is created (or re-started after crashing). It gets its arguments from supervisor:start_link, which we call from our local start_link (that we'll explain in a moment). init is expected to return a restart strategy and a list of Childspecs, where a Childspec looks like (straight from the Erlang supervisor documentation): <br><br>    {Id,StartFunc,Restart,Shutdown,Type,Modules}, <br>      Id = term() <br>      StartFunc = {M,F,A} <br>         M = F = atom() <br>         A = [term()] <br>      Restart = permanent | transient | temporary <br>      Shutdown = brutal_kill | int()&gt;=0 | infinity <br>      Type = worker | supervisor <br>      Modules = [Module] | dynamic <br>        Module = atom() <br><br>You can read up on what all of that means in the supervisor documentation, but we return a list of them consisting of NumWorkers items (see the list-comprehension) such that each is launched by calling external_program:start_link/3 (specified by the StartFunc in the Childspec), passing each worker their Id, Type and ExtProg. The Id just an atom that we generate from the Type and the worker-number (which is just determined by their launch-order) that you'll recall being passed to gen_server to register the worker's PID so that in debug listings we can see markdown3 instead of &lt;0.15.3&gt; <br><br>The supervisor itself is created by calling our local start_link/3, which calls supervisor:start_link/2 (which actually creates the supervisor, calls our init, etc). This supervisor will be called from formatter_supervisor, defined below, but you could call it done at this point and have a working implementation of an N-worker external program. <br><br>    1&gt; externalprogram_supervisor:start_link(my_server,5,"/usr/local/bin/external_program.pl"). <br>    &lt;0.1976.0&gt; <br>    2&gt; pg2:get_members(my_server). <br>    [&lt;0.1981.0&gt;,&lt;0.1980.0&gt;,&lt;0.1979.0&gt;,&lt;0.1978.0&gt;,&lt;0.1977.0&gt;] <br>    3&gt; gen_server:call(pg2:get_closest_pid(my_server),{filter,&lt;&lt;"This is some random text!"&gt;&gt;}). <br>    &lt;&lt;"This is some random text!"&gt;&gt; <br>  <br><br>formatter_supervisor.erl <br><br>Our original goal was to have N workers running for two external programs. So far all of the code we've written has been generic to the external program, but now we're going to get into (very slightly) more specific stuff. The formatter_supervisor will be a supervisor that will launch and watch two supervisors, one for Markdown and one for our santiser. They'll both run the same externalprogram_supervisor code, they'll just be launched with different arguments. <br></p> 
+<pre><code class="language-java">1 -module(formatter_supervisor). 
+2 -behavior(supervisor). 
+3 
+4 % External exports 
+5 -export([start_link/0]). 
+6 
+7 % supervisor callbacks 
+8 -export([init/1]). 
+9 
+10 start_link() -&gt; 
+11   supervisor:start_link(?MODULE, '_'). 
+12 
+13 % formatters are assumed to create pg2s registered under their 
+14 % type-names (at the moment, markdown and sanitiser) 
+15 init(_Args) -&gt; 
+16   {ok, 
+17    {<!-- -->{one_for_one, 
+18      3, 
+19      10}, 
+20     [{markdown_supervisor, 
+21       {externalprogram_supervisor, 
+22        start_link, 
+23        [markdown, 
+24         myapp_config:markdown_workers(), 
+25         myapp_config:markdown_program()]}, 
+26       permanent, 
+27       _Timeout1=infinity, 
+28       supervisor, 
+29       [externalprogram_supervisor]}, 
+30      {sanitiser_supervisor, 
+31       {externalprogram_supervisor, 
+32        start_link, 
+33        [sanitiser, 
+34         myapp_config:sanitiser_workers(), 
+35         myapp_config:sanitiser_program()]}, 
+36       permanent, 
+37       _Timeout2=infinity, 
+38       supervisor, 
+39       [externalprogram_supervisor]}]}}. 
+</code></pre> 
+<p> <br>That looks almost the same as our externalprogram_supervisor, except that the ChildSpecs returned by init are different. We don't have a local version of start_worker_link, we just call externalprogram_supervisor:create_link (since there's nothing we need to do with it after launching it). The ChildSpec list looks like this: <br><br>    20     [{markdown_supervisor, <br>    21       {externalprogram_supervisor, <br>    22        start_link, <br>    23        [markdown, <br>    24         myapp_config:markdown_workers(), <br>    25         myapp_config:markdown_program()]}, <br>    26       permanent, <br>    27       _Timeout1=infinity, <br>    28       supervisor, <br>    29       [externalprogram_supervisor]}, <br>    30      {sanitiser_supervisor, <br>    31       {externalprogram_supervisor, <br>    32        start_link, <br>    33        [sanitiser, <br>    34         myapp_config:sanitiser_workers(), <br>    35         myapp_config:sanitiser_program()]}, <br>    36       permanent, <br>    37       _Timeout2=infinity, <br>    38       supervisor, <br>    39       [externalprogram_supervisor]}]}}. <br><br>Nothing too special there, except that we pass in the Type atom to externalprogram_supervisor:start_link (markdown or sanitiser), which becomes the name of the pg2 group. The shutdown timeout is set to infinity for supervisors of supervisors (as recommended by the Erlang docs) to give the indirect children all time to shut down, and we've indicated that the worker type is supervisor, so that Erlang knows that we're building a supervision tree. Of course, the arguments to externalprogram_supervisor:start_link assume that myapp_config:markdown_workers/0 and friends have been defined, but you could just replace those with literal values, too. myapp_config:markdown_workers/0 is assumed to return an integer (in my case, five), which is how many copies of the program you want to launch, and myapp_config:markdown_program/0 returns the full path to the program to launch (like "/usr/local/myapp/lib/markdown.pl"). formatter_supervisor is the supervisor that will be started from my application's main supervisor. <br>format.erl <br><br>The actual communication with the programs should be pretty easy now, we just ask external_program to do its magic. Here it is:</p> 
+<pre><code class="language-java">1 -module(format). 
+2 
+3 % formatters are defined and launched by the formatter_supervisor 
+4 
+5 -export([markdown/1, 
+6          sanitise/1]). 
+7 
+8 markdown(Data) -&gt; 
+9   external_program:filter(markdown,Data). 
+10 
+11 sanitise(Data) -&gt; 
+12   external_program:filter(sanitiser,Data). </code></pre> 
+<p> <br><br>It should work with lists or a binaries. Add a use Text::Markdown; to the top of our Perl module module (at the beginning of this entry) and replace its process function with: <br><br>10 sub process { <br>11   return Text::Markdown::markdown($_[0]); <br>12 } <br><br>Launch our formatter_supervisor with formatter_supervisor:start_link() and now we have a working Markdown implementation: <br><br>  (name@node)106&gt; format:markdown("I *really* like cookies"). <br>  &lt;&lt;"&lt;p&gt;I &lt;em&gt;really&lt;em&gt; like cookies&lt;p&gt;\n"&gt;&gt; </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/58c31ed6555c4980e92e7a47af233c32/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">OGRE实例分析之BSP</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/3f252bcd24fc98c78e153ec375cc437b/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">PIX防火墙校园网配置实例</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

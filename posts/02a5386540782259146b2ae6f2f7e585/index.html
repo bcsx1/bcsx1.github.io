@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>UE源码阅读[1]---由问题入手UE中的延迟渲染 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="UE源码阅读[1]---由问题入手UE中的延迟渲染" />
+<meta property="og:description" content="目录
+延迟渲染：
+问题：
+UE渲染部分的起点：
+怎么样处理多光源
+Gbuffer Layout：
+RenderBasePass():
+GetGBufferRenderTargets()
+BasePassPixelShader.usf
+GBuffer布局：
+处理同屏不同的光照模型：
+基本思路：
+ShaderPermutation：
+FDeferredLightPS：
+延迟渲染： 问题： 1.UE 延迟渲染的Gbuffer是什么样的？
+2.怎么样处理多光源
+3.怎么样处理同屏不同的光照模型
+UE渲染部分的起点： UE的渲染部分从GameEngine.h 和 GameEngine.cpp
+voidUGameEngine::Tick( float DeltaSeconds, bool bIdleMode ) { [... ...] //检查设置，比如是否是专属服务器，只有命令行 if (!bIdleMode &amp;&amp; !IsRunningDedicatedServer() &amp;&amp; !IsRunningCommandlet() &amp;&amp; FEmbeddedCommunication::IsAwakeForRendering()) { //渲染窗口/所有物体 RedrawViewports(); // 渲染完之后的回调 GetRendererModule().PostRenderAllViewports(); } [... ...] } //上述的RedrawViewports(); void UGameEngine::RedrawViewports( bool bShouldPresent /*= true*/ ) { SCOPE_CYCLE_COUNTER(STAT_RedrawViewports); CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ViewportMisc); if ( GameViewport != NULL ) { GameViewport-&gt;LayoutPlayers(); if ( GameViewport-&gt;Viewport !" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/02a5386540782259146b2ae6f2f7e585/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-07-02T16:59:06+08:00" />
+<meta property="article:modified_time" content="2022-07-02T16:59:06+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">UE源码阅读[1]---由问题入手UE中的延迟渲染</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p></p> 
+<p id="main-toc"><strong>目录</strong></p> 
+<p id="P8eiq-toc" style="margin-left:0px;"><a href="#P8eiq" rel="nofollow">延迟渲染：</a></p> 
+<p id="AbrfB-toc" style="margin-left:40px;"><a href="#AbrfB" rel="nofollow">问题：</a></p> 
+<p id="aoqQA-toc" style="margin-left:40px;"><a href="#aoqQA" rel="nofollow">UE渲染部分的起点：</a></p> 
+<p id="gKSme-toc" style="margin-left:40px;"><a href="#gKSme" rel="nofollow">怎么样处理多光源</a></p> 
+<p id="hcnvE-toc" style="margin-left:40px;"><a href="#hcnvE" rel="nofollow">Gbuffer Layout：</a></p> 
+<p id="rhJQM-toc" style="margin-left:80px;"><a href="#rhJQM" rel="nofollow">RenderBasePass():</a></p> 
+<p id="mD8kx-toc" style="margin-left:80px;"><a href="#mD8kx" rel="nofollow">GetGBufferRenderTargets()</a></p> 
+<p id="rYwL8-toc" style="margin-left:80px;"><a href="#rYwL8" rel="nofollow">BasePassPixelShader.usf</a></p> 
+<p id="w0fs0-toc" style="margin-left:80px;"><a href="#w0fs0" rel="nofollow">GBuffer布局：</a></p> 
+<p id="S3yAu-toc" style="margin-left:40px;"><a href="#S3yAu" rel="nofollow">处理同屏不同的光照模型：</a></p> 
+<p id="S56C5-toc" style="margin-left:80px;"><a href="#S56C5" rel="nofollow">基本思路：</a></p> 
+<p id="IqEX3-toc" style="margin-left:80px;"><a href="#IqEX3" rel="nofollow">ShaderPermutation：</a></p> 
+<p id="hESZv-toc" style="margin-left:80px;"><a href="#hESZv" rel="nofollow">FDeferredLightPS：</a></p> 
+<hr id="hr-toc"> 
+<p></p> 
+<h2 id="P8eiq">延迟渲染：</h2> 
+<h3 id="AbrfB">问题：</h3> 
+<p id="u92d7e91d">1.UE 延迟渲染的Gbuffer是什么样的？</p> 
+<p id="u4faab84f">2.怎么样处理多光源</p> 
+<p id="u25efbfbb">3.怎么样处理同屏不同的光照模型</p> 
+<p id="ud0796449"></p> 
+<h3 id="aoqQA">UE渲染部分的起点：</h3> 
+<p id="u8deffe4f">UE的渲染部分从GameEngine.h 和 GameEngine.cpp</p> 
+<pre><code class="language-cpp">voidUGameEngine::Tick( float DeltaSeconds, bool bIdleMode )
+{
+[... ...]
+//检查设置，比如是否是专属服务器，只有命令行
+	if (!bIdleMode &amp;&amp; !IsRunningDedicatedServer() &amp;&amp; !IsRunningCommandlet() &amp;&amp; FEmbeddedCommunication::IsAwakeForRendering())
+	{
+		//渲染窗口/所有物体
+		RedrawViewports();
+		// 渲染完之后的回调
+		GetRendererModule().PostRenderAllViewports();
+	}
+[... ...]
+}
+
+//上述的RedrawViewports();
+void UGameEngine::RedrawViewports( bool bShouldPresent /*= true*/ )
+{
+	SCOPE_CYCLE_COUNTER(STAT_RedrawViewports);
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(ViewportMisc);
+	if ( GameViewport != NULL )
+	{
+		GameViewport-&gt;LayoutPlayers();
+		if ( GameViewport-&gt;Viewport != NULL )
+		{
+			GameViewport-&gt;Viewport-&gt;Draw(bShouldPresent);
+		}
+	}
+}
+
+//上述的GameViewport-&gt;Viewport-&gt;Draw(bShouldPresent);
+void UGameViewportClient::Draw() 
+{
+[... ...]
+	if (!bDisableWorldRendering &amp;&amp; PlayerViewMap.Num() &gt; 0 &amp;&amp; FSlateApplication::Get().GetPlatformApplication()-&gt;IsAllowedToRender()) //-V560
+	{
+//渲染玩家视窗，从游戏线程调用发送一个消息到渲染线程正在渲染这个视图家族。
+		GetRendererModule().BeginRenderingViewFamily(SceneCanvas,&amp;ViewFamily);
+	}
+[... ...]
+}
+void FRendererModule::BeginRenderingViewFamily(FCanvas* Canvas, FSceneViewFamily* ViewFamily)
+{
+[... ...]
+		// 创建场景渲染器，FSceneRenderer有两个子类，分别是FMobileSceneRenderer和FDeferredShadingSceneRenderer
+		FSceneRenderer* SceneRenderer = FSceneRenderer::CreateSceneRenderer(ViewFamily, Canvas-&gt;GetHitProxyConsumer());
+// 向渲染线程发送绘制场景指令.
+		ENQUEUE_RENDER_COMMAND(FDrawSceneCommand)(
+			[SceneRenderer, DrawSceneEnqueue](FRHICommandListImmediate&amp; RHICmdList)
+			{
+				const float StartDelayMillisec = FPlatformTime::ToMilliseconds(FPlatformTime::Cycles() - DrawSceneEnqueue);
+				CSV_CUSTOM_STAT_GLOBAL(DrawSceneCommand_StartDelay, StartDelayMillisec, ECsvCustomStatOp::Set);
+[... ...]
+//渲染线程实际干的活
+				RenderViewFamily_RenderThread(RHICmdList, SceneRenderer);
+				FlushPendingDeleteRHIResources_RenderThread();
+			});
+[... ...]
+}
+
+//RenderViewFamily_RenderThread(RHICmdList, SceneRenderer);
+static void RenderViewFamily_RenderThread(FRHICommandListImmediate&amp; RHICmdList, FSceneRenderer* SceneRenderer)
+{
+[... ...]
+//更新任何需要延迟更新的资源
+FDeferredUpdateResource::UpdateResources(RHICmdList);
+[... ...]
+//渲染场景
+	if(SceneRenderer-&gt;ViewFamily.EngineShowFlags.HitProxies)
+		{
+			// Render the scene's hit proxies.
+			SceneRenderer-&gt;RenderHitProxies(RHICmdList);
+		}
+		else
+		{
+			// Render the scene.
+			SceneRenderer-&gt;Render(RHICmdList);
+		}
+[... ...]
+}</code></pre> 
+<p id="u347bde97"></p> 
+<p id="u6787a25a"></p> 
+<p id="u291f3e81">因为要看延迟渲染，所以接下来就直接看FDeferredShadingSceneRenderer.h和FDeferredShadingSceneRenderer.cpp</p> 
+<p id="u99244570">FDeferredShadingSceneRenderer::Render(FRHICommandListImmediate&amp; RHICmdList)这个函数一千三百多行，大概包含了准备大气散射的数据，Prepass 渲染深度, 光追，Base pass 延迟渲染的几何阶段，用于遮挡剔除的简化包围盒深度值渲染，渲染阴影和深度，渲染motion vector，渲染头发，渲染光照，渲染大气，渲染大气散射，渲染雾，渲染体积云，通知特效系统，渲染半透明物体，后处理</p> 
+<p id="ua28e8e8e"></p> 
+<h3 id="gKSme">怎么样处理多光源</h3> 
+<p id="u8520a000">目前不会讲述关于cluster shading的处理</p> 
+<pre><code class="language-cpp"> FDeferredShadingSceneRenderer::Render(FRHICommandListImmediate&amp; RHICmdList)
+{
+[... ...]
+	bool bDoInitViewAftersPrepass = false;
+	{
+		SCOPED_GPU_STAT(RHICmdList, VisibilityCommands);
+		bDoInitViewAftersPrepass = InitViews(RHICmdList, BasePassDepthStencilAccess, ILCTaskData)
+
+	}
+[... ...]
+}
+</code></pre> 
+<p id="u474d4f3c"></p> 
+<pre><code class="language-cpp">bool FDeferredShadingSceneRenderer::InitViews(FRHICommandListImmediate&amp; RHICmdList, FExclusiveDepthStencil::Type BasePassDepthStencilAccess, struct FILCUpdatePrimTaskData&amp; ILCTaskData)
+{
+[... ...]
+
+//平头体裁剪，包围盒计算，遮挡剔除，收集网格信息，创建光源信息
+	ComputeViewVisibility(RHICmdList, BasePassDepthStencilAccess, ViewCommandsPerView, DynamicIndexBufferForInitViews, DynamicVertexBufferForInitViews, DynamicReadBufferForInitViews);
+[... ...]
+
+//处理贴花排序，处理光源可见性
+	PostVisibilityFrameSetup(ILCTaskData);
+
+[... ...]
+}</code></pre> 
+<p id="ud5f9669d"></p> 
+<pre><code class="language-cpp">void FSceneRenderer::PostVisibilityFrameSetup(FILCUpdatePrimTaskData&amp; OutILCTaskData)
+{
+[... ...]
+	// 确定光源的可见性
+	for(TSparseArray&lt;FLightSceneInfoCompact&gt;::TConstIterator LightIt(Scene-&gt;Lights);LightIt;++LightIt)
+	{
+		const FLightSceneInfoCompact&amp; LightSceneInfoCompact = *LightIt;
+		const FLightSceneInfo* LightSceneInfo = LightSceneInfoCompact.LightSceneInfo;
+
+		// 利用摄像机的视锥体裁剪光源
+		for(int32 ViewIndex = 0;ViewIndex &lt; Views.Num();ViewIndex++)
+		{		
+			const FLightSceneProxy* Proxy = LightSceneInfo-&gt;Proxy;
+			FViewInfo&amp; View = Views[ViewIndex];
+			FVisibleLightViewInfo&amp; VisibleLightViewInfo = View.VisibleLightInfos[LightIt.GetIndex()];
+			// 直接光永远可见，点光/聚光灯/面光需要判断
+			if( Proxy-&gt;GetLightType() == LightType_Point ||
+				Proxy-&gt;GetLightType() == LightType_Spot ||
+				Proxy-&gt;GetLightType() == LightType_Rect )
+			{
+				FSphere const&amp; BoundingSphere = Proxy-&gt;GetBoundingSphere();
+				if (View.ViewFrustum.IntersectSphere(BoundingSphere.Center, BoundingSphere.W))
+				{
+//透视相机需要提出太远的光源
+					if (View.IsPerspectiveProjection())
+					{
+						FSphere Bounds = Proxy-&gt;GetBoundingSphere();
+						float DistanceSquared = (Bounds.Center - View.ViewMatrices.GetViewOrigin()).SizeSquared();
+						float MaxDistSquared = Proxy-&gt;GetMaxDrawDistance() * Proxy-&gt;GetMaxDrawDistance() * GLightMaxDrawDistanceScale * GLightMaxDrawDistanceScale;
+
+//考虑了光源的半径、视图的LOD因子、最小光源屏幕半径等因素来决定最终光源是否需要绘制，以便剔除掉远距离屏幕占比很小的光源。
+						const bool bDrawLight = (FMath::Square(FMath::Min(0.0002f, GMinScreenRadiusForLights / Bounds.W) * View.LODDistanceFactor) * DistanceSquared &lt; 1.0f)
+													&amp;&amp; (MaxDistSquared == 0 || DistanceSquared &lt; MaxDistSquared);
+							
+						VisibleLightViewInfo.bInViewFrustum = bDrawLight;
+					}
+					else
+					{
+						VisibleLightViewInfo.bInViewFrustum = true;
+					}
+				}
+			}
+			else
+			{
+				VisibleLightViewInfo.bInViewFrustum = true;
+
+				// 设置单个太阳轴从方向灯移动。 
+				if (bSetupMobileLightShafts &amp;&amp; LightSceneInfo-&gt;bEnableLightShaftBloom &amp;&amp; ShouldRenderLightShaftsForLight(View, *LightSceneInfo-&gt;Proxy))
+				{
+					View.MobileLightShaft = GetMobileLightShaftInfo(View, *LightSceneInfo);
+				}
+			}
+
+[... ...]
+}</code></pre> 
+<p id="u6e1c5b80"></p> 
+<p id="u9be00fde">由上可知对于光源的处理为：使用光源的包围盒与视锥体求交，将不相交的剔除，然后对屏幕占比较小的光源进行提出，并将其可见性记录到VisibleLightViewInfo.bInViewFrustum</p> 
+<p id="uf347b4e4"></p> 
+<h3 id="hcnvE">Gbuffer Layout：</h3> 
+<h4 id="rhJQM">RenderBasePass():</h4> 
+<p id="u72478b44">渲染几何阶段的代码应该在RenderBasePass()这个函数</p> 
+<pre><code class="language-cpp">void FDeferredShadingSceneRenderer::RenderBasePass(
+	FRDGBuilder&amp; GraphBuilder,
+	FExclusiveDepthStencil::Type BasePassDepthStencilAccess,
+	FRDGTextureRef SceneColorTexture,
+	FRDGTextureRef SceneDepthTexture,
+	ERenderTargetLoadAction SceneDepthLoadAction,
+	FRDGTextureRef ForwardShadowMaskTexture)
+{
+	const bool bEnableParallelBasePasses = GRHICommandList.UseParallelAlgorithms() &amp;&amp; CVarParallelBasePass.GetValueOnRenderThread();
+
+	static const auto ClearMethodCVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.ClearSceneMethod"));
+	bool bRequiresRHIClear = true;
+	bool bRequiresFarZQuadClear = false;
+
+	if (ClearMethodCVar)
+	{
+		int32 ClearMethod = ClearMethodCVar-&gt;GetValueOnRenderThread();
+
+		if (ClearMethod == 0 &amp;&amp; !ViewFamily.EngineShowFlags.Game)
+		{
+			// Do not clear the scene only if the view family is in game mode.
+			ClearMethod = 1;
+		}
+
+		switch (ClearMethod)
+		{
+		case 0: // No clear
+			bRequiresRHIClear = false;
+			bRequiresFarZQuadClear = false;
+			break;
+
+		case 1: // RHICmdList.Clear
+			bRequiresRHIClear = true;
+			bRequiresFarZQuadClear = false;
+			break;
+
+		case 2: // Clear using far-z quad
+			bRequiresFarZQuadClear = true;
+			bRequiresRHIClear = false;
+			break;
+		}
+	}
+
+	// Always perform a full buffer clear for wireframe, shader complexity view mode, and stationary light overlap viewmode.
+	if (ViewFamily.EngineShowFlags.Wireframe || ViewFamily.EngineShowFlags.ShaderComplexity || ViewFamily.EngineShowFlags.StationaryLightOverlap)
+	{
+		bRequiresRHIClear = true;
+		bRequiresFarZQuadClear = false;
+	}
+
+	const bool bIsWireframeRenderpass = ViewFamily.EngineShowFlags.Wireframe &amp;&amp; FSceneRenderer::ShouldCompositeEditorPrimitives(Views[0]);
+	const bool bDebugViewMode = ViewFamily.UseDebugViewPS();
+	const bool bRenderLightmapDensity = ViewFamily.EngineShowFlags.LightMapDensity &amp;&amp; AllowDebugViewmodes();
+	const bool bRenderSkyAtmosphereEditorNotifications = ShouldRenderSkyAtmosphereEditorNotifications();
+	const bool bDoParallelBasePass = bEnableParallelBasePasses &amp;&amp; !bDebugViewMode &amp;&amp; !bRenderLightmapDensity; // DebugView and LightmapDensity are non-parallel substitutions inside BasePass
+	const bool bNeedsBeginRender = AllowDebugViewmodes() &amp;&amp;
+		(ViewFamily.EngineShowFlags.RequiredTextureResolution ||
+			ViewFamily.EngineShowFlags.MaterialTextureScaleAccuracy ||
+			ViewFamily.EngineShowFlags.MeshUVDensityAccuracy ||
+			ViewFamily.EngineShowFlags.PrimitiveDistanceAccuracy ||
+			ViewFamily.EngineShowFlags.ShaderComplexity ||
+			ViewFamily.EngineShowFlags.LODColoration ||
+			ViewFamily.EngineShowFlags.HLODColoration);
+
+	const FExclusiveDepthStencil ExclusiveDepthStencil(BasePassDepthStencilAccess);
+
+	FSceneRenderTargets&amp; SceneContext = FSceneRenderTargets::Get(GraphBuilder.RHICmdList);
+
+	TStaticArray&lt;FRDGTextureRef, MaxSimultaneousRenderTargets&gt; BasePassTextures;
+	int32 GBufferDIndex = INDEX_NONE;
+	uint32 BasePassTextureCount = SceneContext.GetGBufferRenderTargets(GraphBuilder, BasePassTextures, GBufferDIndex);
+	TArrayView&lt;FRDGTextureRef&gt; BasePassTexturesView = MakeArrayView(BasePassTextures.GetData(), BasePassTextureCount);
+	FRDGTextureRef BasePassDepthTexture = SceneDepthTexture;
+	FLinearColor SceneColorClearValue;
+
+	if (bRequiresRHIClear)
+	{
+		if (ViewFamily.EngineShowFlags.ShaderComplexity)
+		{
+			SceneContext.ClearQuadOverdrawUAV(GraphBuilder);
+		}
+
+		if (ViewFamily.EngineShowFlags.ShaderComplexity || ViewFamily.EngineShowFlags.StationaryLightOverlap)
+		{
+			SceneColorClearValue = FLinearColor(0, 0, 0, kSceneColorClearAlpha);
+		}
+		else
+		{
+			SceneColorClearValue = FLinearColor(Views[0].BackgroundColor.R, Views[0].BackgroundColor.G, Views[0].BackgroundColor.B, kSceneColorClearAlpha);
+		}
+
+		ERenderTargetLoadAction ColorLoadAction = ERenderTargetLoadAction::ELoad;
+
+		if (SceneColorTexture-&gt;Desc.ClearValue.GetClearColor() == SceneColorClearValue)
+		{
+			ColorLoadAction = ERenderTargetLoadAction::EClear;
+		}
+		else
+		{
+			ColorLoadAction = ERenderTargetLoadAction::ENoAction;
+		}
+
+		auto* PassParameters = GraphBuilder.AllocParameters&lt;FRenderTargetParameters&gt;();
+		PassParameters-&gt;RenderTargets = GetRenderTargetBindings(ColorLoadAction, BasePassTexturesView);
+
+		static TConsoleVariableData&lt;int32&gt;* CVarNoGBufferDClear = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.NoGBufferDClear"));
+		if (CVarNoGBufferDClear &amp;&amp; !!CVarNoGBufferDClear-&gt;GetValueOnRenderThread() &amp;&amp; GBufferDIndex != INDEX_NONE)
+		{
+			PassParameters-&gt;RenderTargets[GBufferDIndex].SetLoadAction(ERenderTargetLoadAction::ENoAction);
+		}
+
+		if (SceneDepthLoadAction == ERenderTargetLoadAction::EClear)
+		{
+			PassParameters-&gt;RenderTargets.DepthStencil = FDepthStencilBinding(BasePassDepthTexture, SceneDepthLoadAction, SceneDepthLoadAction, ExclusiveDepthStencil);
+		}
+
+		GraphBuilder.AddPass(RDG_EVENT_NAME("GBufferClear"), PassParameters, ERDGPassFlags::Raster,
+			[PassParameters, ColorLoadAction, SceneColorClearValue](FRHICommandList&amp; RHICmdList)
+		{
+			// If no fast-clear action was used, we need to do an MRT shader clear.
+			if (ColorLoadAction == ERenderTargetLoadAction::ENoAction)
+			{
+				const FRenderTargetBindingSlots&amp; RenderTargets = PassParameters-&gt;RenderTargets;
+				FLinearColor ClearColors[MaxSimultaneousRenderTargets];
+				FRHITexture* Textures[MaxSimultaneousRenderTargets];
+				int32 TextureIndex = 0;
+
+				RenderTargets.Enumerate([&amp;](const FRenderTargetBinding&amp; RenderTarget)
+				{
+					FRHITexture* TextureRHI = RenderTarget.GetTexture()-&gt;GetRHI();
+					ClearColors[TextureIndex] = TextureIndex == 0 ? SceneColorClearValue : TextureRHI-&gt;GetClearColor();
+					Textures[TextureIndex] = TextureRHI;
+					++TextureIndex;
+				});
+
+				// Clear color only; depth-stencil is fast cleared.
+				DrawClearQuadMRT(RHICmdList, true, TextureIndex, ClearColors, false, 0, false, 0);
+			}
+		});
+
+		if (bRenderSkyAtmosphereEditorNotifications)
+		{
+			// We only render this warning text when bRequiresRHIClear==true to make sure the scene color buffer is allocated at this stage.
+			// When false, the option specifies that all pixels must be written to by a sky dome anyway.
+			RenderSkyAtmosphereEditorNotifications(GraphBuilder, SceneColorTexture);
+		}
+	}
+
+	if (ViewFamily.EngineShowFlags.Wireframe)
+	{
+		checkf(ExclusiveDepthStencil.IsDepthWrite(), TEXT("Wireframe base pass requires depth-write, but it is set to read-only."));
+
+		SceneContext.GetEditorPrimitivesColor(GraphBuilder.RHICmdList);
+		SceneContext.GetEditorPrimitivesDepth(GraphBuilder.RHICmdList);
+
+		BasePassTextureCount = 1;
+		BasePassTextures[0] = GraphBuilder.RegisterExternalTexture(SceneContext.EditorPrimitivesColor, ERenderTargetTexture::Targetable);
+		BasePassTexturesView = MakeArrayView(BasePassTextures.GetData(), BasePassTextureCount);
+
+		BasePassDepthTexture = GraphBuilder.RegisterExternalTexture(SceneContext.EditorPrimitivesDepth, ERenderTargetTexture::Targetable);
+
+		auto* PassParameters = GraphBuilder.AllocParameters&lt;FRenderTargetParameters&gt;();
+		PassParameters-&gt;RenderTargets = GetRenderTargetBindings(ERenderTargetLoadAction::EClear, BasePassTexturesView);
+		PassParameters-&gt;RenderTargets.DepthStencil = FDepthStencilBinding(BasePassDepthTexture, ERenderTargetLoadAction::EClear, ERenderTargetLoadAction::EClear, ExclusiveDepthStencil);
+
+		GraphBuilder.AddPass(RDG_EVENT_NAME("WireframeClear"), PassParameters, ERDGPassFlags::Raster, [](FRHICommandList&amp;) {});
+	}
+
+	// Render targets bindings should remain constant at this point.
+	FRenderTargetBindingSlots BasePassRenderTargets = GetRenderTargetBindings(ERenderTargetLoadAction::ELoad, BasePassTexturesView);
+	BasePassRenderTargets.DepthStencil = FDepthStencilBinding(BasePassDepthTexture, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, ExclusiveDepthStencil);
+
+	BasePassRenderTargets.ShadingRateTexture = GVRSImageManager.GetVariableRateShadingImage(GraphBuilder, ViewFamily, nullptr, EVRSType::None);
+
+	AddSetCurrentStatPass(GraphBuilder, GET_STATID(STAT_CLM_BasePass));
+	RenderBasePassInternal(GraphBuilder, BasePassRenderTargets, BasePassDepthStencilAccess, ForwardShadowMaskTexture, bDoParallelBasePass, bRenderLightmapDensity);
+	AddSetCurrentStatPass(GraphBuilder, GET_STATID(STAT_CLM_AfterBasePass));
+
+	if (ViewFamily.ViewExtensions.Num() &gt; 0)
+	{
+		SCOPE_CYCLE_COUNTER(STAT_FDeferredShadingSceneRenderer_ViewExtensionPostRenderBasePass);
+		RDG_EVENT_SCOPE(GraphBuilder, "BasePass_ViewExtensions");
+		auto* PassParameters = GraphBuilder.AllocParameters&lt;FRenderTargetParameters&gt;();
+		PassParameters-&gt;RenderTargets = BasePassRenderTargets;
+		for (auto&amp; ViewExtension : ViewFamily.ViewExtensions)
+		{
+			for (FViewInfo&amp; View : Views)
+			{
+				RDG_GPU_MASK_SCOPE(GraphBuilder, View.GPUMask);
+				GraphBuilder.AddPass(
+					{},
+					PassParameters,
+					ERDGPassFlags::Raster,
+					[&amp;ViewExtension, &amp;View](FRHICommandListImmediate&amp; RHICmdList)
+				{
+					ViewExtension-&gt;PostRenderBasePass_RenderThread(RHICmdList, View);
+				});
+			}
+		}
+	}
+
+	if (bRequiresFarZQuadClear)
+	{
+		ClearGBufferAtMaxZ(GraphBuilder, Views, BasePassRenderTargets, SceneColorClearValue);
+	}
+
+	if (ShouldRenderAnisotropyPass())
+	{
+		AddSetCurrentStatPass(GraphBuilder, GET_STATID(STAT_CLM_AnisotropyPass));
+		RenderAnisotropyPass(GraphBuilder, SceneDepthTexture, bEnableParallelBasePasses);
+		AddSetCurrentStatPass(GraphBuilder, GET_STATID(STAT_CLM_AfterAnisotropyPass));
+	}
+
+	if (SceneContext.GBufferA)
+	{
+		AddAsyncComputeSRVTransitionHackPass(GraphBuilder, GraphBuilder.RegisterExternalTexture(SceneContext.GBufferA));
+	}
+}</code></pre> 
+<p id="uf3e6212c"></p> 
+<p id="udfc0f4d4"></p> 
+<p id="u5ed12b9f"></p> 
+<h4 id="mD8kx">GetGBufferRenderTargets()</h4> 
+<p id="u417068bf">首先我先确定他有多少个MRT，追踪其中的BasePassRenderTargets变量，一步步深入可以在</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/be/75/ZNRfdRgy_o.png"></p> 
+<p id="u417068bf">中找到int32 FSceneRenderTargets::GetGBufferRenderTargets(）</p> 
+<p id="uda81dd05"></p> 
+<pre><code class="language-cpp">int32 FSceneRenderTargets::GetGBufferRenderTargets(const TRefCountPtr&lt;IPooledRenderTarget&gt;* OutRenderTargets[MaxSimultaneousRenderTargets], int32&amp; OutVelocityRTIndex, int32&amp; OutGBufferDIndex) const
+{
+	int32 MRTCount = 0;
+//rt0为场景颜色
+	OutRenderTargets[MRTCount++] = &amp;GetSceneColor();
+
+	const EShaderPlatform ShaderPlatform = GetFeatureLevelShaderPlatform(CurrentFeatureLevel);
+	const bool bUseGBuffer = IsUsingGBuffers(ShaderPlatform);
+
+	if (bUseGBuffer)
+	{
+		OutRenderTargets[MRTCount++] = &amp;GBufferA;
+		OutRenderTargets[MRTCount++] = &amp;GBufferB;
+		OutRenderTargets[MRTCount++] = &amp;GBufferC;
+	}
+
+//rtVelocity =速度缓冲rt
+	// The velocity buffer needs to be bound before other optionnal rendertargets (when UseSelectiveBasePassOutputs() is true).
+	// Otherwise there is an issue on some AMD hardware where the target does not get updated. Seems to be related to the velocity buffer format as it works fine with other targets.
+	if (bAllocateVelocityGBuffer &amp;&amp; !IsSimpleForwardShadingEnabled(ShaderPlatform))
+	{
+		OutVelocityRTIndex = MRTCount;
+		check(OutVelocityRTIndex == 4 || (!bUseGBuffer &amp;&amp; OutVelocityRTIndex == 1)); // As defined in BasePassPixelShader.usf
+		OutRenderTargets[MRTCount++] = &amp;SceneVelocity;
+	}
+	else
+	{
+		OutVelocityRTIndex = -1;
+	}
+
+	OutGBufferDIndex = INDEX_NONE;
+
+	if (bUseGBuffer)
+	{
+		OutGBufferDIndex = MRTCount;
+		OutRenderTargets[MRTCount++] = &amp;GBufferD;
+
+		if (bAllowStaticLighting)
+		{
+			check(MRTCount == (bAllocateVelocityGBuffer ? 6 : 5)); // As defined in BasePassPixelShader.usf
+			OutRenderTargets[MRTCount++] = &amp;GBufferE;
+		}
+	}
+
+	check(MRTCount &lt;= MaxSimultaneousRenderTargets);
+	return MRTCount;
+}</code></pre> 
+<p id="ucf987260">其中MaxSimultaneousRenderTargets如下：</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/6d/26/18ZN78ns_o.png"></p> 
+<p id="ubda5f87f">根据上述的代码可以知道，RT最多有8个（根据MaxSimultaneousRenderTargets可知，但是上面好像大概只用了七个？），分别为SceneColor，GBufferA，GBufferB，GBufferC，SceneVelocity，GBufferD，GBufferE，然后其相关的定义在BasePassPixelShader.usf这个像素着色器中</p> 
+<p id="ud4bc6dd8"></p> 
+<h4 id="rYwL8">BasePassPixelShader.usf</h4> 
+<p id="u6073acd4">接下来看BasePassPixelShader.usf</p> 
+<p id="ue925651c">BasePassPixelShader的主入口为void FPixelShaderInOut_MainPS(）</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/e2/81/USgaQExc_o.png"></p> 
+<p id="ue62bc9d2"></p> 
+<p id="u9402df19">可以从MRT的写入这里分析出各个RT到底存了什么</p> 
+<pre><code class="language-cpp">	#if MATERIAL_DOMAIN_POSTPROCESS
+		#if MATERIAL_OUTPUT_OPACITY_AS_ALPHA
+			Out.MRT[0] = half4(Color, Opacity);
+		#else
+			Out.MRT[0] = half4(Color, 0);
+		#endif
+		Out.MRT[0] = RETURN_COLOR(Out.MRT[0]);
+	// MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT must come first because it also has MATERIALBLENDING_TRANSLUCENT defined
+	#elif MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
+		// After thin translucency, the final color is going to be:
+		//    FinalColor = DualBlendColorAdd + DualBlendColorMul * BackgroundColor;
+	    // To apply fogging, we want the final equation to be:
+		//    FinalColor = Fogging.rgb + Fogging.a * (DualBlendColorAdd + DualBlendColorMul * BackgroundColor);
+		//    FinalColor = (Fogging.rgb + Fogging.a * DualBlendColorAdd) + Fogging.a * DualBlendColorMul * BackgroundColor;
+		// Or in other words:
+		//    AdjustedDualBlendAdd = Fogging.rgb + Fogging.a * DualBlendColorAdd;
+		//    AdjustedDualBlendMul = Fogging.a * DualBlendColorMul;
+		//    FinalColor = AdjustedDualBlendAdd + AdjustedDualBlendMul * BackgroundColor;
+
+		float3 AdjustedDualBlendAdd = Fogging.rgb + Fogging.a * DualBlendColorAdd;
+		float3 AdjustedDualBlendMul =               Fogging.a * DualBlendColorMul;
+
+		#if THIN_TRANSLUCENT_USE_DUAL_BLEND
+			// no RETURN_COLOR because these values are explicit multiplies and adds
+			Out.MRT[0] = half4(AdjustedDualBlendAdd,0.0);
+			Out.MRT[1] = half4(AdjustedDualBlendMul,1.0);
+		#else
+			// In the fallback case, we are blending with the mode 
+			float AdjustedAlpha = saturate(1-dot(AdjustedDualBlendMul,float3(1.0f,1.0f,1.0f)/3.0f));
+			Out.MRT[0] = half4(AdjustedDualBlendAdd,AdjustedAlpha);
+			Out.MRT[0] = RETURN_COLOR(Out.MRT[0]);
+		#endif
+	#elif MATERIALBLENDING_ALPHAHOLDOUT
+		// not implemented for holdout
+		Out.MRT[0] = half4(Color * Fogging.a + Fogging.rgb * Opacity, Opacity);
+		Out.MRT[0] = RETURN_COLOR(Out.MRT[0]);
+	#elif MATERIALBLENDING_ALPHACOMPOSITE
+		Out.MRT[0] = half4(Color * Fogging.a + Fogging.rgb * Opacity, Opacity);
+		Out.MRT[0] = RETURN_COLOR(Out.MRT[0]);
+	#elif MATERIALBLENDING_TRANSLUCENT
+		Out.MRT[0] = half4(Color * Fogging.a + Fogging.rgb, Opacity);
+		Out.MRT[0] = RETURN_COLOR(Out.MRT[0]);
+	#elif MATERIALBLENDING_ADDITIVE
+		Out.MRT[0] = half4(Color * Fogging.a * Opacity, 0.0f);
+		Out.MRT[0] = RETURN_COLOR(Out.MRT[0]);
+	#elif MATERIALBLENDING_MODULATE
+		// RETURN_COLOR not needed with modulative blending
+		half3 FoggedColor = lerp(float3(1, 1, 1), Color, Fogging.aaa * Fogging.aaa);
+		Out.MRT[0] = half4(FoggedColor, Opacity);
+	#else
+		{
+			FLightAccumulator LightAccumulator = (FLightAccumulator)0;
+
+			// Apply vertex fog
+			Color = Color * Fogging.a + Fogging.rgb;
+
+#if POST_PROCESS_SUBSURFACE
+			// Apply vertex fog to diffuse color
+			DiffuseColor = DiffuseColor * Fogging.a + Fogging.rgb;
+
+			if (UseSubsurfaceProfile(GBuffer.ShadingModelID) &amp;&amp; 
+                View.bSubsurfacePostprocessEnabled &gt; 0 &amp;&amp; View.bCheckerboardSubsurfaceProfileRendering &gt; 0 )
+			{
+				// Adjust for checkerboard. only apply non-diffuse lighting (including emissive) 
+				// to the specular component, otherwise lighting is applied twice
+				Color *= !bChecker;
+			}
+			LightAccumulator_Add(LightAccumulator, Color + DiffuseColor, DiffuseColor, 1.0f, UseSubsurfaceProfile(GBuffer.ShadingModelID));
+#else
+			LightAccumulator_Add(LightAccumulator, Color, 0, 1.0f, false);
+#endif
+			Out.MRT[0] = RETURN_COLOR(LightAccumulator_GetResult(LightAccumulator));
+
+			#if !USES_GBUFFER
+				// Without deferred shading the SSS pass will not be run to reset scene color alpha for opaque / masked to 0
+				// Scene color alpha is used by scene captures and planar reflections
+				Out.MRT[0].a = 0;
+			#endif
+		}
+	#endif
+
+	#if USES_GBUFFER
+		GBuffer.IndirectIrradiance = IndirectIrradiance;
+
+		// -0.5 .. 0.5, could be optimzed as lower quality noise would be sufficient
+		float QuantizationBias = PseudoRandom( MaterialParameters.SvPosition.xy ) - 0.5f;
+		EncodeGBuffer(GBuffer, Out.MRT[1], Out.MRT[2], Out.MRT[3], OutGBufferD, OutGBufferE, OutVelocity, QuantizationBias);
+	#endif 
+
+	if(bEditorWeightedZBuffering)
+	{
+		Out.MRT[0].a = 1;
+
+		#if MATERIALBLENDING_MASKED
+			// some material might have a opacity value
+			Out.MRT[0].a = GetMaterialMaskInputRaw(PixelMaterialInputs);
+		#endif
+
+		#if EDITOR_ALPHA2COVERAGE != 0
+			// per MSAA sample
+			if(View.NumSceneColorMSAASamples &gt; 1)
+			{
+				Out.Coverage = In.Coverage &amp; CustomAlpha2Coverage(Out.MRT[0]);
+			}
+			else
+			{
+				// no MSAA is handle like per pixel
+				clip(Out.MRT[0].a - GetMaterialOpacityMaskClipValue());
+			}
+		#else
+			// per pixel
+			clip(Out.MRT[0].a - GetMaterialOpacityMaskClipValue());
+		#endif
+	}
+
+#if USES_GBUFFER
+	#if GBUFFER_HAS_VELOCITY
+		Out.MRT[4] = OutVelocity;
+	#endif
+
+	Out.MRT[GBUFFER_HAS_VELOCITY ? 5 : 4] = OutGBufferD;
+
+	#if GBUFFER_HAS_PRECSHADOWFACTOR
+		Out.MRT[GBUFFER_HAS_VELOCITY ? 6 : 5] = OutGBufferE;
+	#endif
+#else
+	// If not using the full gbuffer (forward shading) the velocity buffer can still be written to in the basepass.
+	#if GBUFFER_HAS_VELOCITY
+		Out.MRT[1] = OutVelocity;
+	#endif
+#endif
+
+#if !MATERIALBLENDING_MODULATE &amp;&amp; USE_PREEXPOSURE
+#if MATERIAL_IS_SKY
+	// Dynamic capture exposure is 1 as of today.
+	const float ViewPreExposure = View.RealTimeReflectionCapture&gt;0.0f ? View.RealTimeReflectionCapturePreExposure : View.PreExposure;
+#else
+	const float ViewPreExposure = View.PreExposure;
+#endif
+	// We need to multiply pre-exposure by all components including A, otherwise the ratio of
+	// diffuse to specular lighting will get messed up in the SSS pass.
+	// RGB: Full color (Diffuse + Specular)
+	// A:   Diffuse Intensity, but only if we are not blending
+	#if MATERIAL_DOMAIN_POSTPROCESS || MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIALBLENDING_ALPHAHOLDOUT || MATERIALBLENDING_ALPHACOMPOSITE || MATERIALBLENDING_TRANSLUCENT || MATERIALBLENDING_ADDITIVE
+		Out.MRT[0].rgb  *= ViewPreExposure;
+	#else
+		Out.MRT[0].rgba *= ViewPreExposure;
+	#endif
+#endif
+#if MATERIAL_IS_SKY
+	// Sky materials can result in high luminance values, e.g. the sun disk. 
+	// This is so we make sure to at least stay within the boundaries of fp10 and not cause NaN on some platforms.
+	// We also half that range to also make sure we have room for other additive elements such as bloom, clouds or particle visual effects.
+	Out.MRT[0].xyz = min(Out.MRT[0].xyz, Max10BitsFloat.xxx * 0.5f);
+#endif</code></pre> 
+<p id="ue680de78">首先分析SceneColor ，由于ue为了兼容不同的光照模型，用了一堆的宏，基本是思路是调用实际的光照模型变体计算基础Diffuse色+自发光+叠加雾效【会根据着色模型的不同有变化】</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/72/88/K5Tifv1D_o.png"></p> 
+<p id="u914e8fdf">然后上面有个EncodeGBuffer函数将GBuffer中的部分数据编码到MRT中，这个函数的定义在DeferredShadingCommon.ush</p> 
+<pre><code class="language-cpp">/** Populates OutGBufferA, B and C */
+void EncodeGBuffer(
+	FGBufferData GBuffer,
+	out float4 OutGBufferA,
+	out float4 OutGBufferB,
+	out float4 OutGBufferC,
+	out float4 OutGBufferD,
+	out float4 OutGBufferE,
+	out float4 OutGBufferVelocity,
+	float QuantizationBias = 0		// -0.5 to 0.5 random float. Used to bias quantization.
+	)
+{
+	if (GBuffer.ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		OutGBufferA = 0;
+		SetGBufferForUnlit(OutGBufferB);
+		OutGBufferC = 0;
+		OutGBufferD = 0;
+		OutGBufferE = 0;
+	}
+	else
+	{
+#if MOBILE_DEFERRED_SHADING
+		OutGBufferA.rg = UnitVectorToOctahedron( normalize(GBuffer.WorldNormal) ) * 0.5f + 0.5f;
+		OutGBufferA.b = GBuffer.PrecomputedShadowFactors.x;
+		OutGBufferA.a = GBuffer.PerObjectGBufferData;		
+#elif 1
+		OutGBufferA.rgb = EncodeNormal( GBuffer.WorldNormal );
+		OutGBufferA.a = GBuffer.PerObjectGBufferData;
+#else
+		float3 Normal = GBuffer.WorldNormal;
+		uint   NormalFace = 0;
+		EncodeNormal( Normal, NormalFace );
+
+		OutGBufferA.rg = Normal.xy;
+		OutGBufferA.b = 0;
+		OutGBufferA.a = GBuffer.PerObjectGBufferData;
+#endif
+
+		OutGBufferB.r = GBuffer.Metallic;
+		OutGBufferB.g = GBuffer.Specular;
+		OutGBufferB.b = GBuffer.Roughness;
+		OutGBufferB.a = EncodeShadingModelIdAndSelectiveOutputMask(GBuffer.ShadingModelID, GBuffer.SelectiveOutputMask);
+
+		OutGBufferC.rgb = EncodeBaseColor( GBuffer.BaseColor );
+
+#if ALLOW_STATIC_LIGHTING
+		// No space for AO. Multiply IndirectIrradiance by AO instead of storing.
+		OutGBufferC.a = EncodeIndirectIrradiance(GBuffer.IndirectIrradiance * GBuffer.GBufferAO) + QuantizationBias * (1.0 / 255.0);
+#else
+		OutGBufferC.a = GBuffer.GBufferAO;
+#endif
+
+		OutGBufferD = GBuffer.CustomData;
+		OutGBufferE = GBuffer.PrecomputedShadowFactors;
+	}
+
+#if WRITES_VELOCITY_TO_GBUFFER
+	OutGBufferVelocity = GBuffer.Velocity;
+#else
+	OutGBufferVelocity = 0;
+#endif
+}</code></pre> 
+<p id="u30c69db3"></p> 
+<p id="ue08ad937"></p> 
+<p id="u4fcc5156">下面配上上面函数用到的一些函数：</p> 
+<p id="uc113e08f"></p> 
+<p id="u02b477d5">①单位向量的压缩，八面体映射压缩：</p> 
+<pre><code class="language-cpp">// Octahedron Normal Vectors
+// [Cigolle 2014, "A Survey of Efficient Representations for Independent Unit Vectors"]
+//						Mean	Max
+// oct		8:8			0.33709 0.94424
+// snorm	8:8:8		0.17015 0.38588
+// oct		10:10		0.08380 0.23467
+// snorm	10:10:10	0.04228 0.09598
+// oct		12:12		0.02091 0.05874
+
+float2 UnitVectorToOctahedron( float3 N )
+{
+	N.xy /= dot( 1, abs(N) );
+	if( N.z &lt;= 0 )
+	{
+		N.xy = ( 1 - abs(N.yx) ) * ( N.xy &gt;= 0 ? float2(1,1) : float2(-1,-1) );
+	}
+	return N.xy;
+}</code></pre> 
+<p id="ue673c179">②压缩ShadingModelId和SelectiveOutputMask</p> 
+<pre><code class="language-cpp">loat EncodeShadingModelIdAndSelectiveOutputMask(uint ShadingModelId, uint SelectiveOutputMask)
+{
+	uint Value = (ShadingModelId &amp; SHADINGMODELID_MASK) | SelectiveOutputMask;
+	return (float)Value / (float)0xFF;
+}</code></pre> 
+<p id="u5255cd3b"></p> 
+<p id="ua3e3b0a1">③编码IndirectIrradiance</p> 
+<pre><code class="language-cpp">float EncodeIndirectIrradiance(float IndirectIrradiance)
+{
+	float L = IndirectIrradiance;
+#if USE_PREEXPOSURE
+	L *= View.PreExposure; // Apply pre-exposure as a mean to prevent compression overflow.
+#endif
+	const float LogBlackPoint = 0.00390625;	// exp2(-8);
+	return log2( L + LogBlackPoint ) / 16 + 0.5;
+}</code></pre> 
+<p id="udc29d6eb">然后根据这个编码函数我们可以知道GBuffer的布局，虽然根据不同光照模型/管线会有些许差异，</p> 
+<p id="u0e41e693">但是大致可以总结如下：</p> 
+<h4 id="w0fs0">GBuffer布局：</h4> 
+<p id="ua0c911b3">①GBufferA：rg/b存储法线/预计算的阴影因子，a存储预计算的物体数据</p> 
+<p id="uce65058f">②GBufferB：r存储金属度，g存储高光值，b存储粗糙度，a存储编码的光照模型和SelectiveOutputMask</p> 
+<p id="ue0a84e8e">SelectiveOutputMask记录了绘制时以下宏的开启结果：</p> 
+<ul><li id="uc1a7db71">MATERIAL_USES_ANISOTROPY 禁止计算各向异性</li><li id="u8ade165b">!GBUFFER_HAS_PRECSHADOWFACTOR 禁止读取GBufferE数据作为预计算阴影</li><li id="ue1c7b3a9">GBUFFER_HAS_PRECSHADOWFACTOR &amp;&amp; WRITES_PRECSHADOWFACTOR_ZERO 当不读取GBufferE时，若此值为1时，预计算阴影设为0，否则为1。</li><li id="u5cdac0f2">WRITES_VELOCITY_TO_GBUFFER 禁止从Gbuffer中读取速度值。</li></ul> 
+<p id="u658b56ce">③GBufferC ：rgb存储basecolor，a存储AO，如果允许静态光照则a存储IndirectIrradiance*Material AO</p> 
+<p id="ud89de189">④GBufferD：存储自定义的数据</p> 
+<p id="u43912969">⑤GBufferE：存储预计算的阴影值</p> 
+<p id="ue25a84fa">⑥GBufferVelocity：存储SceneVelocity</p> 
+<p id="uc482e48c"></p> 
+<p id="u45285a15"></p> 
+<h3 id="S3yAu">处理同屏不同的光照模型：</h3> 
+<h4 id="S56C5">基本思路：</h4> 
+<p id="u7747db78">UE的shader采用的是Uber Shader的设计，通过再一个shader里面定义一堆的宏，然后在编译Shader的时候，传入不同的宏参数，编译出不同的shader代码（bgfx里面也是这么干的），</p> 
+<p id="u1744f86e"></p> 
+<p id="u42b31936">在编译的时候，不同的宏怎么传入编译器的呢，UE主要建立了一个Shader Permutation的概念，来存储一个唯一的哈希键值，通过不同的Shader Permutation传到HLSL，编译出对应的着色器代码，然后在通过ShaderMap获取到实例的shader</p> 
+<h4 id="IqEX3">ShaderPermutation：</h4> 
+<p id="u83310777">Shader Permutation的相关代码在ShaderPermutation.h中，</p> 
+<pre><code class="language-cpp">template &lt;typename TDimension, typename... Ts&gt;
+struct TShaderPermutationDomain&lt;TDimension, Ts...&gt;
+{
+	/** Setup the dimension's type in permutation domain as itself so that a permutation domain can be
+	 * used as a dimension of another domain.
+	 */
+	using Type = TShaderPermutationDomain&lt;TDimension, Ts...&gt;;
+
+	/** Define a domain as a multidimensional dimension so that ModifyCompilationEnvironment() is used. */
+	static constexpr bool IsMultiDimensional = true;
+
+	/** Parent type in the variadic template to reduce code. */
+	using Super = TShaderPermutationDomain&lt;Ts...&gt;;
+
+	/** Total number of permutation within the domain. */
+	static constexpr int32 PermutationCount = Super::PermutationCount * TDimension::PermutationCount;
+
+
+	/** Constructors. */
+	TShaderPermutationDomain&lt;TDimension, Ts...&gt;()
+		: DimensionValue(TDimension::FromDimensionValueId(0))
+	{
+	}
+
+	explicit TShaderPermutationDomain&lt;TDimension, Ts...&gt;(int32 PermutationId)
+		: DimensionValue(TDimension::FromDimensionValueId(PermutationId % TDimension::PermutationCount))
+		, Tail(PermutationId / TDimension::PermutationCount)
+	{
+		checkf(PermutationId &gt;= 0 &amp;&amp; PermutationId &lt; PermutationCount, TEXT("Invalid shader permutation id %i."), PermutationId);
+	}
+
+
+	/** Set dimension's value. */
+	template&lt;class DimensionToSet&gt;
+	void Set(typename DimensionToSet::Type Value)
+	{
+		return TShaderPermutationDomainSpetialization&lt;TIsSame&lt;TDimension, DimensionToSet&gt;::Value&gt;::template SetDimension&lt;Type, DimensionToSet&gt;(*this, Value);
+	}
+
+
+	/** Get dimension's value. */
+	template&lt;class DimensionToGet&gt;
+	const typename DimensionToGet::Type&amp; Get() const
+	{
+		return TShaderPermutationDomainSpetialization&lt;TIsSame&lt;TDimension, DimensionToGet&gt;::Value&gt;::template GetDimension&lt;Type, DimensionToGet&gt;(*this);
+	}
+
+
+	/** Modify the shader's compilation environment. */
+	void ModifyCompilationEnvironment(FShaderCompilerEnvironment&amp; OutEnvironment) const
+	{
+		TShaderPermutationDomainSpetialization&lt;TDimension::IsMultiDimensional&gt;::template ModifyCompilationEnvironment&lt;Type, TDimension&gt;(*this, OutEnvironment);
+	}
+
+
+	/** Converts domain permutation vector to domain's value id. */
+	static int32 ToDimensionValueId(const Type&amp; PermutationVector)
+	{
+		return PermutationVector.ToDimensionValueId();
+	}
+
+	int32 ToDimensionValueId() const
+	{
+		return TDimension::ToDimensionValueId(DimensionValue) + TDimension::PermutationCount * Tail.ToDimensionValueId();
+	}
+
+
+	/** Returns the permutation domain from the unique ID. */
+	static Type FromDimensionValueId(const int32 PermutationId)
+	{
+		return Type(PermutationId);
+	}
+
+
+	/** Test if equal. */
+	bool operator==(const Type&amp; Other) const
+	{
+		return DimensionValue == Other.DimensionValue &amp;&amp; Tail == Other.Tail;
+	}
+
+	/** Test if not equal. */
+	bool operator!=(const Type&amp; Other) const
+	{
+		return !(*this == Other);
+	}
+
+private:
+	template&lt;bool BooleanSpetialization&gt;
+	friend class TShaderPermutationDomainSpetialization;
+
+	typename TDimension::Type DimensionValue;
+	Super Tail;
+};
+</code></pre> 
+<p id="ue202686b"></p> 
+<p id="u0138961c">这个模板其实不太好理解，根据结合class FDeferredLightPS : public FGlobalShader中的代码简单理一下</p> 
+<h4 id="hESZv">FDeferredLightPS：</h4> 
+<p id="uc360ddd0">首先把对应的阵列声明出来，其中的string就是shader中的宏</p> 
+<pre><code class="language-cpp">	class FSourceShapeDim		: SHADER_PERMUTATION_ENUM_CLASS("LIGHT_SOURCE_SHAPE", ELightSourceShape);
+	class FSourceTextureDim		: SHADER_PERMUTATION_BOOL("USE_SOURCE_TEXTURE");
+	class FIESProfileDim		: SHADER_PERMUTATION_BOOL("USE_IES_PROFILE");
+	class FInverseSquaredDim	: SHADER_PERMUTATION_BOOL("INVERSE_SQUARED_FALLOFF");
+	class FVisualizeCullingDim	: SHADER_PERMUTATION_BOOL("VISUALIZE_LIGHT_CULLING");
+	class FLightingChannelsDim	: SHADER_PERMUTATION_BOOL("USE_LIGHTING_CHANNELS");
+	class FTransmissionDim		: SHADER_PERMUTATION_BOOL("USE_TRANSMISSION");
+	class FHairLighting			: SHADER_PERMUTATION_INT("USE_HAIR_LIGHTING", 2);
+	class FAtmosphereTransmittance : SHADER_PERMUTATION_BOOL("USE_ATMOSPHERE_TRANSMITTANCE");
+	class FCloudTransmittance 	: SHADER_PERMUTATION_BOOL("USE_CLOUD_TRANSMITTANCE");
+	class FAnistropicMaterials 	: SHADER_PERMUTATION_BOOL("SUPPORTS_ANISOTROPIC_MATERIALS");</code></pre> 
+<p id="u6a257bf6"></p> 
+<p id="u32a172f4"></p> 
+<p id="ube49a2d6">然后在获取实例shader的时候如下，先声明一个Permutation域，并且设置他的值表明对应的编译选项是否开启，然后再利用这个Permutation域从ShaderMap获取到对应的实例shader，然后一个shader是否需要编译是通过一个静态函数static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters&amp; Parameters)</p> 
+<pre><code class="language-cpp">	FDeferredLightPS::FPermutationDomain PermutationVector;
+				PermutationVector.Set&lt; FDeferredLightPS::FSourceShapeDim &gt;( ELightSourceShape::Directional );
+				PermutationVector.Set&lt; FDeferredLightPS::FIESProfileDim &gt;( false );
+				PermutationVector.Set&lt; FDeferredLightPS::FInverseSquaredDim &gt;( false );
+				PermutationVector.Set&lt; FDeferredLightPS::FVisualizeCullingDim &gt;( View.Family-&gt;EngineShowFlags.VisualizeLightCulling );
+				PermutationVector.Set&lt; FDeferredLightPS::FLightingChannelsDim &gt;( View.bUsesLightingChannels );
+				PermutationVector.Set&lt; FDeferredLightPS::FAnistropicMaterials &gt;(ShouldRenderAnisotropyPass());
+				PermutationVector.Set&lt; FDeferredLightPS::FTransmissionDim &gt;( bTransmission );
+				PermutationVector.Set&lt; FDeferredLightPS::FHairLighting&gt;(0);
+				// Only directional lights are rendered in this path, so we only need to check if it is use to light the atmosphere
+				PermutationVector.Set&lt; FDeferredLightPS::FAtmosphereTransmittance &gt;(bAtmospherePerPixelTransmittance);
+				PermutationVector.Set&lt; FDeferredLightPS::FCloudTransmittance &gt;(bLight0CloudPerPixelTransmittance || bLight1CloudPerPixelTransmittance);
+
+				TShaderMapRef&lt; FDeferredLightPS &gt; PixelShader( View.ShaderMap, PermutationVector );
+				GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GFilterVertexDeclaration.VertexDeclarationRHI;
+				GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+				GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+
+				SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit);
+				PixelShader-&gt;SetParameters(RHICmdList, View, LightSceneInfo, ScreenShadowMaskTexture, LightingChannelsTexture, &amp;RenderLightParams);
+</code></pre> 
+<p></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2d5b8e7fa2220080dfc1ccb10bb95eb6/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">攻克哈希的基本概念与实现</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/219219568c2710231ecb87a74236b246/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">HTML入门笔记1</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

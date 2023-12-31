@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>V4L2驱动框架简单分析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="V4L2驱动框架简单分析" />
+<meta property="og:description" content="转自：https://www.cnblogs.com/huty/p/8518234.html
+概述 Video4Linux2是Linux内核中关于视频设备的内核驱动框架，为上层的访问底层的视频设备提供了统一的接口。凡是内核中的子系统都有抽象底层硬件的差异，为上层提供统一的接口和提取出公共代码避免代码冗余等好处。就像公司的老板一般都不会直接找底层的员工谈话，而是找部门经理了解情况，一个是因为底层屌丝人数多，意见各有不同，措辞也不准，部门经理会把情况汇总后再向上汇报；二个是老板时间宝贵。
+V4L2支持三类设备：视频输入输出设备、VBI设备和radio设备(其实还支持更多类型的设备，暂不讨论)，分别会在/dev目录下产生videoX、radioX和vbiX设备节点。我们常见的视频输入设备主要是摄像头，也是本文主要分析对象。下图V4L2在Linux系统中的结构图：
+Linux系统中视频输入设备主要包括以下四个部分：
+字符设备驱动程序核心：V4L2本身就是一个字符设备，具有字符设备所有的特性，暴露接口给用户空间；V4L2驱动核心：主要是构建一个内核中标准视频设备驱动的框架，为视频操作提供统一的接口函数；平台V4L2设备驱动：在V4L2框架下，根据平台自身的特性实现与平台相关的V4L2驱动部分，包括注册video_device和v4l2_dev。具体的sensor驱动：主要上电、提供工作时钟、视频图像裁剪、流IO开启等，实现各种设备控制方法供上层调用并注册v4l2_subdev。
+V4L2的核心源码位于drivers/media/v4l2-core，源码以实现的功能可以划分为四类：核心模块实现：由v4l2-dev.c实现，主要作用申请字符主设备号、注册class和提供video device注册注销等相关函数；V4L2框架：由v4l2-device.c、v4l2-subdev.c、v4l2-fh.c、v4l2-ctrls.c等文件实现，构建V4L2框架；Videobuf管理：由videobuf2-core.c、videobuf2-dma-contig.c、videobuf2-dma-sg.c、videobuf2-memops.c、videobuf2-vmalloc.c、v4l2-mem2mem.c等文件实现，完成videobuffer的分配、管理和注销。Ioctl框架：由v4l2-ioctl.c文件实现，构建V4L2ioctl的框架。 V4L2框架 结构体v4l2_device、video_device、v4l2_subdev和v4l2_fh是搭建框架的主要元素。下图是V4L2框架的结构图：
+从上图V4L2框架是一个标准的树形结构，v4l2_device充当了父设备，通过链表把所有注册到其下的子设备管理起来，这些设备可以是GRABBER、VBI或RADIO。V4l2_subdev是子设备，v4l2_subdev结构体包含了对设备操作的ops和ctrls，这部分代码和硬件相关，需要驱动工程师根据硬件实现，像摄像头设备需要实现控制上下电、读取ID、饱和度、对比度和视频数据流打开关闭的接口函数。Video_device用于创建子设备节点，把操作设备的接口暴露给用户空间。V4l2_fh是每个子设备的文件句柄，在打开设备节点文件时设置，方便上层索引到v4l2_ctrl_handler，v4l2_ctrl_handler管理设备的ctrls，这些ctrls(摄像头设备)包括调节饱和度、对比度和白平衡等。
+下面介绍上图提到的几个结构体：
+v4l2_device
+v4l2_device在v4l2框架中充当所有v4l2_subdev的父设备，管理着注册在其下的子设备。以下是v4l2_device结构体原型(去掉了无关的成员)：
+struct v4l2_device { charname[V4L2_DEVICE_NAME_SIZE]; //device 名字 structkref ref; //引用计数 structlist_head subdevs; //用链表管理注册的subdev struct media_device *mdev;	//管理组成media link的媒体设备 struct v4l2_ctrl_handler *ctrl_handler;	//该v4l2设备的控制接口 …… }; 可以看出v4l2_device的主要作用是管理注册在其下的子设备，方便系统查找引用到。
+V4l2_device的注册和注销：
+int v4l2_device_register(struct device*dev, struct v4l2_device *v4l2_dev) static void v4l2_device_release(struct kref *ref) V4l2_subdev
+V4l2_subdev代表子设备，包含了子设备的相关属性和操作。先来看下结构体原型：
+struct v4l2_subdev { structv4l2_device *v4l2_dev; //指向父设备 //提供一些控制v4l2设备的接口 conststruct v4l2_subdev_ops *ops; //向V4L2框架提供的接口函数 conststruct v4l2_subdev_internal_ops *internal_ops; //subdev控制接口 structv4l2_ctrl_handler *ctrl_handler; /* namemust be unique */ charname[V4L2_SUBDEV_NAME_SIZE]; /*subdev device node */ structvideo_device *devnode; }; 每个子设备驱动都需要实现一个v4l2_subdev结构体，v4l2_subdev可以内嵌到其它结构体中，也可以独立使用。结构体中包含了对子设备操作的成员v4l2_subdev_ops和v4l2_subdev_internal_ops，对/dev/videoXX节点进行open/ioctl/close最终会调用到所有子设备中这两个ops的函数。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/bae02b169309c9a0eb92af1ae4fddbc9/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-04-28T09:44:42+08:00" />
+<meta property="article:modified_time" content="2021-04-28T09:44:42+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">V4L2驱动框架简单分析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>转自：<strong>https://www.cnblogs.com/huty/p/8518234.html</strong></p> 
+<h2><a id="_3"></a>概述</h2> 
+<p>Video4Linux2是Linux内核中关于视频设备的内核驱动框架，为上层的访问底层的视频设备提供了统一的接口。凡是内核中的子系统都有抽象底层硬件的差异，为上层提供统一的接口和提取出公共代码避免代码冗余等好处。就像公司的老板一般都不会直接找底层的员工谈话，而是找部门经理了解情况，一个是因为底层屌丝人数多，意见各有不同，措辞也不准，部门经理会把情况汇总后再向上汇报；二个是老板时间宝贵。<br> V4L2支持三类设备：视频输入输出设备、VBI设备和radio设备(其实还支持更多类型的设备，暂不讨论)，分别会在/dev目录下产生videoX、radioX和vbiX设备节点。我们常见的视频输入设备主要是摄像头，也是本文主要分析对象。下图V4L2在Linux系统中的结构图：<br> <img src="https://images2.imgbox.com/df/8c/C9XhQKtf_o.png" alt="在这里插入图片描述"><br> Linux系统中视频输入设备主要包括以下四个部分：</p> 
+<ul><li>字符设备驱动程序核心：V4L2本身就是一个字符设备，具有字符设备所有的特性，暴露接口给用户空间；</li><li>V4L2驱动核心：主要是构建一个内核中标准视频设备驱动的框架，为视频操作提供统一的接口函数；</li><li>平台V4L2设备驱动：在V4L2框架下，根据平台自身的特性实现与平台相关的V4L2驱动部分，包括注册video_device和v4l2_dev。</li><li>具体的sensor驱动：主要上电、提供工作时钟、视频图像裁剪、流IO开启等，实现各种设备控制方法供上层调用并注册v4l2_subdev。<br> V4L2的核心源码位于drivers/media/v4l2-core，源码以实现的功能可以划分为四类：</li><li>核心模块实现：由v4l2-dev.c实现，主要作用申请字符主设备号、注册class和提供video device注册注销等相关函数；</li><li>V4L2框架：由v4l2-device.c、v4l2-subdev.c、v4l2-fh.c、v4l2-ctrls.c等文件实现，构建V4L2框架；</li><li>Videobuf管理：由videobuf2-core.c、videobuf2-dma-contig.c、videobuf2-dma-sg.c、videobuf2-memops.c、videobuf2-vmalloc.c、v4l2-mem2mem.c等文件实现，完成videobuffer的分配、管理和注销。</li><li>Ioctl框架：由v4l2-ioctl.c文件实现，构建V4L2ioctl的框架。</li></ul> 
+<h2><a id="V4L2_19"></a>V4L2框架</h2> 
+<p>结构体v4l2_device、video_device、v4l2_subdev和v4l2_fh是搭建框架的主要元素。下图是V4L2框架的结构图：<br> <img src="https://images2.imgbox.com/42/74/rJUJHecM_o.png" alt="在这里插入图片描述"><br> 从上图V4L2框架是一个标准的树形结构，v4l2_device充当了父设备，通过链表把所有注册到其下的子设备管理起来，这些设备可以是GRABBER、VBI或RADIO。V4l2_subdev是子设备，v4l2_subdev结构体包含了对设备操作的ops和ctrls，这部分代码和硬件相关，需要驱动工程师根据硬件实现，像摄像头设备需要实现控制上下电、读取ID、饱和度、对比度和视频数据流打开关闭的接口函数。Video_device用于创建子设备节点，把操作设备的接口暴露给用户空间。V4l2_fh是每个子设备的文件句柄，在打开设备节点文件时设置，方便上层索引到v4l2_ctrl_handler，v4l2_ctrl_handler管理设备的ctrls，这些ctrls(摄像头设备)包括调节饱和度、对比度和白平衡等。<br> 下面介绍上图提到的几个结构体：<br> <strong>v4l2_device</strong><br> v4l2_device在v4l2框架中充当所有v4l2_subdev的父设备，管理着注册在其下的子设备。以下是v4l2_device结构体原型(去掉了无关的成员)：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> v4l2_device <span class="token punctuation">{<!-- --></span>
+         charname<span class="token punctuation">[</span>V4L2_DEVICE_NAME_SIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>    <span class="token comment">//device 名字</span>
+         structkref ref<span class="token punctuation">;</span>      <span class="token comment">//引用计数</span>
+         structlist_head subdevs<span class="token punctuation">;</span>    <span class="token comment">//用链表管理注册的subdev</span>
+         <span class="token keyword">struct</span> media_device <span class="token operator">*</span>mdev<span class="token punctuation">;</span>		<span class="token comment">//管理组成media link的媒体设备</span>
+         <span class="token keyword">struct</span> v4l2_ctrl_handler <span class="token operator">*</span>ctrl_handler<span class="token punctuation">;</span>		<span class="token comment">//该v4l2设备的控制接口</span>
+         ……
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>可以看出v4l2_device的主要作用是管理注册在其下的子设备，方便系统查找引用到。<br> V4l2_device的注册和注销：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">v4l2_device_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device<span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span>
+<span class="token keyword">static</span> <span class="token keyword">void</span> <span class="token function">v4l2_device_release</span><span class="token punctuation">(</span><span class="token keyword">struct</span> kref <span class="token operator">*</span>ref<span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>V4l2_subdev</strong><br> V4l2_subdev代表子设备，包含了子设备的相关属性和操作。先来看下结构体原型：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> v4l2_subdev <span class="token punctuation">{<!-- --></span>
+         structv4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">;</span>  <span class="token comment">//指向父设备</span>
+         <span class="token comment">//提供一些控制v4l2设备的接口</span>
+         conststruct v4l2_subdev_ops <span class="token operator">*</span>ops<span class="token punctuation">;</span>
+         <span class="token comment">//向V4L2框架提供的接口函数</span>
+         conststruct v4l2_subdev_internal_ops <span class="token operator">*</span>internal_ops<span class="token punctuation">;</span>
+         <span class="token comment">//subdev控制接口</span>
+         structv4l2_ctrl_handler <span class="token operator">*</span>ctrl_handler<span class="token punctuation">;</span>
+         <span class="token comment">/* namemust be unique */</span>
+         charname<span class="token punctuation">[</span>V4L2_SUBDEV_NAME_SIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>
+         <span class="token comment">/*subdev device node */</span>
+         structvideo_device <span class="token operator">*</span>devnode<span class="token punctuation">;</span>  
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>每个子设备驱动都需要实现一个v4l2_subdev结构体，v4l2_subdev可以内嵌到其它结构体中，也可以独立使用。结构体中包含了对子设备操作的成员v4l2_subdev_ops和v4l2_subdev_internal_ops，对/dev/videoXX节点进行open/ioctl/close最终会调用到所有子设备中这两个ops的函数。</p> 
+<p><strong>v4l2_subdev_ops</strong>结构体原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> v4l2_subdev_ops <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">//视频设备通用的操作：初始化、加载FW、上电和RESET等</span>
+         conststruct v4l2_subdev_core_ops        <span class="token operator">*</span>core<span class="token punctuation">;</span>
+		<span class="token comment">//tuner特有的操作</span>
+         conststruct v4l2_subdev_tuner_ops      <span class="token operator">*</span>tuner<span class="token punctuation">;</span>
+		<span class="token comment">//audio特有的操作</span>
+         conststruct v4l2_subdev_audio_ops      <span class="token operator">*</span>audio<span class="token punctuation">;</span>
+		<span class="token comment">//视频设备的特有操作：设置帧率、裁剪图像、开关视频流等</span>
+         conststruct v4l2_subdev_video_ops      <span class="token operator">*</span>video<span class="token punctuation">;</span>
+		……
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>视频设备通常需要实现core和video成员，这两个OPS中的操作都是可选的，但是对于视频流设备video-&gt;s_stream(开启或关闭流IO)必须要实现。</p> 
+<p><strong>v4l2_subdev_internal_ops</strong>结构体原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> v4l2_subdev_internal_ops <span class="token punctuation">{<!-- --></span>
+    	<span class="token comment">//当subdev注册时被调用，读取IC的ID来进行识别</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>registered<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span><span class="token punctuation">(</span><span class="token operator">*</span>unregistered<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//当设备节点被打开时调用，通常会给设备上电和设置视频捕捉FMT</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>open<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_subdev_fh <span class="token operator">*</span>fh<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>close<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_subdev_fh <span class="token operator">*</span>fh<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>v4l2_subdev_internal_ops是向V4L2框架提供的接口，只能被V4L2框架层调用。在注册或打开子设备时，进行一些辅助性操作。</p> 
+<p>Subdev的注册和注销<br> 当我们把v4l2_subdev需要实现的成员都已经实现，就可以调用以下函数把子设备注册到V4L2核心层：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">v4l2_device_register_subdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device<span class="token operator">*</span>v4l2_dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span>
+</code></pre> 
+<p>当卸载子设备时，可以调用以下函数进行注销：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">v4l2_device_unregister_subdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev<span class="token operator">*</span>sd<span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>video_device</strong><br> video_device结构体用于在/dev目录下生成设备节点文件，把操作设备的接口暴露给用户空间。</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> video_device
+<span class="token punctuation">{<!-- --></span>
+         conststruct v4l2_file_operations <span class="token operator">*</span>fops<span class="token punctuation">;</span>  <span class="token comment">//V4L2设备操作集合</span>
+         <span class="token comment">/*sysfs */</span>
+         structdevice dev<span class="token punctuation">;</span>             <span class="token comment">/* v4l device */</span>
+         structcdev <span class="token operator">*</span>cdev<span class="token punctuation">;</span>            <span class="token comment">//字符设备</span>
+         <span class="token comment">/* Seteither parent or v4l2_dev if your driver uses v4l2_device */</span>
+         structdevice <span class="token operator">*</span>parent<span class="token punctuation">;</span>              <span class="token comment">/* deviceparent */</span>
+         structv4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">;</span>          <span class="token comment">/*v4l2_device parent */</span>
+         <span class="token comment">/*Control handler associated with this device node. May be NULL. */</span>
+         structv4l2_ctrl_handler <span class="token operator">*</span>ctrl_handler<span class="token punctuation">;</span>
+         <span class="token comment">/* 指向video buffer队列*/</span>
+         structvb2_queue <span class="token operator">*</span>queue<span class="token punctuation">;</span>
+         intvfl_type<span class="token punctuation">;</span>      <span class="token comment">/* device type */</span>
+         intminor<span class="token punctuation">;</span>  <span class="token comment">//次设备号</span>
+         <span class="token comment">/* V4L2file handles */</span>
+         spinlock_t                  fh_lock<span class="token punctuation">;</span> <span class="token comment">/* Lock for allv4l2_fhs */</span>
+         structlist_head        fh_list<span class="token punctuation">;</span> <span class="token comment">/* List ofstruct v4l2_fh */</span>
+         <span class="token comment">/*ioctl回调函数集，提供file_operations中的ioctl调用 */</span>
+         conststruct v4l2_ioctl_ops <span class="token operator">*</span>ioctl_ops<span class="token punctuation">;</span>
+         ……
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>Video_device分配和释放，用于分配和释放video_device结构体：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> video_device <span class="token operator">*</span><span class="token function">video_device_alloc</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span>
+<span class="token keyword">void</span> <span class="token function">video_device_release</span><span class="token punctuation">(</span><span class="token keyword">struct</span> video_device <span class="token operator">*</span>vdev<span class="token punctuation">)</span>
+</code></pre> 
+<p>video_device注册和注销，实现video_device结构体的相关成员后，就可以调用下面的接口进行注册：</p> 
+<pre><code class="prism language-c"><span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">int</span> <span class="token function">__must_checkvideo_register_device</span><span class="token punctuation">(</span><span class="token keyword">struct</span> video_device <span class="token operator">*</span>vdev<span class="token punctuation">,</span>
+                   inttype<span class="token punctuation">,</span> <span class="token keyword">int</span> nr<span class="token punctuation">)</span>
+<span class="token keyword">void</span> <span class="token function">video_unregister_device</span><span class="token punctuation">(</span><span class="token keyword">struct</span> video_device<span class="token operator">*</span>vdev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>vdev：需要注册和注销的video_device；<br> type：设备类型，包括VFL_TYPE_GRABBER、VFL_TYPE_VBI、VFL_TYPE_RADIO和VFL_TYPE_SUBDEV。<br> nr：设备节点名编号，如/dev/video[nr]。</p> 
+<p><strong>v4l2_fh</strong><br> v4l2_fh是用来保存子设备的特有操作方法，也就是下面要分析到的v4l2_ctrl_handler，内核提供一组v4l2_fh的操作方法，通常在打开设备节点时进行v4l2_fh注册。<br> 初始化v4l2_fh，添加v4l2_ctrl_handler到v4l2_fh：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">v4l2_fh_init</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_fh <span class="token operator">*</span>fh<span class="token punctuation">,</span> structvideo_device <span class="token operator">*</span>vdev<span class="token punctuation">)</span>
+</code></pre> 
+<p>添加v4l2_fh到video_device，方便核心层调用到：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">v4l2_fh_add</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_fh <span class="token operator">*</span>fh<span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>v4l2_ctrl_handler</strong><br> v4l2_ctrl_handler是用于保存子设备控制方法集的结构体，对于视频设备这些ctrls包括设置亮度、饱和度、对比度和清晰度等，用链表的方式来保存ctrls，可以通过v4l2_ctrl_new_std函数向链表添加ctrls。</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> v4l2_ctrl <span class="token operator">*</span><span class="token function">v4l2_ctrl_new_std</span><span class="token punctuation">(</span>structv4l2_ctrl_handler <span class="token operator">*</span>hdl<span class="token punctuation">,</span>
+                            conststruct v4l2_ctrl_ops <span class="token operator">*</span>ops<span class="token punctuation">,</span>
+                            u32id<span class="token punctuation">,</span> s32 min<span class="token punctuation">,</span> s32 max<span class="token punctuation">,</span> u32 step<span class="token punctuation">,</span> s32 def<span class="token punctuation">)</span>
+</code></pre> 
+<p>hdl是初始化好的v4l2_ctrl_handler结构体；<br> ops是v4l2_ctrl_ops结构体，包含ctrls的具体实现；<br> id是通过IOCTL的arg参数传过来的指令，定义在v4l2-controls.h文件；<br> min、max用来定义某操作对象的范围。如：<br> v4l2_ctrl_new_std(hdl, ops, V4L2_CID_BRIGHTNESS,-208, 127, 1, 0);<br> 用户空间可以通过ioctl的VIDIOC_S_CTRL指令调用到v4l2_ctrl_handler，id透过arg参数传递。</p> 
+<h2><a id="ioctl_181"></a>ioctl框架</h2> 
+<p>你可能观察到用户空间对V4L2设备的操作基本都是ioctl来实现的，V4L2设备都有大量可操作的功能(配置寄存器)，所以V4L2的ioctl也是十分庞大的。它是一个怎样的框架，是怎么实现的呢？<br> Ioctl框架是由v4l2_ioctl.c文件实现，文件中定义结构体数组v4l2_ioctls，可以看做是ioctl指令和回调函数的关系表。用户空间调用系统调用ioctl，传递下来ioctl指令，然后通过查找此关系表找到对应回调函数。<br> 以下是截取数组的两项：</p> 
+<pre><code class="prism language-c"><span class="token function">IOCTL_INFO_FNC</span><span class="token punctuation">(</span>VIDIOC_QUERYBUF<span class="token punctuation">,</span> v4l_querybuf<span class="token punctuation">,</span>v4l_print_buffer<span class="token punctuation">,</span> INFO_FL_QUEUE <span class="token operator">|</span> <span class="token function">INFO_FL_CLEAR</span><span class="token punctuation">(</span>v4l2_buffer<span class="token punctuation">,</span> length<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+<span class="token function">IOCTL_INFO_STD</span><span class="token punctuation">(</span>VIDIOC_G_FBUF<span class="token punctuation">,</span> vidioc_g_fbuf<span class="token punctuation">,</span>v4l_print_framebuffer<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+</code></pre> 
+<p>内核提供两个宏(IOCTL_INFO_FNC和IOCTL_INFO_STD)来初始化结构体，参数依次是ioctl指令、回调函数或者v4l2_ioctl_ops结构体成员、debug函数、flag。如果回调函数是v4l2_ioctl_ops结构体成员，则使用IOCTL_INFO_STD；如果回调函数是v4l2_ioctl.c自己实现的，则使用IOCTL_INFO_FNC。<br> IOCTL调用的流程图如下：<br> <img src="https://images2.imgbox.com/ab/29/u2qy6M7I_o.png" alt="在这里插入图片描述"><br> 用户空间通过打开/dev/目录下的设备节点，获取到文件的file结构体，通过系统调用ioctl把cmd和arg传入到内核。通过一系列的调用后最终会调用到__video_do_ioctl函数，然后通过cmd检索v4l2_ioctls[]，判断是INFO_FL_STD还是INFO_FL_FUNC。如果是INFO_FL_STD会直接调用到视频设备驱动中video_device-&gt;v4l2_ioctl_ops函数集。如果是INFO_FL_FUNC会先调用到v4l2自己实现的标准回调函数，然后根据arg再调用到video_device-&gt;v4l2_ioctl_ops或v4l2_fh-&gt;v4l2_ctrl_handler函数集。</p> 
+<h2><a id="IO_195"></a>IO访问</h2> 
+<p>V4L2支持三种不同IO访问方式(内核中还支持了其它的访问方式，暂不讨论)：<br> read和write，是基本帧IO访问方式，通过read读取每一帧数据，数据需要在内核和用户之间拷贝，这种方式访问速度可能会非常慢；<br> 内存映射缓冲区(V4L2_MEMORY_MMAP)，是在内核空间开辟缓冲区，应用通过mmap()系统调用映射到用户地址空间。这些缓冲区可以是大而连续DMA缓冲区、通过vmalloc()创建的虚拟缓冲区，或者直接在设备的IO内存中开辟的缓冲区(如果硬件支持)；<br> 用户空间缓冲区(V4L2_MEMORY_USERPTR)，是用户空间的应用中开辟缓冲区，用户与内核空间之间交换缓冲区指针。很明显，在这种情况下是不需要mmap()调用的，但驱动为有效的支持用户空间缓冲区，其工作将也会更困难。<br> Read和write方式属于帧IO访问方式，每一帧都要通过IO操作，需要用户和内核之间数据拷贝，而后两种是流IO访问方式，不需要内存拷贝，访问速度比较快。内存映射缓冲区访问方式是比较常用的方式。</p> 
+<h3><a id="_202"></a>内存映射缓存区方式</h3> 
+<p>硬件层的数据流传输：<br> Camerasensor捕捉到图像数据通过并口或MIPI传输到CAMIF(camera interface)，CAMIF可以对图像数据进行调整(翻转、裁剪和格式转换等)。然后DMA控制器设置DMA通道请求AHB将图像数据传到分配好的DMA缓冲区。<br> <img src="https://images2.imgbox.com/ac/88/DVppVD9P_o.png" alt="在这里插入图片描述"></p> 
+<p>待图像数据传输到DMA缓冲区之后，mmap操作把缓冲区映射到用户空间，应用就可以直接访问缓冲区的数据。</p> 
+<p><strong>vb2_queue</strong><br> 为了使设备支持流IO这种方式，驱动需要实现struct vb2_queue，来看下这个结构体：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> vb2_queue <span class="token punctuation">{<!-- --></span>
+         enumv4l2_buf_type                  type<span class="token punctuation">;</span>  <span class="token comment">//buffer类型</span>
+         unsignedint                        io_modes<span class="token punctuation">;</span>  <span class="token comment">//访问IO的方式:mmap、userptr etc</span>
+         conststruct vb2_ops                 <span class="token operator">*</span>ops<span class="token punctuation">;</span>   <span class="token comment">//buffer队列操作函数集合</span>
+         conststruct vb2_mem_ops     <span class="token operator">*</span>mem_ops<span class="token punctuation">;</span>  <span class="token comment">//buffer memory操作集合</span>
+         structvb2_buffer              <span class="token operator">*</span>bufs<span class="token punctuation">[</span>VIDEO_MAX_FRAME<span class="token punctuation">]</span><span class="token punctuation">;</span>  <span class="token comment">//代表每个buffer</span>
+         unsignedint                        num_buffers<span class="token punctuation">;</span>    <span class="token comment">//分配的buffer个数</span>
+		……
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>Vb2_queue代表一个videobuffer队列，vb2_buffer是这个队列中的成员，vb2_mem_ops是缓冲内存的操作函数集，vb2_ops用来管理队列。</p> 
+<p><strong>vb2_mem_ops</strong><br> b2_mem_ops包含了内存映射缓冲区、用户空间缓冲区的内存操作方法：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> vb2_mem_ops <span class="token punctuation">{<!-- --></span>
+         <span class="token keyword">void</span>           <span class="token operator">*</span><span class="token punctuation">(</span><span class="token operator">*</span>alloc<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>alloc_ctx<span class="token punctuation">,</span> unsignedlong size<span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//分配视频缓存</span>
+         <span class="token keyword">void</span>           <span class="token punctuation">(</span><span class="token operator">*</span>put<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>            <span class="token comment">//释放视频缓存</span>
+		<span class="token comment">//获取用户空间视频缓冲区指针</span>
+         <span class="token keyword">void</span>           <span class="token operator">*</span><span class="token punctuation">(</span><span class="token operator">*</span>get_userptr<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>alloc_ctx<span class="token punctuation">,</span><span class="token keyword">unsigned</span> <span class="token keyword">long</span> vaddr<span class="token punctuation">,</span> 
+                                               unsignedlong size<span class="token punctuation">,</span> <span class="token keyword">int</span> write<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span>           <span class="token punctuation">(</span><span class="token operator">*</span>put_userptr<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>       <span class="token comment">//释放用户空间视频缓冲区指针</span>
+		<span class="token comment">//用于缓存同步</span>
+         <span class="token keyword">void</span>           <span class="token punctuation">(</span><span class="token operator">*</span>prepare<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span>           <span class="token punctuation">(</span><span class="token operator">*</span>finish<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span>           <span class="token operator">*</span><span class="token punctuation">(</span><span class="token operator">*</span>vaddr<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span>           <span class="token operator">*</span><span class="token punctuation">(</span><span class="token operator">*</span>cookie<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         unsignedint     <span class="token punctuation">(</span><span class="token operator">*</span>num_users<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">)</span><span class="token punctuation">;</span>         <span class="token comment">//返回当期在用户空间的buffer数</span>
+         <span class="token keyword">int</span>              <span class="token punctuation">(</span><span class="token operator">*</span>mmap<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>buf_priv<span class="token punctuation">,</span> structvm_area_struct <span class="token operator">*</span>vma<span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//把缓冲区映射到用户空间</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>这是一个相当庞大的结构体，这么多的结构体需要实现还不得累死，幸运的是内核都已经帮我们实现了。提供了三种类型的视频缓存区操作方法：连续的DMA缓冲区、集散的DMA缓冲区以及vmalloc创建的缓冲区，分别由videobuf2-dma-contig.c、videobuf2-dma-sg.c和videobuf-vmalloc.c文件实现，可以根据实际情况来使用。</p> 
+<p><strong>vb2_ops</strong><br> vb2_ops是用来管理buffer队列的函数集合，包括队列和缓冲区初始化</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> vb2_ops <span class="token punctuation">{<!-- --></span>
+         <span class="token comment">//队列初始化</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>queue_setup<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_queue <span class="token operator">*</span>q<span class="token punctuation">,</span> <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_format <span class="token operator">*</span>fmt<span class="token punctuation">,</span>
+                               <span class="token keyword">unsigned</span> <span class="token keyword">int</span> <span class="token operator">*</span>num_buffers<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span><span class="token operator">*</span>num_planes<span class="token punctuation">,</span>
+                               <span class="token keyword">unsigned</span> <span class="token keyword">int</span> sizes<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>alloc_ctxs<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token comment">//释放和获取设备操作锁</span>
+         <span class="token keyword">void</span><span class="token punctuation">(</span><span class="token operator">*</span>wait_prepare<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_queue <span class="token operator">*</span>q<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span><span class="token punctuation">(</span><span class="token operator">*</span>wait_finish<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_queue <span class="token operator">*</span>q<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token comment">//对buffer的操作</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>buf_init<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_buffer <span class="token operator">*</span>vb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>buf_prepare<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_buffer <span class="token operator">*</span>vb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>buf_finish<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_buffer <span class="token operator">*</span>vb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+         <span class="token keyword">void</span><span class="token punctuation">(</span><span class="token operator">*</span>buf_cleanup<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_buffer <span class="token operator">*</span>vb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//开始视频流</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>start_streaming<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_queue <span class="token operator">*</span>q<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> count<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//停止视频流</span>
+         <span class="token keyword">int</span><span class="token punctuation">(</span><span class="token operator">*</span>stop_streaming<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_queue <span class="token operator">*</span>q<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//把VB传递给驱动</span>
+         <span class="token keyword">void</span><span class="token punctuation">(</span><span class="token operator">*</span>buf_queue<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> vb2_buffer <span class="token operator">*</span>vb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p><strong>vb2_buffer</strong>是缓存队列的基本单位，内嵌在其中v4l2_buffer是核心成员。当开始流IO时，帧以v4l2_buffer的格式在应用和驱动之间传输。一个缓冲区可以有三种状态：<br> 在驱动的传入队列中，驱动程序将会对此队列中的缓冲区进行处理，用户空间通过IOCTL:VIDIOC_QBUF把缓冲区放入到队列。对于一个视频捕获设备，传入队列中的缓冲区是空的，驱动会往其中填充数据；<br> 在驱动的传出队列中，这些缓冲区已由驱动处理过，对于一个视频捕获设备，缓存区已经填充了视频数据，正等用户空间来认领；<br> 用户空间状态的队列，已经通过IOCTL:VIDIOC_DQBUF传出到用户空间的缓冲区，此时缓冲区由用户空间拥有，驱动无法访问。<br> 这三种状态的切换如下图所示：<br> <img src="https://images2.imgbox.com/05/28/gFLX1j97_o.png" alt="在这里插入图片描述"><br> v4l2_buffer结构如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> v4l2_buffer <span class="token punctuation">{<!-- --></span>
+         __u32                          index<span class="token punctuation">;</span>  <span class="token comment">//buffer 序号</span>
+         __u32                          type<span class="token punctuation">;</span>   <span class="token comment">//buffer类型</span>
+         __u32                          bytesused<span class="token punctuation">;</span>  缓冲区已使用byte数
+         __u32                          flags<span class="token punctuation">;</span>
+         __u32                          field<span class="token punctuation">;</span>
+         structtimeval           timestamp<span class="token punctuation">;</span>  <span class="token comment">//时间戳，代表帧捕获的时间</span>
+         structv4l2_timecode       timecode<span class="token punctuation">;</span>
+         __u32                          sequence<span class="token punctuation">;</span>
+         <span class="token comment">/*memory location */</span>
+         __u32                          memory<span class="token punctuation">;</span>  <span class="token comment">//表示缓冲区是内存映射缓冲区还是用户空间缓冲区</span>
+         <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+                   __u32           offset<span class="token punctuation">;</span>  <span class="token comment">//内核缓冲区的位置</span>
+                   unsignedlong   userptr<span class="token punctuation">;</span>   <span class="token comment">//缓冲区的用户空间地址</span>
+                   structv4l2_plane <span class="token operator">*</span>planes<span class="token punctuation">;</span>
+                   __s32                 fd<span class="token punctuation">;</span>
+         <span class="token punctuation">}</span> m<span class="token punctuation">;</span>
+         __u32                          length<span class="token punctuation">;</span>   <span class="token comment">//缓冲区大小，单位byte</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>当用户空间拿到v4l2_buffer，可以获取到缓冲区的相关信息。Byteused是图像数据所占的字节数，如果是V4L2_MEMORY_MMAP方式，m.offset是内核空间图像数据存放的开始地址，会传递给mmap函数作为一个偏移，通过mmap映射返回一个缓冲区指针p，p+byteused是图像数据在进程的虚拟地址空间所占区域；如果是用户指针缓冲区的方式，可以获取的图像数据开始地址的指针m.userptr，userptr是一个用户空间的指针，userptr+byteused便是所占的虚拟地址空间，应用可以直接访问。</p> 
+<h2><a id="_304"></a>用户空间访问设备</h2> 
+<p>驱动程序可参考linux/driver/media/platform/vivi.c，测试程序参考v4l2_api_test.c<br> 下面通过内核映射缓冲区方式访问视频设备(capturedevice)的流程。</p> 
+<ol><li>打开设备文件</li></ol> 
+<pre><code class="prism language-c">fd <span class="token operator">=</span> <span class="token function">open</span><span class="token punctuation">(</span>dev_name<span class="token punctuation">,</span> O_RDWR <span class="token comment">/* required */</span> <span class="token operator">|</span> O_NONBLOCK<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+dev_name<span class="token punctuation">[</span><span class="token operator">/</span>dev<span class="token operator">/</span>videoX<span class="token punctuation">]</span>
+</code></pre> 
+<ol start="2"><li>查询设备支持的能力</li></ol> 
+<pre><code class="prism language-c">Struct v4l2_capability  cap<span class="token punctuation">;</span>
+<span class="token function">ioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_QUERYCAP<span class="token punctuation">,</span> <span class="token operator">&amp;</span>cap<span class="token punctuation">)</span>
+</code></pre> 
+<ol start="3"><li>设置视频捕获格式</li></ol> 
+<pre><code class="prism language-c">fmt<span class="token punctuation">.</span>type<span class="token operator">=</span> V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+fmt<span class="token punctuation">.</span>fmt<span class="token punctuation">.</span>pix<span class="token punctuation">.</span>width       <span class="token operator">=</span> <span class="token number">640</span><span class="token punctuation">;</span>
+fmt<span class="token punctuation">.</span>fmt<span class="token punctuation">.</span>pix<span class="token punctuation">.</span>height      <span class="token operator">=</span> <span class="token number">480</span><span class="token punctuation">;</span>
+fmt<span class="token punctuation">.</span>fmt<span class="token punctuation">.</span>pix<span class="token punctuation">.</span>pixelformat<span class="token operator">=</span> V4L2_PIX_FMT_YUYV<span class="token punctuation">;</span>  <span class="token comment">//像素格式</span>
+fmt<span class="token punctuation">.</span>fmt<span class="token punctuation">.</span>pix<span class="token punctuation">.</span>field       <span class="token operator">=</span> V4L2_FIELD_INTERLACED<span class="token punctuation">;</span>
+<span class="token function">ioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span>VIDIOC_S_FMT<span class="token punctuation">,</span> <span class="token operator">&amp;</span> fmt<span class="token punctuation">)</span>
+</code></pre> 
+<ol start="4"><li>向驱动申请缓冲区</li></ol> 
+<pre><code class="prism language-c">Struct  v4l2_requestbuffers req<span class="token punctuation">;</span>
+req<span class="token punctuation">.</span>count<span class="token operator">=</span> <span class="token number">4</span><span class="token punctuation">;</span>  <span class="token comment">//缓冲个数</span>
+req<span class="token punctuation">.</span>type<span class="token operator">=</span> V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+req<span class="token punctuation">.</span>memory<span class="token operator">=</span> V4L2_MEMORY_MMAP<span class="token punctuation">;</span>
+<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span> <span class="token function">xioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_REQBUFS<span class="token punctuation">,</span> <span class="token operator">&amp;</span>req<span class="token punctuation">)</span><span class="token punctuation">)</span>
+</code></pre> 
+<ol start="5"><li>获取每个缓冲区的信息，映射到用户空间</li></ol> 
+<pre><code class="prism language-c">structbuffer <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">void</span>  <span class="token operator">*</span>start<span class="token punctuation">;</span>
+        size_t length<span class="token punctuation">;</span>
+<span class="token punctuation">}</span> <span class="token operator">*</span>buffers<span class="token punctuation">;</span>
+buffers <span class="token operator">=</span> <span class="token function">calloc</span><span class="token punctuation">(</span>req<span class="token punctuation">.</span>count<span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token operator">*</span>buffers<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">for</span> <span class="token punctuation">(</span>n_buffers<span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> n_buffers <span class="token operator">&lt;</span> req<span class="token punctuation">.</span>count<span class="token punctuation">;</span> <span class="token operator">++</span>n_buffers<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token keyword">struct</span>  v4l2_buffer buf<span class="token punctuation">;</span>
+buf<span class="token punctuation">.</span>type        <span class="token operator">=</span> V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+buf<span class="token punctuation">.</span>memory      <span class="token operator">=</span> V4L2_MEMORY_MMAP<span class="token punctuation">;</span>
+buf<span class="token punctuation">.</span>index       <span class="token operator">=</span> n_buffers<span class="token punctuation">;</span>
+<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span><span class="token function">xioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_QUERYBUF<span class="token punctuation">,</span> <span class="token operator">&amp;</span> buf<span class="token punctuation">)</span><span class="token punctuation">)</span>
+                       <span class="token function">errno_exit</span><span class="token punctuation">(</span><span class="token string">"VIDIOC_QUERYBUF"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+buffers<span class="token punctuation">[</span>n_buffers<span class="token punctuation">]</span><span class="token punctuation">.</span>length<span class="token operator">=</span> buf<span class="token punctuation">.</span>length<span class="token punctuation">;</span>
+buffers<span class="token punctuation">[</span>n_buffers<span class="token punctuation">]</span><span class="token punctuation">.</span>start<span class="token operator">=</span>
+        <span class="token function">mmap</span><span class="token punctuation">(</span><span class="token constant">NULL</span> <span class="token comment">/* start anywhere */</span><span class="token punctuation">,</span>
+        buf<span class="token punctuation">.</span>length<span class="token punctuation">,</span>
+        PROT_READ <span class="token operator">|</span> PROT_WRITE <span class="token comment">/* required */</span><span class="token punctuation">,</span>
+        MAP_SHARED <span class="token comment">/* recommended */</span><span class="token punctuation">,</span>
+        fd<span class="token punctuation">,</span> buf<span class="token punctuation">.</span>m<span class="token punctuation">.</span>offset<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ <span class="token punctuation">}</span>
+</code></pre> 
+<ol start="6"><li>把缓冲区放入到传入队列上，打开流IO，开始视频采集</li></ol> 
+<pre><code class="prism language-c"><span class="token keyword">for</span> <span class="token punctuation">(</span>i <span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> n_buffers<span class="token punctuation">;</span> <span class="token operator">++</span>i<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">struct</span> v4l2_buffer buf<span class="token punctuation">;</span>
+    buf<span class="token punctuation">.</span>type <span class="token operator">=</span> V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+    buf<span class="token punctuation">.</span>memory <span class="token operator">=</span> V4L2_MEMORY_MMAP<span class="token punctuation">;</span>
+    buf<span class="token punctuation">.</span>index <span class="token operator">=</span> i<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span> <span class="token function">xioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_QBUF<span class="token punctuation">,</span> <span class="token operator">&amp;</span>buf<span class="token punctuation">)</span><span class="token punctuation">)</span>
+          <span class="token function">errno_exit</span><span class="token punctuation">(</span><span class="token string">"VIDIOC_QBUF"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ <span class="token punctuation">}</span>
+ type <span class="token operator">=</span> V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+ <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span> <span class="token function">xioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_STREAMON<span class="token punctuation">,</span> <span class="token operator">&amp;</span> type<span class="token punctuation">)</span><span class="token punctuation">)</span>
+</code></pre> 
+<ol start="7"><li>调用select监测文件描述符，缓冲区的数据是否填充好，然后开始对视频数据处理</li></ol> 
+<pre><code class="prism language-c">        <span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token punctuation">;</span><span class="token punctuation">;</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                        fd_set fds<span class="token punctuation">;</span>
+                        <span class="token keyword">struct</span> timeval tv<span class="token punctuation">;</span>
+                        <span class="token keyword">int</span> r<span class="token punctuation">;</span>
+                        <span class="token function">FD_ZERO</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>amp<span class="token punctuation">;</span>fds<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token function">FD_SET</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span><span class="token operator">&amp;</span>amp<span class="token punctuation">;</span>fds<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token comment">/* Timeout. */</span>
+                        tv<span class="token punctuation">.</span>tv_sec <span class="token operator">=</span> <span class="token number">2</span><span class="token punctuation">;</span>
+                        tv<span class="token punctuation">.</span>tv_usec <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+                        <span class="token comment">//监测文件描述是否变化</span>
+                        r <span class="token operator">=</span> <span class="token function">select</span><span class="token punctuation">(</span>fd <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">,</span><span class="token operator">&amp;</span> fds<span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">,</span> <span class="token operator">&amp;</span> tv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span> r<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                                <span class="token keyword">if</span> <span class="token punctuation">(</span>EINTR <span class="token operator">==</span>errno<span class="token punctuation">)</span>
+                                      <span class="token keyword">continue</span><span class="token punctuation">;</span>
+                               <span class="token function">errno_exit</span><span class="token punctuation">(</span><span class="token string">"select"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token number">0</span> <span class="token operator">==</span> r<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                                <span class="token function">fprintf</span><span class="token punctuation">(</span><span class="token constant">stderr</span><span class="token punctuation">,</span><span class="token string">"select timeout\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                               <span class="token function">exit</span><span class="token punctuation">(</span>EXIT_FAILURE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                        <span class="token punctuation">}</span>
+                        <span class="token comment">//对视频数据进行处理</span>
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">read_frame</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+                                <span class="token keyword">break</span><span class="token punctuation">;</span>
+                        <span class="token comment">/* EAGAIN - continueselect loop. */</span>
+               <span class="token punctuation">}</span>
+</code></pre> 
+<ol start="8"><li>取出已经填充好的缓冲，获取到视频数据的大小，然后对数据进行处理。这里取出的缓冲只包含缓冲区的信息，并没有进行视频数据拷贝。</li></ol> 
+<pre><code class="prism language-c">buf<span class="token punctuation">.</span>type<span class="token operator">=</span> V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+buf<span class="token punctuation">.</span>memory<span class="token operator">=</span> V4L2_MEMORY_MMAP<span class="token punctuation">;</span>
+<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span><span class="token function">ioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_DQBUF<span class="token punctuation">,</span> <span class="token operator">&amp;</span> buf<span class="token punctuation">)</span><span class="token punctuation">)</span>    <span class="token comment">//取出缓冲</span>
+           <span class="token function">errno_exit</span><span class="token punctuation">(</span><span class="token string">"VIDIOC_QBUF"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token function">process_image</span><span class="token punctuation">(</span>buffers<span class="token punctuation">[</span>buf<span class="token punctuation">.</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>start<span class="token punctuation">,</span>buf<span class="token punctuation">.</span>bytesused<span class="token punctuation">)</span><span class="token punctuation">;</span>   <span class="token comment">//视频数据处理</span>
+<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span> <span class="token operator">==</span><span class="token function">xioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span> VIDIOC_QBUF<span class="token punctuation">,</span> <span class="token operator">&amp;</span> buf<span class="token punctuation">)</span><span class="token punctuation">)</span>  <span class="token comment">//然后又放入到传入队列</span>
+     <span class="token function">errno_exit</span><span class="token punctuation">(</span><span class="token string">"VIDIOC_QBUF"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<ol start="9"><li>停止视频采集</li></ol> 
+<pre><code class="prism language-c">type <span class="token operator">=</span>V4L2_BUF_TYPE_VIDEO_CAPTURE<span class="token punctuation">;</span>
+<span class="token function">ioctl</span><span class="token punctuation">(</span>fd<span class="token punctuation">,</span>VIDIOC_STREAMOff<span class="token punctuation">,</span> <span class="token operator">&amp;</span> type<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>10.关闭设备</p> 
+<pre><code class="prism language-c"><span class="token function">Close</span><span class="token punctuation">(</span>fd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>Reference:<br> http://lxr.linux.no/linux+v3.8.8/Documentation/video4linux/v4l2-framework.txt<br> http://lxr.linux.no/linux+v3.9/Documentation/DocBook/media/v4l/capture.c.xml<br> http://linuxtv.org/downloads/v4l-dvb-apis/vidioc-reqbufs.html<br> http://lwn.net/Articles/203924/<br> http://lxr.linux.no/linux+v3.9.1/drivers/media/platform/vivi.c</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/852bd9e266c8f212ffc9969a53db3ef8/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">管理学之父彼得·德鲁克：目标管理的基本思路、原则及分解方法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/7487ed10cd08259d7409bf9403259597/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Redis6 系列三 配置文件介绍</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

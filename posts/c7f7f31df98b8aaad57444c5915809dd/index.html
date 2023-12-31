@@ -1,0 +1,1327 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Analyzing and Improving the Image Quality of StyleGAN （StyleGAN2 ：分析和改善StyleGAN的图像质量） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Analyzing and Improving the Image Quality of StyleGAN （StyleGAN2 ：分析和改善StyleGAN的图像质量）" />
+<meta property="og:description" content="NVIDIA 实验室在 styleGAN1 之后所做了改进，论文标题： Analyzing and Improving the Image Quality of StyleGAN （分析和改善StyleGAN的图像质量），本文是论文的翻译，因为作者本人水平有限，部分地方翻译可能有不妥当之处，还请读者不吝赐教，相互交流，一起进步。
+摘要 基于样式的GAN架构（StyleGAN）在数据驱动的无条件生成图像建模中产生了最新的结果。我们将揭露和分析其一些特征工件，并提出模型架构和训练方法方面的更改以解决这些问题。特别是，我们重新设计了生成器归一化，重新审视了渐进式增长，并对生成器进行了正则化，以鼓励从潜矢量到图像的映射中的良好条件。除了改善图像质量，该路径长度调节器还带来了额外的好处，即发生器变得非常易于反转。这使得可以可靠地检测图像是否由特定网络生成。我们进一步可视化了发生器如何充分利用其输出分辨率，并确定了容量问题，从而激励我们训练更大的模型以进一步提高质量。总体而言，我们改进的模型在现有的分发质量指标和感知的图像质量方面都重新定义了无条件图像建模的最新技术水平。
+1.介绍 通过生成方法，尤其是生成对抗网络（GAN）[15]生成的图像的分辨率和质量正在迅速提高[23，31，5]。目前，用于高分辨率图像合成的最新方法是StyleGAN [24]，它已被证明可以在各种数据集上可靠地工作。我们的工作重点是修复其特有的伪像并进一步提高结果质量。
+StyleGAN [24]的显着特征是其非常规的生成器体系结构。映射网络不是将输入的潜在代码 z ∈ Z z \in Z z∈Z 仅馈送到网络的开头，而是将其转换为中间的潜在代码 w ∈ W w \in W w∈W。细微变换然后产生通过自适应实例规范化（AdaIN）控制合成网络g的层的样式[20、9、12、8]。另外，通过向合成网络提供额外的随机噪声图来促进随机变化。已经证明[24，38]，该设计使中间潜空间W的纠缠比输入潜空间Z的纠缠小得多。在本文中，我们将所有分析仅集中在W上，因为从综合网络的角度来看，W是相关的潜在空间。
+许多观察者已经注意到由StyleGAN [3]生成的图像中的特征伪影。我们确定了造成这些假象的两个原因，并描述了消除这些假象的体系结构和训练方法的变化。首先，我们研究常见的斑点状伪像的起源，并发现生成器创建它们是为了规避其体系结构中的设计缺陷。在第2节中，我们重新设计了生成器中使用的规范化，该规范化消除了伪影。其次，我们分析了与渐进增长相关的伪影[23]，该伪影在稳定高分辨率GAN训练方面非常成功。我们提出了一种可实现相同目标的替代设计-训练从关注低分辨率图像开始，然后逐渐将焦点转移到越来越高的分辨率-而不在训练期间更改网络拓扑。这种新设计还使我们能够对所生成图像的有效分辨率进行推理，结果证明该分辨率低于预期，从而导致了容量的增加（第4节）。
+使用生成方法产生的图像质量的定量分析仍然是一个具有挑战性的话题。Fr’echet初始距离（FID）[19]测量InceptionV3分类器的高维特征空间中两个分布的密度差异[39]。精确度和召回率（P＆R）[36、27]分别通过显式量化类似于训练数据的生成图像的百分比和可以生成的训练数据的百分比来提供额外的可见性。我们使用这些指标来量化改进。
+FID和P＆R均基于分类器网络，最近已显示该分类器网络侧重于纹理而不是形状[11]，因此，度量标准无法准确地捕获图像质量的所有方面。我们观察到，作为估计潜在空间插入质量的方法而引入的感知路径长度（PPL）度量[24]与形状的一致性和稳定性相关。在此基础上，我们对合成网络进行了正则化处理，以支持平滑映射（第3节），并实现了质量的明显提高。为了抵消其计算费用，我们还建议不那么频繁地执行所有正则化，因为这样做可以在不影响有效性的情况下进行。
+图1.实例归一化导致StyleGAN图像中出现类似水滴的伪影。这些在生成的图像中并不总是很明显，但是如果我们查看生成器网络内部的激活，则问题始终存在，在所有从64x64分辨率开始的特征图中。这是困扰所有StyleGAN图像的系统性问题。
+最后，我们发现，使用新的路径长度正则化生成器将图像投影到潜在空间W的效果比原始StyleGAN显着更好。这具有实际意义，因为它使我们能够可靠地判断是否使用特定的生成器生成了给定的图像（第5节）。
+我们的实施和训练有素的模型可在以下位置获得 https://github.com/NVlabs/stylegan2
+删除标准化的伪像 我们首先观察到StyleGAN生成的大多数图像都呈现出类似于水滴的特征性斑点状伪像。如图1所示，即使液滴在最终图像中可能不明显，它也存在于发生器的中间特征图中【在极少数情况下（可能占图像的0.1％），液滴会丢失，从而导致图像严重损坏。有关详细信息，请参见附录A】。在所有特征图中都出现了约64×64分辨率的异常现象，并在更高的分辨率下逐渐增强。如此一致的伪影的存在令人困惑，因为辨别器应该能够检测到它。
+我们将问题精确定位到AdaIN运算中，该运算分别对每个特征图的均值和方差进行归一化，从而潜在地破坏了在特征量级中相对于彼此发现的任何信息。我们假设液滴伪像是生成器故意将信号强度信息偷偷经过实例归一化的结果：通过创建一个强的局部尖峰来支配统计数据，生成器可以像其他地方一样有效地缩放信号。我们的假设得到以下发现的支持：当从发生器中删除标准化步骤时，如下所述，液滴伪像会完全消失。
+2.1 重新审视生成器结构 我们将首先修改StyleGAN生成器的一些细节，以更好地促进我们重新设计的归一化。就质量指标而言，这些变化本身对中性或小小的积极影响。
+图2a显示了原始的StyleGAN合成网络g [24]，在图2b中，我们通过显示权重和偏差并将AdaIN操作分解为其两个组成部分：归一化和调制，将图扩展为完整细节。这使我们可以重新绘制概念上的灰色框，以便每个框都指示网络中激活一种样式的部分（即“样式块”）。有趣的是，原始的StyleGAN在样式块中施加了偏置和噪音，使它们的相对影响与当前样式的大小成反比。我们观察到，通过将这些操作移到样式块之外（它们对规范化数据进行操作），可以获得更可预测的结果。此外，我们注意到，在进行此更改之后，仅对标准偏差进行归一化和调制就足够了（即，不需要均值）。偏置，噪声和归一化对恒定输入的应用也可以安全地消除，而没有明显的缺点。此变体如图2c所示，并作为我们重新设计的归一化的起点。
+2.2 实例规范化的重新审视 考虑到实例规范化似乎过于强大，我们如何在保留样式特定比例效果的同时放松它呢？我们排除了批量归一化[21]，因为它与高分辨率合成所需的小型迷你批处理不兼容。或者，我们可以简单地删除标准化。尽管实际上稍微改善了FID [27]，但这会使样式的效果累积而不是按比例缩放，从而实质上失去了StyleGAN提供的可控制性（请参见视频）。现在我们将提出一种替代方法，该方法在保留可控性的同时去除了伪像。主要思想是基于归一化特征图的预期统计量进行归一化，但没有明确的强制。
+图片2 我们重新设计了StyleGAN合成网络的架构。 （a）原始StyleGAN，其中A表示从W学习到的仿射变换，产生样式，而B表示噪声广播操作。 （b）完整细节相同的图。在这里，我们将AdaIN分解为显式归一化后再进行调制，然后对每个特征图的均值和标准差进行操作。我们还对学习的权重（w），偏差（b）和常数输入（c）进行了注释，并重新绘制了灰色框，以便每个框都激活一种样式。激活功能（泄漏的ReLU）总是在添加偏置后立即应用。 （c）我们对原始架构进行了一些改动，这些改动在正文中是合理的。我们从一开始就删除了一些多余的操作，将b和B的相加移到样式的有效区域之外，并仅调整每个要素图的标准偏差。 （d）修改后的体系结构使我们能够用“解调”操作代替实例规范化，该操作适用于与每个卷积层相关的权重。
+回想一下，图2c中的样式块由调制，卷积和规范化组成。让我们首先考虑调制和卷积的影响。调制会根据传入样式缩放卷积的每个输入特征图，也可以通过缩放卷积权重来实现：
+w i , j , k ′ = s i ⋅ w i , j , k ( 1 ) w^{\prime}_{i,j,k}=s_i \cdot w_{i,j,k} \quad\quad (1) wi,j,k′​=si​⋅wi,j,k​(1) 其中w和分别是原始权重和调制权重，是与第i个输入特征图相对应的比例，而j和k分别枚举输出特征图和卷积的空间足迹。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/c7f7f31df98b8aaad57444c5915809dd/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2019-12-17T22:08:16+08:00" />
+<meta property="article:modified_time" content="2019-12-17T22:08:16+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Analyzing and Improving the Image Quality of StyleGAN （StyleGAN2 ：分析和改善StyleGAN的图像质量）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <blockquote> 
+ <p>NVIDIA 实验室在 styleGAN1 之后所做了改进，论文标题： Analyzing and Improving the Image Quality of StyleGAN （分析和改善StyleGAN的图像质量），本文是论文的翻译，因为作者本人水平有限，部分地方翻译可能有不妥当之处，还请读者不吝赐教，相互交流，一起进步。</p> 
+</blockquote> 
+<h3><a id="_2"></a>摘要</h3> 
+<p>基于样式的GAN架构（StyleGAN）在数据驱动的无条件生成图像建模中产生了最新的结果。我们将揭露和分析其一些特征工件，并提出模型架构和训练方法方面的更改以解决这些问题。特别是，我们重新设计了生成器归一化，重新审视了渐进式增长，并对生成器进行了正则化，以鼓励从潜矢量到图像的映射中的良好条件。除了改善图像质量，该路径长度调节器还带来了额外的好处，即发生器变得非常易于反转。这使得可以可靠地检测图像是否由特定网络生成。我们进一步可视化了发生器如何充分利用其输出分辨率，并确定了容量问题，从而激励我们训练更大的模型以进一步提高质量。总体而言，我们改进的模型在现有的分发质量指标和感知的图像质量方面都重新定义了无条件图像建模的最新技术水平。</p> 
+<h3><a id="1_5"></a>1.介绍</h3> 
+<p>通过生成方法，尤其是生成对抗网络（GAN）[15]生成的图像的分辨率和质量正在迅速提高[23，31，5]。目前，用于高分辨率图像合成的最新方法是StyleGAN [24]，它已被证明可以在各种数据集上可靠地工作。我们的工作重点是修复其特有的伪像并进一步提高结果质量。</p> 
+<p>StyleGAN [24]的显着特征是其非常规的生成器体系结构。映射网络不是将输入的潜在代码 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         z 
+        
+       
+         ∈ 
+        
+       
+         Z 
+        
+       
+      
+        z \in Z 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.5782em; vertical-align: -0.0391em;"></span><span class="mord mathdefault" style="margin-right: 0.04398em;">z</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.68333em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.07153em;">Z</span></span></span></span></span> 仅馈送到网络的开头，而是将其转换为中间的潜在代码 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         w 
+        
+       
+         ∈ 
+        
+       
+         W 
+        
+       
+      
+        w \in W 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.5782em; vertical-align: -0.0391em;"></span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.68333em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.13889em;">W</span></span></span></span></span>。细微变换然后产生通过自适应实例规范化（AdaIN）控制合成网络g的层的样式[20、9、12、8]。另外，通过向合成网络提供额外的随机噪声图来促进随机变化。已经证明[24，38]，该设计使中间潜空间W的纠缠比输入潜空间Z的纠缠小得多。在本文中，我们将所有分析仅集中在W上，因为从综合网络的角度来看，W是相关的潜在空间。</p> 
+<p>许多观察者已经注意到由StyleGAN [3]生成的图像中的特征伪影。我们确定了造成这些假象的两个原因，并描述了消除这些假象的体系结构和训练方法的变化。首先，我们研究常见的斑点状伪像的起源，并发现生成器创建它们是为了规避其体系结构中的设计缺陷。在第2节中，我们重新设计了生成器中使用的规范化，该规范化消除了伪影。其次，我们分析了与渐进增长相关的伪影[23]，该伪影在稳定高分辨率GAN训练方面非常成功。我们提出了一种可实现相同目标的替代设计-训练从关注低分辨率图像开始，然后逐渐将焦点转移到越来越高的分辨率-而不在训练期间更改网络拓扑。这种新设计还使我们能够对所生成图像的有效分辨率进行推理，结果证明该分辨率低于预期，从而导致了容量的增加（第4节）。</p> 
+<p>使用生成方法产生的图像质量的定量分析仍然是一个具有挑战性的话题。Fr’echet初始距离（FID）[19]测量InceptionV3分类器的高维特征空间中两个分布的密度差异[39]。<mark>精确度和召回率（P＆R）[36、27]分别通过显式量化类似于训练数据的生成图像的百分比和可以生成的训练数据的百分比来提供额外的可见性</mark>。我们使用这些指标来量化改进。</p> 
+<p><mark>FID和P＆R均基于分类器网络，最近已显示该分类器网络侧重于纹理而不是形状[11]</mark>，因此，度量标准无法准确地捕获图像质量的所有方面。我们观察到，作为估计潜在空间插入质量的方法而引入的感知路径长度（PPL）度量[24]与形状的一致性和稳定性相关。在此基础上，我们对合成网络进行了正则化处理，以支持平滑映射（第3节），并实现了质量的明显提高。为了抵消其计算费用，我们还建议不那么频繁地执行所有正则化，因为这样做可以在不影响有效性的情况下进行。</p> 
+<p><img src="https://images2.imgbox.com/7a/ae/hJbx4j9d_o.png" alt="在这里插入图片描述"><br> <em>图1.实例归一化导致StyleGAN图像中出现类似水滴的伪影。这些在生成的图像中并不总是很明显，但是如果我们查看生成器网络内部的激活，则问题始终存在，在所有从64x64分辨率开始的特征图中。这是困扰所有StyleGAN图像的系统性问题。</em></p> 
+<p>最后，我们发现，使用新的路径长度正则化生成器将图像投影到潜在空间W的效果比原始StyleGAN显着更好。这具有实际意义，因为它使我们能够可靠地判断是否使用特定的生成器生成了给定的图像（第5节）。</p> 
+<p>我们的实施和训练有素的模型可在以下位置获得 https://github.com/NVlabs/stylegan2</p> 
+<h3><a id="_23"></a>删除标准化的伪像</h3> 
+<p>我们首先观察到StyleGAN生成的大多数图像都呈现出类似于水滴的特征性斑点状伪像。如图1所示，即使液滴在最终图像中可能不明显，它也存在于发生器的中间特征图中【<mark>在极少数情况下（可能占图像的0.1％），液滴会丢失，从而导致图像严重损坏。有关详细信息，请参见附录A</mark>】。在所有特征图中都出现了约64×64分辨率的异常现象，并在更高的分辨率下逐渐增强。如此一致的伪影的存在令人困惑，因为辨别器应该能够检测到它。</p> 
+<p>我们将问题精确定位到AdaIN运算中，该运算分别对每个特征图的均值和方差进行归一化，从而潜在地破坏了在特征量级中相对于彼此发现的任何信息。我们假设液滴伪像是生成器故意将信号强度信息偷偷经过实例归一化的结果：通过创建一个强的局部尖峰来支配统计数据，生成器可以像其他地方一样有效地缩放信号。我们的假设得到以下发现的支持：当从发生器中删除标准化步骤时，如下所述，液滴伪像会完全消失。</p> 
+<h4><a id="21__28"></a>2.1 重新审视生成器结构</h4> 
+<p>我们将首先修改StyleGAN生成器的一些细节，以更好地促进我们重新设计的归一化。就质量指标而言，这些变化本身对中性或小小的积极影响。</p> 
+<p>图2a显示了原始的StyleGAN合成网络g [24]，在图2b中，我们通过显示权重和偏差并将AdaIN操作分解为其两个组成部分：归一化和调制，将图扩展为完整细节。这使我们可以重新绘制概念上的灰色框，以便每个框都指示网络中激活一种样式的部分（即“样式块”）。有趣的是，原始的StyleGAN在样式块中施加了偏置和噪音，使它们的相对影响与当前样式的大小成反比。我们观察到，通过将这些操作移到样式块之外（它们对规范化数据进行操作），可以获得更可预测的结果。此外，我们注意到，在进行此更改之后，仅对标准偏差进行归一化和调制就足够了（即，不需要均值）。偏置，噪声和归一化对恒定输入的应用也可以安全地消除，而没有明显的缺点。此变体如图2c所示，并作为我们重新设计的归一化的起点。</p> 
+<h4><a id="22__33"></a>2.2 实例规范化的重新审视</h4> 
+<p>考虑到实例规范化似乎过于强大，我们如何在保留样式特定比例效果的同时放松它呢？我们排除了批量归一化[21]，因为它与高分辨率合成所需的小型迷你批处理不兼容。或者，我们可以简单地删除标准化。尽管实际上稍微改善了FID [27]，但这会使样式的效果累积而不是按比例缩放，从而实质上失去了StyleGAN提供的可控制性（请参见视频）。现在我们将提出一种替代方法，该方法在保留可控性的同时去除了伪像。主要思想是基于归一化特征图的预期统计量进行归一化，但没有明确的强制。<br> <img src="https://images2.imgbox.com/0e/3c/2tvLyeSc_o.png" alt="在这里插入图片描述"><br> <em>图片2 我们重新设计了StyleGAN合成网络的架构。 （a）原始StyleGAN，其中A表示从W学习到的仿射变换，产生样式，而B表示噪声广播操作。 （b）完整细节相同的图。在这里，我们将AdaIN分解为显式归一化后再进行调制，然后对每个特征图的均值和标准差进行操作。我们还对学习的权重（w），偏差（b）和常数输入（c）进行了注释，并重新绘制了灰色框，以便每个框都激活一种样式。激活功能（泄漏的ReLU）总是在添加偏置后立即应用。 （c）我们对原始架构进行了一些改动，这些改动在正文中是合理的。我们从一开始就删除了一些多余的操作，将b和B的相加移到样式的有效区域之外，并仅调整每个要素图的标准偏差。 （d）修改后的体系结构使我们能够用“解调”操作代替实例规范化，该操作适用于与每个卷积层相关的权重。</em></p> 
+<p>回想一下，图2c中的样式块由调制，卷积和规范化组成。让我们首先考虑调制和卷积的影响。调制会根据传入样式缩放卷积的每个输入特征图，也可以通过缩放卷积权重来实现：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+         
+         
+           w 
+          
+          
+          
+            i 
+           
+          
+            , 
+           
+          
+            j 
+           
+          
+            , 
+           
+          
+            k 
+           
+          
+         
+           ′ 
+          
+         
+        
+          = 
+         
+         
+         
+           s 
+          
+         
+           i 
+          
+         
+        
+          ⋅ 
+         
+         
+         
+           w 
+          
+          
+          
+            i 
+           
+          
+            , 
+           
+          
+            j 
+           
+          
+            , 
+           
+          
+            k 
+           
+          
+         
+         
+         
+        
+          ( 
+         
+        
+          1 
+         
+        
+          ) 
+         
+        
+       
+         w^{\prime}_{i,j,k}=s_i \cdot w_{i,j,k} \quad\quad (1) 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.185em; vertical-align: -0.383108em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.801892em;"><span class="" style="top: -2.453em; margin-left: -0.02691em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.383108em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.59445em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.311664em;"><span class="" style="top: -2.55em; margin-left: 0em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.03611em; vertical-align: -0.286108em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.336108em;"><span class="" style="top: -2.55em; margin-left: -0.02691em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.286108em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 1em;"></span><span class="mspace" style="margin-right: 1em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span></span></span></span></span></span> 其中w和分别是原始权重和调制权重，是与第i个输入特征图相对应的比例，而j和k分别枚举输出特征图和卷积的空间足迹。</p> 
+<p>现在，实例规范化的目的是从卷积输出特征图的统计信息中实质上消除s的影响。我们观察到可以更直接地实现这一目标。让我们假设输入激活是i.i.d.带有单位标准偏差的随机变量。经过调制和卷积后，输出激活的标准偏差为：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+         
+         
+           σ 
+          
+         
+           j 
+          
+         
+        
+          = 
+         
+         
+          
+           
+           
+             ∑ 
+            
+            
+            
+              i 
+             
+            
+              , 
+             
+            
+              k 
+             
+            
+           
+           
+            
+            
+              w 
+             
+             
+             
+               i 
+              
+             
+               , 
+              
+             
+               j 
+              
+             
+               , 
+              
+             
+               k 
+              
+             
+            
+              ′ 
+             
+            
+           
+             2 
+            
+           
+          
+         
+         
+         
+        
+          ( 
+         
+        
+          2 
+         
+        
+          ) 
+         
+        
+       
+         \sigma_j = \sqrt{\sum_{i,k} {w^{\prime}_{i,j,k}}^2} \quad\quad (2) 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.716668em; vertical-align: -0.286108em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.311664em;"><span class="" style="top: -2.55em; margin-left: -0.03588em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.286108em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 3.04em; vertical-align: -1.60023em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 1.43977em;"><span class="svg-align" style="top: -5em;"><span class="pstrut" style="height: 5em;"></span><span class="mord" style="padding-left: 1em;"><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 1.05001em;"><span class="" style="top: -1.84789em; margin-left: 0em;"><span class="pstrut" style="height: 3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.05em;"><span class="pstrut" style="height: 3.05em;"></span><span class=""><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 1.43822em;"><span class=""></span></span></span></span></span><span class="mspace" style="margin-right: 0.166667em;"></span><span class="mord"><span class="mord"><span class="mord"><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.733692em;"><span class="" style="top: -2.39869em; margin-left: -0.02691em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.0448em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.437416em;"><span class=""></span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.9377em;"><span class="" style="top: -3.18659em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span class="" style="top: -3.39977em;"><span class="pstrut" style="height: 5em;"></span><span class="hide-tail" style="min-width: 1.02em; height: 3.08em;"> 
+            <svg width="400em" height="3.08em" viewbox="0 0 400000 3240" preserveaspectratio="xMinYMin slice"> 
+             <path d="M473,2793c339.3,-1799.3,509.3,-2700,510,-2702
+c3.3,-7.3,9.3,-11,18,-11H400000v40H1017.7s-90.5,478,-276.2,1466c-185.7,988,
+-279.5,1483,-281.5,1485c-2,6,-10,9,-24,9c-8,0,-12,-0.7,-12,-2c0,-1.3,-5.3,-32,
+-16,-92c-50.7,-293.3,-119.7,-693.3,-207,-1200c0,-1.3,-5.3,8.7,-16,30c-10.7,
+21.3,-21.3,42.7,-32,64s-16,33,-16,33s-26,-26,-26,-26s76,-153,76,-153s77,-151,
+77,-151c0.7,0.7,35.7,202,105,604c67.3,400.7,102,602.7,104,606z
+M1001 80H400000v40H1017z"></path> 
+            </svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 1.60023em;"><span class=""></span></span></span></span></span><span class="mspace" style="margin-right: 1em;"></span><span class="mspace" style="margin-right: 1em;"></span><span class="mopen">(</span><span class="mord">2</span><span class="mclose">)</span></span></span></span></span></span>即，通过相应权重的<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          L 
+         
+        
+          2 
+         
+        
+       
+      
+        L_2 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.83333em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.301108em;"><span class="" style="top: -2.55em; margin-left: 0em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span></span></span></span></span>规范对输出进行缩放。随后的标准化旨在将输出恢复为单位标准偏差。基于等式2，如果我们通过<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          1 
+         
+         
+         
+           σ 
+          
+         
+           j 
+          
+         
+        
+       
+      
+        \frac{1}{\sigma_j} 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.38743em; vertical-align: -0.54232em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.845108em;"><span class="" style="top: -2.655em;"><span class="pstrut" style="height: 3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathdefault mtight" style="margin-right: 0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.328086em;"><span class="" style="top: -2.357em; margin-left: -0.03588em; margin-right: 0.0714286em;"><span class="pstrut" style="height: 2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.281886em;"><span class=""></span></span></span></span></span></span></span></span></span><span class="" style="top: -3.23em;"><span class="pstrut" style="height: 3em;"></span><span class="frac-line" style="border-bottom-width: 0.04em;"></span></span><span class="" style="top: -3.394em;"><span class="pstrut" style="height: 3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.54232em;"><span class=""></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span>缩放（“解调”）每个输出特征图j，就可以实现这一点。或者，我们可以再次将其烘焙到卷积权重中：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+         
+         
+           w 
+          
+          
+          
+            i 
+           
+          
+            , 
+           
+          
+            j 
+           
+          
+            , 
+           
+          
+            k 
+           
+          
+          
+          
+            ′ 
+           
+          
+            ′ 
+           
+          
+         
+        
+          = 
+         
+         
+         
+           w 
+          
+          
+          
+            i 
+           
+          
+            , 
+           
+          
+            j 
+           
+          
+            , 
+           
+          
+            k 
+           
+          
+         
+           ′ 
+          
+         
+        
+          / 
+         
+         
+          
+           
+           
+             ∑ 
+            
+            
+            
+              i 
+             
+            
+              , 
+             
+            
+              k 
+             
+            
+           
+           
+            
+            
+              w 
+             
+             
+             
+               i 
+              
+             
+               , 
+              
+             
+               j 
+              
+             
+               , 
+              
+             
+               k 
+              
+             
+            
+              ′ 
+             
+            
+           
+             2 
+            
+           
+          
+            + 
+           
+          
+            ϵ 
+           
+          
+         
+         
+         
+        
+          ( 
+         
+        
+          3 
+         
+        
+          ) 
+         
+        
+       
+         w^{\prime\prime}_{i,j,k}=w^{\prime}_{i,j,k} / \sqrt{\sum_{i,k}{w^{\prime}_{i,j,k}}^2+\epsilon} \quad \quad (3) 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.185em; vertical-align: -0.383108em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.801892em;"><span class="" style="top: -2.453em; margin-left: -0.02691em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.383108em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 3.04em; vertical-align: -1.60023em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.801892em;"><span class="" style="top: -2.453em; margin-left: -0.02691em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.383108em;"><span class=""></span></span></span></span></span></span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 1.43977em;"><span class="svg-align" style="top: -5em;"><span class="pstrut" style="height: 5em;"></span><span class="mord" style="padding-left: 1em;"><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 1.05001em;"><span class="" style="top: -1.84789em; margin-left: 0em;"><span class="pstrut" style="height: 3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.05em;"><span class="pstrut" style="height: 3.05em;"></span><span class=""><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 1.43822em;"><span class=""></span></span></span></span></span><span class="mspace" style="margin-right: 0.166667em;"></span><span class="mord"><span class="mord"><span class="mord"><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.733692em;"><span class="" style="top: -2.39869em; margin-left: -0.02691em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.05724em;">j</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03148em;">k</span></span></span></span><span class="" style="top: -3.0448em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.437416em;"><span class=""></span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.9377em;"><span class="" style="top: -3.18659em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mord mathdefault">ϵ</span></span></span><span class="" style="top: -3.39977em;"><span class="pstrut" style="height: 5em;"></span><span class="hide-tail" style="min-width: 1.02em; height: 3.08em;"> 
+            <svg width="400em" height="3.08em" viewbox="0 0 400000 3240" preserveaspectratio="xMinYMin slice"> 
+             <path d="M473,2793c339.3,-1799.3,509.3,-2700,510,-2702
+c3.3,-7.3,9.3,-11,18,-11H400000v40H1017.7s-90.5,478,-276.2,1466c-185.7,988,
+-279.5,1483,-281.5,1485c-2,6,-10,9,-24,9c-8,0,-12,-0.7,-12,-2c0,-1.3,-5.3,-32,
+-16,-92c-50.7,-293.3,-119.7,-693.3,-207,-1200c0,-1.3,-5.3,8.7,-16,30c-10.7,
+21.3,-21.3,42.7,-32,64s-16,33,-16,33s-26,-26,-26,-26s76,-153,76,-153s77,-151,
+77,-151c0.7,0.7,35.7,202,105,604c67.3,400.7,102,602.7,104,606z
+M1001 80H400000v40H1017z"></path> 
+            </svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 1.60023em;"><span class=""></span></span></span></span></span><span class="mspace" style="margin-right: 1em;"></span><span class="mspace" style="margin-right: 1em;"></span><span class="mopen">(</span><span class="mord">3</span><span class="mclose">)</span></span></span></span></span></span>ϵ是一个小常数，以避免数值问题。</p> 
+<p>现在，我们已经将整个样式块烘焙到单个卷积层，其权重使用公式（1）和公式（3）基于s进行调整（图2d）。与实例规范化相比，我们的解调技术较弱，因为它基于关于信号的统计假设，而不是特征图的实际内容。类似的统计分析已在现代网络初始化程序中广泛使用【13,18】，但我们不知道它先前已被用来替代依赖数据的规范化。我们的解调也与权重归一化【37】有关，权重归一化【37】执行与重新设定权重张量相同的计算。先前的工作已将权重归一化确定为在GAN训练中是有益的。</p> 
+<p>我们的新设计消除了特征伪像（图3），同时保持了完全的可控制性，如随附视频所示。FID基本上不受影响（表1，A，B行），但从精度到召回率有明显的转变。我们认为这通常是合乎需要的，因为可以通过截断将召回率转换为精度，但事实并非如此[27]。在实践中，可以使用分组卷积有效地实现我们的设计，如附录B中所述。为了避免在公式3中考虑激活函数，我们对激活函数进行了缩放，以使其保留预期的信号方差。<br> <img src="https://images2.imgbox.com/e5/98/WoJmRPUn_o.png" alt="在这里插入图片描述"><br> <em>图3.用解调代替规范化可从图像和激活中删除特征性伪像。</em><br> <img src="https://images2.imgbox.com/79/89/y72Pm73p_o.png" alt="在这里插入图片描述"><br> <em>表1.主要结果。对于每次训练，我们选择FID最低的训练快照。我们使用不同的随机种子计算了每个指标10次，并报告了它们的平均值。“路径长度”列对应于基于W [24]中的路径端点计算的PPL度量。对于LSUN数据集，我们报告的路径长度不包含最初为FFHQ建议的中心作物。FFHQ数据集包含70k图像，我们在训练过程中显示了25M的鉴别器图像。对于LSUN CAR，相应的数字是893k和57M。</em></p> 
+<h3><a id="3_53"></a>3.图像质量和发生器平滑度</h3> 
+<p>尽管GAN度量标准（例如FID或Precision and Recall（P＆R））成功地捕获了生成器的许多方面，但它们仍然在图像质量上仍然处于盲点。 例如，请参见图13和图14，它们对比了具有相同FID和P＆R分数但总体质量明显不同的生成器。【<em>我们认为，明显的不一致的关键在于要素空间的特定选择，而不是FID或P＆R的基础。 最近发现，使用ImageNet [35]训练的分类器倾向于将决策更多地基于纹理而不是形状[11]，而人类则强烈关注形状[28]。 这在我们的上下文中是有意义的，因为FID和P＆R分别使用了InceptionV3 [39]和VGG-16 [39]的高级功能，这些功能是以这种方式进行训练的，因此有望偏向于纹理检测。 这样，具有强猫纹理的图像可能看起来比人类观察者所同意的彼此更相似，从而部分损害了基于密度的度量（FID）和多方面的覆盖度量（P＆R）。</em>】</p> 
+<p>我们观察到了感知的图像质量和感知路径长度（PPL）之间的有趣关系[24]，该指标最初是通过测量平均LPIPS距离[49]来量化从潜在空间到输出图像的映射平滑度的指标 在潜在空间中的小扰动下生成图像。 再次参考图13和14，较小的PPL（平滑的发生器映射）似乎与较高的整体图像质量相关，而其他指标则看不到该变化。 图4通过对在LSUN CAT上训练的StyleGAN上W上各个点周围的潜在空间进行采样而计算出的每个图像PPL分数，更加仔细地检查了这种相关性：低PPL分数的确表明了高质量的图像，反之亦然。 图5a显示了每个图像PPL得分的相应直方图，并揭示了分布的长尾巴。 该模型的总体PPL只是每个图像PPL得分的预期值。</p> 
+<p><img src="https://images2.imgbox.com/be/50/srhHHFgJ_o.png" alt="在这里插入图片描述"><br> <em>图4.使用基线StyleGAN（表1中的配置A）感知路径长度和图像质量之间的联系。 （a）具有低PPL（<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          &lt; 
+         
+        
+          = 
+         
+        
+          1 
+         
+         
+         
+           0 
+          
+          
+          
+            t 
+           
+          
+            h 
+           
+          
+         
+        
+       
+         &lt;=10^{th} 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.5782em; vertical-align: -0.0391em;"></span><span class="mrel">&lt;</span></span><span class="base"><span class="strut" style="height: 0.36687em; vertical-align: 0em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.849108em; vertical-align: 0em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.849108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">t</span><span class="mord mathdefault mtight">h</span></span></span></span></span></span></span></span></span></span></span></span></span>百分位数）的随机示例。 （b）PPL高的示例（<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          &gt; 
+         
+        
+          = 
+         
+        
+          9 
+         
+         
+         
+           0 
+          
+          
+          
+            t 
+           
+          
+            h 
+           
+          
+         
+        
+       
+         &gt;=90^{th} 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.5782em; vertical-align: -0.0391em;"></span><span class="mrel">&gt;</span></span><span class="base"><span class="strut" style="height: 0.36687em; vertical-align: 0em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.849108em; vertical-align: 0em;"></span><span class="mord">9</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.849108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">t</span><span class="mord mathdefault mtight">h</span></span></span></span></span></span></span></span></span></span></span></span></span>个百分点）。PPL分数与图像的语义一致性之间存在明显的相关性。</em></p> 
+<p><img src="https://images2.imgbox.com/ba/66/juOffd0N_o.png" alt="在这里插入图片描述"><br> <em>图5.（a）使用基线StyleGAN生成的单个图像的PPL分数分布（表1中的配置A，FID = 8.53，PPL = 924）。对应于图4的百分比范围以橙色突出显示。 （b）我们的方法（配置F）显着改善了PPL分布（显示具有相同FID = 8.53，PPL = 387的快照）。</em></p> 
+<p>为何PPL值低与图像质量相关联并不太明显。我们假设，在训练过程中，由于鉴别器会对残破的图像进行惩罚，因此生成器改进的最直接方法是有效地拉伸产生良好图像的潜在空间区域。这将导致低质量的图像被压缩到快速变化的较小的潜在空间区域中。虽然这可以在短期内提高平均输出质量，但累积的失真会损害训练动态，从而影响最终的图像质量。</p> 
+<p>这种经验相关性表明，在训练过程中通过鼓励低PPL来支持平滑的生成器映射可能会改善图像质量，我们在以下情况中会证明这种情况。由于所得的正则化项计算起来有些昂贵，因此我们首先描述适用于所有正则化技术的一般优化。</p> 
+<h4><a id="31__68"></a>3.1 延迟正则化</h4> 
+<p>通常，主要损失函数（例如，逻辑损失[15]）和正则化项（例如，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          R 
+         
+        
+          1 
+         
+        
+       
+      
+        R_1 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.83333em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.301108em;"><span class="" style="top: -2.55em; margin-left: -0.00773em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span></span></span></span></span> [30]）被写为单个表达式，因此被同时优化。我们观察到，正规化项的计算频率通常比主要损失函数低得多，从而大大降低了它们的计算成本和整体内存使用量。表1中的C行显示，每16个迷你批仅执行一次<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          R 
+         
+        
+          1 
+         
+        
+       
+      
+        R_1 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.83333em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.301108em;"><span class="" style="top: -2.55em; margin-left: -0.00773em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span></span></span></span></span>正则化不会造成任何损害，并且我们对新的正则化器也采用了相同的策略。附录B给出了实现细节。</p> 
+<h4><a id="32__71"></a>3.2 路径长度正则化</h4> 
+<p>生成器中的路径失真过大显然是不良的局部条件：W中的任何小区域在被g映射时都会被任意挤压和拉伸。与早期工作[33]一致，如果在潜在空间中的每个点处，小的位移都在图像空间中产生相同大小的变化，而与摄动方向无关，则我们认为从潜在空间到图像空间的生成器映射条件良好。</p> 
+<p>在单个<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         w 
+        
+       
+         ∈ 
+        
+       
+         W 
+        
+       
+      
+        w\in W 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.5782em; vertical-align: -0.0391em;"></span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.68333em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.13889em;">W</span></span></span></span></span> 处，生成器映射g(w) : <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         W 
+        
+       
+         → 
+        
+       
+         w 
+        
+       
+      
+        W\to w 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.68333em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.13889em;">W</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.43056em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span></span></span></span></span> 的局部度量比例缩放性由雅克比矩阵 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          J 
+         
+        
+          w 
+         
+        
+       
+         = 
+        
+       
+         ∂ 
+        
+       
+         g 
+        
+       
+         ( 
+        
+       
+         w 
+        
+       
+         ) 
+        
+       
+         / 
+        
+       
+         ∂ 
+        
+       
+         w 
+        
+       
+      
+        J_w=\partial g(w)/ \partial w 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.83333em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.151392em;"><span class="" style="top: -2.55em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1em; vertical-align: -0.25em;"></span><span class="mord" style="margin-right: 0.05556em;">∂</span><span class="mord mathdefault" style="margin-right: 0.03588em;">g</span><span class="mopen">(</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mclose">)</span><span class="mord">/</span><span class="mord" style="margin-right: 0.05556em;">∂</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span></span></span></span></span> 捕获，处于保持向量预期长度（无论方向如何）的动机，我们将正则化为：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+         
+         
+           E 
+          
+          
+          
+            w 
+           
+          
+            , 
+           
+          
+            y 
+           
+          
+            ∼ 
+           
+          
+            N 
+           
+          
+            ( 
+           
+          
+            0 
+           
+          
+            ， 
+           
+          
+            I 
+           
+          
+            ) 
+           
+          
+         
+        
+          ( 
+         
+         
+          
+          
+            ∥ 
+           
+           
+            
+             
+              
+               
+                
+                
+                  J 
+                 
+                
+                  w 
+                 
+                
+                  T 
+                 
+                
+               
+                 y 
+                
+               
+              
+             
+            
+           
+          
+            ∥ 
+           
+          
+         
+           2 
+          
+         
+        
+          − 
+         
+        
+          a 
+         
+         
+         
+           ) 
+          
+         
+           2 
+          
+         
+         
+         
+        
+          ( 
+         
+        
+          4 
+         
+        
+          ) 
+         
+        
+       
+         E_{w,y \sim N(0，I)}(\begin{Vmatrix}J_w^Ty\end{Vmatrix}_2-a)^2 \quad\quad (4) 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.26236em; vertical-align: -0.400366em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.05764em;">E</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.3448em;"><span class="" style="top: -2.5198em; margin-left: -0.05764em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight" style="margin-right: 0.02691em;">w</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight" style="margin-right: 0.03588em;">y</span><span class="mrel mtight">∼</span><span class="mord mathdefault mtight" style="margin-right: 0.10903em;">N</span><span class="mopen mtight">(</span><span class="mord mtight">0</span><span class="mord cjk_fallback mtight">，</span><span class="mord mathdefault mtight" style="margin-right: 0.07847em;">I</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.3552em;"><span class=""></span></span></span></span></span></span><span class="mopen">(</span><span class="minner"><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.86199em;"><span class="" style="top: -2.25599em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span><span class="" style="top: -2.86199em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.35001em;"><span class=""></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-c"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.850665em;"><span class="" style="top: -3.00933em;"><span class="pstrut" style="height: 3em;"></span><span class="mord"><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.841331em;"><span class="" style="top: -2.453em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.02691em;">w</span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.247em;"><span class=""></span></span></span></span></span></span><span class="mord mathdefault" style="margin-right: 0.03588em;">y</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.350666em;"><span class=""></span></span></span></span></span></span></span><span class="mclose"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.86199em;"><span class="" style="top: -2.25599em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span><span class="" style="top: -2.86199em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.35001em;"><span class=""></span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.0507425em;"><span class="" style="top: -2.29963em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.400366em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.11411em; vertical-align: -0.25em;"></span><span class="mord mathdefault">a</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.864108em;"><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right: 1em;"></span><span class="mspace" style="margin-right: 1em;"></span><span class="mopen">(</span><span class="mord">4</span><span class="mclose">)</span></span></span></span></span></span>其中y 是具有正太分布像素强度的随机图像，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         w 
+        
+       
+         ∼ 
+        
+       
+         f 
+        
+       
+         ( 
+        
+       
+         z 
+        
+       
+         ) 
+        
+       
+      
+        w \sim f(z) 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.43056em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1em; vertical-align: -0.25em;"></span><span class="mord mathdefault" style="margin-right: 0.10764em;">f</span><span class="mopen">(</span><span class="mord mathdefault" style="margin-right: 0.04398em;">z</span><span class="mclose">)</span></span></span></span></span> ，其中z是正太分布。我们在附录C 的显示，在高维上，当 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          J 
+         
+        
+          w 
+         
+        
+       
+      
+        J_w 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.83333em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.151392em;"><span class="" style="top: -2.55em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span></span></span></span></span> 在任何 w 处都是正交的（最大到全局范围）时，此先验被最小化。正交矩阵会保留长度，并且不会沿着任何的维度压缩。</p> 
+<p><img src="https://images2.imgbox.com/2a/73/aX0GJS3g_o.png" alt="在这里插入图片描述"><br> <em>图6.渐进式增长导致“阶段”伪像。 在此示例中，牙齿不跟随姿势，而是与摄像机保持对齐，如蓝线所示</em></p> 
+<p>为了避免对雅克比矩阵进行显示计算，我们使用身份 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          J 
+         
+        
+          w 
+         
+        
+          T 
+         
+        
+       
+         y 
+        
+       
+         = 
+        
+        
+        
+          ∇ 
+         
+        
+          w 
+         
+        
+       
+         ( 
+        
+       
+         g 
+        
+       
+         ( 
+        
+       
+         w 
+        
+       
+         ) 
+        
+       
+         ⋅ 
+        
+       
+         y 
+        
+       
+         ) 
+        
+       
+      
+        J_w^Ty=\nabla_w(g(w)\cdot y) 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.08833em; vertical-align: -0.247em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.841331em;"><span class="" style="top: -2.453em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.02691em;">w</span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.247em;"><span class=""></span></span></span></span></span></span><span class="mord mathdefault" style="margin-right: 0.03588em;">y</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1em; vertical-align: -0.25em;"></span><span class="mord"><span class="mord">∇</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.151392em;"><span class="" style="top: -2.55em; margin-left: 0em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathdefault" style="margin-right: 0.03588em;">g</span><span class="mopen">(</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mclose">)</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1em; vertical-align: -0.25em;"></span><span class="mord mathdefault" style="margin-right: 0.03588em;">y</span><span class="mclose">)</span></span></span></span></span>，该身份可以使用标准反向传播【6】有效的计算出来，在优化过程中，将常数 a 动态设置为长度 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         ∥ 
+        
+        
+         
+          
+           
+            
+             
+             
+               J 
+              
+             
+               W 
+              
+             
+               T 
+              
+             
+            
+              ⋅ 
+             
+            
+              y 
+             
+            
+           
+          
+         
+        
+       
+         ∥ 
+        
+       
+      
+        \begin{Vmatrix}J_W^T \cdot y\end{Vmatrix} 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.21266em; vertical-align: -0.350666em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.86199em;"><span class="" style="top: -2.25599em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span><span class="" style="top: -2.86199em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.35001em;"><span class=""></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-c"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.850665em;"><span class="" style="top: -3.00933em;"><span class="pstrut" style="height: 3em;"></span><span class="mord"><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.841331em;"><span class="" style="top: -2.42467em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">W</span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.275331em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mord mathdefault" style="margin-right: 0.03588em;">y</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.350666em;"><span class=""></span></span></span></span></span></span></span><span class="mclose"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.86199em;"><span class="" style="top: -2.25599em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span><span class="" style="top: -2.86199em;"><span class="pstrut" style="height: 2.606em;"></span><span class="delimsizinginner delim-size1"><span class="">∥</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.35001em;"><span class=""></span></span></span></span></span></span></span></span></span></span></span> 的长期指数移动平均值，从而使优化本身可以找到合适的全局尺度。</p> 
+<p>我们的正则器与Odena等人提出的Jacobian夹紧正则器密切相关。 [33]。 实际的差异包括我们通过分析来计算乘积 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          J 
+         
+        
+          W 
+         
+        
+          T 
+         
+        
+       
+         ⋅ 
+        
+       
+         y 
+        
+       
+      
+        J_W^T\cdot y 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.11666em; vertical-align: -0.275331em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.841331em;"><span class="" style="top: -2.42467em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">W</span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.275331em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 0.625em; vertical-align: -0.19444em;"></span><span class="mord mathdefault" style="margin-right: 0.03588em;">y</span></span></span></span></span>，而它们使用有限的差异用<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         δ 
+        
+       
+         ∼ 
+        
+       
+         N 
+        
+       
+         ( 
+        
+       
+         0 
+        
+       
+         , 
+        
+       
+         I 
+        
+       
+         ) 
+        
+       
+      
+        \delta \sim N(0,I) 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.69444em; vertical-align: 0em;"></span><span class="mord mathdefault" style="margin-right: 0.03785em;">δ</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1em; vertical-align: -0.25em;"></span><span class="mord mathdefault" style="margin-right: 0.10903em;">N</span><span class="mopen">(</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right: 0.166667em;"></span><span class="mord mathdefault" style="margin-right: 0.07847em;">I</span><span class="mclose">)</span></span></span></span></span> 估计 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          J 
+         
+        
+          W 
+         
+        
+          T 
+         
+        
+       
+         ⋅ 
+        
+       
+         y 
+        
+       
+      
+        J_W^T\cdot y 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.11666em; vertical-align: -0.275331em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.841331em;"><span class="" style="top: -2.42467em; margin-left: -0.09618em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">W</span></span></span><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right: 0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.275331em;"><span class=""></span></span></span></span></span></span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 0.625em; vertical-align: -0.19444em;"></span><span class="mord mathdefault" style="margin-right: 0.03588em;">y</span></span></span></span></span>。 应当指出，发生器[45]的频谱归一化[31]仅约束最大奇异值，对其他奇异值没有约束，因此不一定导致更好的调节。</p> 
+<p>在实践中，我们注意到路径长度正则化导致更可靠和始终如一的行为模型，从而使架构探索更加容易。图5b显示，路径长度正则化明显改善了每个图像PPL分数的分布。表1的D行表明，正则化可以按预期方式降低PPL，但是LSUN CAR和结构比FFHQ少的其他数据集中的FID和PPL之间存在折衷。此外，我们观察到，更平滑的生成器更易于反转（第5节）。</p> 
+<h3><a id="4_86"></a>4.重新审视渐进性增长</h3> 
+<p>渐进式生长[23]在稳定高分辨率图像合成方面非常成功，但是会导致其自身的特征失真。关键问题在于，逐渐增长的生成器似乎对细节的位置偏好很高。随附的视频显示，当牙齿或眼睛等特征在图像上平滑移动时，它们可能会停留在原位，然后跳到下一个首选位置。图6显示了一个相关的伪像。我们认为问题在于，在逐步增长的过程中，每个分辨率都会瞬间用作输出分辨率，迫使其生成最大频率细节，然后导致受过训练的网络在中间层具有过高的频率，从而损害了位移不变性[48]。附录A显示了一个示例。这些问题促使我们寻找一种替代配方，该配方将保留渐进式增长的优点而没有缺点。</p> 
+<h5><a id="41__90"></a>4.1 替代网络架构</h5> 
+<p>虽然StyleGAN在生成器（合成网络）和鉴别器中使用简单的前馈设计，但仍有大量工作致力于研究更好的网络体系结构。特别地，在生成方法的背景下，跳跃连接[34、22]，残差网络[17、16、31]和分层方法[7、46、47]也被证明是非常成功的。因此，我们决定重新评估StyleGAN的网络设计，并寻找一种能够生成高质量图像而不会渐进增长的体系结构。</p> 
+<p>图7a显示了MSG-GAN [22]，它使用多个跳过连接来连接发生器和鉴别器的匹配分辨率。修改了MSG-GAN生成器以输出mipmap [41]而不是图像，并且还为每个真实图像计算了类似的表示形式。在图7b中，我们通过对与不同分辨率对应的RGB输出的贡献进行上采样和求和来简化此设计。在鉴别器中，我们类似地将降采样后的图像提供给鉴别器的每个分辨率块。我们在所有上采样和下采样操作中都使用双线性滤波。在图7c中，我们进一步修改了设计以使用残差连接【<mark><em>（在残差网络架构中，两条路径的相加会导致信号方差加倍，我们可以通过乘以1 /√2来抵消。 这对于我们的网络至关重要，而在分类Resnet [17]中，问题通常被批处理归一化隐藏）</em></mark>】。此设计类似于LAPGAN [7]，但没有Denton等人使用的每分辨率鉴别器。<br> <img src="https://images2.imgbox.com/74/19/KBaKXhqE_o.png" alt="在这里插入图片描述"><br> <em>图7：三种发生器（虚线以上）和鉴别器体系结构。 上和下分别表示双线性上和下采样。 在残差网络中，这些还包括1×1卷积以调整特征图的数量。 tRGB和fRGB在RGB和高维每像素数据之间转换。 配置E和F中使用的架构以绿色突出显示</em></p> 
+<p>表2比较了三种生成器架构和三种鉴别器架构：StyleGAN中使用的原始前馈网络，跳过连接和残差网络，所有这些网络都经过训练而没有渐进增长。为9种组合中的每种组合提供了FID和PPL。我们可以看到两个主要趋势：在所有配置中，生成器中的跳过连接都可以极大地提高PPL，而残差的判别器网络显然对FID有利。后者也许不足为奇，因为判别器的结构类似于分类器，在分类器中已知残差的架构会有所帮助。但是，残差的体系结构对生成器有害。当两个网络都是残差的时，唯一的例外是LSUN CAR中的FID。<br> <img src="https://images2.imgbox.com/75/96/Aq9FESop_o.png" alt="在这里插入图片描述"><br> <em>表2.无渐进增长的生成器和鉴别器架构的比较。 具有输出跳过的生成器和残差鉴别符的组合对应于主结果表中的配置E。</em></p> 
+<p>在本文的其余部分，我们使用跳过生成器和残差鉴别器，而不使用渐进式增长。这对应于表1中的配置E，从表中可以看出，切换到此设置可以显着改善FID和PPL。</p> 
+<h4><a id="42__103"></a>4.2 分辨率用法</h4> 
+<p>我们要保留的渐进式增长的关键方面是，生成器将首先关注低分辨率功能，然后逐渐将注意力转移到更精细的细节上。图7中的体系结构使生成器可以以显着方式首先输出不受高分辨率层影响的低分辨率图像，然后随着训练的进行将焦点转移到高分辨率层。由于不以任何方式强制执行此操作，因此生成器仅在有益时才会执行此操作。为了分析实践中的行为，我们需要量化生成器在训练过程中对特定分辨率的依赖程度。</p> 
+<p>由于跳过生成器（图7b）通过显式求和多个分辨率的RGB值来形成图像，因此我们可以通过测量相应层对最终图像的贡献来估计相应层的相对重要性。在图8a中，我们绘制了每个tRGB层产生的像素值的标准偏差与训练时间的关系。我们计算w的1024个随机样本的标准差，并对值进行归一化，以使它们的总和为100％。</p> 
+<p><img src="https://images2.imgbox.com/2c/cf/DzMN6MCO_o.png" alt="在这里插入图片描述"><br> <em>图8：每种分辨率对发生器输出的贡献取决于训练时间。 纵轴显示了不同分辨率的相对标准偏差的细目分类，而横轴对应于训练进度，以向鉴别器显示的数百万个训练图像进行测量。 我们可以看到，从一开始，网络就专注于低分辨率图像，并随着训练的进行逐渐将其注意力转移到较大分辨率上。 在（a）中，生成器基本上输出 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          51 
+         
+         
+         
+           2 
+          
+         
+           2 
+          
+         
+        
+       
+         512^2 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">5</span><span class="mord">1</span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 图像，并针对 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          102 
+         
+         
+         
+           4 
+          
+         
+           2 
+          
+         
+        
+       
+         1024^2 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">1</span><span class="mord">0</span><span class="mord">2</span><span class="mord"><span class="mord">4</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 进行一些锐化；而在（b）中，较大的网络更多地关注高分辨率细节</em><br> <img src="https://images2.imgbox.com/3b/0e/EW9wFnu7_o.png" alt="在这里插入图片描述"><br> <em>表3：使用FID和PPL测量的LSUN数据集的改进。 我们对CAR进行了5700万幅图像的培训，对CAT进行了88M的培训，对CHURCH进行了48M的培训，对HORSE进行了100M的训练。</em></p> 
+<p>在训练开始时，我们可以看到新的跳过生成器的行为类似于渐进式增长-现在无需更改网络拓扑即可实现。因此，可以预期，最高分辨率将在训练结束时占主导地位。但是，该图表明实际上这没有发生，这表明生成器可能无法“充分利用”目标分辨率。为了验证这一点，我们手动检查了生成的图像，并注意到它们通常缺少训练数据中存在的某些像素级别的细节-图像可以描述为 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         51 
+        
+        
+        
+          2 
+         
+        
+          2 
+         
+        
+       
+      
+        512^2 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">5</span><span class="mord">1</span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 图像的锐化版本，而不是真实的 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         102 
+        
+        
+        
+          4 
+         
+        
+          2 
+         
+        
+       
+      
+        1024^2 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">1</span><span class="mord">0</span><span class="mord">2</span><span class="mord"><span class="mord">4</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 图像。</p> 
+<p>这使我们假设网络中存在容量问题，我们通过将两个网络的最高分辨率层中的特征图数量加倍来进行测试【<mark>我们在第<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          6 
+         
+         
+         
+           4 
+          
+         
+           2 
+          
+         
+        
+       
+         64^2 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">6</span><span class="mord"><span class="mord">4</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>–<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          102 
+         
+         
+         
+           4 
+          
+         
+           2 
+          
+         
+        
+       
+         1024^2 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">1</span><span class="mord">0</span><span class="mord">2</span><span class="mord"><span class="mord">4</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>号决议中将特征图的数量增加了一倍，同时保持网络的其他部分不变。 这样，生成器中可训练参数的总数增加了22％（25M→30M），而鉴别器中可训练参数的总数增加了21％（24M→29M）。</mark>】。 这使行为更符合预期：图8b显示了最高分辨率图层的贡献显着增加，表1 F行显示FID和Recall显着改善</p> 
+<p>表3在几个LSUN类别中比较了StyleGAN和我们改进的变体，再次显示了FID的明显改进和PPL的显着进步。 尺寸的进一步增加可能会带来更多好处。</p> 
+<h3><a id="5__119"></a>5. 将图像投影到潜在空间</h3> 
+<p>合成网络g的反转是一个有趣的问题，它具有许多应用。要在潜在特征空间中处理给定图像，首先需要为其找到匹配的潜在向量w。另外，随着GAN图像质量的提高，能够判断一个潜在的合成图像是不是网络生成的变得十分重要。</p> 
+<p>先前的研究[1，10]建议，比起找到一个共同的潜矢量，为生成器的每一层选择一个单独的 w ，可以改善结果。在早期的编码器实现中使用了相同的方法[32]。以这种方式扩展潜伏空间可以找到与给定图像更接近的匹配，同时还可以投射不应该具有潜伏表现的任意图像。着重于对生成图像的取证检测，我们专注于在原始未扩展的潜在空间中查找潜在代码，因为这些代码对应于生成器可能生成的图像。</p> 
+<p>我们的投影方法在两个方面与以前的方法不同。首先，我们在优化过程中向潜在代码添加了降低的噪声，以便更全面地探索潜在空间。其次，我们还优化了StyleGAN发生器的随机噪声输入，对其进行正则化以确保它们最终不会携带相干信号。该正则化基于强制噪声图的自相关系数在多个尺度上匹配单位高斯噪声的自相关系数。 我们的投影方法的详细信息可以在附录D中找到。</p> 
+<h4><a id="51___125"></a>5.1 检测生成的图像</h4> 
+<p>可以训练分类器以相当高的置信度检测GAN生成的图像[29、44、40、50]。 然而，鉴于进展的迅速，这可能不是持久的情况。 基于投影的方法的独特之处在于，它们可以以匹配的潜矢量的形式提供证据，来说明图像是由特定网络合成的[2]。 随着合成图像质量的提高，它们的有效性也没有理由降低，这与基于分类器的方法（将来可能可以使用的线索较少）不同<br> <img src="https://images2.imgbox.com/22/9e/VpfLP77F_o.png" alt="在这里插入图片描述"><br> <em>图9.原始图像和投影图像之间的LPIPS距离。 生成的图像的距离直方图以蓝色显示，真实的图像以橙色显示。 尽管改进后的生成器具有更高的图像质量，但将生成的图像投影到其潜在空间W中要容易得多。在所有情况下都使用相同的投影方法。</em></p> 
+<p>事实证明，即使生成的图像质量更高，我们对StyleGAN的改进也使得使用基于投影的方法更容易检测生成的图像。我们通过计算原始图像和重新合成图像之间的LPIPS [49]距离，即： <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         D 
+        
+       
+         L 
+        
+       
+         P 
+        
+       
+         I 
+        
+       
+         P 
+        
+       
+         S 
+        
+       
+         [ 
+        
+       
+         x 
+        
+       
+         ， 
+        
+       
+         g 
+        
+       
+         （ 
+        
+        
+         
+         
+           g 
+          
+         
+           ‾ 
+          
+         
+         
+         
+           − 
+          
+         
+           1 
+          
+         
+        
+       
+         （ 
+        
+       
+         x 
+        
+       
+         ） 
+        
+       
+         ） 
+        
+       
+         ] 
+        
+       
+      
+        DLPIPS [x，g（ \overline{g}^{-1}（x））] 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.08457em; vertical-align: -0.25em;"></span><span class="mord mathdefault" style="margin-right: 0.02778em;">D</span><span class="mord mathdefault">L</span><span class="mord mathdefault" style="margin-right: 0.13889em;">P</span><span class="mord mathdefault" style="margin-right: 0.07847em;">I</span><span class="mord mathdefault" style="margin-right: 0.13889em;">P</span><span class="mord mathdefault" style="margin-right: 0.05764em;">S</span><span class="mopen">[</span><span class="mord mathdefault">x</span><span class="mord cjk_fallback">，</span><span class="mord mathdefault" style="margin-right: 0.03588em;">g</span><span class="mord cjk_fallback">（</span><span class="mord"><span class="mord overline"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.63056em;"><span class="" style="top: -3em;"><span class="pstrut" style="height: 3em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.03588em;">g</span></span></span><span class="" style="top: -3.55056em;"><span class="pstrut" style="height: 3em;"></span><span class="overline-line" style="border-bottom-width: 0.04em;"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.19444em;"><span class=""></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.834568em;"><span class="" style="top: -3.08346em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mord cjk_fallback">（</span><span class="mord mathdefault">x</span><span class="mord cjk_fallback">）</span><span class="mord cjk_fallback">）</span><span class="mclose">]</span></span></span></span></span> 来衡量投影成功的程度，其中x是被分析的图像，而g〜- 1表示近似投影操作。图9显示了使用原始的StyleGAN和我们最好的架构的 LSUN CAR和FFHQ数据集的这些距离的直方图，图10显示了示例投影。如后者所示，使用我们改进的架构生成的图像可以很好地投影到生成器输入中，从而可以明确地将它们归因于生成网络。使用原始StyleGAN，即使从技术上来说应该可以找到匹配的潜矢量，但实际上，潜空间似乎太复杂了，无法可靠地成功实现。我们具有更平滑的潜在空间W的改进模型受此问题的影响要小得多。<br> <img src="https://images2.imgbox.com/52/fb/uxnpI5zJ_o.png" alt="在这里插入图片描述"><br> <em>图10.示例图像及其投影和重新合成的对应图像。 对于每种配置，第一行显示目标图像，第二行显示相应的投影潜在矢量和噪声输入的合成。 顶部：使用基线StyleGAN，投影通常会找到与生成的图像相当接近的匹配，但尤其是背景与原始图像有所不同。 中：使用我们最好的架构生成的图像可以几乎完美地投影回生成器输入中，从而可以明确地归因于生成模型。 下图：投影的真实图像（来自训练集）显示出与原始图像明显的差异，正如预期的那样。 所有测试均使用相同的投影方法和超参数完成。</em></p> 
+<h3><a id="6_134"></a>6.结论和未来的工作</h3> 
+<p>我们已经在StyleGAN中确定并修复了多个图像质量问题，从而进一步改善了质量，并在多个数据集中大大提高了现有技术水平。在某些情况下，如所附视频所示，在运动中可以更清楚地看到这些改进。附录A包含使用我们的方法可获得的结果的更多示例。尽管质量有所提高，但与原始StyleGAN相比，使用基于投影的方法检测由我们的方法生成的图像更容易。</p> 
+<p>训练表现也有所提高。在<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         102 
+        
+        
+        
+          4 
+         
+        
+          2 
+         
+        
+       
+      
+        1024^2 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.814108em; vertical-align: 0em;"></span><span class="mord">1</span><span class="mord">0</span><span class="mord">2</span><span class="mord"><span class="mord">4</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.814108em;"><span class="" style="top: -3.063em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span>分辨率下，原始StyleGAN（表1中的配置A）在配备8个Tesla V100 GPU的NVIDIA DGX-1上以每秒37张图像的速度训练，而我们的配置E在61 img / s的速度下训练了40％。由于权重解调，惰性正则化和代码优化，大多数加速来自简化的数据流。配置F（大型网络）的训练速度为31 img / s，因此，其训练成本仅比原始StyleGAN高。使用配置F，FFHQ的总训练时间为9天，LSUN CAR的总训练时间为13天。</p> 
+<p>作为未来的工作，研究进一步改善路径长度正则化可能是富有成果的，例如，通过用数据驱动的特征空间度量代替像素空间 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+        
+        
+          L 
+         
+        
+          2 
+         
+        
+       
+      
+        L_2 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.83333em; vertical-align: -0.15em;"></span><span class="mord"><span class="mord mathdefault">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.301108em;"><span class="" style="top: -2.55em; margin-left: 0em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.15em;"><span class=""></span></span></span></span></span></span></span></span></span></span> 距离。</p> 
+<h3><a id="_142"></a>参考文献：</h3> 
+<p>略～</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/425be4f47d965e3f4f5cc2cab3716072/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">将excel表的数据导入</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/11b5bc932845aa941321cc4967b1c5e5/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">配置被覆盖更新后，/etc/init.d/* 服务启动失败</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

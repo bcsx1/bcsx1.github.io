@@ -1,0 +1,1506 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>mysqldump原理分析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="mysqldump原理分析" />
+<meta property="og:description" content="今天学习了下mysqldump原理，具体的结论如下： 1、mysqldump在不加任何参数进行备份的时候： 如果单独备份一个表会对备份表上读锁，直到备份结束unlock，如果备份的整个库，那么会同时lock 这个库下的所有的表，最后在unlock tables，如果备份的是整个实例(加参数--all-databases 或者-A会备份除了performance_schema和performance_schema这俩库之外的所有的库），那么是一个库一库的去备份，也就是说先备份库A，把库A下的所有的表上读锁，备份完库A，unlock tables,然后再备份库B,把库B下的所有的表上读锁，备份完库B，unlock tables，那么所以在使用mysqldump备份某个表或者某个库的时候，没有加任何的参数，会上读锁，并且备份出来的数据是一致性的，但是如果备份的是整个实例，那么库和库之间的数据的一致性就不能保证了； 2、参数--single-transaction ； 针对innodb的引擎，可以加上参数 --single-transaction来保证备份的一致性，并且是借助的修改隔离级别为REPEATABLE READ&#43;START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */开启快照读事务共同来保证一致性的，所以不需要加read lock;注意该参数仅仅对innodb引擎起作用，对于myisam引擎，虽然添加了--single-transaction参数的myisam表备份处理过程和innodb的过程完全一致，但是因为myisam不支持事务，在整个dump过程中无法保证可重复读，无法得到一致性的备份。 3、参数--master-data； --master-data指定为2指的是会在备份文件中生成CHANGE MASTER的注释。如下所示： -- CHANGE MASTER TO MASTER_LOG_FILE=&#39;mysql2-bin.000049&#39;, MASTER_LOG_POS=587; 如果该值设置为1，则生成的是CHANGE MASTER的命令，而不是注释。如下所示： CHANGE MASTER TO MASTER_LOG_FILE=&#39;mysql2-bin.000049&#39;, MASTER_LOG_POS=587; 当加上这个参数的时候，为了得到准确的binlog的位置状态信息，会通过FLUSH TABLES WITH READLOCK来保证，备份开始到结束，是不允许别的事务修改的，同时也就保证了一致性； 4、参数--single-transaction和参数参数--master-data一起使用； 也会执行 FLUSH TABLES WITH READ LOCK，但是在还没有开始备份时，也就是在 SHOW MASTER STATUS显示了主库的binlog状态之后就unlock tables了，也会 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ，之后和单独加--single-transaction过程是一样的。 5、参数--lock-all-tables，通过给整个实例所有表都加read lock来保证一致性备份； 加上--lock-all-tables和不加上--lock-all-tables得区别就在于前者是FLUSH TABLES WITH READ LOCK对整个实例所有的表都上读锁，后者只针对要备份的表加读锁（LOCK TABLES `liu` READ）；并且前者并没有显现的unlock tables，因为整个过程中数据库是不能写的，并且FLUSH TABLES WITH READ LOCK这个命令一旦这个会话结束，相应的读锁也就不存在了，而后者只是锁了一个表，显现的unlock解锁了，其实后者也是会话结束就释放对表的读锁了，也可以不加unlock， 6、START TRANSACTION和START TRANSACTION WITH CONSISTENT SNAPSHOT并不一样; START TRANSACTION WITH CONSISTENT SNAPSHOT相当于在执行完START TRANSACTION后对每个Innodb表执行了SELECT操作，在隔离级别为REPEATABLE READ时，并不是当start transaction 就能保证之后的查询内容是一样，而是当你发出第一个query的时候，才会开启快照读取，之后再有相同的sql查出来的结果是一样的。 在mysqldump加上参数--single-transaction的时候使用的是START TRANSACTION WITH CONSISTENT SNAPSHOT，而不是START TRANSACTION来保证一致性的，是因为每个表的备份时间并不相同，如果使用START TRANSACTION，在对第一张表进行备份的期间，别的事务对第二个表进行了insert数据A，那么在开始对第二张表备份时,是可以看到数据A的，那么第一个表和第二个表就不是一致性的了，所以START TRANSACTION无法实现当一个库下有多个表的时候的一致性。." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/faaac4c58dfce8c7c7409ca193492fe5/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2018-04-29T23:24:19+08:00" />
+<meta property="article:modified_time" content="2018-04-29T23:24:19+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">mysqldump原理分析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div class="preview-main"> 
+ <div> 
+  <strong><span style="font-size:14px;">今天学习了下mysqldump原理，具体的结论如下：</span></strong> 
+ </div> 
+ <div> 
+  <strong>1、mysqldump在不加任何参数进行备份的时候：</strong> 
+ </div> 
+ <div>
+   如果单独备份一个表会对备份表上读锁，直到备份结束unlock，如果备份的整个库，那么会同时lock 这个库下的所有的表，最后在unlock tables，如果备份的是整个实例(加参数--all-databases 或者-A会备份除了performance_schema和performance_schema这俩库之外的所有的库），那么是一个库一库的去备份，也就是说先备份库A，把库A下的所有的表上读锁，备份完库A，unlock tables,然后再备份库B,把库B下的所有的表上读锁，备份完库B，unlock tables，那么所以在使用mysqldump备份某个表或者某个库的时候，没有加任何的参数，会上读锁，并且备份出来的数据是一致性的，但是如果备份的是整个实例，那么库和库之间的数据的一致性就不能保证了； 
+ </div> 
+ <div> 
+  <strong>2、参数--single-transaction ；</strong> 
+ </div> 
+ <div>
+   针对innodb的引擎，可以加上参数 --single-transaction来保证备份的一致性，并且是借助的修改隔离级别为REPEATABLE READ+START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */开启快照读事务共同来保证一致性的，所以不需要加read lock;注意该参数仅仅对innodb引擎起作用，对于myisam引擎，虽然添加了--single-transaction参数的myisam表备份处理过程和innodb的过程完全一致，但是因为myisam不支持事务，在整个dump过程中无法保证可重复读，无法得到一致性的备份。 
+ </div> 
+ <div> 
+  <strong>3、参数--master-data；</strong> 
+ </div> 
+ <div>
+   --master-data指定为2指的是会在备份文件中生成CHANGE MASTER的注释。如下所示： 
+ </div> 
+ <div>
+   -- CHANGE MASTER TO MASTER_LOG_FILE='mysql2-bin.000049', MASTER_LOG_POS=587; 
+ </div> 
+ <div>
+   如果该值设置为1，则生成的是CHANGE MASTER的命令，而不是注释。如下所示： 
+ </div> 
+ <div>
+   CHANGE MASTER TO MASTER_LOG_FILE='mysql2-bin.000049', MASTER_LOG_POS=587; 
+ </div> 
+ <div>
+   当加上这个参数的时候，为了得到准确的binlog的位置状态信息，会通过FLUSH TABLES WITH READLOCK来保证，备份开始到结束，是不允许别的事务修改的，同时也就保证了一致性； 
+ </div> 
+ <div> 
+  <strong>4、参数--single-transaction和参数参数--master-data一起使用；</strong> 
+ </div> 
+ <div>
+   也会执行 FLUSH TABLES WITH READ LOCK，但是在还没有开始备份时，也就是在 SHOW MASTER STATUS显示了主库的binlog状态之后就unlock tables了，也会 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ，之后和单独加--single-transaction过程是一样的。 
+ </div> 
+ <div> 
+  <strong>5、参数--lock-all-tables，通过给整个实例所有表都加read lock来保证一致性备份；</strong> 
+ </div> 
+ <div>
+   加上--lock-all-tables和不加上--lock-all-tables得区别就在于前者是FLUSH TABLES WITH READ LOCK对整个实例所有的表都上读锁，后者只针对要备份的表加读锁（LOCK TABLES `liu` READ）；并且前者并没有显现的unlock tables，因为整个过程中数据库是不能写的，并且FLUSH TABLES WITH READ LOCK这个命令一旦这个会话结束，相应的读锁也就不存在了，而后者只是锁了一个表，显现的unlock解锁了，其实后者也是会话结束就释放对表的读锁了，也可以不加unlock， 
+ </div> 
+ <div> 
+  <strong>6、START TRANSACTION和START TRANSACTION WITH CONSISTENT SNAPSHOT并不一样;</strong> 
+ </div> 
+ <div>
+      START TRANSACTION WITH CONSISTENT SNAPSHOT相当于在执行完START TRANSACTION后对每个Innodb表执行了SELECT操作，在隔离级别为REPEATABLE READ时，并不是当start transaction 就能保证之后的查询内容是一样，而是当你发出第一个query的时候，才会开启快照读取，之后再有相同的sql查出来的结果是一样的。 
+ </div> 
+ <div>
+       在mysqldump加上参数--single-transaction的时候使用的是START TRANSACTION WITH CONSISTENT SNAPSHOT，而不是START TRANSACTION来保证一致性的，是因为每个表的备份时间并不相同，如果使用START TRANSACTION，在对第一张表进行备份的期间，别的事务对第二个表进行了insert数据A，那么在开始对第二张表备份时,是可以看到数据A的，那么第一个表和第二个表就不是一致性的了，所以START TRANSACTION无法实现当一个库下有多个表的时候的一致性。. 
+ </div> 
+ <div> 
+  <strong>综上所述：<br></strong>在使用mysqldump进行数据备份的时候，尽量在业务量比较小的时候执行，并且根据是不是innodb引擎来选择不同的参数，如果是innodb的引擎可以使用--single-transaction参数来保证一致性，并且还不用上read lock；但是如果想保证整个实例的一致性（既有innodb又有myisam的表）最好还是使用参数--lock-all-tables，当然为了实现point to point恢复或者不停master服务来添加slave的目的，最好还是加上参数--master-data，同时也就能保证一致性，因为加上参数--master-data会执行FLUSH TABLES WITH READLOCK； 
+ </div> 
+ <div> 
+  <strong><span style="font-size:14px;">下面是具体的验证过程：</span></strong> 
+ </div> 
+ <div> 
+  <strong>一：打开general log，便于分析mysqldump具体执行了什么操作</strong> 
+ </div> 
+ <div>
+   mysql&gt; set global general_log=on; 
+ </div> 
+ <div>
+   其中，general log的存放路径可通过以下命令查看 
+ </div> 
+ <div>
+   mysql&gt; show variables like '%general_log_file%'; 
+ </div> 
+ <div> 
+  <strong><span style="font-size:14px;">二：执行MySQLdump导出表实验如下：</span></strong> 
+ </div> 
+ <div> 
+  <strong>2.1首先什么参数都不加的情况：</strong> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe liuhe blocks_infos_opensearch&gt; /mysql/blocks_infos_opensearch.sql 
+ </div> 
+ <div>
+   查看相应的general_log： 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 14:12:22 17 Quit 
+ </div> 
+ <div>
+   180429 14:12:55 18 Connect root@localhost on 
+ </div> 
+ <div>
+   18 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   18 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   18 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   18 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENG 
+ </div> 
+ <div>
+   INE ORDER BY LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   18 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NA 
+ </div> 
+ <div>
+   ME 
+ </div> 
+ <div>
+   18 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   18 Init DB liuhe 
+ </div> 
+ <div>
+   18 Query SHOW TABLES LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   18 Query LOCK TABLES `blocks_infos_opensearch` READ /*!32311 LOCAL */ 
+ </div> 
+ <div>
+   18 Query show table status like 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   18 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   18 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   18 Query show create table `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   18 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   18 Query show fields from `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   18 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   18 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   18 Query use `liuhe` 
+ </div> 
+ <div>
+   18 Query select @@collation_database 
+ </div> 
+ <div>
+   18 Query SHOW TRIGGERS LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   18 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   18 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   18 Quit 
+ </div> 
+ <div> 
+  <strong>2.2:加上参数--single-transaction</strong> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe --single-transaction liuhe blocks_infos_opensearch&gt; /mysql/blocks_infos_opensearch.sql 
+ </div> 
+ <div> 
+  <br> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 14:20:41 21 Quit 
+ </div> 
+ <div>
+   180429 14:20:47 22 Connect root@localhost on 
+ </div> 
+ <div>
+   22 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   22 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   22 Query SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ 
+ </div> 
+ <div>
+   22 Query START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */ #开启快照读 
+ </div> 
+ <div>
+   22 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   22 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   22 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENG 
+ </div> 
+ <div>
+   INE ORDER BY LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   22 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NA 
+ </div> 
+ <div>
+   ME 
+ </div> 
+ <div>
+   22 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   22 Init DB liuhe 
+ </div> 
+ <div>
+   22 Query SHOW TABLES LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   22 Query SAVEPOINT sp 
+ </div> 
+ <div>
+   22 Query show table status like 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   22 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   22 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   22 Query show create table `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   22 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   22 Query show fields from `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   22 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   22 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div> 
+  <br> 
+ </div> 
+ <div>
+   22 Query use `liuhe` 
+ </div> 
+ <div>
+   22 Query select @@collation_database 
+ </div> 
+ <div>
+   22 Query SHOW TRIGGERS LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   22 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   22 Query ROLLBACK TO SAVEPOINT sp #把事务回退到这个点 sp 
+ </div> 
+ <div>
+   22 Query RELEASE SAVEPOINT sp #放弃保存点，需要注意的是一旦rollback或者commit，那么之前创建的savepoint就会失效； 
+ </div> 
+ <div>
+   180429 14:20:48 22 Quit 
+ </div> 
+ <div>
+   通过.1和3.2可以看出来加上参数--single-transaction，可以保证mysqldump的时候不需要LOCK TABLES `blocks_infos_opensearch` READ ;并且使用参数--single-transaction，需要修改MySQL的隔离界别为 REPEATABLE READ来保证各个事务之间互相不影响对方，保证在执行MySQLdump的会话始终读取不到别的事务的操作，进而保证了MySQLdump出来的数据的一致性；并且为了能获得准确的pos点，需要START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */ 来开启快照读的事务，因为如果只START TRANSACTION ，并没有生成快照，而是在执行第一个select的时候，才会生成快照，也就是说如果START TRANSACTION之后，另一个事务insert了数据A，然后你再select，是可以看到的数据A的，这样就不能得到精确的pos值了。 
+ </div> 
+ <div> 
+  <strong>2.3加上参数--master-data</strong> 
+ </div> 
+ <div>
+   具体如下： 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe --master-data=2 liuhe blocks_infos_opensearch&gt; /mysql/blocks_infos_opensearch.sql 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 18:01:27 35 Quit 
+ </div> 
+ <div>
+   180429 18:02:15 36 Connect root@localhost on 
+ </div> 
+ <div>
+   36 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   36 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   36 Query FLUSH /*!40101 LOCAL */ TABLES 
+ </div> 
+ <div>
+   36 Query FLUSH TABLES WITH READ LOCK 
+ </div> 
+ <div>
+   36 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   36 Query SHOW MASTER STATUS 
+ </div> 
+ <div>
+   36 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENG 
+ </div> 
+ <div>
+   INE ORDER BY LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   36 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NA 
+ </div> 
+ <div>
+   ME 
+ </div> 
+ <div>
+   36 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   36 Init DB liuhe 
+ </div> 
+ <div>
+   36 Query SHOW TABLES LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   36 Query show table status like 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   36 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   36 Query show create table `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   36 Query show fields from `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   36 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   180429 18:02:16 36 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   36 Query use `liuhe` 
+ </div> 
+ <div>
+   36 Query select @@collation_database 
+ </div> 
+ <div>
+   36 Query SHOW TRIGGERS LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   36 Quit 
+ </div> 
+ <div>
+   通过2.1和2.2可以看出来，通过 SHOW MASTER STATUS来显示当时binlog的位置，通过FLUSH TABLES WITH READ LOCK，来保证一致性，注意尽管只是备份一个表，由于这个binlog的位置是可以在不停主库的前提下添加从库时直接可以使用的位置，所以需要锁住整个实例的所有的表（ FLUSH TABLES WITH READ LOCK），来保证这个位置在备份开始的时候，不再有任何dml操作，也就是这个位置就不再增大； 
+ </div> 
+ <div> 
+  <strong>2.4同时添加上参数--master-data和--single-transaction</strong> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe --single-transaction --master-data=2 liuhe blocks_infos_opensearch&gt; /mysql/blocks_infos_opensearch.sql 
+ </div> 
+ <div>
+   Warning: Using a password on the command line interface can be insecure. 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 18:50:06 37 Quit 
+ </div> 
+ <div>
+   180429 18:50:36 38 Connect root@localhost on 
+ </div> 
+ <div>
+   38 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   38 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   38 Query FLUSH /*!40101 LOCAL */ TABLES 
+ </div> 
+ <div>
+   38 Query FLUSH TABLES WITH READ LOCK 
+ </div> 
+ <div>
+   38 Query SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ 
+ </div> 
+ <div>
+   38 Query START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */ 
+ </div> 
+ <div>
+   38 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   38 Query SHOW MASTER STATUS 
+ </div> 
+ <div>
+   38 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   38 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENG 
+ </div> 
+ <div>
+   INE ORDER BY LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   38 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('blocks_infos_opensearch')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NA 
+ </div> 
+ <div>
+   ME 
+ </div> 
+ <div>
+   38 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   38 Init DB liuhe 
+ </div> 
+ <div>
+   38 Query SHOW TABLES LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   38 Query SAVEPOINT sp 
+ </div> 
+ <div>
+   38 Query show table status like 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   38 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   38 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   38 Query show create table `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   38 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   38 Query show fields from `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   38 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   38 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   38 Query use `liuhe` 
+ </div> 
+ <div>
+   38 Query select @@collation_database 
+ </div> 
+ <div>
+   38 Query SHOW TRIGGERS LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   38 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   38 Query ROLLBACK TO SAVEPOINT sp 
+ </div> 
+ <div>
+   38 Query RELEASE SAVEPOINT sp 
+ </div> 
+ <div>
+   38 Quit 
+ </div> 
+ <div>
+   通过2.4和2.1对比可以知道，当同时添加上参数--master-data和 --single-transaction 的时候，会执行 FLUSH TABLES WITH READ LOCK（但是还没有开始备份，在 SHOW MASTER STATUS显示了主库的binlog状态之后就unlock tables了），也会 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ，之后和单独加--single-transaction是一样的； 
+ </div> 
+ <div> 
+  <strong>2.5:如果是myisam引擎会怎么样？（创建了存储引擎为myisam的表liu）</strong> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe --single-transaction liuhe liu&gt;/mysql/liu.sql 
+ </div> 
+ <div>
+   查看general log发现和innodb 添加--single-transaction参数的情况是一样的执行过程 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 19:54:28 3 Quit 
+ </div> 
+ <div>
+   180429 19:55:29 4 Connect root@localhost on 
+ </div> 
+ <div>
+   4 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   4 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   4 Query SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ 
+ </div> 
+ <div>
+   4 Query START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */ 
+ </div> 
+ <div>
+   4 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   4 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   4 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('liu'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENGINE ORDER BY LOGFILE 
+ </div> 
+ <div>
+   _GROUP_NAME 
+ </div> 
+ <div>
+   4 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('liu')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   4 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   4 Init DB liuhe 
+ </div> 
+ <div>
+   4 Query SHOW TABLES LIKE 'liu' 
+ </div> 
+ <div>
+   4 Query SAVEPOINT sp 
+ </div> 
+ <div>
+   4 Query show table status like 'liu' 
+ </div> 
+ <div>
+   4 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   4 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   4 Query show create table `liu` 
+ </div> 
+ <div>
+   4 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   4 Query show fields from `liu` 
+ </div> 
+ <div>
+   4 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `liu` 
+ </div> 
+ <div>
+   4 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   4 Query use `liuhe` 
+ </div> 
+ <div>
+   4 Query select @@collation_database 
+ </div> 
+ <div>
+   4 Query SHOW TRIGGERS LIKE 'liu' 
+ </div> 
+ <div>
+   4 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   4 Query ROLLBACK TO SAVEPOINT sp 
+ </div> 
+ <div>
+   4 Query RELEASE SAVEPOINT sp 
+ </div> 
+ <div>
+   4 Quit 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt; 
+ </div> 
+ <div>
+   分析： 
+ </div> 
+ <div>
+   虽然添加了--single-transaction参数的myisam表处理过程和innodb的过程完全一致，但是因为myisam不支持事务，在整个dump过程中无法保证可重复读，无法得到一致性的备份。而innodb在备份过程中，虽然其他线程也在写数据，但是dump出来的数据能保证是备份开始时那个binlog pos的数据。 
+ </div> 
+ <div>
+   myisam引擎要保证得到一致性的数据的可以通过添加--lock-all-tables，这样在flush tables with read lock后，直到整个dump过程结束，断开线程后才会unlock tables释放锁(没必要主动发unlock tables指令)，整个dump过程其他线程不可写，从而保证数据的一致性; 
+ </div> 
+ <div> 
+  <strong>2.6:备份myisam的时候，加上--lock-all-tables和不加该参数的不同的执行过程如下：</strong> 
+ </div> 
+ <div>
+   2.6.1加上--lock-all-tables的情况如下： 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe --lock-all-tables liuhe liu&gt;/mysql/liu.sql 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 20:16:12 5 Quit 
+ </div> 
+ <div>
+   180429 20:18:18 6 Connect root@localhost on 
+ </div> 
+ <div>
+   6 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   6 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   6 Query FLUSH TABLES 
+ </div> 
+ <div>
+   180429 20:18:19 6 Query FLUSH TABLES WITH READ LOCK 
+ </div> 
+ <div>
+   6 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   6 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('liu'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENGINE ORDER BY LOGFILE 
+ </div> 
+ <div>
+   _GROUP_NAME 
+ </div> 
+ <div>
+   6 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('liu')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   6 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   6 Init DB liuhe 
+ </div> 
+ <div>
+   6 Query SHOW TABLES LIKE 'liu' 
+ </div> 
+ <div>
+   6 Query show table status like 'liu' 
+ </div> 
+ <div>
+   6 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   6 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   6 Query show create table `liu` 
+ </div> 
+ <div>
+   6 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   6 Query show fields from `liu` 
+ </div> 
+ <div>
+   6 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `liu` 
+ </div> 
+ <div>
+   6 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   6 Query use `liuhe` 
+ </div> 
+ <div>
+   6 Query select @@collation_database 
+ </div> 
+ <div>
+   6 Query SHOW TRIGGERS LIKE 'liu' 
+ </div> 
+ <div>
+   6 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   6 Quit 
+ </div> 
+ <div>
+   2.6.2不加上--lock-all-tables得过程如下： 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe liuhe liu&gt;/mysql/liu.sql 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 20:25:43 7 Quit 
+ </div> 
+ <div>
+   180429 20:25:53 8 Connect root@localhost on 
+ </div> 
+ <div>
+   8 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   8 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   8 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   8 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('liu'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENGINE ORDER BY LOGFILE 
+ </div> 
+ <div>
+   _GROUP_NAME 
+ </div> 
+ <div>
+   8 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA='liuhe' AND TABLE_NAME IN ('liu')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   8 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   8 Init DB liuhe 
+ </div> 
+ <div>
+   8 Query SHOW TABLES LIKE 'liu' 
+ </div> 
+ <div>
+   8 Query LOCK TABLES `liu` READ /*!32311 LOCAL */ 
+ </div> 
+ <div>
+   8 Query show table status like 'liu' 
+ </div> 
+ <div>
+   8 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   8 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   8 Query show create table `liu` 
+ </div> 
+ <div>
+   8 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   8 Query show fields from `liu` 
+ </div> 
+ <div>
+   8 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `liu` 
+ </div> 
+ <div>
+   8 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   8 Query use `liuhe` 
+ </div> 
+ <div>
+   8 Query select @@collation_database 
+ </div> 
+ <div>
+   8 Query SHOW TRIGGERS LIKE 'liu' 
+ </div> 
+ <div>
+   8 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   8 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   8 Quit 
+ </div> 
+ <div>
+   对比2.6.1和2.6.2可以知道myisam表，加上--lock-all-tables和不加上--lock-all-tables得区别就在于前者是FLUSH TABLES WITH READ LOCK对整个实例所有的表都上读锁，后者只针对要备份的表加读锁（LOCK TABLES `liu` READ）；并且前者并没有显现的unlock tables，因为整个过程中数据库是不能写的，并且FLUSH TABLES WITH READ LOCK这个命令一旦这个会话结束，相应的读锁也就不存在了，而后者只是锁了一个表，显现的unlock解锁了，其实后者也是会话结束就释放对表的读锁了，也可以不加unlock， 
+ </div> 
+ <div> 
+  <strong>2.7.备份整个库时候，不加任何参数，可以看到会同时lock 这个库下的所有的表，最后在unlock</strong> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;mysqldump -uroot -pliuwenhe liuhe &gt; /mysql/blocks_infos_opensearch.sql 
+ </div> 
+ <div> 
+  <br> 
+ </div> 
+ <div>
+   bogon:root@/mysql/data/data&gt;more bogon.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.38-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 21:21:44 9 Quit 
+ </div> 
+ <div>
+   180429 21:22:21 10 Connect root@localhost on 
+ </div> 
+ <div>
+   10 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   10 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   10 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   10 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL AND LOGFILE_GROUP_NAME IN (SELECT DISTINCT LOGFILE_GROUP_NAME FROM 
+ </div> 
+ <div>
+   INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHE 
+ </div> 
+ <div>
+   MA.PARTITIONS WHERE TABLE_SCHEMA IN ('liuhe'))) GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENGINE ORDER BY LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   10 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.PARTITIONS WHERE TABLE_SCHEMA IN ('liuhe')) ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   10 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   10 Init DB liuhe 
+ </div> 
+ <div>
+   10 Query show tables 
+ </div> 
+ <div>
+   10 Query LOCK TABLES `blocks_infos` READ /*!32311 LOCAL */,`blocks_infos1` READ /*!32311 LOCAL */,`blocks_inf 
+ </div> 
+ <div>
+   os_opensearch` READ /*!32311 LOCAL */,`liu` READ /*!32311 LOCAL */,`test` READ /*!32311 LOCAL */ 
+ </div> 
+ <div>
+   10 Query show table status like 'blocks\_infos' 
+ </div> 
+ <div>
+   10 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query show create table `blocks_infos` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show fields from `blocks_infos` 
+ </div> 
+ <div>
+   10 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos` 
+ </div> 
+ <div>
+   180429 21:22:23 10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query use `liuhe` 
+ </div> 
+ <div>
+   10 Query select @@collation_database 
+ </div> 
+ <div>
+   10 Query SHOW TRIGGERS LIKE 'blocks\_infos' 
+ </div> 
+ <div>
+   10 Query SHOW CREATE TRIGGER `tri_insert_blocks_infos1` 
+ </div> 
+ <div>
+   10 Query SHOW CREATE TRIGGER `tri_update_blocks_infos1` 
+ </div> 
+ <div>
+   10 Query SHOW CREATE TRIGGER `tri_delete_blocks_infos1` 
+ </div> 
+ <div>
+   10 Query SHOW CREATE TRIGGER `tri_delete_blocks_infos` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show table status like 'blocks\_infos1' 
+ </div> 
+ <div>
+   10 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query show create table `blocks_infos1` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show fields from `blocks_infos1` 
+ </div> 
+ <div>
+   10 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos1` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query use `liuhe` 
+ </div> 
+ <div>
+   10 Query select @@collation_database 
+ </div> 
+ <div>
+   10 Query SHOW TRIGGERS LIKE 'blocks\_infos1' 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show table status like 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   10 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query show create table `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show fields from `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   10 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `blocks_infos_opensearch` 
+ </div> 
+ <div>
+   180429 21:22:24 10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query use `liuhe` 
+ </div> 
+ <div>
+   10 Query select @@collation_database 
+ </div> 
+ <div>
+   10 Query SHOW TRIGGERS LIKE 'blocks\_infos\_opensearch' 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show table status like 'liu' 
+ </div> 
+ <div>
+   10 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query show create table `liu` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show fields from `liu` 
+ </div> 
+ <div>
+   10 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `liu` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query use `liuhe` 
+ </div> 
+ <div>
+   10 Query select @@collation_database 
+ </div> 
+ <div>
+   10 Query SHOW TRIGGERS LIKE 'liu' 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show table status like 'test' 
+ </div> 
+ <div>
+   10 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query show create table `test` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query show fields from `test` 
+ </div> 
+ <div>
+   10 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `test` 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   10 Query use `liuhe` 
+ </div> 
+ <div>
+   10 Query select @@collation_database 
+ </div> 
+ <div>
+   10 Query SHOW TRIGGERS LIKE 'test' 
+ </div> 
+ <div>
+   10 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   10 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   10 Quit 
+ </div> 
+ <div> 
+  <strong>2.8：</strong> 
+  <strong>备份整个实例的所有的库</strong> 
+  <strong></strong> 
+  <strong>加上参数--all-databases 或者-A ，然后不加别的参数</strong> 
+  <strong></strong> 
+  <br> 如果是备份整个实例的所有的库，也就加上参数--all-databases 或者-A ，然后不加别的参数，如下可知，是一个库一库的去备份，也就是说先备份库A，把库A下的所有的表上读锁，备份完库A，unlock tables,然后再备份库B,把库B下的所有的表上读锁，备份完库B，unlock tables,这样就可以知道，不加任何参数的话，全实例备份时，只能保证一个库下的所有的表是一致性的，但是库和库之间却不能保证一致性； 
+ </div> 
+ <div>
+   [root@oracle3 ~]# more /home/mysql/data/data/oracle3.log 
+ </div> 
+ <div>
+   /usr/local/mysql/bin/mysqld, Version: 5.6.39-log (Source distribution). started with: 
+ </div> 
+ <div>
+   Tcp port: 3306 Unix socket: /tmp/mysql.sock 
+ </div> 
+ <div>
+   Time Id Command Argument 
+ </div> 
+ <div>
+   180429 21:58:24 35 Query show variables like '%general_log_file%' 
+ </div> 
+ <div>
+   180429 21:58:30 35 Quit 
+ </div> 
+ <div>
+   180429 21:58:45 36 Connect root@localhost on 
+ </div> 
+ <div>
+   36 Query /*!40100 SET @@SQL_MODE='' */ 
+ </div> 
+ <div>
+   36 Query /*!40103 SET TIME_ZONE='+00:00' */ 
+ </div> 
+ <div>
+   36 Query SHOW VARIABLES LIKE 'gtid\_mode' 
+ </div> 
+ <div>
+   36 Query SELECT LOGFILE_GROUP_NAME, FILE_NAME, TOTAL_EXTENTS, INITIAL_SIZE, ENGINE, EXTRA FROM INFORMATION_SC 
+ </div> 
+ <div>
+   HEMA.FILES WHERE FILE_TYPE = 'UNDO LOG' AND FILE_NAME IS NOT NULL GROUP BY LOGFILE_GROUP_NAME, FILE_NAME, ENGINE ORDER BY LOGFILE_GR 
+ </div> 
+ <div>
+   OUP_NAME 
+ </div> 
+ <div>
+   36 Query SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, INITIAL_SIZE, ENGINE FR 
+ </div> 
+ <div>
+   OM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NAME 
+ </div> 
+ <div>
+   36 Query SHOW DATABASES 
+ </div> 
+ <div>
+   36 Query SHOW VARIABLES LIKE 'ndbinfo\_version' 
+ </div> 
+ <div>
+   36 Init DB liuhe 
+ </div> 
+ <div>
+   36 Query SHOW CREATE DATABASE IF NOT EXISTS `liuhe` 
+ </div> 
+ <div>
+   36 Query show tables 
+ </div> 
+ <div>
+   36 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   36 Init DB liuwenhe 
+ </div> 
+ <div>
+   36 Query SHOW CREATE DATABASE IF NOT EXISTS `liuwenhe` 
+ </div> 
+ <div>
+   36 Query show tables 
+ </div> 
+ <div>
+   36 Query LOCK TABLES `test` READ /*!32311 LOCAL */ 
+ </div> 
+ <div>
+   36 Query show table status like 'test' 
+ </div> 
+ <div>
+   36 Query SET SQL_QUOTE_SHOW_CREATE=1 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   36 Query show create table `test` 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   36 Query show fields from `test` 
+ </div> 
+ <div>
+   36 Query SELECT /*!40001 SQL_NO_CACHE */ * FROM `test` 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'binary' 
+ </div> 
+ <div>
+   36 Query use `liuwenhe` 
+ </div> 
+ <div>
+   36 Query select @@collation_database 
+ </div> 
+ <div>
+   36 Query SHOW TRIGGERS LIKE 'test' 
+ </div> 
+ <div>
+   36 Query SET SESSION character_set_results = 'utf8' 
+ </div> 
+ <div>
+   36 Query UNLOCK TABLES 
+ </div> 
+ <div>
+   36 Init DB mysql 
+ </div> 
+ <div>
+   36 Query SHOW CREATE DATABASE IF NOT EXISTS `mysql` 
+ </div> 
+ <div>
+   36 Query show tables 
+ </div> 
+ <div>
+   36 Query LOCK TABLES `columns_priv` READ /*!32311 LOCAL */,`db` READ /*!32311 LOCAL */,`event` READ /*!32311 
+ </div> 
+ <div>
+   LOCAL */,`func` READ /*!32311 LOCAL */,`help_category` READ /*!32311 LOCAL */,`help_keyword` READ /*!32311 LOCAL */,`help_relation` 
+ </div> 
+ <div>
+   READ /*!32311 LOCAL */,`help_topic` READ /*!32311 LOCAL */,`innodb_index_stats` READ /*!32311 LOCAL */,`innodb_table_stats` READ /*! 
+ </div> 
+ <div>
+   32311 LOCAL */,`ndb_binlog_index` READ /*!32311 LOCAL */,`plugin` READ /*!32311 LOCAL */,`proc` READ /*!32311 LOCAL */,`procs_priv` 
+ </div> 
+ <div>
+   READ /*!32311 LOCAL */,`proxies_priv` READ /*!32311 LOCAL */,`servers` READ /*!32311 LOCAL */,`slave_master_info` READ /*!32311 LOCA 
+ </div> 
+ <div>
+   L */,`slave_relay_log_info` READ /*!32311 LOCAL */,`slave_worker_info` READ /*!32311 LOCAL */,`tables_priv` READ /*!32311 LOCAL */,` 
+ </div> 
+ <div>
+   time_zone` READ /*!32311 LOCAL */,`time_zone_leap_second` READ /*!32311 LOCAL */,`time_zone_name` READ /*!32311 LOCAL */,`time_zone_ 
+ </div> 
+ <div>
+   transition` READ /*!32311 LOCAL */,`time_zone_transition_type` READ /*!32311 LOCAL */,`user` READ /*!32311 LOCAL */ 
+ </div> 
+ <div> 
+  <strong><span style="font-size:14px;">题外话</span></strong> 
+ </div> 
+ <div>
+   考虑一下，我们知道当没有添加任何参数的时候，mysqldump默认也会lock 这个需要备份的表，但是如果mysiam引擎中也添加--single-transaction参数（这样备份出来的数据就是不一致的）再用这个备份去创建从库或恢复到指定时间点，会有什么样的影响？ 
+ </div> 
+ <div>
+   我个人的理解是如果整个dump过程中只有简单的insert操作，是没有关系的，期间肯定会有很多的主键重复错误，直接跳过或忽略就好了。如果是update操作，那就要出问题了，分几种情况考虑 
+ </div> 
+ <div>
+   1） 如果是基于时间点的恢复，假设整个dump过程有update a  set id=5 where id=4之类的操作，相当于重复执行两次该操作，应该问题不大 
+ </div> 
+ <div>
+   2） 如果是创建从库，遇到上面的sql从库会报错，找不到该记录，这时跳过就好 
+ </div> 
+ <div>
+   3）不管是恢复还是创建从库，如果dump过程中有update a set id=id+5 之类的操作，那就有问题，重复执行两次，数据全变了。 
+ </div> 
+ <div> 
+  <br> 
+ </div> 
+ <p style="clear:both;"></p> 
+ <p class="translate"> 来自 “ ITPUB博客 ” ，链接：http://blog.itpub.net/29654823/viewspace-2153553/，如需转载，请注明出处，否则将追究法律责任。 </p> 
+</div> 
+<p>转载于:http://blog.itpub.net/29654823/viewspace-2153553/</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/70c1b9a970bd4ed585487b34bacc0ab7/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">python中opencv imshow函数显示一片白色原因</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/22449fcba5aded249f03d9030f27cb26/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">matlab画折线图，标记指定点</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

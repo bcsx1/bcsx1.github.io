@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>订单系统架构设计与实践 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="订单系统架构设计与实践" />
+<meta property="og:description" content="一、背景 单体架构：性能瓶颈
+单表存储：存储瓶颈
+开发效率：成本
+运维困难：发现问题、解决问题的效率和成本
+服务化改造势在必行。
+二、系统架构 订单模块从商城拆分出来，独立为订单系统，使用独立的数据库，为商城提供订单、支付、物流、售后等标准化服务。
+系统架构如下图所示：
+三、技术挑战 1、数据量问题 历史订单不断累积，MySQL中订单表数据量已到达千万级。
+数据量大的解决方案：
+数据归档：冷热数据分离，冷数据（3个月以上的订单历史数据）进行归档。分库分表 2、高并发问题 单机的处理能力是有限的，高并发的解决方案有：
+使用缓存：订单系统有个特点，每个用户的订单数据都不一样，所以缓存命中率不高，效果不太好。
+读写分离
+订单数据的更新操作较多，下单高峰期主库的压力依然没有得到解决。
+存在主从同步延迟，正常情况下延迟非常小，不超过1ms。
+分库：垂直分库、水平分库
+分表：垂直分表、水平分表
+3、分库分表技术选型 应用层开源类库ORM框架扩展代理层组件
+采用开源的ShardingJDBC方案
+分库分表策略 选取用户标识作为分片键，假设有n个库，每个库有m张表。
+库序号：hash(userId) / m % n表序号：hash(userId) % m
+路由过程如下图所示：
+分表分库的局限性和应对方案 极大限制数据库的查询能力：一些简单的关联查询可能无法实现（需要制定合适的分库分表策略，使得主表和从表的数据都落在同一个数据库中）
+全局唯一ID设计 很多内部系统的交互接口只有订单号，没有用户标识这个分片键，如何用订单号来找到对应的库表呢？在生成订单号时，就将库表编号隐含在其中。在没有用户标识的场景下，从订单号中获取库表编号。
+历史订单号没有隐含库表信息 用一张表单独存储历史订单号和用户标识的映射关系，随着时间推移，这些订单逐渐不在系统间交互，就慢慢不再被用到。
+管理后台需要根据各种筛选条件，分页查询所有满足条件的订单 将订单数据冗余存储在搜索引擎ES中，仅用于后台查询。
+4、怎么做到MySQL到ES的数据同步 双写策略 写完数据库后写ES，可以通过异步解耦。
+消息队列 ES更新服务作为消费者，接收订单变更消息后对ES进行更新。
+Binlog ES更新服务借助Canal等开源项目，把自己伪装成MySQL的从节点，接收binlog并解析得到数据变更信息，然后根据变更信息去更新ES。
+选择消息队列方案，因为其相对简单，针对极端情况下的消息丢失，可以通过手动同步ES的功能解决。
+5、如何安全地更换数据库 不停机迁移方案 复制全量旧库数据到新库，然后复制旧库的增量数据到新库。上线检测程序比较新旧数据库的数据是否一致，有则进行修正补偿。应用上线双写程序，以写旧库为准，只读取旧库数据；停止增量同步程序，检测程序继续检查新旧数据库的数据是否一致。应用逐步将读请求切至新数据库。应用以写新库为准，检测程序继续检查新旧数据库的数据是否一致。应用下线双写程序，只读写新数据库；下线检测程序、全量/增量同步程序。
+停机迁移方案 上线新订单系统，将旧数据库的全量数据同步到新数据库，检测新旧数据库的数据是否一致。商城v1应用停机，确保旧库数据不会再发生变化。执行增量同步程序，将第一步未迁移的订单同步到新数据库。商城v2应用接入流量，开始验证，如果失败则回滚到商城v1应用。
+考虑到不停机方案的改造成本太高，而夜间停机方案的业务损失不大，所以选择停机方案。 6、分布式事务问题 不同业务场景对数据一致性的要求不同，业界的主流方案中，
+解决强一致性的有：两阶段提交（2PC）、三阶段提交（3PC）
+解决最终一致性的有：TCC、消息队列&#43;本地消息表、事务消息、最大努力通知和SEATA等。
+本地消息方案相对简单，依赖第三方组件少，所以选择本地消息方案。
+在本地事务中将要执行的异步操作记录在消息表中，如果执行失败，可以通过定时任务来补偿。
+下图以订单完成后通知积分系统赠送积分为例。
+7、系统安全和稳定性 网络隔离 只有极少数第三方接口可通过外网访问，且都有验证签名，内部系统交互使用内网域名和RPC接口。
+并发锁 通过数据库的行级锁加以限制，防止出现并发更新的问题；此外还使用行记录的版本号避免延时到达的旧数据覆盖新数据的问题。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/a055a3c3913598962b7e03e83a190440/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-10-19T17:54:04+08:00" />
+<meta property="article:modified_time" content="2023-10-19T17:54:04+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">订单系统架构设计与实践</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h3><a id="_0"></a>一、背景</h3> 
+<p>单体架构：性能瓶颈<br> 单表存储：存储瓶颈<br> 开发效率：成本<br> 运维困难：发现问题、解决问题的效率和成本<br> 服务化改造势在必行。</p> 
+<h3><a id="_6"></a>二、系统架构</h3> 
+<p>订单模块从商城拆分出来，独立为订单系统，使用独立的数据库，为商城提供订单、支付、物流、售后等标准化服务。<br> 系统架构如下图所示：<br> <img src="https://images2.imgbox.com/94/a7/s8n8MVMR_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="_10"></a>三、技术挑战</h3> 
+<h4><a id="1_11"></a>1、数据量问题</h4> 
+<p>历史订单不断累积，MySQL中订单表数据量已到达千万级。<br> 数据量大的解决方案：</p> 
+<ul><li>数据归档：冷热数据分离，冷数据（3个月以上的订单历史数据）进行归档。</li><li>分库分表</li></ul> 
+<h4><a id="2_16"></a>2、高并发问题</h4> 
+<p>单机的处理能力是有限的，高并发的解决方案有：</p> 
+<ul><li> <p>使用缓存：订单系统有个特点，每个用户的订单数据都不一样，所以缓存命中率不高，效果不太好。<br> <img src="https://images2.imgbox.com/bf/86/yBCFudsg_o.png" alt="在这里插入图片描述"></p> </li><li> <p>读写分离</p> </li><li> <p>订单数据的更新操作较多，下单高峰期主库的压力依然没有得到解决。</p> </li><li> <p>存在主从同步延迟，正常情况下延迟非常小，不超过1ms。<br> <img src="https://images2.imgbox.com/f4/da/7O8aHx4q_o.png" alt="在这里插入图片描述"></p> </li><li> <p>分库：垂直分库、水平分库</p> </li><li> <p>分表：垂直分表、水平分表</p> </li></ul> 
+<h4><a id="3_27"></a>3、分库分表技术选型</h4> 
+<ul><li>应用层开源类库</li><li>ORM框架扩展</li><li>代理层组件<br> 采用开源的ShardingJDBC方案<br> <img src="https://images2.imgbox.com/d8/49/aIO6FMqS_o.png" alt="在这里插入图片描述"></li></ul> 
+<h5><a id="_33"></a>分库分表策略</h5> 
+<p>选取用户标识作为分片键，假设有n个库，每个库有m张表。</p> 
+<ul><li>库序号：hash(userId) / m % n</li><li>表序号：hash(userId) % m<br> 路由过程如下图所示：<br> <img src="https://images2.imgbox.com/62/e0/3CtLAXlf_o.png" alt="在这里插入图片描述"></li></ul> 
+<h5><a id="_39"></a>分表分库的局限性和应对方案</h5> 
+<p>极大限制数据库的查询能力：一些简单的关联查询可能无法实现（需要制定合适的分库分表策略，使得主表和从表的数据都落在同一个数据库中）</p> 
+<h6><a id="ID_41"></a>全局唯一ID设计</h6> 
+<p>很多内部系统的交互接口只有订单号，没有用户标识这个分片键，如何用订单号来找到对应的库表呢？在生成订单号时，就将库表编号隐含在其中。在没有用户标识的场景下，从订单号中获取库表编号。</p> 
+<h6><a id="_43"></a>历史订单号没有隐含库表信息</h6> 
+<p>用一张表单独存储历史订单号和用户标识的映射关系，随着时间推移，这些订单逐渐不在系统间交互，就慢慢不再被用到。</p> 
+<h6><a id="_45"></a>管理后台需要根据各种筛选条件，分页查询所有满足条件的订单</h6> 
+<p>将订单数据冗余存储在搜索引擎ES中，仅用于后台查询。</p> 
+<h4><a id="4MySQLES_47"></a>4、怎么做到MySQL到ES的数据同步</h4> 
+<h5><a id="_48"></a>双写策略</h5> 
+<p>写完数据库后写ES，可以通过异步解耦。</p> 
+<h5><a id="_50"></a>消息队列</h5> 
+<p>ES更新服务作为消费者，接收订单变更消息后对ES进行更新。<br> <img src="https://images2.imgbox.com/3b/04/x9adI6me_o.png" alt="在这里插入图片描述"></p> 
+<h5><a id="Binlog_53"></a>Binlog</h5> 
+<p>ES更新服务借助Canal等开源项目，把自己伪装成MySQL的从节点，接收binlog并解析得到数据变更信息，然后根据变更信息去更新ES。<br> <img src="https://images2.imgbox.com/25/99/qCEDYwH1_o.png" alt="在这里插入图片描述"></p> 
+<p>选择消息队列方案，因为其相对简单，针对极端情况下的消息丢失，可以通过手动同步ES的功能解决。</p> 
+<h4><a id="5_58"></a>5、如何安全地更换数据库</h4> 
+<h5><a id="_59"></a>不停机迁移方案</h5> 
+<ul><li>复制全量旧库数据到新库，然后复制旧库的增量数据到新库。</li><li>上线检测程序比较新旧数据库的数据是否一致，有则进行修正补偿。</li><li>应用上线双写程序，以写旧库为准，只读取旧库数据；停止增量同步程序，检测程序继续检查新旧数据库的数据是否一致。</li><li>应用逐步将读请求切至新数据库。</li><li>应用以写新库为准，检测程序继续检查新旧数据库的数据是否一致。</li><li>应用下线双写程序，只读写新数据库；下线检测程序、全量/增量同步程序。<br> <img src="https://images2.imgbox.com/3f/5a/q5GMV235_o.png" alt="在这里插入图片描述"></li></ul> 
+<h5><a id="_67"></a>停机迁移方案</h5> 
+<ul><li>上线新订单系统，将旧数据库的全量数据同步到新数据库，检测新旧数据库的数据是否一致。</li><li>商城v1应用停机，确保旧库数据不会再发生变化。</li><li>执行增量同步程序，将第一步未迁移的订单同步到新数据库。</li><li>商城v2应用接入流量，开始验证，如果失败则回滚到商城v1应用。<br> <img src="https://images2.imgbox.com/c3/a6/yz9VdFfS_o.png" alt="在这里插入图片描述"><br> 考虑到不停机方案的改造成本太高，而夜间停机方案的业务损失不大，所以选择停机方案。</li></ul> 
+<h4><a id="6_74"></a>6、分布式事务问题</h4> 
+<p>不同业务场景对数据一致性的要求不同，业界的主流方案中，<br> 解决强一致性的有：两阶段提交（2PC）、三阶段提交（3PC）<br> 解决最终一致性的有：TCC、消息队列+本地消息表、事务消息、最大努力通知和SEATA等。<br> 本地消息方案相对简单，依赖第三方组件少，所以选择本地消息方案。<br> 在本地事务中将要执行的异步操作记录在消息表中，如果执行失败，可以通过定时任务来补偿。<br> 下图以订单完成后通知积分系统赠送积分为例。<br> <img src="https://images2.imgbox.com/2a/d2/J5DMhLZ7_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="7_83"></a>7、系统安全和稳定性</h4> 
+<h5><a id="_84"></a>网络隔离</h5> 
+<p>只有极少数第三方接口可通过外网访问，且都有验证签名，内部系统交互使用内网域名和RPC接口。</p> 
+<h5><a id="_86"></a>并发锁</h5> 
+<p>通过数据库的行级锁加以限制，防止出现并发更新的问题；此外还使用行记录的版本号避免延时到达的旧数据覆盖新数据的问题。</p> 
+<h5><a id="_88"></a>幂等性</h5> 
+<p>在提交订单前先获取订单号，提交时根据订单号进行去重，避免重复下单。</p> 
+<h5><a id="_90"></a>限流</h5> 
+<p>单机限流、分布式限流</p> 
+<h5><a id="_92"></a>降级、熔断</h5> 
+<p>Sentinal、Hystrix</p> 
+<h5><a id="_94"></a>监控和告警</h5> 
+<p>系统监控：各种资源的使用率<br> 调用链监控：接口RT、QPS、异常数量、异常比例<br> 分布式日志系统：查看异常</p> 
+<h4><a id="8_98"></a>8、踩过的坑</h4> 
+<h5><a id="ES_99"></a>订单数据同步到ES的数据一致性问题</h5> 
+<p>左图为原方案：线程A会将订单的旧数据覆盖线程B写入的订单新数据。<br> 右图为新方案：线程A读取订单数据时会加行锁，线程B阻塞，线程A写入ES后线程B再写入。<br> <img src="https://images2.imgbox.com/ac/91/a4qbDNJD_o.png" alt="在这里插入图片描述"></p> 
+<h5><a id="ES_103"></a>ES分页查询时漏掉数据或者重复数据</h5> 
+<p>如果排序字段存在重复的值，最好加一个唯一的字段作为第二排序条件，避免分页查询时漏掉数据、查出重复数据。<br> 比如用的是订单创建时间作为唯一排序条件，同一时间如果存在很多数据，就会导致查询的订单存在遗漏或者重复。</p> 
+<h3><a id="_106"></a>四、结语</h3> 
+<p>系统设计时并没有一味追求前沿技术和思想，面对问题时也不是直接采用主流的解决方案，而是根据业务实际情况来做出取舍，将合适的方案落地。<br> 一个系统避免从一开始就过度设计，需是要遵循简单原则、合适原则、演进原则。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/fe494349426b5e4d2fcc8d29e5abf281/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">ikuai路由器通过curl模拟功能操作</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/d1e91383756607a913e295fb43f68184/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Git要提交到B分支。但是误提交到A分支，然后推送到远程仓库。然后撤回并重新提交到B分支。</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

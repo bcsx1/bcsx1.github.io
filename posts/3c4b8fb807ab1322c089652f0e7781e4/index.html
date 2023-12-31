@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ByteTracker行人跟踪核心代码解读 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ByteTracker行人跟踪核心代码解读" />
+<meta property="og:description" content="byteTracker中因为目标检测和行人跟踪是解耦的，因此这里主要分析的是byteTracker中的代码。
+也即是分析当给定一帧图片frame_id,给定这帧中的box列表，行人跟踪类是怎么跟踪每条轨迹的。
+也就是https://github.com/ifzhang/ByteTrack中位于目录tutorials/trades/byte_tracker中的代码。
+首先这个代码中最重要的两个类，一个是轨迹类STrack，一个是跟踪类BYTETracker类。
+前者是每条轨迹，后者管理目前视频流中的所有轨迹，并在新的一帧到来之后通过调用类方法update更新当前视频流中的轨迹状态（可能有新的轨迹，可能有旧的轨迹失去跟踪目标框，可能有目标框匹配成功，可能有之前丢失目标框的轨迹重新匹配成功）。
+之所以写这个代码解读，是因为每次重新捡起来阅读的时候都被各种参数搞得晕头转向，很容易混淆不同参数的含义。索性写个详细的笔记记录一下。
+一、轨迹类STrack 这里面保存的都是轨迹自身的状态。跟踪类BYTETracker类通过调用轨迹的属性和方法来进行轨迹状态的管理。
+1 属性集合 属性名称类型含义self._tlwh列表保存目标框属性self.is_activatedbool该轨迹是否是激活状态（也就是保持追踪中）,如果是视频流的第一帧，那么第一次update的时候，该属性就是True，如果不是第一帧，那么需要第二次匹配成功的时候才会设置为True（考虑一下误识别的情况，这就可以理解了，只有当连续两帧都匹配成功，才认为这个轨迹可靠）。self.kalman_filter类实例在第一次调用activate()函数时，设置卡尔曼滤波器self.mean, self.covariancendarray保存卡尔曼滤波对于这个轨迹的mean和convariance.其中len(mean)=8(x,y,a,h,va,vy,va,vh),v表示速度，covariance为[8,8]。在第一次调用activate()函数时进行初始化，初始化根据目标框的坐标进行估计self.tlbrndarray如果self.is_activated=True，那么就是根据卡尔曼滤波预测的左上角和右下角坐标,如果self.is_activated=False，那么就是当前检测框观测值的左上角和右下角坐标self.tlwhndarray如果self.is_activated=True，那么就是根据卡尔曼滤波预测的左上角和宽高，如果self.is_activated=False，那么就是当前检测框观测值的左上角和宽高self.scorefloat轨迹分数，采用当前帧的目标框分数作为轨迹分数self.tracklet_lenint轨迹追踪的帧数，初始为0，后面每追踪成功（调用update方法），则&#43;1self.stateTrackStateTrackState.New，Tracked,Lost,Removed四种状态，初始化为new。如果调用activate()/re_activate()/update方法时转换为Tracked状态，调用mark_lost()方法转为Lost状态，调用mark_removed()方法转为Removed方法。self.track_idintself.is_activated=True 轨迹的id，全局唯一标志self.start_frameint第一次调用activate方法时，这个轨迹的frame_idself.frame_idint目前位置，最后一次出现该轨迹的匹配框的帧编号self.end_frameint最后一帧出现该轨迹的帧编号,同frame_id 2. 方法集合 方法名称备注init(self, tlwh, score)每个目标框都会初始化一个track，但是此时的self.is_activated=Falseactivate(self, kalman_filter, frame_id)激活这条轨迹，如果是当前帧是视频流的第一帧，那么设置self.is_activated=True，否则这个属性依旧是False；设置state属性为TrackState.Trackedupdate(self, new_track, frame_id)更新轨迹信息，设置is_activate=True主要更新self.frame_id,self.score,tracklet_len,卡尔曼滤波mean,conv；re_activate(self, new_track, frame_id, new_id=False)重新激活这个轨迹（之前处于丢失状态），重新计算卡尔曼滤波的mean, covariance；重新计算self.tracklet_len；更新self.frame_id,self.score；mark_lost(self)将state参数设置为TrackState.Lost 这里需要注意两个概念：
+1. is_activated状态和activate函数的关系：
+不是调用了activate函数，轨迹的is_activated状态就是True。
+is_activated状态可以理解为该轨迹是否大概率为真实的轨迹。
+如果这状态为True，我们会认为这个轨迹是一个真实的轨迹，已经通过多帧的匹配得到的认证，是在追踪逻辑中高优先级的一个轨迹。但是如果这个轨迹是第一次出现，也就是目前只有一帧图片中出现了目标框，那么需要后续帧能够存在匹配的目标框来确保这个轨迹是真实的，而不是检测器的误检，那么此时这个is_activated状态就是False。第一帧数据除外，第一帧数据中的高分目标框默认生成的轨迹is_activated状态就是True。
+调用了activate函数是表明当前这个目标框分数较高，很可能是一个新的轨迹的第一帧。
+is_activated状态和state状态的关系：
+正如上面说了is_activated的含义，state的含义单纯表示当前轨迹在当前帧的状态。
+初始化为New；
+对于第一次出现且没有匹配轨迹的高分检测框，会调用activate函数初始化一条轨迹，那么状态就是Tracked;
+对于能够匹配到目标框的轨迹，通过调用轨迹的update方法，依旧将状态维持为Tracked;
+对于当前帧丢失匹配的情况，将状态转为Lost;
+对于多帧丢失乃至于超过BYTETracker定义max_time_lost的，则将其state设置为Removed。
+二、轨迹追踪类BYTETracker 整个服务维护一个BYTETracker对象，负责当前视频所有轨迹的追踪和维护。其内部的类属性中最上面的三个列表维护了当前视频流中的所有轨迹，其余类属性为各种阈值参数。
+属性类 属性名称类型含义self.tracked_strackslist[STrack]维护当前追踪中的轨迹列表self.lost_strackslist[STrack]维护到前一帧为止的追踪中丢失了检测框的轨迹列表self.removed_strackslist[STrack]维护删除的轨迹列表self.frame_idint当前视频流的帧id，默认从1开始，每次调用update方法，&#43;1self.det_threshfloat检测阈值，高于这个阈值且无法在当前轨迹中找到匹配的检测框可以生成一条新的轨迹。self.track_thresh高质量检测框的分数阈值self.match_threshfloat轨迹和目标框匹配的阈值self.low_threshfloat低质量检测框的分数阈值self.max_time_lostint一条轨迹如果在该值数量的帧中都丢失了检测框，则认为这个轨迹丢失 方法类 方法名称备注init()初始化，初始化上述的属性reset(self)对于新的视频流需要重新初始化这个类的属性step(self, output_results)比较复杂，详细见下面 step方法详解 step(self, output_results)函数中的操作
+先定义的一些用于保存中间结果的函数内列表
+activated_starcks = []#存在的轨迹并且已经出于激活状态is_activate=Truerefind_stracks = []#当前帧中重新找到匹配的轨迹，这些轨迹在之前的状态中为Lost状态lost_stracks = []#当前帧中丢失匹配的轨迹，之前这些轨迹的状态为Trackedremoved_stracks = []#当前帧中需要删除的轨迹，这些轨迹到目前为止的丢失匹配帧数超过了self.max_time_lostunconfirmed = []#存在轨迹但是is_activate=False，但是因为这个轨迹出现的帧数不多（目前这版中认为出现1次的为unconfirmed，两次及以上就是确定的真实轨迹），因此不确定是否能真实（也就是目前还没有激活的轨迹）tracked_stracks = [] #self.tracked_stracks中的轨迹且满足轨迹属性is_activated为True 将当前帧检测到的目标框按照阈值分为detections,det_second,分别表示高质量检测框和低质量检测框;
+将当前类中处于追踪状态的轨迹self.tracked_stracks列表，按照属性track.is_activated是否为True划分到tracked_stracks列表和unconfirmed列表中。其中unconfirmed中的轨迹为上一帧中首次出现了高质量目标框，但是因为出现的次数只有一次，所以还不能确定是否真的是一个新轨迹，需要在本帧中进行验证的新轨迹，这类的轨迹称为低优先级轨迹；将tracked_stracks&#43;self.lost_stracks的轨迹集联合起来作为高优先级轨迹，统一更新高优先级轨迹的卡尔曼滤波得到本帧的预测结果。
+具体的步骤如下
+将高质量检测框和步骤2中的高优先级轨迹的预测框进行计算IOU距离,然后乘上检测框的score作为一个联合分数cost_matrix，显然如果IOU越大且score越大，那么认为检测框和2中的轨迹关联性越大。利用匈牙利算法和阈值self.match_thresh，根据上面计算得到的cost_matrix进行匹配，结果集合分为三个matches, u_track, u_detection，分别表示匹配的（轨迹，目标框），未能匹配的轨迹，未能匹配的高质量检测框对于匹配的（轨迹，目标框），如果轨迹的状态为Tracked，那么更新轨迹状态（调用轨迹的update方法），将这个轨迹添加到activated_starcks列表中对于匹配的（轨迹，目标框），如果轨迹的状态为其他，那么重新激活这个轨迹(调用轨迹的re_activate方法），将这个轨迹添加到refind_stracks列表中将低质量的检测框和步骤1中未能匹配的高优先级轨迹u_track中的追踪中轨迹（不考虑lost_strack中的轨迹），执行步骤1计算cost_matrix，需要注意这里的cost_matrix不需要考虑检测框的score权重。将得到的代价矩阵匈牙利匹配算法，此时匹配的阈值为0." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/3c4b8fb807ab1322c089652f0e7781e4/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-12-19T19:06:24+08:00" />
+<meta property="article:modified_time" content="2022-12-19T19:06:24+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ByteTracker行人跟踪核心代码解读</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>byteTracker中因为目标检测和行人跟踪是解耦的，因此这里主要分析的是byteTracker中的代码。</p> 
+<p>也即是分析当给定一帧图片frame_id,给定这帧中的box列表，行人跟踪类是怎么跟踪每条轨迹的。</p> 
+<p>也就是https://github.com/ifzhang/ByteTrack中位于目录tutorials/trades/byte_tracker中的代码。</p> 
+<p>首先这个代码中最重要的两个类，一个是<strong>轨迹类STrack</strong>，一个是<strong>跟踪类BYTETracker类</strong>。<br> 前者是每条轨迹，后者管理目前视频流中的所有轨迹，并在新的一帧到来之后通过调用类方法update更新当前视频流中的轨迹状态（可能有新的轨迹，可能有旧的轨迹失去跟踪目标框，可能有目标框匹配成功，可能有之前丢失目标框的轨迹重新匹配成功）。</p> 
+<p>之所以写这个代码解读，是因为每次重新捡起来阅读的时候都被各种参数搞得晕头转向，很容易混淆不同参数的含义。索性写个详细的笔记记录一下。</p> 
+<h3><a id="STrack_11"></a>一、轨迹类STrack</h3> 
+<p>这里面保存的都是轨迹自身的状态。跟踪类BYTETracker类通过调用轨迹的属性和方法来进行轨迹状态的管理。</p> 
+<h4><a id="1__13"></a>1 属性集合</h4> 
+<table><thead><tr><th>属性名称</th><th>类型</th><th>含义</th></tr></thead><tbody><tr><td>self._tlwh</td><td>列表</td><td>保存目标框属性</td></tr><tr><td>self.is_activated</td><td>bool</td><td>该轨迹是否是激活状态（也就是保持追踪中）,如果是视频流的第一帧，那么第一次update的时候，该属性就是True，如果不是第一帧，那么需要第二次匹配成功的时候才会设置为True（考虑一下误识别的情况，这就可以理解了，只有当连续两帧都匹配成功，才认为这个轨迹可靠）。</td></tr><tr><td>self.kalman_filter</td><td>类实例</td><td>在第一次调用activate()函数时，设置卡尔曼滤波器</td></tr><tr><td>self.mean, self.covariance</td><td>ndarray</td><td>保存卡尔曼滤波对于这个轨迹的mean和convariance.其中len(mean)=8(x,y,a,h,va,vy,va,vh),v表示速度，covariance为[8,8]。在第一次调用activate()函数时进行初始化，初始化根据目标框的坐标进行估计</td></tr><tr><td>self.tlbr</td><td>ndarray</td><td>如果self.is_activated=True，那么就是根据卡尔曼滤波预测的左上角和右下角坐标,如果self.is_activated=False，那么就是当前检测框观测值的左上角和右下角坐标</td></tr><tr><td>self.tlwh</td><td>ndarray</td><td>如果self.is_activated=True，那么就是根据卡尔曼滤波预测的左上角和宽高，如果self.is_activated=False，那么就是当前检测框观测值的左上角和宽高</td></tr><tr><td>self.score</td><td>float</td><td>轨迹分数，采用当前帧的目标框分数作为轨迹分数</td></tr><tr><td>self.tracklet_len</td><td>int</td><td>轨迹追踪的帧数，初始为0，后面每追踪成功（调用update方法），则+1</td></tr><tr><td>self.state</td><td>TrackState</td><td>TrackState.New，Tracked,Lost,Removed四种状态，初始化为new。如果调用activate()/re_activate()/update方法时转换为Tracked状态，调用mark_lost()方法转为Lost状态，调用mark_removed()方法转为Removed方法。</td></tr><tr><td>self.track_id</td><td>int</td><td>self.is_activated=True 轨迹的id，全局唯一标志</td></tr><tr><td>self.start_frame</td><td>int</td><td>第一次调用activate方法时，这个轨迹的frame_id</td></tr><tr><td>self.frame_id</td><td>int</td><td>目前位置，最后一次出现该轨迹的匹配框的帧编号</td></tr><tr><td>self.end_frame</td><td>int</td><td>最后一帧出现该轨迹的帧编号,同frame_id</td></tr></tbody></table> 
+<h4><a id="2__30"></a>2. 方法集合</h4> 
+<table><thead><tr><th>方法名称</th><th>备注</th></tr></thead><tbody><tr><td>init(self, tlwh, score)</td><td>每个目标框都会初始化一个track，但是此时的self.is_activated=False</td></tr><tr><td>activate(self, kalman_filter, frame_id)</td><td>激活这条轨迹，如果是当前帧是视频流的第一帧，那么设置self.is_activated=True，否则这个属性依旧是False；设置state属性为TrackState.Tracked</td></tr><tr><td>update(self, new_track, frame_id)</td><td>更新轨迹信息，设置is_activate=True主要更新self.frame_id,self.score,tracklet_len,卡尔曼滤波mean,conv；</td></tr><tr><td>re_activate(self, new_track, frame_id, new_id=False)</td><td>重新激活这个轨迹（之前处于丢失状态），重新计算卡尔曼滤波的mean, covariance；重新计算self.tracklet_len；更新self.frame_id,self.score；</td></tr><tr><td>mark_lost(self)</td><td>将state参数设置为TrackState.Lost</td></tr></tbody></table> 
+<p>这里需要注意两个概念：<br> <strong>1. is_activated状态和activate函数的关系</strong>：<br> 不是调用了activate函数，轨迹的is_activated状态就是True。<br> is_activated状态可以理解为该轨迹是否大概率为真实的轨迹。<br> 如果这状态为True，我们会认为这个轨迹是一个真实的轨迹，已经通过多帧的匹配得到的认证，是在追踪逻辑中高优先级的一个轨迹。但是如果这个轨迹是第一次出现，也就是目前只有一帧图片中出现了目标框，那么需要后续帧能够存在匹配的目标框来确保这个轨迹是真实的，而不是检测器的误检，那么此时这个is_activated状态就是False。第一帧数据除外，第一帧数据中的高分目标框默认生成的轨迹is_activated状态就是True。</p> 
+<p>调用了activate函数是表明当前这个目标框分数较高，很可能是一个新的轨迹的第一帧。</p> 
+<p><strong>is_activated状态和state状态的关系</strong>：<br> 正如上面说了is_activated的含义，state的含义单纯表示当前轨迹在当前帧的状态。<br> 初始化为New；<br> 对于第一次出现且没有匹配轨迹的高分检测框，会调用activate函数初始化一条轨迹，那么状态就是Tracked;<br> 对于能够匹配到目标框的轨迹，通过调用轨迹的update方法，依旧将状态维持为Tracked;<br> 对于当前帧丢失匹配的情况，将状态转为Lost;<br> 对于多帧丢失乃至于超过BYTETracker定义max_time_lost的，则将其state设置为Removed。</p> 
+<h3><a id="BYTETracker_56"></a>二、轨迹追踪类BYTETracker</h3> 
+<p>整个服务维护一个BYTETracker对象，负责当前视频所有轨迹的追踪和维护。其内部的类属性中最上面的三个列表维护了当前视频流中的所有轨迹，其余类属性为各种阈值参数。</p> 
+<h4><a id="_59"></a>属性类</h4> 
+<table><thead><tr><th>属性名称</th><th>类型</th><th>含义</th></tr></thead><tbody><tr><td>self.tracked_stracks</td><td>list[STrack]</td><td>维护当前追踪中的轨迹列表</td></tr><tr><td>self.lost_stracks</td><td>list[STrack]</td><td>维护到前一帧为止的追踪中丢失了检测框的轨迹列表</td></tr><tr><td>self.removed_stracks</td><td>list[STrack]</td><td>维护删除的轨迹列表</td></tr><tr><td>self.frame_id</td><td>int</td><td>当前视频流的帧id，默认从1开始，每次调用update方法，+1</td></tr><tr><td>self.det_thresh</td><td>float</td><td>检测阈值，高于这个阈值且无法在当前轨迹中找到匹配的检测框可以生成一条新的轨迹。</td></tr><tr><td>self.track_thresh</td><td></td><td>高质量检测框的分数阈值</td></tr><tr><td>self.match_thresh</td><td>float</td><td>轨迹和目标框匹配的阈值</td></tr><tr><td>self.low_thresh</td><td>float</td><td>低质量检测框的分数阈值</td></tr><tr><td>self.max_time_lost</td><td>int</td><td>一条轨迹如果在该值数量的帧中都丢失了检测框，则认为这个轨迹丢失</td></tr></tbody></table> 
+<h4><a id="_72"></a>方法类</h4> 
+<table><thead><tr><th>方法名称</th><th>备注</th></tr></thead><tbody><tr><td>init()</td><td>初始化，初始化上述的属性</td></tr><tr><td>reset(self)</td><td>对于新的视频流需要重新初始化这个类的属性</td></tr><tr><td>step(self, output_results)</td><td>比较复杂，详细见下面</td></tr></tbody></table> 
+<h4><a id="step_79"></a>step方法详解</h4> 
+<p>step(self, output_results)函数中的操作<br> 先定义的一些用于保存中间结果的函数内列表</p> 
+<ul><li>activated_starcks = []#存在的轨迹并且已经出于激活状态is_activate=True</li><li>refind_stracks = []#当前帧中重新找到匹配的轨迹，这些轨迹在之前的状态中为Lost状态</li><li>lost_stracks = []#当前帧中丢失匹配的轨迹，之前这些轨迹的状态为Tracked</li><li>removed_stracks = []#当前帧中需要删除的轨迹，这些轨迹到目前为止的丢失匹配帧数超过了self.max_time_lost</li><li>unconfirmed = []#存在轨迹但是is_activate=False，但是因为这个轨迹出现的帧数不多（目前这版中认为出现1次的为unconfirmed，两次及以上就是确定的真实轨迹），因此不确定是否能真实（也就是目前还没有激活的轨迹）</li><li>tracked_stracks = [] #self.tracked_stracks中的轨迹且满足轨迹属性is_activated为True</li></ul> 
+<p>将当前帧检测到的目标框按照阈值分为detections,det_second,分别表示<strong>高质量检测框和低质量检测框</strong>;<br> 将当前类中处于追踪状态的轨迹self.tracked_stracks列表，按照属性track.is_activated是否为True划分到tracked_stracks列表和unconfirmed列表中。其中unconfirmed中的轨迹为上一帧中首次出现了高质量目标框，但是因为出现的次数只有一次，所以还不能确定是否真的是一个新轨迹，需要在本帧中进行验证的新轨迹，这类的轨迹称为<strong>低优先级轨迹</strong>；将tracked_stracks+self.lost_stracks的轨迹集联合起来作为<strong>高优先级轨迹</strong>，统一更新高优先级轨迹的卡尔曼滤波得到本帧的预测结果。</p> 
+<p><strong>具体的步骤如下</strong></p> 
+<ol><li><strong>将高质量检测框和步骤2中的高优先级轨迹的预测框</strong>进行计算IOU距离,然后乘上检测框的score作为一个联合分数cost_matrix，显然如果IOU越大且score越大，那么认为检测框和2中的轨迹关联性越大。利用<mark>匈牙利算法</mark>和阈值self.match_thresh，根据上面计算得到的cost_matrix进行匹配，结果集合分为三个matches, u_track, u_detection，分别表示匹配的（轨迹，目标框），未能匹配的轨迹，未能匹配的高质量检测框</li><li>对于匹配的（轨迹，目标框），如果轨迹的状态为Tracked，那么更新轨迹状态（调用轨迹的update方法），将这个轨迹添加到activated_starcks列表中</li><li>对于匹配的（轨迹，目标框），如果轨迹的状态为其他，那么重新激活这个轨迹(调用轨迹的re_activate方法），将这个轨迹添加到refind_stracks列表中</li><li><strong>将低质量的检测框和步骤1中未能匹配的高优先级轨迹</strong>u_track中的追踪中轨迹（不考虑lost_strack中的轨迹），执行步骤1计算cost_matrix，需要注意这里的cost_matrix不需要考虑检测框的score权重。将得到的代价矩阵匈牙利匹配算法，此时匹配的阈值为0.4，同样获得matches, u_track, u_detection_second</li><li>对于步骤4中匹配的(轨迹、目标框),更新轨迹状态（调用轨迹的update方法），将这个轨迹添加到activated_starcks列表中</li><li>对于步骤4中u_track轨迹，将其轨迹状态设置为lost（self.state = TrackState.Lost），将这个轨迹添加到lost_stracks列表中</li><li><strong>对于步骤1中的未能匹配的高质量检测框u_detection和unconfirmed列表中的低优先级轨迹</strong>执行IOU距离计算获得代价矩阵，然后执行匈牙利匹配，得到matches, u_unconfirmed依旧未匹配的轨迹, u_detection依旧未匹配的高质量目标框。</li><li>对于matches中的(轨迹、目标框),更新轨迹状态（调用轨迹的update方法），因为这里的轨迹是原本unconfirmed的，也就是出现过一次，轨迹状态为state=TrackState.New,is_activate=False的轨迹，这里调用update之后，轨迹的状态为TrackState.Tracked，is_activated = True。将这个轨迹添加到activated_starcks列表中。</li><li>对于步骤7中的u_unconfirmed依旧未匹配的轨迹，标记其状态为state = TrackState.Removed。并将这个轨迹添加到removed_stracks中。这个轨迹因为只在上帧出现依次，本帧没有能够匹配的目标框，因此不认为这个轨迹值得存在了。<br> 10.对于步骤7中的u_detection依旧未匹配的高质量目标框，如果其分数大于阈值self.det_thresh，那么认为这可能是一个新轨迹的第一帧，将其转换为一个新轨迹，调用activate方法；并将这条新轨迹添加到activated_starcks列表中。</li><li>对于类属性self.lost_stracks中的轨迹，判断到当前为止丢失的帧数量，如果超过阈值，那么标记该轨迹的状态为state = TrackState.Removed，并将该轨迹添加到removed_stracks列表。<br> 请添加图片描述</li></ol> 
+<p>虽然上面的过程因为参与的参数和列表名称太多显得非常的复杂，但是通过下面这张图可以清晰的看到每个步骤的：<br> <img src="https://images2.imgbox.com/27/90/SotjiGoC_o.png" alt="在这里插入图片描述"><br> 通过上面的逻辑表述和脑图表述基本可以确定方法列表中保存的额内容</p> 
+<ul><li>activated_starcks中保存了高优先级轨迹和高质量目标框的匹配轨迹；高优先级轨迹和低质量目标框中的匹配轨迹；低优先级轨迹和高质量目标框的匹配轨迹；什么都未能匹配上的高质量目标框单独构成一条新轨迹（其状态为TrackState.Tracked，is_activated=False,也就是对于下一帧来说这个轨迹是一个unconfirmed低优先级的轨迹）。</li><li>refind_stracks中保存了原本self.lost_stracks中的轨迹，但是在这一帧中找到了匹配的目标框的轨迹。</li><li>lost_stracks中保存了本帧中高优先级轨迹无论在高质量目标框还是低质量目标框中都无法匹配的轨迹；</li><li>removed_stracks保存了本帧中unconfirmed低优先级轨迹在本帧没有找到目标框匹配的轨迹，以及高优先级轨迹中丢失目标框的帧数超过阈值的轨迹；</li></ul> 
+<p>最后就是根据上述的5个函数属性来更新类属性<mark>self.tracked_stracks，self.lost_stracks，self.removed_stracks</mark>。</p> 
+<ul><li>self.tracked_stracks=原本的self.tracked_stracks中到现在为止状态依旧为TrackState.Tracked的轨迹+方法属性activated_starcks列表+方法属性refind_stracks</li><li>self.lost_stracks=原本self.lost_stracks中到目前位置状态依旧为TrackState.Lost的轨迹+方法属性lost_stracks列表</li><li>self.removed_stracks = 原本的self.removed_stracks+方法属性removed_stracks列表</li></ul> 
+<p>最后输出self.tracked_stracks中track.is_activated的轨迹作为当前帧的显式跟踪的轨迹。</p> 
+<p>通过上述的逻辑，每帧视频流都会传入目标框，通过step方法不停的更新类属性中的self.tracked_stracks，self.lost_stracks，self.removed_stracks列表来实现轨迹的跟踪。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/db1d95df5cd6bf11985c50c330f70715/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">2023秋招360公司NLP算法岗面经</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/24d0f16888ebdea12d4bce4dd8d1ffc3/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Android存储之分区存储适配</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

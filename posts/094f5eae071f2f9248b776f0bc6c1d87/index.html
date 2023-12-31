@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>手写分布式KV存储引擎（一）： 设计和实现网络框架 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="手写分布式KV存储引擎（一）： 设计和实现网络框架" />
+<meta property="og:description" content="此系列文章对应的源码放在DSTORE下。
+本文为此系列第一篇文章，主要是关于如何设计和实现一个基本的网络框架，全文的组织结构如下：
+网络框架的要点
+DSTORE网络框架的设计与实现
+网络框架的要点
+使用TCP还是UDP?
+由于TCP相对于UDP来讲，可靠性高很多，保证包的按序达到，这对于高可靠的存储系统来讲是十分必要的，因此，本文的网络框架将基于TCP来实现。
+操作系统的选择
+由于目前Linux是服务端编程中主流的操作系统平台，因此，本文的网络框架将基于Linux平台，且为X86_64体系架构。
+Reactor VS Proactor
+一般Reactor模型基于I/O多路复用来实现，Linux平台提供select,epoll等接口，而Proactor模型一般基于异步I/O来实现，目前Linux系统对这块支持不太好，因此，本文的网络框架将基于Reactor来实现。
+线程模型
+两种常见的线程模型，一是IO线程和工作线程共用相同线程，二是IO线程和工作线程分开。
+I/O线程和工作线程共用
+如上图，I/O线程和工作线程共用的线程模型中，实际上是没有专门的工作线程的，I/O线程不仅需要负责处理I/O，还需要真正地处理请求，计算结果。一般典型的处理流程为
+Process Read I/O: 处理读I/O
+Process: 解析请求，计算结果
+Process Write I/O： 处理写I/O，把计算结果返回给客户端
+这种线程模型的特点是
+处理流程相对简单，解析好请求后就能直接在同一线程处理，省去了线程切换的开销，非常适合Process耗费时间较小的请求
+由于Process过程需要耗费时间，对于大任务，可能时间较长，会影响其他请求的处理
+I/O线程和工作线程独立
+如上图，在I/O线程和工作线程独立的线程模型中，有专门的工作线程来处理请求，计算结果，I/O线程仅仅需要做读写数据相关的操作。在这种线程模型下，整个流程为
+Process Read I/O:处理读数据，然后解析请求，生成任务，推送到工作线程的队列中，然后以异步事件方式通知工作线程处理
+Process: 工作线程接收到异步事件后，从其工作队列中拿出任务，依次处理，处理完成后，生成结果，放到I/O线程的队列中，然后以异步事件方式通知I/O线程处理
+Process Write I/O：I/O线程收到通知后，依次处理写数据请求
+这种线程模型的特点是
+I/O和计算分开处理，会引入线程切换开销，比较适合Process耗费时间长的任务请求
+对于小任务请求不适合，大量时间耗费在线程切换开销
+对于存储系统，一般计算需求较小，因此采用第一种线程模型。
+KV存储项目介绍
+基础架构-KV存储项目 （代码&#43;文档地址：点击登录查看）
+kv存储的架构设计
+网络同步与事务序列化(1)
+网络同步与事务序列化(2)
+KV存储的性能测试(1)
+KV存储的性能测试(2)
+​
+I/O线程模型
+选定好在I/O线程中处理任务之后，又需要确定I/O线程具体是如何分工的，一般有三种方式
+单线程做accept和I/O
+单读一个线程accept,其他线程I/O
+多线程，每个线程accept并且Ｉ/O
+主要从两个角度考虑这几个I/O模型的选择
+连接建立的频繁与否
+I/O的吞吐量高与否
+对于第一种模型，比较适合连接建立不频繁的场景，在CPU使用不高的情况下，单线程也可以做到打满网络带宽
+对于第二种模型，比较适合连接建立不频繁的场景，可以通过增加I/O线程的数量，来提升I/O的吞吐量
+对于第三种模型，比较适合连接建立频繁的场景，可以通过增加线程的数量，来提升连接建立的速度和I/O的吞吐量
+对于存储系统调用者来讲，一般会使用连接池，因此，存储系统一般不会频繁的建立连接；并且一般存储系统对I/O吞吐量需要较高，因此，选择第一种和第二种模型。本文中暂时采用第一种模型，如果在第一种模型不能提供足够的I/O带宽的情况下，考虑采用第二种模型。
+DSTORE网络框架设计与实现
+网络框架需要处理的事件
+在描述DSTORE网络框架设计之前，先分析网络框架需要处理的事件
+网络请求处理流程" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/094f5eae071f2f9248b776f0bc6c1d87/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-08-11T21:56:48+08:00" />
+<meta property="article:modified_time" content="2023-08-11T21:56:48+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">手写分布式KV存储引擎（一）： 设计和实现网络框架</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>此系列文章对应的源码放在<a href="https://github.com/Charles0429/dstore" title="DSTORE">DSTORE</a>下。</p> 
+<p>本文为此系列第一篇文章，主要是关于如何设计和实现一个基本的网络框架，全文的组织结构如下：</p> 
+<ul><li> <p>网络框架的要点</p> </li><li> <p>DSTORE网络框架的设计与实现</p> </li></ul> 
+<h4></h4> 
+<p>网络框架的要点</p> 
+<h4></h4> 
+<p>使用TCP还是UDP?</p> 
+<p>由于TCP相对于UDP来讲，可靠性高很多，保证包的按序达到，这对于高可靠的存储系统来讲是十分必要的，因此，本文的网络框架将基于TCP来实现。</p> 
+<h4></h4> 
+<p>操作系统的选择</p> 
+<p>由于目前Linux是服务端编程中主流的操作系统平台，因此，本文的网络框架将基于Linux平台，且为X86_64体系架构。</p> 
+<h4></h4> 
+<p>Reactor VS Proactor</p> 
+<p>一般Reactor模型基于I/O多路复用来实现，Linux平台提供select,epoll等接口，而Proactor模型一般基于异步I/O来实现，目前Linux系统对这块支持不太好，因此，本文的网络框架将基于Reactor来实现。</p> 
+<h4></h4> 
+<p>线程模型</p> 
+<p>两种常见的线程模型，一是IO线程和工作线程共用相同线程，二是IO线程和工作线程分开。</p> 
+<h4></h4> 
+<p>I/O线程和工作线程共用</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="369" src="https://images2.imgbox.com/99/23/Z6SuEp3J_o.png" width="859"></p> 
+<p></p> 
+<p>如上图，I/O线程和工作线程共用的线程模型中，实际上是没有专门的工作线程的，I/O线程不仅需要负责处理I/O，还需要真正地处理请求，计算结果。一般典型的处理流程为</p> 
+<ul><li> <p>Process Read I/O: 处理读I/O</p> </li><li> <p>Process: 解析请求，计算结果</p> </li><li> <p>Process Write I/O： 处理写I/O，把计算结果返回给客户端</p> </li></ul> 
+<p>这种线程模型的特点是</p> 
+<ul><li> <p>处理流程相对简单，解析好请求后就能直接在同一线程处理，省去了线程切换的开销，非常适合Process耗费时间较小的请求</p> </li><li> <p>由于Process过程需要耗费时间，对于大任务，可能时间较长，会影响其他请求的处理</p> </li></ul> 
+<h4></h4> 
+<p>I/O线程和工作线程独立</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="1013" src="https://images2.imgbox.com/6f/6a/8FEYUaEx_o.png" width="934"></p> 
+<p></p> 
+<p>如上图，在I/O线程和工作线程独立的线程模型中，有专门的工作线程来处理请求，计算结果，I/O线程仅仅需要做读写数据相关的操作。在这种线程模型下，整个流程为</p> 
+<ul><li> <p>Process Read I/O:处理读数据，然后解析请求，生成任务，推送到工作线程的队列中，然后以异步事件方式通知工作线程处理</p> </li><li> <p>Process: 工作线程接收到异步事件后，从其工作队列中拿出任务，依次处理，处理完成后，生成结果，放到I/O线程的队列中，然后以异步事件方式通知I/O线程处理</p> </li><li> <p>Process Write I/O：I/O线程收到通知后，依次处理写数据请求</p> </li></ul> 
+<p>这种线程模型的特点是</p> 
+<ul><li> <p>I/O和计算分开处理，会引入线程切换开销，比较适合Process耗费时间长的任务请求</p> </li><li> <p>对于小任务请求不适合，大量时间耗费在线程切换开销</p> </li></ul> 
+<p>对于存储系统，一般计算需求较小，因此采用第一种线程模型。</p> 
+<h4></h4> 
+<p>KV存储项目介绍</p> 
+<h4></h4> 
+<p>基础架构-KV存储项目 （代码+文档地址：<a href="https://link.zhihu.com/?target=https%3A//xxetb.xet.tech/s/4CJqPY" rel="nofollow" title="点击登录查看">点击登录查看</a>）</p> 
+<ul><li> <p>kv存储的架构设计</p> </li><li> <p>网络同步与事务序列化(1)</p> </li><li> <p>网络同步与事务序列化(2)</p> </li><li> <p>KV存储的性能测试(1)</p> </li><li> <p>KV存储的性能测试(2)</p> </li></ul> 
+<p></p> 
+<p class="img-center"><img alt="" height="441" src="https://images2.imgbox.com/21/0c/rukz41AI_o.jpg" width="720"></p> 
+<p></p> 
+<p></p> 
+<p class="img-center"><img alt="" height="751" src="https://images2.imgbox.com/5f/6d/UN2ojqaG_o.jpg" width="720"></p> 
+<p>​</p> 
+<p></p> 
+<p></p> 
+<h4></h4> 
+<p>I/O线程模型</p> 
+<p>选定好在I/O线程中处理任务之后，又需要确定I/O线程具体是如何分工的，一般有三种方式</p> 
+<ul><li> <p>单线程做accept和I/O</p> </li><li> <p>单读一个线程accept,其他线程I/O</p> </li><li> <p>多线程，每个线程accept并且Ｉ/O</p> </li></ul> 
+<p>主要从两个角度考虑这几个I/O模型的选择</p> 
+<ul><li> <p>连接建立的频繁与否</p> </li><li> <p>I/O的吞吐量高与否</p> </li></ul> 
+<p>对于第一种模型，比较适合连接建立不频繁的场景，在CPU使用不高的情况下，单线程也可以做到打满网络带宽</p> 
+<p>对于第二种模型，比较适合连接建立不频繁的场景，可以通过增加I/O线程的数量，来提升I/O的吞吐量</p> 
+<p>对于第三种模型，比较适合连接建立频繁的场景，可以通过增加线程的数量，来提升连接建立的速度和I/O的吞吐量</p> 
+<p>对于存储系统调用者来讲，一般会使用连接池，因此，存储系统一般不会频繁的建立连接；并且一般存储系统对I/O吞吐量需要较高，因此，选择第一种和第二种模型。本文中暂时采用第一种模型，如果在第一种模型不能提供足够的I/O带宽的情况下，考虑采用第二种模型。</p> 
+<h4></h4> 
+<p>DSTORE网络框架设计与实现</p> 
+<h4></h4> 
+<p>网络框架需要处理的事件</p> 
+<p>在描述DSTORE网络框架设计之前，先分析网络框架需要处理的事件</p> 
+<h4></h4> 
+<p>网络请求处理流程</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="863" src="https://images2.imgbox.com/4e/21/C8ZNdoLY_o.png" width="1042"></p> 
+<p></p> 
+<p>从上面的处理流程可以看出，对于Client和Server，它们需要关注的事情包括</p> 
+<ul><li> <p>消息的解码</p> </li><li> <p>对消息的处理，生成响应</p> </li><li> <p>把响应结果根据格式编码</p> </li></ul> 
+<p>对于网络框架层，需要关注的是</p> 
+<ul><li> <p>读事件及读数据</p> </li><li> <p>写事件及写数据</p> </li></ul> 
+<p>网络框架除了需要关注读写事件及读写数据外，还需要处理连接的建立和断开。</p> 
+<h4></h4> 
+<p>网络连接处理流程</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="647" src="https://images2.imgbox.com/57/99/m3JRjZbq_o.png" width="754"></p> 
+<p>​</p> 
+<p>网络连接处理流程和网络处理请求流程不太一样，在于Client和Server的处理与网络请求处理的流程不太一致，其流程如下</p> 
+<ol><li> <p>Client发起网络框架提供的API connect来请求建立连接</p> </li><li> <p>Client端的网络框架记录此事件，并加入监听</p> </li><li> <p>Client端的操作系统把包发送给通过网卡发送到网络</p> </li><li> <p>Server端的操作系统读取网卡数据，通知网络框架</p> </li><li> <p>Server端网络框架调用accept建立连接，并调用Server的建立连接的接口</p> </li><li> <p>Server端的accept调用会产生一个回包</p> </li><li> <p>Client端的操作系统收到后，触发网络框架的事件</p> </li><li> <p>Client端网络框架通知Client连接已建立</p> </li></ol> 
+<p>其中步骤5中accept返回后，其后半步骤与步骤6是并发的，并没有严格的顺序。</p> 
+<p>从上述流程可以看出，对于网络连接的建立，Server端和Client端处理调用网络框架的API之外，几乎不需要额外的处理。</p> 
+<p>而对于网络框架来讲，在Client和Server端的处理流程是不同的，分别是</p> 
+<ul><li> <p>在Client端，网络框架需要调用操作系统提供的connect接口，并且，监听connect完成的事件</p> </li><li> <p>在Server端，网络框架需要调用操作系统提供的accept接口，并且，需要触发server的新建连接的接口(这个连接维护也可以在网络框架中处理)</p> </li></ul> 
+<p>网络请求完成后，需要正确地关闭连接，其处理流程如下。</p> 
+<h4></h4> 
+<p>网络连接关闭流程</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="647" src="https://images2.imgbox.com/e2/eb/85Pi43Ve_o.png" width="754"></p> 
+<p>​</p> 
+<p></p> 
+<p>如上图，对于Client端，需要处理的主要是调用网络框架的close API；对于Server端，则需要处理其上维护的连接结构体等等。</p> 
+<p>对于网络框架，需要处理的是</p> 
+<ul><li> <p>Client端调用close</p> </li><li> <p>Server端需要监听close，然后触发Server端处理(也可以在网络框架中处理)</p> </li></ul> 
+<h4></h4> 
+<p>网络框架需要处理事件</p> 
+<p>通过上面的分析，可以总结出网络框架应该处理以下事件</p> 
+<ul><li> <p>处理连接的建立</p> </li><li> <p>处理连接的关闭</p> </li><li> <p>处理读事件和读数据</p> </li><li> <p>处理写事件和写数据</p> </li></ul> 
+<p>备注：此文写作时，Client端的网络框架尚未实现。</p> 
+<h4></h4> 
+<p>DSTORE网络框架设计</p> 
+<p>本网络框架的目标是使得Server端和Client端编程时，只需要以下事件</p> 
+<p>Server端需要关注的事件</p> 
+<ul><li> <p>请求编码</p> </li><li> <p>请求解码</p> </li><li> <p>处理</p> </li></ul> 
+<p>Client端需要关注的事件</p> 
+<ul><li> <p>请求编码</p> </li><li> <p>请求解码</p> </li><li> <p>处理</p> </li><li> <p>主动调用close关闭连接</p> </li></ul> 
+<p>其他的一律由网络框架部分来处理，网络框架的整体框架如下</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="395" src="https://images2.imgbox.com/25/08/VmwobyzT_o.png" width="649"></p> 
+<p></p> 
+<p>网框框架整体包含两部分：</p> 
+<ul><li> <p>Reactor负责监听读写事件</p> </li><li> <p>Connection Management负责根据读写事件，来建立连接，关闭连接，读数据和写数据</p> </li></ul> 
+<h4></h4> 
+<p>Reactor</p> 
+<p>一个reactor模式如下图：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="492" src="https://images2.imgbox.com/df/a6/AU0tAQa2_o.png" width="869"></p> 
+<p>​</p> 
+<p></p> 
+<p>Reactor中组件包括Reactor，EventHandler，I/O multiplexing和Timer</p> 
+<ul><li> <p>EventHandler是事件的接口，一般分为I/O事件、定时器事件等等</p> </li><li> <p>I/O multiplexing即I/O多路复用，linux中一般采用epoll接口</p> </li><li> <p>Timer是管理定时器的类，主要负责注册事件、获取超时事件列表等等，一般由网络框架开发者实现</p> </li><li> <p>Reactor中使用了I/O multiplexing和Timer，有EventHandler注册时，会调用相应的接口。Reactor的HandleEvents中需要先调用I/O multiplexing和Timer的接口，获取已就绪好的事件，最终调用每个EventHandler的HandleEvent接口来处理事件</p> </li></ul> 
+<p>本文写作时，DSTORE的网络框架还没有实现定时器相关的功能。</p> 
+<h4></h4> 
+<p>Connection Management</p> 
+<p>Connection Management主要需要处理如下</p> 
+<ul><li> <p>on_read：读事件触发后，读取缓冲区的数据</p> </li><li> <p>on_write：缓冲区空闲后，写入应用所请求要写入的数据</p> </li><li> <p>on_connect：连接建立后，维护连接所必须的结构体和资源</p> </li><li> <p>on_close：连接关闭后，清理连接所必须的结构体和资源</p> </li></ul> 
+<h4></h4> 
+<p>DSTORE网络框架实现</p> 
+<p>本部分主要描述Reactor和Connection Management部分的实现。</p> 
+<h4></h4> 
+<p>Reactor实现</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="713" src="https://images2.imgbox.com/88/19/Q5uoGkPA_o.png" width="787"></p> 
+<p>​</p> 
+<p></p> 
+<ul><li> <p>EventLoop：对应于Reactor，调用epoll或select的接口</p> </li><li> <p>Event：每个文件描述符对应一个事件，read_cb处理读事件,write_cb处理写事件</p> </li><li> <p>EventPollAPI：I/O多路复用的接口，可以有epoll，select，poll和kqueue等多种实现，本文写作时只封装了epoll的接口</p> </li></ul> 
+<p>源码链接</p> 
+<ul><li> <p><a href="https://github.com/Charles0429/dstore/blob/master/dstore/network/event_loop.cpp" title="EventLoop and Event">EventLoop and Event</a></p> </li><li> <p><a href="https://github.com/Charles0429/dstore/blob/master/dstore/network/epoll.cpp" title="Epoll">Epoll</a></p> </li></ul> 
+<p>Connection Management实现</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="521" src="https://images2.imgbox.com/a2/83/2l5VGViO_o.png" width="1004"></p> 
+<p></p> 
+<p>TCPServer</p> 
+<p>TCPServer中维护了所有连接的hashmap，用来保存Client端和Server端所有建立的连接情况。</p> 
+<p>实现了连接管理中的四种功能：</p> 
+<ul><li> <p>读数据</p> </li><li> <p>写数据</p> </li><li> <p>连接建立</p> </li><li> <p>连接关闭</p> </li></ul> 
+<p>其中读数据和写数据依赖于EventLoop中每个Event的读事件和写事件的触发</p> 
+<p><a href="https://github.com/Charles0429/dstore/blob/master/dstore/network/tcp_server.cpp" title="源码">源码</a></p> 
+<p>TCPListener</p> 
+<p>TCPListener是用来处理accept相关的事件的，包括服务端socket从创建到listen的全过程，以及accept调用的支持。TCPListener调用accept之后，会触发TCPServer中的on_connect事件。</p> 
+<p><a href="https://github.com/Charles0429/dstore/blob/master/dstore/network/tcp_listener.cpp" title="源码">源码</a></p> 
+<h4></h4> 
+<p>Connection</p> 
+<p>Connection代表了Client与Server端的连接，每个连接上可能会收到客户端的多个请求，其使用链表来维护尚未处理的请求。</p> 
+<p></p> 
+<p>Message</p> 
+<p>Message代表来自Client的一个完整的消息，Server根据消息中的指定的操作，来进行相应的处理。</p> 
+<p><a href="https://github.com/Charles0429/dstore/blob/master/dstore/network/message.cpp" title="源码">源码</a></p> 
+<p>使用例子</p> 
+<p>一个简单的使用例子请参照<a href="https://github.com/Charles0429/dstore/blob/master/dstore/test/simple_packet_test.cpp" title="simple_packet_test.cpp">simple_packet_test.cpp</a></p> 
+<blockquote> 
+ <p>原文：<a href="http://oserror.com/distributed/implement-network-framework-using-C/" rel="nofollow" title="自己动手写分布式KV存储引擎（一）：　设计和实现网络框架">自己动手写分布式KV存储引擎（一）：　设计和实现网络框架</a></p> 
+</blockquote>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/4b1b9133fd408cbc2563268b5e72cb5d/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Android：Namespace not specified. Please specify a namespace in the module‘s build.gradle file like</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/69ce7223a8bdec4cfd3d6dab1a2dd3d1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">西门子博图1200学习笔记_（第五章：标识与数据类型 ）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

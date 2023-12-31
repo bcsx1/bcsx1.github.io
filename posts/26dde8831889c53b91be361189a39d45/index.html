@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>深入理解 Linux 内核---进程地址空间 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="深入理解 Linux 内核---进程地址空间" />
+<meta property="og:description" content="讲述：
+进程是怎样看待动态内存的。
+进程空间的基本组成。
+缺页异常处理程序在推迟给进程分配页框中所起的作用。
+内核怎样创建和删除进程的整个地址空间。
+与进程的地址空间管理有关的 API 和系统调用。
+进程的地址空间 进程的地址空间由允许进程使用的全部线性地址组成。
+每个进程看到的线性地址集合是不同的。
+内核可通过增加或删除某些线性地址区间来动态地修改进程的地址空间。
+内核通过线性区来表示线性地址区间，由起始线性地址、长度和一些访问权限描述。
+为效率起见，起始地址和长度都必须是 4096 的倍数，这样线性区的数据就可以完全填满分配给它的页框。
+下面是获得新线性区的一些典型情况：
+用户在控制台输入一条命令时，shell 进程创建一个新进程区执行该命令，一组线性区会分配给新进程。正在运行的进程可能会装入一个完全不同的程序，进程标识符保持不变，但该程序使用的线性区会替换。正在运行的进程可能对一个文件（或它的一部分）执行”内存映射“，内核会给该进程分配一个新的线性区来映射该文件。进程可能持续向它的用户态堆栈增加数据，直到映射该堆栈的线性区用完，这时，内核也许会扩展该线性区的大小。进程可能创建一个 IPC 共享线性区来与其他何作进程共享数据，这时，内核会给该进程分配一个新的线性区。进程可能通过调用类似 malloc() 的函数扩展自己的动态区（堆），这时，内核可能决定扩展分配给该堆的线性区。 确定一个进程当前所拥有的线性区（即进程的地址空间）是内核的基本任务，因为可让缺页异常处理程序有效地区分两种不同的无效线性地址：
+由编程错误引发的无效线性地址。由缺页引发的无效线性地址：即使该线性地址属于进程的地址空间，但对应于该地址的页框仍有待分配。 内存描述符 内存描述符包含与进程地址空间有关的全部信息，该结构类型为 mm_struct，进程描述符的 mm 字段指向它。
+所有的内存描述符存放在一个双向链表。
+每个描述符的 mmlist 字段存放链表相邻元素的地址。
+链表的第一个元素是 init_mm 的 mmlist 字段，init_mm 是初始化阶段进程 0 所使用的内存描述符。
+mmlist_lock 自旋锁保护多处理器系统堆链表的同时访问。
+mm_users 字段存放共享 mm_struct 数据结构的轻量级进程的个数。
+mm_count 字段是内存描述符的主使用计数器，值为 0 时，解除该内存描述符。
+mm_users 次使用计数器中的所有用户在 mm_count 中值作为一个单位。
+如果内核向确保内存描述符在一个长操作的中间不被释放，应该增加 mm_users 字段而不是 mm_count 字段的值，最终结果是相同的。
+mm_alloc() 获得一个新的内存描述符。
+由于内存描述符被保存在 slab 分配器高速缓存中，因此，mm_alloc() 调用 kmem_cache_alloc() 初始化新的内存描述符，并将 mm_count 和 mm_users 都设为 1。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/26dde8831889c53b91be361189a39d45/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2018-12-08T21:37:32+08:00" />
+<meta property="article:modified_time" content="2018-12-08T21:37:32+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">深入理解 Linux 内核---进程地址空间</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>讲述：<br> 进程是怎样看待动态内存的。<br> 进程空间的基本组成。<br> 缺页异常处理程序在推迟给进程分配页框中所起的作用。<br> 内核怎样创建和删除进程的整个地址空间。<br> 与进程的地址空间管理有关的 API 和系统调用。</p> 
+<h2><a id="_7"></a>进程的地址空间</h2> 
+<p>进程的地址空间由允许进程使用的全部线性地址组成。<br> 每个进程看到的线性地址集合是不同的。<br> 内核可通过增加或删除某些线性地址区间来动态地修改进程的地址空间。</p> 
+<p>内核通过线性区来表示线性地址区间，由起始线性地址、长度和一些访问权限描述。<br> 为效率起见，起始地址和长度都必须是 4096 的倍数，这样线性区的数据就可以完全填满分配给它的页框。<br> 下面是获得新线性区的一些典型情况：</p> 
+<ul><li>用户在控制台输入一条命令时，shell 进程创建一个新进程区执行该命令，一组线性区会分配给新进程。</li><li>正在运行的进程可能会装入一个完全不同的程序，进程标识符保持不变，但该程序使用的线性区会替换。</li><li>正在运行的进程可能对一个文件（或它的一部分）执行”内存映射“，内核会给该进程分配一个新的线性区来映射该文件。</li><li>进程可能持续向它的用户态堆栈增加数据，直到映射该堆栈的线性区用完，这时，内核也许会扩展该线性区的大小。</li><li>进程可能创建一个 IPC 共享线性区来与其他何作进程共享数据，这时，内核会给该进程分配一个新的线性区。</li><li>进程可能通过调用类似 malloc() 的函数扩展自己的动态区（堆），这时，内核可能决定扩展分配给该堆的线性区。</li></ul> 
+<p>确定一个进程当前所拥有的线性区（即进程的地址空间）是内核的基本任务，因为可让缺页异常处理程序有效地区分两种不同的无效线性地址：</p> 
+<ul><li>由编程错误引发的无效线性地址。</li><li>由缺页引发的无效线性地址：即使该线性地址属于进程的地址空间，但对应于该地址的页框仍有待分配。</li></ul> 
+<h2><a id="_27"></a>内存描述符</h2> 
+<p>内存描述符包含与进程地址空间有关的全部信息，该结构类型为 mm_struct，进程描述符的 mm 字段指向它。</p> 
+<p>所有的内存描述符存放在一个双向链表。<br> 每个描述符的 mmlist 字段存放链表相邻元素的地址。<br> 链表的第一个元素是 init_mm 的 mmlist 字段，init_mm 是初始化阶段进程 0 所使用的内存描述符。<br> mmlist_lock 自旋锁保护多处理器系统堆链表的同时访问。</p> 
+<p>mm_users 字段存放共享 mm_struct 数据结构的轻量级进程的个数。<br> mm_count 字段是内存描述符的主使用计数器，值为 0 时，解除该内存描述符。<br> mm_users 次使用计数器中的所有用户在 mm_count 中值作为一个单位。</p> 
+<p>如果内核向确保内存描述符在一个长操作的中间不被释放，应该增加 mm_users 字段而不是 mm_count 字段的值，最终结果是相同的。</p> 
+<p>mm_alloc() 获得一个新的内存描述符。<br> 由于内存描述符被保存在 slab 分配器高速缓存中，因此，mm_alloc() 调用 kmem_cache_alloc() 初始化新的内存描述符，并将 mm_count 和 mm_users 都设为 1。</p> 
+<p>mmput() 递减内存描述符的 mm_users 字段。<br> 如果 mm_users 变为 0，释放局部描述符表、线性区描述符、由内存描述符所引用的页表，并调用 mmdrop()。<br> mmdrop() 将 mm_count 字段减 1，如果变为 0，释放 mm_struct 数据结构。</p> 
+<h3><a id="_49"></a>内核线程的内存描述符</h3> 
+<p>内核线程仅运行在内核态，因此拥有不会访问低于 TASK_SIZE 的地址。<br> 与普通进程相反，内核线程不使用线性区，因此内存描述符的很多字段对内核线程无意义。</p> 
+<p>因为大于 TASK_SIZE 线性地址的相应页表项应该总是相同的，所以，一个内核线程使用什么样的页表都可以。<br> 为了避免无用的 TLB 和高速缓存刷新，内核线程使用一组最近运行的普通进程的页表。<br> 因此，每个进程描述符中包含了两种内存描述符指针：mm 和 active_mm。</p> 
+<p>进程描述符中的 mm 字段指向进程所拥有的内存描述符，active_mm 字段指向进程运行时所使用的内存描述符。<br> 对于普通进程，这两个字段存放相同的指针。<br> 但对于内核线程，不拥有内存描述符，mm 字段总为 NULL。<br> 内核线程运行时，active_mm 字段被初始化为前一个运行进程的 active_mm 值。</p> 
+<p>然而，事情更复杂，只要处于内核态的一个进程为”高端“线性地址（高于 TASK_SIZE) 修改了页表项，那么，它也应当更新系统中所有进程页表集合中的相应表项。<br> 但触及所有进程的页表集合比较费时，因此，Linux 采用一种延迟方式。</p> 
+<p>延迟方式：每当一个高端地址必须被重新映射时（一般是通过 vmalloc() 或 vfree()），内核就更新根目录在 swapper_pg_dir 主内核页全局目录中的常规页表集合。<br> 该页全局目录由主内存描述符的 pgd 字段所指向，主内存描述符存放于 init_mm 变量。</p> 
+<h2><a id="_69"></a>线性区</h2> 
+<p>vm_area_struct 对象实现线性区。</p> 
+<p>每个线性区描述符表示一个线性地址区间。<br> vm_start 字段包含区间的第一个线性地址。<br> vm_end 字段包含区间之外的第一个线性地址。<br> vm_mm 字段指向拥有该区间的进程的 mm_struct 内存描述符。</p> 
+<p>进程所拥有的线性区从不重叠，且内核尽力把新分配的线性区与紧邻的现有线性区进行合并。<br> 如果两个相邻区的访问权限相匹配，就能把它们合并在一起。<br> <img src="https://images2.imgbox.com/92/1a/Iperysb7_o.png" alt="在这里插入图片描述"><br> vm_ops 字段指向 vm_operations_struct 数据结构，该结构中存放的是线性区的方法。</p> 
+<h3><a id="_83"></a>线性区数据结构</h3> 
+<p>进程所拥有的所有线性区是通过一个简单的链表链接在一起的。<br> 链表中的线性区按照内存地址升序排列，但每两个线性区可由未用的内存地址区隔开。<br> vm_area_struct 的 vm_next 字段指向链表的下一个元素。<br> 内核通过进程的内存描述符的 mmap 字段指向链表中的第一个线性区描述符。</p> 
+<p>内存描述符的 map_count 字段存放所有进程所拥有的线性区数目。<br> 默认，一个进程最多可拥有 65536 个不同的线性区，可通过 /proc/sys/vm/max_map_count 文件修改该限定值。</p> 
+<p><img src="https://images2.imgbox.com/7a/48/YNSaLKzu_o.png" alt="在这里插入图片描述"><br> 但是，当进程的线性区非常少时，比如一二十个，使用链表才比较法方便，为提高效率，存放进程的线性区时，Linux 既使用了链表，也使用了红黑树。<br> 这两种数据结构包含指向同一线性区描述符的指针，当插入或删除一个线性区描述符时，内核通过红黑树搜索前后元素，并用搜索结果快速更新链表而不用扫描链表。</p> 
+<p>红黑树的首部由内存描述符的 mm_rb 字段指向。<br> 任何线性区对象都在在类型为 rb_node 的 vm_rb 字段中存放节点颜色以及指向双亲、左孩子和右孩子的指针。</p> 
+<p>一般，红黑树用来确定含有指定线性地址的线性区，而链表通常用于扫描整个线性区集合。</p> 
+<h3><a id="_102"></a>线性区访问权限</h3> 
+<p>页和线性区之间的关系：每个线性区都由一组号码连续的页构成。</p> 
+<p>与页有关的标志：</p> 
+<ul><li>由 80x86 硬件用来检查能否指向所请求的寻址类型，如 Read/Write，Present 或 User/Supervisor。</li><li>由 Linux 用于许多不同的目的，flags 字段中的一组标志。</li><li>与线性区的页相关的标志，存放在 vm_area_struct 描述的 vm_flags 字段。一些标志给内核提供有关该线性区全部页的信息，如包含有什么内容，进程访问每个页的权限是什么。另外的标志描述线性区自身，如应如何增长。</li></ul> 
+<p>线性区描述符所包含的页访问权限可任意组合。<br> 页访问权限表示何种类型的访问应该产生一个缺页异常。</p> 
+<p>页表标志的初值存放在 vm_area_struct 描述符的 vm_page_prot 字段。</p> 
+<p>不能把线性区的访问权限直接转换成页保护位，因为</p> 
+<ul><li>某些情况下，即使 vm_flags 字段允许对该页访问，但访问时还是会产生一个缺页异常，如”写时复制“。</li><li>80x86 处理器的页表仅有两个保护位，即 Read/Write 和 User/Supervisor 标志。线性区的页的 User/Supervisor 标志总为 1，因为用户态进程必须总能访问该其中的页。</li><li>启用 PAE 时，所有 64 位页表项支持 NX 标志。</li></ul> 
+<p>如果内核没有被编译成 PAE，采用以下规则克服 80x86 微处理器的硬件限制：</p> 
+<ul><li>读访问权限总是隐含着执行访问权限，反之亦然。</li><li>写访问权限总是隐含着读访问权限。</li></ul> 
+<p>但如果内核被编译成支持 PAE，且 CPU 有 NX 标志，采用不同的规则：</p> 
+<ul><li>执行访问权限总是隐含着读访问权限。</li><li>写访问权限总是隐含着读访问权限。</li></ul> 
+<p>根据以下规则精简由读、写、执行核共享访问权限的 16 种可能组合：</p> 
+<ul><li>如果页具有写和共享两种访问权限，Read/Write 位被设置为 1。</li><li>如果页具有读或执行访问权限，但没有写或共享访问权限，则 Read/Write 位被清 0。</li><li>如果支持 NX 位，且页没有执行访问权限，则把 NX 位设置为 1.</li><li>如果页没有任何访问权限，Present 位被清 0，以便每次访问都产生一个缺页异常。但为了与真正的页框不存在的情况区分，Page size 置 1。</li></ul> 
+<p>访问权限的每种组合所对应的精简后的保护位存放在元素个数为 16 的 protection_map 数组中。</p> 
+<h3><a id="_137"></a>线性区的处理</h3> 
+<p>对线性区描述符进行操作的底层函数可被看作简化了的 do_map() 和 do_unmap()。<br> 但函数所处的层次更高一些，它们的参数不是线性区描述符，而是一个线性地址区间的起始地址、长度和访问权限。</p> 
+<p><strong>查找给定地址的最邻近区：find_vma()</strong></p> 
+<p>参数：</p> 
+<ul><li>进程内存描述符的地址 mm</li><li>线性地址 addr</li></ul> 
+<p>它查找第一个 vm_end 字段大于 addr 的线性区，并返回该线性区描述符的地址。</p> 
+<p>内存描述符的 mmap_cache 字段保存进程最后一次引用线性区的描述符地址。<br> 该附加字段时为了减少查找一个给定线性地址所在线性区而花费的时间。</p> 
+<pre><code>// 函数一开始就检查 mmap_cache 所指定的线性区是否包含 addr
+// 如果是，就返回该线性区描述符的指针
+vma = mm-&gt;mmap_cache;
+if(vma &amp;&amp; vma-&gt;vm_end &gt; addr &amp;&amp; vma-&gt;vm_start &lt;= adddr)
+	return vma;
+
+// 否则，必须扫描进程的线性区，并在红黑树中查找线性区
+rb_node = mm-&gt;mm_rb.rb_rbnode;
+vma  = NULL;
+while(rb_node)
+{
+	// 从指向红黑树中的一个节点的指针导出相应线性区描述符的地址
+	vma_tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);  
+
+	if(vmap_tmp-&gt;vm_end &gt; addr)
+	{
+		vma = vma_tmp;
+		if(vma_tmp-&gt;vm_start &lt;= addr)
+			break;
+		rb_node = rb_node-&gt;rb_left;
+	}
+	else
+		rb_node = rb_node-&gt;rb_right;
+}
+if(vma)
+	mm-&gt;mmap_cache = vma;
+return vma;
+</code></pre> 
+<p>find_vma_prev() 与 find_vma() 类似，但它把函数选中的前一个线性区描述符的指针赋给附加字段 ppre。</p> 
+<p>最后，find_vma_prepare() 确定新叶子节点在与给定线性地址对应的红黑树中的位置，并返回前一个线性区的地址和要插入的叶节点的父节点地址。</p> 
+<p><strong>查找一个与给定的地址区间相重叠的线性区：find_vma_intersection()</strong></p> 
+<p>查找与给定的线性地址区间重叠的第一个线性区。</p> 
+<p>参数：</p> 
+<ul><li>mm 参数指向进程的内存描述符。</li><li>线性地址 start_addr 和 end_addr 指定该区间。</li></ul> 
+<pre><code>// 如果返回一个有效的地址，但所找到的线性区位于给定线性区之后，vma 就被置为 NULL
+vma = find_vma(mm, start_addr); 
+if(vma &amp;&amp; end_addr &lt;= vma-&gt;vmstart)
+	vma = NULL;
+return vma;
+</code></pre> 
+<p><strong>查找一个空闲的地址区间：get_unmapped_area()</strong></p> 
+<p>搜查进程的地址空间以找到一个可以使用的线性地址区间。</p> 
+<p>参数：</p> 
+<ul><li>len，指定区间的长度</li><li>addr，从哪个地址开始查找</li></ul> 
+<p>如果查找成功，返回新区间的起始地址；否则，返回错误码 -ENOMEM。</p> 
+<p>addr 不等于 NULL 时，检查 addr 是否在用户态空间，并与页边界对齐。<br> 根据线性地址区间是用于文件内存映射，还是匿名内存映射，调用两个方法：</p> 
+<ul><li>前一种情况下，执行 get_unmapped_area 文件操作。</li><li>后一种情况下，执行内存描述符的 get_unmapped_area 方法。<br> 根据进程线性区类型，由 arch_get_unmapped_area() 或 arch_get_unmapped_area_topdown() 实现 get_unmapped_area方法。<br> 通过调用 mmap()，每个进程可能获得两种不同形式的线性区：一种从线性地址 0x40000000 向高端地址增长，另一种从用户态堆栈开始向低端地址增长。</li></ul> 
+<p>arch_get_unmapped_area() 分配从低端地址向高端地址的线性区：</p> 
+<pre><code> // 检查区间的长度是否在用户态下线性地址区间的限长 TASK_SIZE 之内
+if(len &gt; TASK_SIZE) 
+	return -ENOMEM;
+	
+addr = (addr + 0xfff) &amp; 0xfffff000;  // 调整为 4KB 的倍数
+if(addr &amp;&amp; addr + len &lt;= TASK_SIZE)
+{
+	vma = find_vma(current-&gt;mm, addr);  // 试图从 addr 开始分配区间
+
+	// 找到一个足够大的空闲区，返回 addr
+	if(!vma || addr + len &lt;= vma-&gt;vm_start)
+		return addr;
+}
+
+// addr == NULL 或前面的搜索失败
+// 扫描用户态线性地址空间以查找一个可以包含新区的足够大的线性地址范围
+// 但任何已有的线性区都不包含该地址范围
+// 为提高搜索速度，从最近被分配的线性区后面的地址开始
+// 把内存描述符字段 mm-&gt;free_area_cache 初始化为用户态线性地址空间的三分之一（通常为 1GB）
+// 并在以后创建新线性区时对齐更新
+// 用户态线性地址空间的三分之一是为有预定义起始线性地址的线性区保留的
+start_addr = addr = mm-&gt;free_area_cache;
+for(vma = find_vma(current-&gt;mm, addr); ; vma = vma-&gt;vm_next) 
+{
+	// 如果所请求的区间大于待扫描的线性地址空间部分
+	// 就从用户态地址空间的三分之一处重新搜索
+	if(addr + len &gt; TASK_SIZE)
+	{
+		// 如果已经完成第二次搜索，返回 -ENOMEM
+		if(start_addr == (TASK_SIZE/3 + 0xfff) &amp; 0xfffff000)
+			return -ENOMEM;
+			
+		start_addr = addr = (TASK_SIZE/3 + 0xfff) &amp; 0xfffff000;
+		vma = find_vma(current-&gt;mm, addr);
+	}
+	
+	// 找到一个足够大的空闲区，返回 addr
+	if(!vma || addr + len &lt;= vma-&gt;vm_start)
+	{
+		mm-&gt;free_area_cache = addr + len;
+		return addr;
+	}
+
+	// 刚刚扫描过的线性区后面的空闲区太小，继续考虑下一个线性区
+	addr = vma-&gt;vm_end;
+}
+</code></pre> 
+<p><strong>向内存描述符链表中插入一个线性区：insert_vm_struct()</strong></p> 
+<p>在线性区对象链表和内存描述符的红黑树中插入一个 vm_area_struct 结构。</p> 
+<p>参数：</p> 
+<ul><li>mm 指定进程描述符地址</li><li>vmp 指定要插入的 vm_area_struct 对象的地址。线性区对象的 vm_start 和 vm_end 字段已经初始化过。</li></ul> 
+<p>调用 find_vma_prepare() 在红黑树 mm-&gt;mm_rb 中查找 vma 应该位于何处。</p> 
+<p>然后，insert_vm_struct() 调用 vma_link() 执行以下操作：</p> 
+<ol><li>在 mm-&gt;mmap 指向的链表中插入线性区。</li><li>在红黑树 mm-&gt;mmrb 中插入线性区。</li><li>如果线性区是匿名的，就把它插入以相应的 anon_vma 数据结构为头节点的链表中。</li><li>mm-&gt;map_count++;</li></ol> 
+<p>如果线性区包含一个内存映射文件，vma_link() 执行相应任务。</p> 
+<p>__vma_unlink() 参数：</p> 
+<ul><li>内存描述符地址 mm</li><li>两个线性区对象地址 vma 和 prev，都属于 mm。</li></ul> 
+<p>__vma_link() 从内存描述符链表和红黑树中删除 vma，如果 mm-&gt;mmap_cache 指向刚被删除的线性区，还需对 mm-&gt;mmap_cache 更新。</p> 
+<h3><a id="_294"></a>分配线性地址区间</h3> 
+<p>do_mmap() 为当前进程创建并初始化一个新的线性区。<br> 分配成功后，可与进程已有的其他线性区进行合并。</p> 
+<p>参数：</p> 
+<ul><li>file、offset，如果新的线性区将把一个文件映射到内存，则使用文件描述符指针 file 和文件偏移量 offset</li><li>addr，从何处查找一个空闲的区间</li><li>len，线性地址区间的长度</li><li>prot，指定线性区所包含页的访问权限</li><li>flag，指定线性区的其他标志</li></ul> 
+<p>do_mmap() 对 offset 进行初步检查，然后执行 do_mmap_pgoff()。<br> 假设新的线性地址区间映射的不是磁盘文件，这里仅对匿名线性区的 do_mmap_pgoff() 函数进行说明。</p> 
+<ol><li>检查参数的值是否正确，所提的请求是否能被满足，如果不满足，则返回一个负值。如果线性区地址区间的长度为 0，则函数不执行任何操作就返回。<br> 尤其检查以下不能满足请求的条件：</li></ol> 
+<ul><li>线性地址区间的长度为 0 或包含的地址大于 TASK_SIZE。</li><li>进程已经映射了过多的线性区，因此 mm 内存描述符的 map_count 字段的值超过了允许的最大值。</li><li>flag 参数指定新线性地址区间的页必须被锁在 RAM 中，但不允许进程创建上锁的线性区，或者进程加锁页的总数超过了保存在进程描述符中的阈值 signal-&gt;rlim[RLIMIT_MEMLOCK].rlim_cur。</li></ul> 
+<ol start="2"><li>get_unmapped_area() 获得新线性区的线性地址区间。</li><li>通过将存放在 prot 和 flags 参数中的值进行组合来计算新线性区描述符的标志：</li></ol> 
+<pre><code>vm_flags = calc_vm_prot_bits(prot, flags) | calc_vm_flag_bits(prot, flags) | mm-&gt;def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+if(flags &amp; MAP_SHARED)
+	vm_flags |= VM_SHARED | VM_MAYSHARE;
+</code></pre> 
+<ol start="4"><li>find_vma_prepare() 确定线性区的对象的位置，应该位于新区间之前，以及新线性区在红黑树中的位置。</li></ol> 
+<pre><code>for(;;)
+{
+	vma = find_vma_prepare(mm, addr, &amp;prev, &amp;rb_link, &amp;rv_parent);
+	if(!vma || vma-&gt;vm_start &gt;= addr + len)  
+		break;
+
+	// 如果找到的线性区位于新区间结束地址之前
+	// 说明与新区间存在重叠的线性区
+	// 删除新的区间
+	if(do_munmap(mm, addr, len))  
+		return -ENOMEM;
+}
+</code></pre> 
+<ol start="5"><li>检查插入新的线性区是否导致进程地址空间的大小 (mm-&gt;total_vm&lt;&lt;PAGE_SHIFT)+len 超过了进程描述符 signal-&gt;rlim[RLIMIT_AS].rlim_cur 字段中的阈值。</li><li>如果 flags 参数没有设置 MAP_NORESERVE 标志，且新的线性区包含私有可写页，且没有足够的空闲页框，返回错误码 -ENOMEM；这最后一个检查由 security_vm_enough_memory() 实现。</li><li>如果新区间是私有的（没有设置 VM_SHARED），且映射的不是磁盘上的一个文件，则调用 vma_merge() 检查前一个线性区是否以此种方式扩展以包含新的区间。<br> 前一个线性区必须前一个线性区必须与在 vm_flags 局部变量中存放标志的那些线性区具有完全相同的标志。<br> 如果前一个线性区可以扩展，那么 vma_merge() 将它与随后的线性区合并（发生在新区间填充两个线性区之间的空洞，且三个线性区具有全部相同的标志时）。<br> 扩展前一个线性区成功则跳到第 12 步。</li><li>调用 slab 分配函数 kem_cache_alloc() 为新的线性区分配一个 vm_area_struct 数据结构。</li><li>初始化 vma 指向的新的线性区对象：</li></ol> 
+<pre><code>vma-&gt;vm_mm = mm;
+vma-&gt;vm_start = addr;
+vma-&gt;vm_end = addr + len;
+vma-&gt;vm_flags = vm_flags;
+vma-&gt;vm_page_prot = protection_map[vm_flags &amp;  0x0f];
+vma-&gt;vm_ops = NULL;
+vma-&gt;vm_pgoff = pgoff;
+vma-&gt;vm_file = NULL;
+vma-&gt;vm_private_data = NULL;
+vma-&gt;vm_next = NULL;
+INIT_LIST_HEAD(&amp;vma-&gt;shared);
+</code></pre> 
+<ol start="10"><li>如果 MAP_SHARED 标志被设置（以及新的线性区不映射磁盘上的文件），则该线性区是一个共享匿名区：调用 shmem_zero_setup() 对它进行初始化。共享匿名区主要用于进程通信。</li><li>调用 vma_link() 将新线性区插入到线性区链表和红黑树中。</li><li>增加存放在内存描述符 total_vm 字段中的进程地址空间的大小。</li><li>如果设置了 VM_LOCKED 标志，调用 make_pages_present() 连续分配线性区的所有页，并把它们锁在 RAM 中：</li></ol> 
+<pre><code>if(vm_flags &amp; VM_LOCKED)
+{
+	mm-&gt;locked_vm += len &gt;&gt; PAGE_SHIFT;
+	make_pages_present(addr, addr + len);
+}
+</code></pre> 
+<p>make_pages_present() 调用 get_user_pages()：</p> 
+<pre><code>write = (vma-&gt;vm_flags &amp; VM_WRITE) != 0;
+get_user_pages(current, current-&gt;mm, addr, len, write, 0, NULL, NULL);
+</code></pre> 
+<ul><li>get_user_pages() 在 addr 和 addr_len 之间的页的所有起始线性地址上循环；对于每个页，调用 follow_page() 检查在当前页表中是否有到物理页的映射。如果不存在这样的物理页，则 get_user_pages() 调用 handle_mm_fault() 分配一个页框并根据内存描述符的 vm_flags 字段设置它的页表项。</li></ul> 
+<ol start="14"><li>返回新线性区的地址。</li></ol> 
+<p>总结：对线性区间进行检查，获得，检查，描述，得到插入位置，检查，扩展，插入，更新，决定是否锁在 RAM 中。</p> 
+<h3><a id="_381"></a>释放线性地址区间</h3> 
+<p>do_munmap() 从当前进程的地址空间中删除一个线性地址区间。要删除的区间可能是一个线性区，可能是线性区的一部分，可能是多个线性区。</p> 
+<p>参数：</p> 
+<ul><li>进程内存描述符的地址 mm</li><li>地址区间的起始地址 start 及其长度 len</li></ul> 
+<p><strong>do_munmap() 函数</strong></p> 
+<p>第一阶段，1~6 步，扫描进程所拥有的线性区链表，并删除包含在进程地址空间的线性地址区间。<br> 第二阶段，7~12 步，更新进程的页表，并删除在第一阶段找到的线性区。<br> 会用到后面要说明的 split_vma() 和 unmap_region() 函数。</p> 
+<p>执行如下步骤：</p> 
+<ol><li>对参数进行初步检查：如果线性地址区间所含的地址大于 TASK_SIZE，或 start 不是 4096 的倍数，或线性地址区间的长度为 0，则返回错误代码 -EINVAL。</li><li>确定要删除的线性地址区间之后的第一个线性地址区 mpnt 的位置：</li></ol> 
+<pre><code>mpnt = find_vma_prev(mm, start, &amp;prev);
+</code></pre> 
+<ol start="3"><li>如果 mpnt 不存在，或与线性地址区间不重叠，则什么都不做，因为该区间上没有线性区：</li></ol> 
+<pre><code>end = start + len;
+if(!mpnt || mpnt-&gt;vm_start &gt;= end)
+	return 0;
+</code></pre> 
+<ol start="4"><li>如果线性区的起始地址在 mpnt 内，就调用 split_vma() 将 mpnt 划分成两个较小的区：一个区在线性地址区间外部，另一个在内部。</li></ol> 
+<pre><code>if(start &gt; mpnt-&gt;vm_start)
+{
+	if(split_vma(mm, mpnt, start, 0))
+		return -ENOMEM;
+	prev = mpnt;  // prev 指向要删除的第一个线性区前面的那个线性区
+}
+</code></pre> 
+<ol start="5"><li>如果线性区的结束地址在一个线性区内部，再次调用 split_vma() 将最后重叠的那个线性区同样划分成两个较小的区。</li></ol> 
+<pre><code>last  = find_vma(mm, end);
+if(last &amp;&amp; end &gt; last-&gt;vm_start))
+{
+	if(split_vma(mm, last, start, end, 1))
+		return -ENOMEM;
+}
+</code></pre> 
+<ol start="6"><li>更新 mpnt 的值，使其指向线性地址区间的第一个线性区。</li></ol> 
+<pre><code>mpnt = prev ? prev-&gt;vm_next : mm-&gt;mmap;
+</code></pre> 
+<ol start="7"><li>调用 detach_vmas_to_be_unmapped() 从进程的线性地址空间中删除位于线性地址区间中的线性区。</li></ol> 
+<pre><code>vma = mpnt;  // 要删除的线性区的描述符放在一个排好序的链表中，mpnt 指向该链表的头
+insertion_point = (prev ? &amp;prev-&gt;vm_next : &amp;mm-&gt;mmap);
+do
+{
+	rb_erase(&amp;vma-&gt;vm_rb, &amp;mm-&gt;mm_rb);
+	mm-&gt;map_count--;
+	tail_vma = vma;
+	vma = vma-&gt;next;
+}while(vma &amp;&amp; vma-&gt;start &lt; end);
+*insertion_point = vma;
+tail_vma-&gt;vm_next = NULL;
+mm-&gt;map_cache = NULL;
+</code></pre> 
+<ol start="8"><li>获得 mm-&gt;page_table_lock 自旋锁。</li><li>调用 unmap_region() 清除与线性地址区间对应的页表项并释放相应的页表：</li></ol> 
+<pre><code>unmap_region(mm, mpnt, prev, start, end);
+</code></pre> 
+<ol start="10"><li>释放 mm-&gt;page_table_lock 自旋锁。</li><li>释放在第 7 步建立链表时收集的线性区描述符：</li></ol> 
+<pre><code>do
+{
+	struct vm_area_struct *next = mpnt-&gt;vm_next;
+	unmap_vma(mm, mpnt);
+	mpnt = next;
+}while(mpnt != NULL);
+</code></pre> 
+<ul><li>对链表中的所有线性区调用 unmap_vma() 函数，本质上执行下述步骤：<br> a. 更新 mm-&gt;total_vm 和 mm-&gt;locked_vm 字段。<br> b. 执行内存描述符的 mm-&gt;unmap_area 方法。根据进程线性区的类型选择 arch_unmap_area() 或 arch_unmap_topdown()，必要时更新 mm-&gt;free_area_cache 字段。<br> c. 调用线性区的 close 方法。<br> d. 如果线性区是匿名的，则将其从 mm-&gt;anon_vma 指向的匿名线性区链表中删除。<br> e. 调用 kmem_cache_free() 释放线性区描述符。</li></ul> 
+<ol start="12"><li>成功，返回 0。</li></ol> 
+<p><strong>split_vma()</strong></p> 
+<p>把与线性地址区间交叉的线性区划分成两个较小的区，一个在线性地址外部，另一个在区间的内部。</p> 
+<p>参数：</p> 
+<ul><li>内存描述符指针 mm</li><li>线性区描述符指针 vma</li><li>区间与线性区之间交叉点的地址 addr</li><li>表示区间和线性区之间交叉点在区间起始处还是结束处的标志 new_below</li></ul> 
+<ol><li>调用 kmem_cache_alloc() 获得线性区描述符 vm_area_struct，并将它的地址存在新的局部变量中，如果没有可用的空闲空间，返回 -ENOMEM。</li><li>用 vma 描述符的字段值初始化新描述符的字段。</li><li>如果标志 new_below 为 0，说明线性地址区间的起始地址在 vma 线性区的内部，因此应将新线性区放在 vma 线性区之后，所以将 new-&gt;vm_start = addr; vma-&gt;vm_end = addr。</li><li>如果标志 new_below 为 1，说明线性地址区间的结束地址在 vma 线性区的内部，因此应将新线性区放在 vma 线性区之前，所以将 new-&gt;vm_start = addr; vma-&gt;vm_start = addr。</li><li>如果定义了新线性区的 open 方法，就执行它。</li><li>把新线性区描述符链接到线性区链表 mm-&gt;mmap 和红黑树 mm-&gt;mm_rb。根据线性区 vma 的最新大小对红黑树进行调整。</li><li>成功，返回 0。</li></ol> 
+<p><strong>unmap_region()</strong></p> 
+<p>遍历线性区链表并释放它们的页框。</p> 
+<p>参数：</p> 
+<ul><li>内存描述符指针 mm</li><li>指向第一个被删除线性区描述符的指针 vma</li><li>指向进程链表中 vma 前面的线性区的指针 prev</li><li>两个地址 start 和 end，用来界定被删除线性地址区间的范围</li></ul> 
+<ol><li>调用 lru_add_drain()。</li><li>调用 tlb_gather_mm() 初始化每 CPU 变量 mmu_gathers。mm_gathers 通常存放更新进程页表项所需的所有信息。80x86 体系结构中，tlb_gather_mmu() 只是把 mm 赋给本地 CPU 的 mm_gathers 变量。</li><li>把 mmu_gathers 变量的地址保存在局部变量 tlb 中。</li><li>调用 unmap_vmas() 扫描线性地址空间的所有页表项：如果只有一个有效 CPU，则调用 free_swap_and_cache() 释放相应页；否则，mm_gathers = 相应页描述符的指针。</li><li>free_pgtables(tlb, prev, start, end) 回收在上一步已经清空的进程页表。</li><li>tlb_finish_mmu(tlb, start, end) 结束 unmap_region() 的工作，tlb_finish_mmu(tlb, start, end) 执行下面的操作：<br> a. flush_tlb_mm() 刷新 TLB。<br> b. 多处理器系统中，free_pages_and_swap_cache() 释放页框，这些页框的指针已经集中存放在 mmu_gather 数据结构中了。1</li></ol> 
+<h2><a id="_504"></a>缺页异常处理程序</h2> 
+<p>Linux 的缺页异常处理程序必须区分以下两种情况：</p> 
+<ul><li>由编程错误所引起的异常</li><li>引用属于进程地址空间但还尚未分配物理页框所引起的异常</li></ul> 
+<p>线性区描述符可以让缺页异常处理程序非常有效地完成其工作。<br> do_page_fault() 是 80x86 上的缺页中断服务程序，它将引起缺页的线性地址和当前进程的线性区比较，从而根据图 9-4 所示的方案处理该异常。<br> <img src="https://images2.imgbox.com/bf/59/8i6Wlsqj_o.png" alt="在这里插入图片描述"><br> 实际情况会更复杂一些，如图 9-5 所示。<br> <img src="https://images2.imgbox.com/43/2d/YE90Olif_o.png" alt="在这里插入图片描述"></p> 
+<p>do_page_fault() 接收以下参数：</p> 
+<ul><li>pt_regs 结构的地址 regs，该结构包含当异常发生时的微处理器寄存器的值。</li><li>3 位的 error_code，当异常发生时由控制单元压入栈中，这些位的含义如下：</li><li> 
+  <ul><li>如果第 0 位被清 0，则异常由访问一个不存在的页所引起；否则，异常由无效的访问权限引起。</li></ul> </li><li> 
+  <ul><li>如果第 1 位被清 0，则异常由读访问或执行访问所引起；否则，异常由写访问引起。</li></ul> </li><li> 
+  <ul><li>如果第 2 位被清 0，则异常发生在处理器处于内核态时；否则，异常发生在处理器处于用户态时。</li></ul> </li></ul> 
+<p>do_page_fault() 执行下述步骤：</p> 
+<p>读取引起缺页的线性地址 address</p> 
+<pre><code>// 当异常发生时，CPU 将 address 存放在 cr2 控制寄存器中
+asm("movl %%cr2, %0":"=r" (address));
+
+// 如果缺页发生之前或 CPU 运行在虚拟 8086 模式时本地中断是可打开的
+// 则函数还需要确保本地中断是可打开的
+if(regs-&gt;eflags &amp; 0x00020200)
+	local_irq_enable();
+
+// 将指向 current 进程描述符的指针保存在 tsk 局部变量中
+tsk = current;
+</code></pre> 
+<p>检查引起缺页的线性地址是否属于第 4 个 GB</p> 
+<pre><code>info.si_code = SEGV_MAPERR;
+if(address &gt;= TASK_SIZE)
+{
+	if(!(error_code &amp; 0x101))
+		goto vmalloc_fault;   // 处理非连续内存访问
+	goto bad_area_nosemaphore;  // 处理地址空间以外的错误地址
+}
+</code></pre> 
+<p>检查异常发生时内核是否正在一些一些关键例程或正在运行内核线程。</p> 
+<pre><code>// in_atomic() 宏等于 1 的情况：
+// 1. 内核正在指向中断处理程序或可延迟函数
+// 2. 内核在禁用内核抢占的情况下执行临界区代码
+// 进程描述符的 mm 字段为 NULL 时，说明为内核线程
+if(in_atomic() || !tsk-&gt;mm)
+	goto bad_area_nosemaphore;
+</code></pre> 
+<p>假定缺页没有发生在中断处理程序、可延迟函数、临界区或内核线程中，于是，必须检查进程所拥有的线性区，以确定引起缺页的线性地址是否包含在进程的地址空间中，为此必须获得进程的 mmap_sem 读/写信号量：</p> 
+<pre><code>// 如果内核 bug 和硬件故障可被排除，缺页发生时，当前进程还没有获得 mmap_sem 写信号量
+// 但还是要确定一下，真的没有获得该信号量，否则会发生死锁
+if(!down_read_trylock(&amp;tsk-&gt;mm-&gt; mmap_sem))
+{
+	// 缺页时由内核 bug 或严重的故障引起的
+	if((error_code &amp; 4) == 0 &amp;&amp; !search_exception_table(regs-&gt;eip))
+		goto bad_area_nosemaphore;   
+
+	// 获得 mmap_sem 读信号量
+	down_read(&amp;tsk-&gt;mm-&gt;mmap_sem);
+}
+</code></pre> 
+<p>假设获得了 mmap_sem 读信号量，开始搜索错误线性地址所在的线性区。</p> 
+<pre><code>vma = find_vma(tsk-&gt;mm, address);
+if(!vma)  // 说明 address 后面没有线性区，因此这个错误的地址无效
+	goto bad_area;   // 处理地址空间以外的错误地址
+
+if(vma-&gt;vm_start &lt;= address)  // 如果在 address 之后的第一个线性区包含 address
+	goto good_area;   // 处理地址空间内的错误地址
+</code></pre> 
+<p>如果两个“if”条件都不满足，则函数已确定 address 没有包含在任何线性区中，还需进一步检查，因为该错误可能是由 push 或 pusha 指令在进程的用户态堆栈上的操作引起的。</p> 
+<p>可能是 push 引用了该线性区以外的一个地址（即引用一个不存在的页框）。该异常不是由程序的错误引起的，因此必须由缺页处理程序单独处理。</p> 
+<pre><code>// 向低地址扩展的栈所在的区，它的 VM_GROWSDOWN 标志被设置
+// 这样，当 vm_start 字段的值减少时，vm_end 字段的值保持不变
+if(!(vma-&gt;vm_flags &amp; VM_GROWSDOWN))
+	goto bad_area;   // 处理地址空间以外的错误地址
+
+// 如果线性区的 VM_GROWSDOWN 标志被设置，且异常发生在用户态，且 address &lt; regs-&gt;esp 栈指针
+if(error_code &amp; 4 &amp;&amp; address + 32 &lt; regs-&gt;esp)
+	goto bad_area;  // 处理地址空间以外的错误地址
+
+// 如果地址足够高（在允许范围内）
+// 则检查是否允许进程既扩展栈页扩展它的地址空间
+// 如果一切都可以，将 vma 的 vm_start 字段设为 address，并返回 0；否则，返回 -ENOMEM
+if(expand_stack(vma, address))
+	goto bad_area;
+	
+goto good_area;   // 处理地址空间内的错误地址
+</code></pre> 
+<h3><a id="_607"></a>处理地址空间以外的错误地址</h3> 
+<p>如果 address 不属于进程的地址空间，则 do_page_fault() 继续执行 bad_area 标记处的语句。<br> 如果错误发生在用户态，则向 current 进程发生一个 SIGSEGV 信号并结束函数：</p> 
+<pre><code>bad_area:
+up_read(&amp;tsk-&gt;mm-&gt;mmap_sem);
+bad_area_nosemaphore:
+if(error_code &amp; 4)  // 用户模式
+{
+	tsk-&gt;thread.cr2 = address;
+	tsk-&gt;thread.error_code = error_code | (address &gt;= TASK_SIZE);
+	tsk-&gt;thread.trap_no = 14;
+	info.si_signo = SIGSEGV;
+	info.si_errno  = 0;
+	info.si_addr = (void *)address;
+
+	// 确信进程不忽略或阻塞 SIGSEGV 信号
+	// 并通过 info 局部变量传递附加信息的同时发送给用户态进程
+	// info.si_code 字段已被设置为 SEGV_MAPERR 或 SEGV_ACCERR
+	force_sig_info(SIGSEGV, &amp;info, tsk);  
+
+	return;
+}
+</code></pre> 
+<p>如果异常发生在内核态（error_code 的第 2 位被清 0），有两种情况：</p> 
+<ul><li>异常的引起是由于把某个线性地址作为系统调用的参数传递给内核。</li><li>异常是因一个真正的内核缺陷引起的。</li></ul> 
+<p>区分两种情况：</p> 
+<pre><code>no_context:
+if((fixup = search_exception_table(regs-&gt;eip)) != 0)
+{
+	regs-&gt;eip = fixup;
+	return;
+}
+</code></pre> 
+<p>第一种情况中，代码跳到一段“修正代码”处，向当前进程发送 SIGSEGV 信号，或用一个适当的出错码终止系统调用处理程序。</p> 
+<p>第二种情况中，函数将 CPU 寄存器和内核态堆栈的所有转储打印到控制台，并输出到一个系统消息缓冲区，方便编程人员定位错误，然后调用 do_exit() 杀死当前进程。</p> 
+<h3><a id="_652"></a>处理地址空间内的错误地址</h3> 
+<p>如果 addr 地址属于进程的地址空间，则 do_page_fault() 转到 good_area 标记处的语句执行：</p> 
+<pre><code>good_area:
+info.si_code = SEGV_ACCERR;
+write = 0;
+if(error_code &amp; 2)  // 异常由写访问引起
+{
+	// 检查该线性区是否可写
+	// 不可写，跳到 bad_area
+	// 可写， write++
+	if(!(vma-&gt;vm_flags &amp; VM_WRITE))  
+		goto bad_area;   
+	write++;
+}
+else  // 异常由读或执行访问引起
+{
+	// 检查这一页是否已存在于 RAM
+	// 存在时，异常发生是由于进程试图访问用户态下的一个有特权的页框，跳到 bad_area
+	// 不存在时，检查该线性区是否可读或可执行
+	if((error_code &amp; 1) || !(vma-&gt;vm_flags &amp; (VM_READ | VM_EXEC)))  
+		goto bad_area;   
+}
+</code></pre> 
+<p>如果该线性区的访问权限与引起异常的访问类型相匹配，则调用 handle_mm_fault() 分配一个新的页框：</p> 
+<pre><code>survive:
+
+// 如果成功地分配给进程一个页框，则返回 VM_FAULT_MINOR 或 VM_FAULT_MAJOR
+ret = handle_mm_fault(tsk-&gt;mm, vma, address, write);  
+if(ret == VM_FAULT_MINOR || ret = VM_FAULT_MAJOR)
+{
+	if(ret == VM_FAULT_MINOR)  // 没有阻塞当前进程的情况下处理了缺页
+		tsk-&gt;min_flt++;  
+	else  // 迫使当前进程睡眠
+		tsk-&gt;maj_flt++;
+	up_read(&amp;tsk-&gt;mm-&gt;mmap_sem);
+	return;
+}
+</code></pre> 
+<p>如果 handle_mm_fault() 返回 VM_FAULT_SIGBUG，则向进程发送 SIGBUS 信号：</p> 
+<pre><code>if(ret == VM_FAULT_SIGBUS)
+{
+do_sigbus:
+	up_read(&amp;tsk-&gt;mm-&gt;mmap_sem);
+	if(!(error_code &amp; 4))  // 内核态
+		goto no_context;
+	tsk-&gt;thread.cr2 = address;
+	tsk-&gt;thread.error_code = error_code;
+	tsk-&gt;thread.trap_no = 14;
+	info.si_signo = SIGBUS;
+	info.si_errno = 0;
+	info.si_code = BUS_ADRERR;
+	info.si_addr = (void *)address;
+	force_sig_info(SIGBUS, &amp;info, tsk);
+}
+</code></pre> 
+<p>如果 handle_mm_fault() 不分配新的页框，则返回 VM_FAULT_OOM，此时内核通常杀死当前进程。<br> 但如果当前进程是 init 进程，则只是将它放在运行队列的末尾并调用调度程序；<br> 一旦 init 恢复执行，则 handle_mm_fault() 继续执行：</p> 
+<pre><code>if(ret == VM_FAULT_OOM)
+{
+out_of_memory:
+	up_read(&amp;tsk-&gt;mm-&gt;mmap_sem);
+	if(tsk-&gt;pid != 1)
+	{
+		if(error_code &amp; 4)  // 用户模式
+			do_exit(SIGKILL);
+		goto no_context;
+	}
+	yield();
+	down_read(&amp;tsk-&gt;mm-&gt;mmap_sem);
+	goto survive;
+}
+</code></pre> 
+<p>handle_mm_fault() 参数：</p> 
+<ul><li>mm，指向异常发生时正在 CPU 上运行的进程的内存描述符</li><li>vma，指向引起异常的线性地址所在线性区的描述符</li><li>address，引起异常的线性地址</li><li>write_access，如果 tsk 试图向 address 写，则置为 1；如果 tsk 试图在 address 读或执行，则置为 0</li></ul> 
+<p>首先检查用来映射 address 的页中间目录和页表是否存在，不存在的话分配。</p> 
+<pre><code>// pgd 局部变量包含了引用 address 的页全局目录项
+pgd = pgd_offset(mm, address);   
+
+spin_lock(&amp;mm-&gt;page_table_lock);
+pud = pud_alloc(mm, pgd, address);  // 分配新的页上级目录
+if(pud)
+{
+	pmd = pmd_alloc(mm, pud, address);  // 分配页中间目录
+	if(pmd)
+	{
+		pte = pte_alloc_map(mm, pmd, address);  // 分配一个新的页表
+		if(pte)
+			return handle_pte_fault(mm, vma, address, wrie_access, pte, pmd);  
+	}
+}
+spin_unlock(&amp;mm-&gt;page_table_lock);
+return VM_FAULT_OOM;
+</code></pre> 
+<p>handle_pte_fault() 检查 address 地址对应的页表项，并决定如何为进程分配一个新页框：</p> 
+<ul><li>如果被访问的页不存在，即没有存放在任何一个页框中，则内核分配一个新的页框并适当初始化，称为请求调页。</li><li>如果被访问的页存在但是标记为只读，即已经被存放在一个页框中，则内核分配一个新的页框，并将旧页框的数据拷贝到新页框来初始化它的内容，称为写时复制。</li></ul> 
+<h3><a id="_767"></a>请求调页</h3> 
+<p>是一种动态内存分配技术，它将页框的分配推迟到进程要访问的页不在 RAM 中时为止，由此引起一个缺页异常。</p> 
+<p>被访问的页可能不在主存中，原因或者是进程从没访问过该页，或者内核已经回收了相应的页框。</p> 
+<p>缺页处理程序为进程分配新的页框后，如何初始化该页框取决于哪一种页以及页是否被进程访问过。特殊情况下：</p> 
+<ol><li>或者该页从未被进程访问到且没有映射磁盘文件，或者页映射了磁盘文件。<br> 内核识别该种情况的依据：页表相应的表项被填充为 0，即 pte_none 宏返回 1。</li><li>页属于一个非线性磁盘文件映射。<br> 内核识别该种情况的依据：Present 标志被清 0 且 Dirty 标志被置 1，即 pte_file 宏返回 1。</li><li>进程已经访问过该页，但其内容被临时保存在磁盘上。<br> 内核识别该种情况的依据：相应的页表项没被填充为 0，但 Present 和 Dirty 标志被清 0。</li></ol> 
+<p>handle_pte_fault() 通过检查 address 对应的页表项区分那三种情况：</p> 
+<pre><code>entry = *pte;
+if(!pte_present(entry))
+{
+	// 第一种情况
+	if(pte_none(entry))
+		return do_no_page(mm, vma, address, write_access, pte, pmd);
+	if(pte_file(entry))
+		return do_file_page(mm, vma, address, write_access, pte, pmd);
+	return do_swap_page(mm, vma, address, pte, pmd, entry, write_access);
+}
+</code></pre> 
+<p>第 1 种情况下，调用 do_no_page()。有两种方法装入所缺的页，取决于该页是否被映射到一个磁盘文件。<br> 通过检查 vma 线性区描述符的 nopage 字段来确定，如果页被映射到一个文件，nopage 就指向一个函数，该函数将所缺的页从磁盘装入到 RAM。<br> 可能的情况是：</p> 
+<ul><li>vma-&gt;vm_ops-&gt;nopage != NULL，说明线性区映射了一个磁盘文件，nopage 指向装入页的函数。</li><li>vma-&gt;vm_ops == NULL || vma-&gt;ops-&gt;nopage == NULL， 说明线性区没有映射磁盘文件，即它是一个匿名映射。因此，调用 do_anonymous_page() 获得一个新的页框：</li></ul> 
+<pre><code>if(!vma-&gt;vm_ops || !vma-&gt;vm_ops-&gt;nopage)
+	return do_anonymous_page(mm, vma, page_table, pmd, write_access, address);
+
+do_anonymous_page() 分别处理写请求和读请求：
+if(write_access)
+{
+	// pte_unmap 宏释放一种临时内核映射，
+	// 该临时映射映射了在调用 handle_pte_fault() 前由 pte_offset_map 宏所建的页表项的高端内存物理地址
+	// 临时内核映射必须在调用 alloc_page() 之前释放，因为该函数可能阻塞当前进程
+	pte_unmap(page_table);
+
+	spin_unlock(&amp;mm-&gt;page_table_lock);
+	
+	page = alloc_page(GFP_HIGHUSER | __GFP_ZERO);
+	
+	spin_lock(&amp;mm-&gt;page_table_lock);
+	page_table = pte_offset_map(pmd, addr);
+
+	mm-&gt;rss++;  // 记录分配给进程的页框总数
+
+	// 相应的页表项设置为页框的物理地址，该页框被标记为既脏又可写的
+	entry = maybe_mkwrite(pte_mkdirty(mk_pte(page, vma-&gt;vm_page_prot)), vma);
+
+	lru_cache_add_active(page);  // 把新页框插入与交换相关的数据结构
+
+	SetPageReferenced(page);
+	set_pte(page_table, entry);
+	pte_unmap(page_table);
+	spin_unlock(&amp;mm-&gt;page_table_lock);
+	
+	return VM_FAULT_MINOR;
+}
+</code></pre> 
+<p>处理读访问时，可以分配一个现有的称为零页的页，以推迟页框的分配。<br> 零页在内核初始化期间被静态分配，并存放在 empty_zero_page 变量中。</p> 
+<p>用零页的物理地址设置页表项：</p> 
+<pre><code>entry = pte_wrprotect(mk_pte(virt_to_page(empty_zero_page), vma-&gt;vm_page_prot));
+set_pte(page_table, entry);
+spin_unlock(&amp;mm-&gt;page_table_lock);
+return VM_FAULT_MINOR;
+</code></pre> 
+<p>该页标记为不可写，如果进程试图写该页，则激活写时复制机制。</p> 
+<h3><a id="_849"></a>写时复制</h3> 
+<p>第一代 Unix 系统实现了傻瓜式的进程创建，fork() 比较耗时，因为需要：</p> 
+<ul><li>为子进程的页表分配页框</li><li>为子进程的页分配页框</li><li>初始化子进程的页表</li><li>把父进程的页复制到子进程相应的页中</li></ul> 
+<p>现在的 Unix 实现了写时复制。<br> 父进程和子进程共享页框。<br> 无论父进程还是子进程何时试图写一个共享的页框，就产生一个异常，这时内核就把该页复制到一个新的页框中并标记为可写。<br> 原来的页框仍然是写保护的，当其他进程试图写入时，内核检查写进程是否是该页框的唯一属主，如果是，就把该页框标记为对该进程是可写的。</p> 
+<p>页描述符的 _count 字段跟踪共享相应页框的进程数。<br> 只要进程释放一个页框或在它上面执行写时复制，它的 _count 字段就减小。<br> 只有 _count 变为 -1 时，该页框才被释放。</p> 
+<p>handle_pte_fault() 确定异常是由访问内存中现有的一个页而引起时，执行以下指令：</p> 
+<pre><code>if(pte_present(entry))  // 如果页是存在的
+{
+	if(write_access)  // 访问权限是写允许的
+	{
+		if(!pte_write(entry))  // 页框是写保护的
+		{
+			return do_wp_page(mm, vma, address, pte, pmd, entry);
+		}
+		entry = pte_mkdirty(entry);
+	}
+	entry = pte_mkyong(entry);
+	set_pte(pte, entry);
+	flush_tlb_page(vma, address);
+	pte_unmap(pte);
+	spin_unlock(&amp;mm-&gt;page_table_lock);
+	return VM_FAULT_MINOR;
+}
+</code></pre> 
+<p>do_wp_page()：<br> 首先获取与缺页异常相关的页框描述符。<br> 然后读取页描述符的 _count 字段：如果等于 0（仅有一个进程拥有该页），写时复制就不必进行。<br> 实际上，检查要复杂一些， 为当页插入到交换高速缓存，且当设置了页描述符的 PG_private 标志时，_count 字段也增加。<br> 当写时复制不进行时，就将该页框标记为可写的，以面试图写时引起进一步的缺页异常：</p> 
+<pre><code>set_pte(page_table, maybe_mkwrite(pte_mkyoung(pte_mkdirty(pte)), vma));
+flush_tlb_page(vma, address);
+pte_unmap(page_table);
+spin_unlock(&amp;mm-&gt;page_table_lock);
+return VM_FAULT_MINOR;
+</code></pre> 
+<p>如果多个进程通过写时复制共享页框，那么函数就把旧页框的内容复制到新分配的页框中。<br> 为避免竞争条件，在开始复制前调用 get_page() 将 old_page 的使用计数加 1：</p> 
+<pre><code>old-&gt;page = pte_page(pte);
+pte_unmap(page_table);
+get_page(old_page);  // old_page 的使用计数加 1
+spin_unlock(&amp;mm-&gt;page_table_lock);
+if(old_page == virt_to_page(empty_zero_page))  // 如果旧页框是零页
+{
+	new_page = alloc_page(GFP_HIGHUSR | __GFP_ZERO);  // 就在分配新页框时将它填充为 0
+}
+else
+{
+	new_page = allock_page(GFP_HIGHUSER);
+	vfrom = kmap_atomic(old_page, KM_USER0);  
+	vto = kmap_atomic(new_page, KM_USER1);
+	copy_page(vto, vfrom);   // 如果旧页框不是零页，复制页框的内容
+	kunmap_atomic(vfrom, KM_USER0);
+	kunmap_atomic(vto, KM_USER0);
+}
+</code></pre> 
+<p>因为页框的分配可能阻塞进程，因此，检查自从函数开始执行以来是否已经修改了页表项。<br> 如果是，新的页框被释放，old_page 的使用计数器被减少，函数结束。</p> 
+<p>如果所有进展顺利，新页框的物理地址最终被写进页表项，且使相应的 TLB 寄存器无效：</p> 
+<pre><code>spin_lock(&amp;mm-&gt;page_table_lock);
+entry = maybe_mkwrite(pte_mkdirty(mk_pte(new_page, vma-&gt;vm_page_prot)), vma);
+set_pte(page_table, entry);
+flush_tlb_page(vma, address);
+lru_cache_add_active(new_page);  // 将新页框插入到与交换相关的数据结构
+pte_unmap(page_table);
+spin_unlock(&amp;mm-&gt;page_table_lock);	
+</code></pre> 
+<p>最后，do_wp_page() 把 old_page 的使用计数器减少两次。<br> 第一次的减少是取消复制页框内容之前进行的安全性增加。<br> 第二次的减少是反映当前进程不再拥有该页框。</p> 
+<h3><a id="_943"></a>处理非连续内存区访问</h3> 
+<p>内核在更新非连续内存区对应的页表项时是非常懒惰的。<br> vmalloc() 和 vfree() 只把自己限制在更新主内核页表。</p> 
+<p>一旦内核初始化阶段结束，任何进程或内核线程便都不直接使用主内核页表。<br> 内核态进程对非连续内存区第一次访问时，会产生缺页异常，缺页异常认识该情况，因为异常发生在内核态且产生缺页的线性地址大于 TASK_SIZE。<br> 因此，do_page_fault() 检查相应的主内核页表项：</p> 
+<pre><code>vmalloc_fault:
+
+// 将 cr3 寄存器中的当前进程页全局目录的物理地址赋给局部变量 pgd_paddr
+asm("movl %%cr3, %0":"=r" (pgd_paddr));  
+
+// 将与 pgd_addr 相应的线性地址赋给局部变量 pgd
+pgd = pgd_index(address) + (pgd_t *)__va(pgd_paddr);
+
+// 将主内核页全局目录的线性地址赋给 pgd_k 局部变量
+pgd_k = init_mm.pgd + pgd_index(address);
+
+// 如果产生缺页的线性地址所对对应的主内核页全局目录项为空，跳到 no_context 代码处
+if(!pgd_present(*pgd_k))
+	goto no_context;
+
+// 检查与错误线性地址相对应的主内核页上级目录项
+pud = pud_offset(pgd, address);
+pud_k = pud_offset(pgd_k, address);
+if(!pud_present(*pud_k))
+	goto no_context;
+
+// 检查与错误线性地址相对应的主内核页中间目录项
+pmd = pmd_offset(pud, address);
+pmd_k = pmd_offset(pud_k, address);
+if(!pmd_present(*pmd_k))
+	goto no_context;
+
+// 将主目录项复制到进程页中间目录的相应项
+set_pmd(pmd, *pmd_k);
+pte_k = pte_offset_kernel(pmd_k, address);
+if(!pte_present(*pte_k))
+	goto no_context;
+return;
+</code></pre> 
+<h2><a id="_987"></a>创建和删除进程的地址空间</h2> 
+<h3><a id="_989"></a>创建进程的地址空间</h3> 
+<p>clone()、fork() 和 vfork() 创建一个新的进程时，内核调用 copy_mm()。<br> 该函数通过建立新进程的所有页表和内存描述符来创建进程的地址空间。</p> 
+<p>如果通过 clone() 已经创建了新进程，且 flag 参数的 CLONE_VM 标志被设置，则 copy_mm() 将父进程 current 地址空间给子进程 tsk：</p> 
+<pre><code>
+if(clone_flags &amp; CLONE_VM)
+{
+	atomic_inc(&amp;current-&gt;mm-&gt;mm_users);
+
+	// 如果其他 CPU 持有进程页表自旋锁，就保证在释放锁之前，缺页处理程序不会结束
+	// 自旋锁除了保护页表外，还必须进程创建新的轻量进程，因为它们共享 current-&gt;mm 描述符
+	spin_unlock_wait(&amp;current-&gt;mm-&gt;page_table_lock);
+
+	tsk-&gt;mm = current-&gt;mm;
+	tsk-&gt;active_mm = current-&gt;mm;
+	return 0;
+}
+</code></pre> 
+<p>如果没有设置 CLONE_VM 标志，copy_mm() 就必须创建一个新的地址空间。<br> 分配一个新的内存描述符，把它的地址存放在新进程描述符 tsk 的 mm 字段，并把 current-&gt;mm 的内容复制到 tsk-&gt;mm 中，然后改变新进程描述符的一些字段：</p> 
+<pre><code>tsk-&gt;mm = kmem_cache_alloc(mm_cachep, SLAB_KERNEL);
+memcpy(tsk-&gt;mm, current-&gt;mm, sizeof(*tsk-&gt;mm));
+atomic_set(&amp;tsk-&gt;mm-&gt;mm_users, 1);
+atomic_set(&amp;tsk-&gt;mm-&gt;mm_count, 1);
+init_rwsem(&amp;tsk-&gt;mm-&gt;mmap_set);
+tsk-&gt;mm-&gt;core_waiters = 0;
+tsk-&gt;mm-&gt;page_table_lock = SPIN_LOCK_UNLOCKED;
+tsk-&gt;mm-&gt;ioctx_list_lock = RW_LOCK_UNLOCKED;
+tsk-&gt;mm-&gt;ioctx_list = NULL;
+tsk-&gt;mm-&gt;default_kioctx = INIT_KIOCTX(tsk-&gt;mm-&gt;default_kioctx, *tsk-&gt;mm);
+tsk-&gt;mm-&gt;free_area_cache = (TASK_SIZE/3 + 0xfff) &amp; 0xfffff000;
+tsk-&gt;mm-&gt;pgd = pgd_alloc(tsk-&gt;mm);
+tsk-&gt;mm-&gt;def_flags = 0;
+</code></pre> 
+<p>然后调用依赖于体系结构的 init_new_context()：对于 80x86，检查当前进程是否拥有定制的局部描述符，如果是，复制一份 current 的局部描述符表，并将其插入 tsk 地址空间。</p> 
+<p>最后，调用 dup_mmap() 复制父进程的线性区和页表：</p> 
+<ul><li>将新内存描述符 tsk-&gt;mm 插入到内存描述符的全局链表中。</li><li>从 current-&gt;mm-&gt;mmap 指向的线性区开始扫描父进程的线性区链表。</li><li>复制遇到的每个 vm_area_struct 线性区描述符</li><li>将复制品插入到子进程的线性区链表和红黑树中</li><li>插入一个新的线性区描述符后，如果需要，立即调用 copy_page_range() 创建必要的页表来映射该线性区所包含的一组页，并初始化新表的表项，尤其是，与私有的、可写的页所对应的任一页框都标记为对父子进程是只读的。</li></ul> 
+<h3><a id="_1040"></a>删除进程的地址空间</h3> 
+<p>进程结束时，内核调用 exit_mm() 释放进程的地址空间：</p> 
+<pre><code>// 唤醒在 tsk-&gt;vfork_done 补充原语上睡眠的任一进程
+// 典型的，只有当现有进程通过 vfork() 被创建时，相应的等待队列才会为非空
+mm_release(tsk, tsk-&gt;mm);
+
+// 如果正在被终止的进程是内核线程
+if(!(mm = tsk-&gt;mm))  
+	return;
+
+// 如果正在被终止的进程不是内核线程，就必须释放内存描述符和所有相关的数据结构
+// 首先，检查 mm-&gt;core_waiters 标志是否被置位
+// 如果是，就把内存的所有内容卸载到一个转储文件中
+// 为避免转储文件的混乱，利用 mm-&gt;core_done 和 mm-&gt;core_startup_done 补充原语使共享同一内存描述符 mm 的轻量级进程执行串行化
+down_read(&amp;mm-&gt;mmap_sem);
+</code></pre> 
+<p>接下来，递增内存描述符的主使用计数器，重新设置进程描述符的 mm 字段，并使处理器处于懒惰 TLB 模式：</p> 
+<pre><code>atomic_inc(&amp;mm-&gt;mm_count);
+spin_lock(tsk-&gt;alloc_lock);
+tsk-&gt;mm = NULL;
+up_read(&amp;mm-&gt;map_sem);
+enter_lazy_tlb(mm, current);
+spin_unlock(tsk-&gt;alloc_lock);
+mmput(mm);
+</code></pre> 
+<p>最后，调用 mmput() 释放局部描述符表、线性区描述符和页表。<br> 但因为 exit_mm() 已经递增了主使用计数器，所以不释放内存描述本身。<br> 当要把正在被终止的进程从本地 CPU 撤销时，由 finish_task_switch() 释放内存描述符。</p> 
+<h2><a id="_1076"></a>堆的管理</h2> 
+<p>每个 Unix 进程都拥有一个特殊的线性区—堆，满足进程的动态内存请求。<br> 内存描述符的 start_brk 与 brk 字段分别限定了该区的开始地址和结束地址。</p> 
+<p>进程调用以下 API 请求和释放动态内存：</p> 
+<ul><li>malloc(size) 请求 size 个字节的动态内存。分配成功则返回所分配内存单元的第一个字节的线性地址。</li><li>calloc(n, size) 请求含有 n 个大小为 size 的元素的一个数组。分配成功则将数组元素初始化为 0，并返回第一个元素的线性地址。</li><li>realloc(ptr, size) 改变由 malloc() 或 calloc() 分配的内存区字段的大小。</li><li>free(addr) 释放由 malloc() 或 calloc() 分配的起始地址为 addr 的线性区。</li><li>brk(addr) 直接修改堆的大小。addr 指定 current-&gt;mm-&gt;brk 的新值，返回线性区新的结束地址。</li><li>sbrk(incr) 类似于 brk()，但 incr 指定是增加还是减少以字节为单位的堆的大小。</li></ul> 
+<p>brk() 是唯一以系统调用的方式实现的函数，而其他函数是使用 brk() 和 mmap() 系统调用实现的 C 语言库函数。</p> 
+<p>用户态进程调用 brk() 时，内核执行 sys_brk(addr)：</p> 
+<pre><code>// 首先检验 addr 是否位于进程代码所在的线性区
+// 如果是，立即返回，因为堆不能与进程代码所在的线性区重叠
+mm = current-&gt;mm;
+down_write(&amp;mm-&gt;mmap_sem);
+if(addr &lt; mm-&gt;end_code)
+{
+out:
+	up_write(&amp;mm-&gt;mmap_sem);
+	return mm-&gt;brk;
+}
+
+// 由于 brk() 作用于某一个线性区，分配和释放完整的页
+// 因此，将 addr 的值调整为 PAGE_SIZE 的倍数，然后将调整结果于内存描述符的 brk 字段比较
+newbrk = (addr + 0xfff) &amp; 0xfffff000;
+oldbrk = (mm-&gt;brk + 0xfff) &amp; 0xfffff000;
+if(oldbrk == newbrk)
+{
+	mm-&gt;brk = addr;
+	goto out;
+}
+
+// 如果进程要求缩小堆，则调用 do_munmap() 完成并返回
+if(addr &lt;= mm-&gt;brk)
+{
+	if(!do_munmap(mm, newbrk, oldbrk-newbrk))
+		mm-&gt;brk = addr;
+	goto out;
+}
+
+// 如果进程请求扩大堆，首先检查是否允许
+// 如果进程企图分配限制范围之外的内存，只简单返回 mm-&gt;brk 的原有值
+rlim = current-&gt;signal-&gt;rlim[RLIMIT_DATA].rlim_cur;
+if(rlim &lt; RLIM_INFINITY &amp;&amp; addr - mm-&gt;start_data &gt; rlim)
+	goto out;
+
+// 然后，检查扩大后的堆是否可进程的其他线性区重叠，如果是，直接返回
+if(find_vma_intersection(mm, oldbrk, newbrk+PAGE_SIZE))
+	goto out;
+
+// 如果一切顺利，调用 do_brk()
+// 如果它返回 oldbrk，则分配成功，返回 addr；否则，返回旧的 mm-&gt;brk
+if(do_brk(oldbrk, newbrk-oldbrk) == oldbrk)
+	mm-&gt;brk = addr;
+goto out;
+</code></pre> 
+<p>do_brk() 实际上是 do_mmap() 的进化版，仅处理匿名线性区，等价于：</p> 
+<pre><code>do_mmap(NULL, oldbrk, newbrk-oldbrk, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_FIXED|MAP_PRIVATE, 0)
+</code></pre> 
+<p>do_brk() 假定线性区不映射磁盘上的文件，从而避免了检查线性区对象的几个字段，因此比 do_mmap() 稍快。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2c4feddbd52fd80fcdf309421145642f/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">python实现蒙特卡洛Monte Carlo算法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e05f12ca869342ab78edf3c332575b3c/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">C&#43;&#43; 实现大整数类运算符重载</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

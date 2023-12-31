@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Postgresql实现主从复制，读写分离 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Postgresql实现主从复制，读写分离" />
+<meta property="og:description" content="前言 简单记录一下postgresql主从的实现方式之一——基于Standby的异步流复制，这是PostgreSQL9.x版本（2010.9）之后提供的一个很nice的功能，类似的功能在Oracle中是11g之后才提供的active dataguard和SQL Server 2012版本之后才提供的日志传送，此处再次为pg鼓掌，确实是一个很棒的开源数据库。废话不多说，本篇blog就详细记录一下在pg9.5中实现Hot Standby异步流复制的完整配置过程和注意事项。
+Standby数据库原理 简单介绍一些基础概念与原理，首先我们做主从同步的目的就是实现db服务的高可用性，通常是一台主数据库提供读写，然后把数据同步到另一台从库，然后从库不断apply从主库接收到的数据，从库不提供写服务，只提供读服务。在postgresql中提供读写全功能的服务器称为primary database或master database，在接收主库同步数据的同时又能提供读服务的从库服务器称为hot standby server。
+PostgreSQL在数据目录下的pg_xlog子目录中维护了一个WAL日志文件，该文件用于记录数据库文件的每次改变，这种日志文件机制提供了一种数据库热备份的方案，即：在把数据库使用文件系统的方式备份出来的同时也把相应的WAL日志进行备份，即使备份出来的数据块不一致，也可以重放WAL日志把备份的内容推到一致状态。这也就是基于时间点的备份（Point-in-Time Recovery），简称PITR。而把WAL日志传送到另一台服务器有两种方式，分别是：
+WAL日志归档（base-file）流复制（streaming replication） 第一种是写完一个WAL日志后，才把WAL日志文件拷贝到standby数据库中，简言之就是通过cp命令实现远程备份，这样通常备库会落后主库一个WAL日志文件。而第二种流复制是postgresql9.x之后才提供的新的传递WAL日志的方法，它的好处是只要master库一产生日志，就会马上传递到standby库，同第一种相比有更低的同步延迟，所以我们肯定也会选择流复制的方式。
+在实际操作之前还有一点需要说明就是standby的搭建中最关键的一步——在standby中生成master的基础备份。postgresql9.1之后提供了一个很方便的工具—— pg_basebackup，关于它的详细介绍和参数说明可以在官网中查看（pg_basebackup tool），下面在搭建过程中再做相关具体说明，关于一些基础概念和原理先介绍到这里。
+详细配置 下面开始实战，首先准备两台服务器，我这里开了2个虚拟机做测试，分别是：
+主库（master） centos-release-7-3.1511 192.168.42.71 postgresql 9.5从库（standby） centos-release-7-3.1511 192.168.42.70 postgresql 9.5 一、主库（master）安装 并 配置postgresql （1）安装postgresql
+1.添加RPM
+$ sudo yum install https://download.postgresql.org/pub/repos/yum/9.5/redhat/rhel-7-x86_64/pgdg-centos95-9.5-2.noarch.rpm
+# 2.安装PostgreSQL 9.5
+$ sudo yum install postgresql95-server postgresql95-contrib
+# 3.初始化数据库（切记：从库不需要初始化数据库）
+$ sudo /usr/pgsql-9.5/bin/postgresql95-setup initdb
+# 4.设置开机自启动
+$ sudo systemctl enable postgresql-9.5.service
+#5.启动服务
+$ sudo systemctl start postgresql-9.5.service" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/4987e5c025a73370df99fbd985a43e33/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2019-01-29T16:08:53+08:00" />
+<meta property="article:modified_time" content="2019-01-29T16:08:53+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Postgresql实现主从复制，读写分离</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2 id="前言"><a name="t0"></a>前言</h2> 
+<p>简单记录一下postgresql主从的实现方式之一——基于Standby的异步流复制，这是PostgreSQL9.x版本（2010.9）之后提供的一个很nice的功能，类似的功能在<a href="http://lib.csdn.net/base/oracle" rel="nofollow">Oracle</a>中是11g之后才提供的active dataguard和SQL Server 2012版本之后才提供的日志传送，此处再次为pg鼓掌，确实是一个很棒的开源<a href="http://lib.csdn.net/base/mysql" rel="nofollow">数据库</a>。废话不多说，本篇blog就详细记录一下在pg9.5中实现Hot Standby异步流复制的完整配置过程和注意事项。</p> 
+<h2 id="standby数据库原理"><a name="t1"></a>Standby数据库原理</h2> 
+<p>简单介绍一些基础概念与原理，首先我们做主从同步的目的就是实现db服务的高可用性，通常是一台主数据库提供读写，然后把数据同步到另一台从库，然后从库不断apply从主库接收到的数据，从库不提供写服务，只提供读服务。在postgresql中提供读写全功能的服务器称为primary database或master database，在接收主库同步数据的同时又能提供读服务的从库服务器称为hot standby server。</p> 
+<p>PostgreSQL在数据目录下的pg_xlog子目录中维护了一个WAL日志文件，该文件用于记录数据库文件的每次改变，这种日志文件机制提供了一种数据库热备份的方案，即：在把数据库使用文件系统的方式备份出来的同时也把相应的WAL日志进行备份，即使备份出来的数据块不一致，也可以重放WAL日志把备份的内容推到一致状态。这也就是基于时间点的备份（Point-in-Time Recovery），简称PITR。而把WAL日志传送到另一台服务器有两种方式，分别是：</p> 
+<ol><li>WAL日志归档（base-file）</li><li>流复制（streaming replication）</li></ol> 
+<p>第一种是写完一个WAL日志后，才把WAL日志文件拷贝到standby数据库中，简言之就是通过cp命令实现远程备份，这样通常备库会落后主库一个WAL日志文件。而第二种流复制是postgresql9.x之后才提供的新的传递WAL日志的方法，它的好处是只要master库一产生日志，就会马上传递到standby库，同第一种相比有更低的同步延迟，所以我们肯定也会选择流复制的方式。</p> 
+<p>在实际操作之前还有一点需要说明就是standby的搭建中最关键的一步——在standby中生成master的基础备份。postgresql9.1之后提供了一个很方便的工具—— pg_basebackup，关于它的详细介绍和参数说明可以在官网中查看（<a href="https://www.postgresql.org/docs/current/static/app-pgbasebackup.html" rel="nofollow">pg_basebackup tool</a>），下面在搭建过程中再做相关具体说明，关于一些基础概念和原理先介绍到这里。</p> 
+<h2 id="详细配置"><a name="t2"></a>详细配置</h2> 
+<p>下面开始实战，首先准备两台服务器，我这里开了2个虚拟机做<a href="http://lib.csdn.net/base/softwaretest" rel="nofollow">测试</a>，分别是：</p> 
+<ol><li>主库（master） centos-release-7-3.1511 192.168.42.71 postgresql 9.5</li><li>从库（standby） centos-release-7-3.1511 192.168.42.70 postgresql 9.5</li></ol> 
+<h4>一、主库（master）安装 并 配置postgresql </h4> 
+<p>（1）安装postgresql</p> 
+<p>  1.添加RPM<br>    $ sudo yum install https://download.postgresql.org/pub/repos/yum/9.5/redhat/rhel-7-x86_64/pgdg-centos95-9.5-2.noarch.rpm<br>    # 2.安装PostgreSQL 9.5<br>    $ sudo yum install postgresql95-server postgresql95-contrib<br>    # 3.初始化数据库（切记：从库不需要初始化数据库）<br>    $ sudo /usr/pgsql-9.5/bin/postgresql95-setup initdb<br>    # 4.设置开机自启动<br>    $ sudo systemctl enable postgresql-9.5.service<br>    #5.启动服务<br>    $ sudo systemctl start postgresql-9.5.service</p> 
+<p>#6.停止服务</p> 
+<p>$sudo systemctl stop postgresql-9.5.service</p> 
+<p><br>    安装完成默认会做三件事：</p> 
+<p>   1. 创建 `postgres` 的 Linux 用户；<br>    2. 创建 `postgres` 不带密码的默认数据库管理员账户；<br>    3. 创建 `postgres` 系统数据库。</p> 
+<p>(2)修改配置文件</p> 
+<p>cd  /var/lib/pgsql/9.5/data</p> 
+<p>vim pg_hba.conf 增加以下配置：（切记：必须要配置为从库的ip/32）</p> 
+<blockquote> 
+ <p> host all all 0.0.0.0 0.0.0.0 md5</p> 
+</blockquote> 
+<blockquote> 
+ <p>host replication postgres 192.168.42.70/32 md5      #这句话的意思允许从数据库连接主数据库去拖wal日志数据</p> 
+</blockquote> 
+<p>vim postgresql.conf</p> 
+<pre class="has"><code>Listen_adresses = '*'
+wal_level = hot_standby                #主从设置为热血模式，流复制必选
+
+max_wal_senders=2 #流复制允许连接进程
+wal_keep_segments =64 
+max_connections = 1000 默认参数，非主从配置相关参数，表示到数据库的连接数</code></pre> 
+<p>第一个不用说了，wal_level表示启动搭建Hot Standby，max_wal_senders则需要设置为一个大于0的数，它表示主库最多可以有多少个并发的standby数据库，而最后一个wal_keep_segments也应当设置为一个尽量大的值，以防止主库生成WAL日志太快，日志还没有来得及传送到standby就被覆盖，但是需要考虑磁盘空间允许，一个WAL日志文件的大小是16M： <br><img alt="这里写图片描述" class="has" src="https://images2.imgbox.com/28/e3/Eo6LdaL9_o.png"></p> 
+<p>如上图，一个WAL日志文件是16M，如果wal_keep_segments设置为64，也就是说将为standby库保留64个WAL日志文件，那么就会占用16*64=1GB的磁盘空间，所以需要综合考虑，在磁盘空间允许的情况下设置大一些，就会减少standby重新搭建的风险。接下来还需要在主库创建一个超级用户来专门负责让standby连接去拖WAL日志：</p> 
+<p>(3)启动 主 数据库</p> 
+<blockquote> 
+ <p>$ sudo systemctl start postgresql-9.5.service</p> 
+</blockquote> 
+<h4>二、从库（standby）安装 并 配置postgresql </h4> 
+<p>（1）从库安装完成后，不初始化，若已经初始化，删除其/var/lib/pgsql/9.5/data目录</p> 
+<p>执行，以下命令将主数据库的/var/lib/pgsql/9.5/data的目录同步过来。</p> 
+<blockquote> 
+ <p>pg_basebackup -h 192.168.42.71 -U postgres -F p -x -P -R -D /var/lib/pgsql/9.5/data/ -l postgresbackup20190129</p> 
+</blockquote> 
+<p>下面简单做一下参数说明（可以通过<code>pg_basebackup --help</code>进行查看），<code>-h</code>指定连接的数据库的主机名或IP地址，这里就是主库的ip。<code>-U</code>指定连接的用户名，此处是我们刚才创建的专门负责流复制的repl用户。<code>-F</code>指定了输出的格式，支持p（原样输出）或者t（tar格式输出）。<code>-x</code>表示备份开始后，启动另一个流复制连接从主库接收WAL日志。<code>-P</code>表示允许在备份过程中实时的打印备份的进度。<code>-R</code>表示会在备份结束后自动生成recovery.conf文件，这样也就避免了手动创建。<code>-D</code>指定把备份写到哪个目录，这里尤其要注意一点就是做基础备份之前从库的数据目录（/usr/local/postgresql/data）目录需要手动清空。<code>-l</code>表示指定一个备份的标识，运行命令后看到如下进度提示就说明生成基础备份成功： <br><img alt="这里写图片描述" class="has" src="https://images2.imgbox.com/a0/06/J0LA4Ba1_o.png"></p> 
+<p>如上图，由于我们在pg_hba.conf中指定的md5认证方式，所以需要输入主数据库postgres用户的密码postgres。</p> 
+<p>（2）修改配置文件</p> 
+<p>vi /postgres/data/postgresql.conf</p> 
+<p>#在基础备份时，初始化文件是从主库复制来的，所以配置文件一致，注释掉</p> 
+<p>wal_level，</p> 
+<p>max_wal_senders</p> 
+<p>wal_keep_segments等参数</p> 
+<p>打开如下参数：</p> 
+<pre class="has"><code>
+hot_standby = on   #在备份的同时允许查询
+max_standby_streaming_delay = 30s #可选，流复制最大延迟
+
+wal_receiver_status_interval = 10s #可选，从向主报告状态的最大间隔时间
+hot_standby_feedback = on #可选，查询冲突时向主反馈
+max_connections = 1000 #默认参数，非主从配置相关参数，表示到数据库的连接数，一般从库做主要的读服务时，设置值需要高于主库
+</code></pre> 
+<p>(3)创建恢复文件recovery.conf（如果我们在执行pg_basebackup的时候指定了-R 参数，可以忽略此步骤 ）</p> 
+<p>recovery.conf    #在做基础备份时，也可通过-R参数在备份结束后自动生产一个recovery.conf文件</p> 
+<p>standby_mode = on  #指明从库身份</p> 
+<p>primary_conninfo = 'host=10.0.120.150 port=5432 user=repl password=repl1234'      #连接到主库信息</p> 
+<p>recovery_target_timeline = 'latest'     #同步到最新数据</p> 
+<p>#trigger_file = ‘/postgres/data/trigger_activestandby’</p> 
+<p>指定触发文件，文件存在时，将触发从库提升为主库，前提是必须设置”standby_mode = on”；如果不设置此参数，也可采用”pg_ctl promote“触发从库切换成主库</p> 
+<p>（4）启动从数据库，可能会报权限不正确的错误</p> 
+<p>[root@scoder19 9.3]# service postgresql-9.3 start<br> Starting postgresql-9.3 service: [FAILED]<br> 日志文件（/var/lib/pgsql/9.3/pgstartup.log）：报错如下：</p> 
+<p><img alt="" class="has" height="248" src="https://images2.imgbox.com/91/9b/8ITI8qlq_o.png" width="1195"></p> 
+<p>原因是应该是 文件夹 “/var/lib/pgsql/9.3/data”权限错误， 权限应该是 rwx (0700)。<br> 解决方法：<br> 切换到 具有root权限的用户，<br> 先把文件夹 “/var/lib/pgsql/9.5/data” 的用户所属组，给postgres 用户：<br> 进入/var/lib/pgsql/9.5目录<br> cd /var/lib/pgsql/9.5<br> chown -R postgres:postgres data<br> 把data目前的所有文件及子目录文件权限改成： rwx (0700)<br> chmod -R 0700 data<br> 重启PostgreSQL 数据库，问题解决。</p> 
+<h4>三 、验证主从是否配置成功</h4> 
+<p>（1）查看主库sender进程</p> 
+<p><img alt="" class="has" height="242" src="https://images2.imgbox.com/84/7d/fhfshOMK_o.png" width="1151"></p> 
+<p>（2）查看从库receiver进程</p> 
+<p><img alt="" class="has" height="203" src="https://images2.imgbox.com/47/78/QUV9V3am_o.png" width="1004"></p> 
+<p> （3）向主库中创建表，并插入数据，查看从库是否同步过去 </p> 
+<p>su postgres</p> 
+<p>psql</p> 
+<p>select * from pg_stat_replication;</p> 
+<p>create table test(id int primary key,name vatchar(20),salary real);</p> 
+<p>insert into test values(10,'i love you',10000.00);</p> 
+<p>insert into test values(2,'li si',12000.00);</p> 
+<p><img alt="" class="has" height="531" src="https://images2.imgbox.com/a4/70/0uMKMRGa_o.png" width="1020"></p> 
+<p><br> 从库只读，不可插入数据，修改，删除数据</p> 
+<p><img alt="" class="has" height="358" src="https://images2.imgbox.com/76/fc/z62iL105_o.png" width="622"></p> 
+<p><img alt="" class="has" height="338" src="https://images2.imgbox.com/52/f1/j0Bo8ldc_o.png" width="632"></p> 
+<p> 到此主从复制建立完成。</p> 
+<h4>四  、主从切换（未完待续）</h4> 
+<p>（1）通过自带的函数，是备机则是t<br> postgres=# select pg_is_in_recovery();<br> pg_is_in_recovery<br> ——————-<br> f </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p><br>  </p> 
+<p> </p> 
+<p> </p> 
+<p> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/6b54ac5591d48fc590d8f9b26be9432d/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">SpringMVC 之 @PatchMapping</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/15b3f83a4b7326b1bebd0241c4fd1b4c/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">C/C&#43;&#43; 指针和数组</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

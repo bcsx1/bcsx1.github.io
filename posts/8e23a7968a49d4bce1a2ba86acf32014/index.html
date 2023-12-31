@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Linux C&#43;&#43;代码打印堆栈 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Linux C&#43;&#43;代码打印堆栈" />
+<meta property="og:description" content="webrtc中有一份打印堆栈的源码，依赖于 libunwind源码文件中包含了几个webrtc的基础库，用于日志打印、临界区控制、字符串处理。在集成使用中，可以依次分别替换为你自己的日志打印、std::mutex/pthread_mutex、std::stringstream/sprintf。经本人验证，可以交叉编译后在arm板上使用。 头文件
+/* * Copyright 2019 The WebRTC project authors. All Rights Reserved. * * Use of this source code is governed by a BSD-style license * that can be found in the LICENSE file in the root of the source * tree. An additional intellectual property rights grant can be found * in the file PATENTS. All contributing project authors may * be found in the AUTHORS file in the root of the source tree." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8e23a7968a49d4bce1a2ba86acf32014/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-05-17T11:43:29+08:00" />
+<meta property="article:modified_time" content="2023-05-17T11:43:29+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Linux C&#43;&#43;代码打印堆栈</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <ol><li>webrtc中有一份打印堆栈的源码，依赖于 <strong>libunwind</strong></li><li>源码文件中包含了几个webrtc的基础库，用于日志打印、临界区控制、字符串处理。在集成使用中，可以依次分别替换为<code>你自己的日志打印</code>、<code>std::mutex/pthread_mutex</code>、<code>std::stringstream/sprintf</code>。</li><li>经本人验证，可以交叉编译后在arm板上使用。</li></ol> 
+<hr> 
+<p>头文件</p> 
+<pre><code class="prism language-c++">/*
+ *  Copyright 2019 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#ifndef SDK_ANDROID_NATIVE_API_STACKTRACE_STACKTRACE_H_
+#define SDK_ANDROID_NATIVE_API_STACKTRACE_STACKTRACE_H_
+
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+namespace webrtc {
+
+struct StackTraceElement {
+  // Pathname of shared object (.so file) that contains address.
+  const char* shared_object_path;
+  // Execution address relative to the .so base address. This matches the
+  // addresses you get with "nm", "objdump", and "ndk-stack", as long as the
+  // code is compiled with position-independent code. Android requires
+  // position-independent code since Lollipop.
+  uint32_t relative_address;
+  // Name of symbol whose definition overlaps the address. This value is null
+  // when symbol names are stripped.
+  const char* symbol_name;
+};
+
+// Utility to unwind stack for a given thread on Android ARM devices. This works
+// on top of unwind.h and unwinds native (C++) stack traces only.
+std::vector&lt;StackTraceElement&gt; GetStackTrace(int tid);
+
+// Unwind the stack of the current thread.
+std::vector&lt;StackTraceElement&gt; GetStackTrace();
+
+// Get a string representation of the stack trace in a format ndk-stack accepts.
+std::string StackTraceToString(
+    const std::vector&lt;StackTraceElement&gt;&amp; stack_trace);
+
+}  // namespace webrtc
+
+#endif  // SDK_ANDROID_NATIVE_API_STACKTRACE_STACKTRACE_H_
+
+</code></pre> 
+<p>源码文件</p> 
+<pre><code class="prism language-c++">/*
+ *  Copyright 2019 The WebRTC project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#include "sdk/android/native_api/stacktrace/stacktrace.h"
+
+#include &lt;dlfcn.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;linux/futex.h&gt;
+#include &lt;sys/ptrace.h&gt;
+#include &lt;sys/ucontext.h&gt;
+#include &lt;syscall.h&gt;
+#include &lt;ucontext.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;unwind.h&gt;
+#include &lt;atomic&gt;
+
+// ptrace.h is polluting the namespace. Clean up to avoid conflicts with rtc.
+#if defined(DS)
+#undef DS
+#endif
+
+#include "rtc_base/critical_section.h"
+#include "rtc_base/logging.h"
+#include "rtc_base/strings/string_builder.h"
+
+namespace webrtc {
+
+namespace {
+
+// Maximum stack trace depth we allow before aborting.
+constexpr size_t kMaxStackSize = 100;
+// Signal that will be used to interrupt threads. SIGURG ("Urgent condition on
+// socket") is chosen because Android does not set up a specific handler for
+// this signal.
+constexpr int kSignal = SIGURG;
+
+// Note: This class is only meant for use within this file, and for the
+// simplified use case of a single Wait() and a single Signal(), followed by
+// discarding the object (never reused).
+// This is a replacement of rtc::Event that is async-safe and doesn't use
+// pthread api. This is necessary since signal handlers cannot allocate memory
+// or use pthread api. This class is ported from Chromium.
+class AsyncSafeWaitableEvent {
+ public:
+  AsyncSafeWaitableEvent() {
+    std::atomic_store_explicit(&amp;futex_, 0, std::memory_order_release);
+  }
+
+  ~AsyncSafeWaitableEvent() {}
+
+  // Returns false in the event of an error and errno is set to indicate the
+  // cause of the error.
+  bool Wait() {
+    // futex() can wake up spuriously if this memory address was previously used
+    // for a pthread mutex. So, also check the condition.
+    while (true) {
+      int res = syscall(SYS_futex, &amp;futex_, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0,
+                        nullptr, nullptr, 0);
+      if (std::atomic_load_explicit(&amp;futex_, std::memory_order_acquire) != 0)
+        return true;
+      if (res != 0)
+        return false;
+    }
+  }
+
+  void Signal() {
+    std::atomic_store_explicit(&amp;futex_, 1, std::memory_order_release);
+    syscall(SYS_futex, &amp;futex_, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, nullptr,
+            nullptr, 0);
+  }
+
+ private:
+  std::atomic&lt;int&gt; futex_;
+};
+
+// Struct to store the arguments to the signal handler.
+struct SignalHandlerOutputState {
+  // This event is signalled when signal handler is done executing.
+  AsyncSafeWaitableEvent signal_handler_finish_event;
+  // Running counter of array index below.
+  size_t stack_size_counter = 0;
+  // Array storing the stack trace.
+  uintptr_t addresses[kMaxStackSize];
+};
+
+// Global lock to ensure only one thread gets interrupted at a time.
+rtc::GlobalLockPod g_signal_handler_lock;
+// Argument passed to the ThreadSignalHandler() from the sampling thread to the
+// sampled (stopped) thread. This value is set just before sending signal to the
+// thread and reset when handler is done.
+SignalHandlerOutputState* volatile g_signal_handler_output_state;
+
+// This function is called iteratively for each stack trace element and stores
+// the element in the array from |unwind_output_state|.
+_Unwind_Reason_Code UnwindBacktrace(struct _Unwind_Context* unwind_context,
+                                    void* unwind_output_state) {
+  SignalHandlerOutputState* const output_state =
+      static_cast&lt;SignalHandlerOutputState*&gt;(unwind_output_state);
+
+  // Avoid overflowing the stack trace array.
+  if (output_state-&gt;stack_size_counter &gt;= kMaxStackSize)
+    return _URC_END_OF_STACK;
+
+  // Store the instruction pointer in the array. Subtract 2 since we want to get
+  // the call instruction pointer, not the return address which is the
+  // instruction after.
+  output_state-&gt;addresses[output_state-&gt;stack_size_counter] =
+      _Unwind_GetIP(unwind_context) - 2;
+  ++output_state-&gt;stack_size_counter;
+
+  return _URC_NO_REASON;
+}
+
+// This signal handler is exectued on the interrupted thread.
+void SignalHandler(int signum, siginfo_t* info, void* ptr) {
+  _Unwind_Backtrace(&amp;UnwindBacktrace, g_signal_handler_output_state);
+  g_signal_handler_output_state-&gt;signal_handler_finish_event.Signal();
+}
+
+// Temporarily change the signal handler to a function that records a raw stack
+// trace and interrupt the given tid. This function will block until the output
+// thread stack trace has been stored in |params|. The return value is an error
+// string on failure and null on success.
+const char* CaptureRawStacktrace(int pid,
+                                 int tid,
+                                 SignalHandlerOutputState* params) {
+  // This function is under a global lock since we are changing the signal
+  // handler and using global state for the output. The lock is to ensure only
+  // one thread at a time gets captured. The lock also means we need to be very
+  // careful with what statements we put in this function, and we should even
+  // avoid logging here.
+  struct sigaction act;
+  struct sigaction old_act;
+  memset(&amp;act, 0, sizeof(act));
+  act.sa_sigaction = &amp;SignalHandler;
+  act.sa_flags = SA_RESTART | SA_SIGINFO;
+  sigemptyset(&amp;act.sa_mask);
+
+  rtc::GlobalLockScope ls(&amp;g_signal_handler_lock);
+  g_signal_handler_output_state = params;
+
+  if (sigaction(kSignal, &amp;act, &amp;old_act) != 0)
+    return "Failed to change signal action";
+
+  // Interrupt the thread which will execute SignalHandler() on the given
+  // thread.
+  if (tgkill(pid, tid, kSignal) != 0)
+    return "Failed to interrupt thread";
+
+  // Wait until the thread is done recording its stack trace.
+  if (!params-&gt;signal_handler_finish_event.Wait())
+    return "Failed to wait for thread to finish stack trace";
+
+  // Restore previous signal handler.
+  sigaction(kSignal, &amp;old_act, /* old_act= */ nullptr);
+
+  return nullptr;
+}
+
+// Translate addresses into symbolic information using dladdr().
+std::vector&lt;StackTraceElement&gt; FormatStackTrace(
+    const SignalHandlerOutputState&amp; params) {
+  std::vector&lt;StackTraceElement&gt; stack_trace;
+  for (size_t i = 0; i &lt; params.stack_size_counter; ++i) {
+    const uintptr_t address = params.addresses[i];
+
+    Dl_info dl_info = {};
+    if (!dladdr(reinterpret_cast&lt;void*&gt;(address), &amp;dl_info)) {
+      RTC_LOG(LS_WARNING)
+          &lt;&lt; "Could not translate address to symbolic information for address "
+          &lt;&lt; address &lt;&lt; " at stack depth " &lt;&lt; i;
+      continue;
+    }
+
+    StackTraceElement stack_trace_element;
+    stack_trace_element.shared_object_path = dl_info.dli_fname;
+    stack_trace_element.relative_address = static_cast&lt;uint32_t&gt;(
+        address - reinterpret_cast&lt;uintptr_t&gt;(dl_info.dli_fbase));
+    stack_trace_element.symbol_name = dl_info.dli_sname;
+
+    stack_trace.push_back(stack_trace_element);
+  }
+
+  return stack_trace;
+}
+
+}  // namespace
+
+std::vector&lt;StackTraceElement&gt; GetStackTrace(int tid) {
+  // Only a thread itself can unwind its stack, so we will interrupt the given
+  // tid with a custom signal handler in order to unwind its stack. The stack
+  // will be recorded to |params| through the use of the global pointer
+  // |g_signal_handler_param|.
+  SignalHandlerOutputState params;
+
+  const char* error_string = CaptureRawStacktrace(getpid(), tid, &amp;params);
+  if (error_string != nullptr) {
+    RTC_LOG(LS_ERROR) &lt;&lt; error_string &lt;&lt; ". tid: " &lt;&lt; tid
+                      &lt;&lt; ". errno: " &lt;&lt; errno;
+    return {};
+  }
+  if (params.stack_size_counter &gt;= kMaxStackSize) {
+    RTC_LOG(LS_WARNING) &lt;&lt; "Stack trace for thread " &lt;&lt; tid &lt;&lt; " was truncated";
+  }
+  return FormatStackTrace(params);
+}
+
+std::vector&lt;StackTraceElement&gt; GetStackTrace() {
+  SignalHandlerOutputState params;
+  _Unwind_Backtrace(&amp;UnwindBacktrace, &amp;params);
+  if (params.stack_size_counter &gt;= kMaxStackSize) {
+    RTC_LOG(LS_WARNING) &lt;&lt; "Stack trace was truncated";
+  }
+  return FormatStackTrace(params);
+}
+
+std::string StackTraceToString(
+    const std::vector&lt;StackTraceElement&gt;&amp; stack_trace) {
+  rtc::StringBuilder string_builder;
+
+  for (size_t i = 0; i &lt; stack_trace.size(); ++i) {
+    const StackTraceElement&amp; stack_trace_element = stack_trace[i];
+    string_builder.AppendFormat(
+        "#%02zu pc %08x %s", i,
+        static_cast&lt;uint32_t&gt;(stack_trace_element.relative_address),
+        stack_trace_element.shared_object_path);
+    // The symbol name is only available for unstripped .so files.
+    if (stack_trace_element.symbol_name != nullptr)
+      string_builder.AppendFormat(" %s", stack_trace_element.symbol_name);
+
+    string_builder.AppendFormat("\n");
+  }
+
+  return string_builder.Release();
+}
+
+}  // namespace webrtc
+
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2aa39efdb8f6ce24d349ef67969875e8/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">处理vue3&#43;vite报错：vite.defineConfig is not a function</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/7c1936683bf779e3b9e628760201d8d3/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Vue2中router-view的多层嵌套参数传递（无需定义props），无需定义参数名，属性值也可传递进儿子、孙子组件。</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

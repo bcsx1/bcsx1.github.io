@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【MySQL】之联合索引与最左匹配原则 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【MySQL】之联合索引与最左匹配原则" />
+<meta property="og:description" content="前言： 最左匹配原则在我们 MySQL 开发过程中和面试过程中经常遇到，为了加深印象和理解，我在这里把 MySQL 的最左匹配原则详细的讲解一下，包括它的原理以及是否导致索引失效的场景。
+在讲解 MySQL 的最左匹配原则之前，我们需要了解一下 MySQL 的联合索引（也称复合索引），因为最左匹配原则是在联合索引的基础上产生的，没有联合索引就没有最左匹配原则这个概念。
+一、联合索引 1、什么是联合索引 我们知道，单值索引指的是只使用一个字段作为索引字段的索引，而联合索引则是使用多个字段来共同构建成一个索引：
+KEY idx_abc (a, b, c); 2、为什么要使用联合索引 2-1、减少开销 建一个联合索引 (a, b, c)，实际上相当于建了 (a)、(a, b)、(a, b, c) 三个索引。这样我们就不需要创建 (a)、(b)、(c) 三个单值索引了。我们知道，每多一个索引，都会增加数据库写操作的开销和磁盘空间的开销，对于大量数据的表，使用联合索引会大大的减少开销！
+2-2、覆盖索引 对联合索引 (a, b, c)，如果有如下的 SQL：select a, b, c from test where a=1 and b=2。那么 MySQL 可以直接通过遍历索引取得数据，而无需回表，从而减少了很多的随机 IO 操作。而减少 IO 操作，而减少随机 IO 是 DBA 主要的优化策略，在真正的实际应用中，覆盖索引是主要的提升性能的优化手段之一。
+2-3、提高效率 联合索引的字段越多，通过索引筛选出的数据越少。假如有 1000W 条数据的表，有如下 sql: select * from table where a=1 and b=2 and c=3，假设每个条件可以筛选出 10% 的数据，如果只有单值索引，那么通过该索引能筛选出 1000W * 10% = 100w 条数据，然后再回表从 100w 条数据中找到符合 b=2 and c=3 的数据，然后再排序，再分页。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/de39c52e50a180cad38e6c4ac527b6a8/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-10T09:48:32+08:00" />
+<meta property="article:modified_time" content="2023-12-10T09:48:32+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【MySQL】之联合索引与最左匹配原则</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-tomorrow-night-eighties">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="_0"></a>前言：</h2> 
+<hr> 
+<p><strong>最左匹配原则</strong>在我们 MySQL 开发过程中和面试过程中经常遇到，为了加深印象和理解，我在这里把 MySQL 的最左匹配原则详细的讲解一下，包括它的原理以及是否导致索引失效的场景。</p> 
+<p>在讲解 MySQL 的最左匹配原则之前，我们需要了解一下 MySQL 的<strong>联合索引</strong>（<em>也称复合索引</em>），因为<strong>最左匹配原则是在联合索引的基础上产生的</strong>，没有联合索引就没有最左匹配原则这个概念。</p> 
+<br> 
+<h2><a id="_8"></a>一、联合索引</h2> 
+<hr> 
+<h3><a id="1_10"></a>1、什么是联合索引</h3> 
+<p>我们知道，<strong>单值索引</strong>指的是只使用一个字段作为索引字段的索引，而联合索引则是使用多个字段来共同构建成一个索引：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">KEY</span> idx_abc <span class="token punctuation">(</span>a<span class="token punctuation">,</span> b<span class="token punctuation">,</span> c<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<h3><a id="2_16"></a>2、为什么要使用联合索引</h3> 
+<h4><a id="21_17"></a>2-1、减少开销</h4> 
+<p>建一个联合索引 <code>(a, b, c)</code>，实际上相当于建了 <code>(a)、(a, b)、(a, b, c)</code> 三个索引。这样我们就不需要创建 <code>(a)、(b)、(c)</code> 三个单值索引了。我们知道，<strong>每多一个索引，都会增加数据库写操作的开销和磁盘空间的开销，对于大量数据的表，使用联合索引会大大的减少开销！</strong></p> 
+<h4><a id="22_21"></a>2-2、覆盖索引</h4> 
+<p>对联合索引 <code>(a, b, c)</code>，如果有如下的 SQL：<code>select a, b, c from test where a=1 and b=2</code>。那么 MySQL 可以直接通过遍历索引取得数据，而<strong>无需回表，从而减少了很多的随机 IO 操作</strong>。而减少 IO 操作，而减少随机 IO 是 DBA 主要的优化策略，在真正的实际应用中，<strong>覆盖索引是主要的提升性能的优化手段之一</strong>。</p> 
+<h4><a id="23_25"></a>2-3、提高效率</h4> 
+<p>联合索引的字段越多，通过索引筛选出的数据越少。假如有 1000W 条数据的表，有如下 <code>sql: select * from table where a=1 and b=2 and c=3</code>，假设每个条件可以筛选出 10% 的数据，如果只有单值索引，那么通过该索引能筛选出 <code>1000W * 10% = 100w</code> 条数据，然后再回表从 100w 条数据中找到符合 b=2 and c=3 的数据，然后再排序，再分页。</p> 
+<p>但如果是联合索引，则通过索引直接筛选出的数据为：<code>1000w * 10% * 10% * 10% = 1w</code>，这效率的提升可想而知！</p> 
+<br> 
+<h2><a id="_33"></a>二、最左匹配原则</h2> 
+<hr> 
+<h3><a id="1_35"></a>1、最左匹配原则的规则</h3> 
+<p>在联合索引当中，索引匹配时：<strong>最左字段优先，以最左边的字段为起点任何连续的字段索引都能匹配上，如果遇到范围查询 <code>(&gt;、&lt;、between、like)</code> 时就会停止匹配</strong>。</p> 
+<h3><a id="2_37"></a>2、索引是否生效的场景</h3> 
+<p><strong>是否满足最左匹配原则是衡量联合索引命中与否的依据</strong>。存在的场景比较多，假设我们创建了以 a, b, c 三个字段的联合索引 <code>idx_abc(a, b, c)</code>，下面我们分别展开讨论索引是否失效的场景。</p> 
+<p><strong>2-1、全字段全值匹配</strong></p> 
+<p>索引的全部字段都在查找条件当中，并且都是使用 <code>=</code> 进行全值匹配的情况下，索引是命中生效的：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">=</span> <span class="token string">'1'</span> <span class="token operator">and</span> b <span class="token operator">=</span> <span class="token string">'2'</span> <span class="token operator">and</span> c <span class="token operator">=</span> <span class="token string">'3'</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> b <span class="token operator">=</span> <span class="token string">'2'</span> <span class="token operator">and</span> a <span class="token operator">=</span> <span class="token string">'1'</span> <span class="token operator">and</span> c <span class="token operator">=</span> <span class="token string">'3'</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> c <span class="token operator">=</span> <span class="token string">'3'</span> <span class="token operator">and</span> b <span class="token operator">=</span> <span class="token string">'2'</span> <span class="token operator">and</span> a <span class="token operator">=</span> <span class="token string">'1'</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+</code></pre> 
+<p>虽然 where 子句几个搜索条件顺序调换了，但不影响查询结果，这是由于 MySQL 的查询优化器会自动调整 where 子句的条件顺序以使用适合的索引，所以 MySQL 不存在 where 子句的顺序问题而造成索引失效。</p> 
+<p><strong>2-2、从左到右按顺序匹配</strong></p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">=</span> <span class="token string">'1'</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">=</span> <span class="token string">'1'</span> <span class="token operator">and</span> b <span class="token operator">=</span> <span class="token string">'2'</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">=</span> <span class="token string">'1'</span> <span class="token operator">and</span> b <span class="token operator">=</span> <span class="token string">'2'</span> <span class="token operator">and</span> c <span class="token operator">=</span> <span class="token string">'3'</span>
+</code></pre> 
+<p>只要是按照联合索引创建的字段从左到右的顺序依次使用，不管使用其中多少个字段，都会命中索引。</p> 
+<p><strong>2-3、缺失最左边的字段</strong></p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span>  b <span class="token operator">=</span> <span class="token string">'2'</span> 
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span>  c <span class="token operator">=</span> <span class="token string">'3'</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span>  b <span class="token operator">=</span> <span class="token string">'1'</span> <span class="token operator">and</span> c <span class="token operator">=</span> <span class="token string">'3'</span> 
+</code></pre> 
+<p>这种缺失了最左边 a 字段的情况就是违背最左匹配原则的典型例子，结果就是没有用到索引（<em>索引失效</em>）。</p> 
+<p>因为缺失了最左边的字段，导致索引数据结构 B+ 树不知道第一步该查哪个节点，从而需要去全表扫描了。在建立搜索树的时候 a 就是第一个比较因子，必须要先根据 a 来搜索，进而才能往后继续查询 b 和 c。</p> 
+<p><strong>2-4、缺失中间的字段</strong></p> 
+<p>假如去掉中间的字段，保留最左边和右边的字段（<em>就是我们说的索引字段不连续</em>）：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">=</span> <span class="token string">'1'</span> <span class="token operator">and</span> c <span class="token operator">=</span> <span class="token string">'3'</span> 
+</code></pre> 
+<p>结果就是只用到了 a 列的索引，而 b 列和 c 列都没有用到。</p> 
+<p>因为在这种情况下进行数据检索时，B+ 树可以用 a 来指定第一步的搜索方向，但由于下一个字段 b 的缺失，所以只能先把 a = 1 的<strong>数据主键 ID 都找出来，然后通过查到的主键 ID 回表查询相关行</strong>，再去匹配 c 值的数据了。当然，这至少把 a = 1 的数据筛选出来了，总比直接全表扫描好多了</p> 
+<p><strong>2-5、匹配范围值</strong></p> 
+<p>出现匹配范围值的情况可能比较复杂或难以理解，但我们只需要牢记最左匹配原则的规则：<strong>遇到范围查询 <code>(&gt;、&lt;、between、like)</code> 时就会停止匹配</strong>。</p> 
+<p>比如下面这种情况：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span>  a <span class="token operator">=</span> <span class="token number">1</span> <span class="token operator">and</span> b <span class="token operator">&gt;</span> <span class="token number">3</span> <span class="token operator">and</span> c <span class="token operator">=</span> <span class="token string">'mm'</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>这种情况下，由于 a 是等值匹配，所以 B+ 树走完 a 索引之后 b 还是有序的，但走完 b 索引之后，由于 b 是范围匹配，所以此时 c 已经是无序的了，最终只使用了 <code>(a, b)</code> 两个索引（<strong>由于此时 c 就没法走索引，所以优化器只能根据 a, b 得到数据的主键 ID 回表查询，最终影响了执行效率</strong>）。</p> 
+<p>再比如下面的情况：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span>  a <span class="token operator">&gt;</span> <span class="token number">1</span> <span class="token operator">and</span> b <span class="token operator">&gt;</span> <span class="token number">1</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span>  a <span class="token operator">&gt;</span> <span class="token number">1</span> <span class="token operator">and</span> a <span class="token operator">&lt;</span> <span class="token number">3</span> <span class="token operator">and</span> b <span class="token operator">&gt;</span> <span class="token number">1</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>当多个列同时进行范围查找时，只有对索引<strong>最左边的那个列</strong>进行范围查找才用到 B+ 树索引，也就是只有 a 用到索引，在 <code>a &gt; 1</code> 和 <code>1 &lt; a &lt; 3</code> 的范围内 b 是无序的，所以 b 不能用索引，找到 a 的记录后，只能根据条件 b &gt; 1 继续逐条过滤。</p> 
+<p><strong>2-6、<code>like</code> 语句匹配问题</strong></p> 
+<p>当索引列是字符型，并且使用了 like 语句进行模糊查询时，如果通配符 <code>%</code> 不出现在开头，则可以用到索引，否则将会违背了最左匹配原则，而不会使用索引，走的是全表扫描：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">like</span> <span class="token string">'As%'</span><span class="token punctuation">;</span>   <span class="token comment">//走索引查询</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">like</span> <span class="token string">'%As'</span><span class="token punctuation">;</span>   <span class="token comment">//全表查询</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">like</span> <span class="token string">'%As%'</span><span class="token punctuation">;</span>  <span class="token comment">//全表查询</span>
+</code></pre> 
+<p>我们先了解一下<strong>字符型字段的比较规则</strong>：当列是字符型的话，它的比较规则是先比较字符串的第一个字符，第一个字符小的那个字符串就比较小，如果两个字符串第一个字符相同，那就再比较第二个字符，依次类推。</p> 
+<p>所以，如果通配符 <code>%</code> 出现在开头，B+ 树则无法进行比较匹配，进而导致索引失效。</p> 
+<h3><a id="3_111"></a>3、解决文件排序的问题</h3> 
+<p>当我们对查询的数据进行 <code>order by</code> 排序时，一般情况下，我们是先把数据记录加载到内存中，再用一些排序算法，比如快速排序，归并排序等在内存中对这些记录进行排序。但有时候查询的结果集太大不能在内存中进行排序时，需要暂时借助磁盘空间存放中间结果，排序操作完成后再把排好序的结果返回客户端。Mysql 把这种在磁盘上进行排序的方式称为<strong>文件排序</strong>（<strong>Filesort</strong>）。</p> 
+<p>文件排序是非常慢非常耗性能的，但如果 <code>order by</code> 子句用到了索引列，就有可能避免文件排序的问题：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">order</span> <span class="token keyword">by</span> a<span class="token punctuation">,</span> b<span class="token punctuation">,</span> c <span class="token keyword">limit</span> <span class="token number">10</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>因为 B+ 树索引本身就是按照上述规则排序的，准确来说就是：<strong>索引是有序的</strong>，所以得到的结果集已经排好序了，不用再进行额外的排序操作。</p> 
+<p><strong>注意</strong>：order by 的子句后面的字段顺序也必须按照索引字段的顺序给出，不能颠倒顺序（<strong>MySQL 不会自动调整排序字段的顺序</strong>）。</p> 
+<p>下面这种就是因为颠倒顺序而没有使用索引的情况：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">order</span> <span class="token keyword">by</span> b<span class="token punctuation">,</span> c<span class="token punctuation">,</span> a <span class="token keyword">limit</span> <span class="token number">10</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>下面这种是用到部分索引的情况：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">order</span> <span class="token keyword">by</span> a <span class="token keyword">limit</span> <span class="token number">10</span><span class="token punctuation">;</span>
+<span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">order</span> <span class="token keyword">by</span> a<span class="token punctuation">,</span> b <span class="token keyword">limit</span> <span class="token number">10</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>下面这种情况，由于联合索引左边列为常量，后边的列排序可以用到索引：</p> 
+<pre><code class="prism language-sql"><span class="token keyword">select</span> <span class="token operator">*</span> <span class="token keyword">from</span> table_name <span class="token keyword">where</span> a <span class="token operator">=</span><span class="token number">1</span> <span class="token keyword">order</span> <span class="token keyword">by</span> b<span class="token punctuation">,</span> c <span class="token keyword">limit</span> <span class="token number">10</span><span class="token punctuation">;</span>
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/d7818c4dcf6e8d5ef9fe72247c51221c/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">【算法专题】分治 - 快速排序</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/8ab4c93dcea6e5b0a23b08e536f2973f/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Java 类加载器和双亲委派机制原理剖析</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

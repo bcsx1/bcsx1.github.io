@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>阿里云oss文件分片、断点续传上传 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="阿里云oss文件分片、断点续传上传" />
+<meta property="og:description" content="1、概述 把文件上传到阿里云oss上有两种上传方案：
+（1） 表单提交
+（2）阿里云sdk
+表单提交操作简单只需要向bucket所在地址发起post请求，并携带上签名，具体的可以由javaScript在前端生成，或者是由自己项目服务端生成，上传文件时需要先获取签名然后再携带上签名的参数向oss服务器上传文件。表单操作便捷，但有三大痛点，第一点是它不支持断点重传，第二它不支持分片上传，第三，它对批量上传不太友好，我曾经实践过，使用表单提交获取的签名只能使用一次，要想通过表单提交来实现批量上传，说白了就是要上传每一个文件时都要先去获取签名，然后再向oss服务器发起一次新的post请求.
+吐槽完了表单提交，再来说说今天的主角阿里云sdk,它支持分片上传和断点续传更加适合真实项目的使用场景。其次对于当前的前后端分离架构文件上传的安全问题，阿里云sdk的解决方案是STS临时访问令牌，这个访问令牌是临时性的，每一次生成都是不同的，并且可以设置过期时间，且前端可以缓存起来重复利用的。它的安全性也是更高的，STS生成的流程是：应用服务器携带者直接身份信息去请求阿里云的STS服务器，STS服务器生成临时访问令牌返回给应用服务器，应用服务器再将令牌以及bucket信息封装返回给前端，前端在再拿着应用服务器返回的令牌去操作oss服务器上文件。
+ok,流程捋完，开始动手实践。
+2、创建RAM用户 角色 权限策略 （1） 进入到oss控制台点击权限管理
+（2）点击前往控制套进入到RAM管理控制台
+（3） 选择用户模块，创建新的用户
+（4）输入用户名，重点是勾上 Open API调用访问
+（5） 点击确定后将出现如下界面
+（6）保存AccessKey Id 和　AccessKey Secret
+可以直接保存到后端的配置文件里，待会获得STS Token 的时候要用到。
+保存之后点击返回。
+（7） 选择角色模块，点击创建新的角色
+此时将会出现如图界面
+选择可信实体类型为 阿里云账号，点击下一步。输入角色名称，点击完成即可。
+找到刚刚创建的角色，点击角色名，将会看到如下页面，需要保存ARN,同前面的AccessKey 一样需要在获取令牌的时候用到。
+（8）创建允许上传文件的权限。 进入权限策略管理，点击创建权限策略,输入策略名称，选择脚本配置，脚本内容可参考。
+&#34;Version&#34;: &#34;1&#34;, &#34;Statement&#34;: [ { &#34;Effect&#34;: &#34;Allow&#34;, &#34;Action&#34;: [ &#34;oss:PutObject&#34; ], &#34;Resource&#34;: [ &#34;acs:oss:*:*:examplebucket/exampledir&#34;, &#34;acs:oss:*:*:examplebucket/exampledir/*&#34; ] } ] } 配置完脚本文件后，点击确认并返回
+（9） 为用户和角色分配权限
+进入到用户模块，点击刚刚创建的用户对用的添加权限
+将会出现如下界面
+搜索sts,点击AliyunSTSAssumRoleAccess ，它将会出现在已选择的框中，点击确定。
+进入到角色模块，找到刚刚创建的角色，点击添加权限
+和为用户分配权健的界面相同，选择自定义策略，添加刚刚创建的策略。
+总结一下，就是需要一个RAM用户一个角色，一个允许文件上传到对应bucket的权限策略，在请求token的时候需要带上accessKeyId和accessKeySecret相当于RAM的账号密码，同时需要带上角色名和角色ARN,通过角色来为token 授予bucket的访问权限；" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/4ac15ed51d2df4e0796606d451a8cbfd/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-08-18T15:38:54+08:00" />
+<meta property="article:modified_time" content="2021-08-18T15:38:54+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">阿里云oss文件分片、断点续传上传</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h3><a id="1_1"></a>1、概述</h3> 
+<p>把文件上传到阿里云oss上有两种上传方案：<br> （1） 表单提交<br> （2）阿里云sdk<br> 表单提交操作简单只需要向bucket所在地址发起post请求，并携带上签名，具体的可以由javaScript在前端生成，或者是由自己项目服务端生成，上传文件时需要先获取签名然后再携带上签名的参数向oss服务器上传文件。表单操作便捷，但有三大痛点，第一点是它不支持断点重传，第二它不支持分片上传，第三，它对批量上传不太友好，我曾经实践过，使用表单提交获取的签名只能使用一次，要想通过表单提交来实现批量上传，说白了就是要上传每一个文件时都要先去获取签名，然后再向oss服务器发起一次新的post请求.<br> 吐槽完了表单提交，再来说说今天的主角阿里云sdk,它支持分片上传和断点续传更加适合真实项目的使用场景。其次对于当前的前后端分离架构文件上传的安全问题，阿里云sdk的解决方案是STS临时访问令牌，这个访问令牌是临时性的，每一次生成都是不同的，并且可以设置过期时间，且前端可以缓存起来重复利用的。它的安全性也是更高的，STS生成的流程是：应用服务器携带者直接身份信息去请求阿里云的STS服务器，STS服务器生成临时访问令牌返回给应用服务器，应用服务器再将令牌以及bucket信息封装返回给前端，前端在再拿着应用服务器返回的令牌去操作oss服务器上文件。<br> ok,流程捋完，开始动手实践。</p> 
+<h3><a id="2RAM___8"></a>2、创建RAM用户 角色 权限策略</h3> 
+<p>（1） 进入到oss控制台点击权限管理<br> （2）点击前往控制套进入到RAM管理控制台</p> 
+<p><img src="https://images2.imgbox.com/f6/18/2GUFkIHs_o.png" alt="在这里插入图片描述"><br> （3） 选择用户模块，创建新的用户<br> <img src="https://images2.imgbox.com/ca/4c/1StXqe1z_o.png" alt="在这里插入图片描述"><br> （4）输入用户名，重点是勾上 Open API调用访问<br> <img src="https://images2.imgbox.com/16/b2/cid0Dna5_o.png" alt="在这里插入图片描述"><br> （5） 点击确定后将出现如下界面<br> <img src="https://images2.imgbox.com/c0/07/BGK3gAPl_o.png" alt="在这里插入图片描述"><br> （6）保存AccessKey Id 和　AccessKey Secret<br> 可以直接保存到后端的配置文件里，待会获得STS Token 的时候要用到。<br> 保存之后点击返回。<br> （7） 选择角色模块，点击创建新的角色<br> <img src="https://images2.imgbox.com/4a/4a/kAwRIn11_o.png" alt="在这里插入图片描述"><br> 此时将会出现如图界面<br> <img src="https://images2.imgbox.com/e0/7d/slunsZZ6_o.png" alt="在这里插入图片描述"><br> 选择可信实体类型为 阿里云账号，点击下一步。输入角色名称，点击完成即可。<br> <img src="https://images2.imgbox.com/ae/c3/XJmDSoMT_o.png" alt="在这里插入图片描述"><br> 找到刚刚创建的角色，点击角色名，将会看到如下页面，需要保存ARN,同前面的AccessKey 一样需要在获取令牌的时候用到。<br> <img src="https://images2.imgbox.com/d1/a3/0W00tRxI_o.png" alt="在这里插入图片描述"></p> 
+<p>（8）创建允许上传文件的权限。 进入权限策略管理，点击创建权限策略,输入策略名称，选择脚本配置，脚本内容可参考。</p> 
+<pre><code class="prism language-{​">    "Version": "1",
+    "Statement": [
+     {
+           "Effect": "Allow",
+           "Action": [
+             "oss:PutObject"
+           ],
+           "Resource": [
+             "acs:oss:*:*:examplebucket/exampledir",
+             "acs:oss:*:*:examplebucket/exampledir/*"
+           ]
+     }
+    ]
+}
+</code></pre> 
+<p><img src="https://images2.imgbox.com/33/22/ey6r4hp2_o.png" alt="在这里插入图片描述"><br> 配置完脚本文件后，点击确认并返回<br> （9） 为用户和角色分配权限<br> 进入到用户模块，点击刚刚创建的用户对用的添加权限<br> <img src="https://images2.imgbox.com/e3/3e/Rz3hln6y_o.png" alt="在这里插入图片描述"><br> 将会出现如下界面<br> <img src="https://images2.imgbox.com/d0/2a/k0F2QAzM_o.png" alt="在这里插入图片描述"></p> 
+<p>搜索sts,点击AliyunSTSAssumRoleAccess ，它将会出现在已选择的框中，点击确定。</p> 
+<p>进入到角色模块，找到刚刚创建的角色，点击添加权限<br> <img src="https://images2.imgbox.com/e5/d0/amuxXc6C_o.png" alt="在这里插入图片描述"><br> 和为用户分配权健的界面相同，选择自定义策略，添加刚刚创建的策略。<br> <img src="https://images2.imgbox.com/e1/eb/LmTJ0Umx_o.png" alt="在这里插入图片描述"><br> 总结一下，就是需要一个RAM用户一个角色，一个允许文件上传到对应bucket的权限策略，在请求token的时候需要带上accessKeyId和accessKeySecret相当于RAM的账号密码，同时需要带上角色名和角色ARN,通过角色来为token 授予bucket的访问权限；</p> 
+<h3><a id="2STSToken_64"></a>2.应用服务端向STS服务器请求Token</h3> 
+<p>如果是SpringBoot项目的话需要引入依赖：</p> 
+<pre><code class="prism language-bash"><span class="token operator">&lt;</span>dependency<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>groupId<span class="token operator">&gt;</span>com.aliyun<span class="token operator">&lt;</span>/groupId<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>artifactId<span class="token operator">&gt;</span>aliyun-java-sdk-sts<span class="token operator">&lt;</span>/artifactId<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>version<span class="token operator">&gt;</span><span class="token number">3.0</span>.<span class="token operator"><span class="token file-descriptor important">0</span>&lt;</span>/version<span class="token operator">&gt;</span>
+        <span class="token operator">&lt;</span>/dependency<span class="token operator">&gt;</span>
+        <span class="token operator">&lt;</span>dependency<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>groupId<span class="token operator">&gt;</span>com.aliyun<span class="token operator">&lt;</span>/groupId<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>artifactId<span class="token operator">&gt;</span>aliyun-java-sdk-core<span class="token operator">&lt;</span>/artifactId<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>version<span class="token operator">&gt;</span><span class="token number">4.4</span>.<span class="token operator"><span class="token file-descriptor important">6</span>&lt;</span>/version<span class="token operator">&gt;</span>
+        <span class="token operator">&lt;</span>/dependency<span class="token operator">&gt;</span>
+</code></pre> 
+<p>如果是SpringCloud项目只需要引入：</p> 
+<pre><code class="prism language-bash"> <span class="token operator">&lt;</span>dependency<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>groupId<span class="token operator">&gt;</span>com.alibaba.cloud<span class="token operator">&lt;</span>/groupId<span class="token operator">&gt;</span>
+            <span class="token operator">&lt;</span>artifactId<span class="token operator">&gt;</span>spring-cloud-starter-alicloud-oss<span class="token operator">&lt;</span>/artifactId<span class="token operator">&gt;</span>
+ <span class="token operator">&lt;</span>/dependency<span class="token operator">&gt;</span>
+</code></pre> 
+<p>引入了依赖之后开始编写获取StsToken的代码,首先定义一个StsToken实体，用来反馈给前端：</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Data</span>
+<span class="token annotation punctuation">@Builder</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">StsTokenVo</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token keyword">private</span> <span class="token class-name">String</span> region<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token class-name">String</span> accessKeyId<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token class-name">String</span> accessKeySecret<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token class-name">String</span> stsToken<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token class-name">String</span> bucket<span class="token punctuation">;</span>
+
+    <span class="token keyword">private</span> <span class="token class-name">String</span> expiration<span class="token punctuation">;</span>
+
+
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>按部就班，来个Service</p> 
+<pre><code class="prism language-java"><span class="token keyword">public</span> <span class="token keyword">interface</span> <span class="token class-name">StsTokenService</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token class-name">StsTokenVo</span> <span class="token function">getStsToken</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token punctuation">}</span>
+</code></pre> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@Service</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">StsTokenServiceImpl</span> <span class="token keyword">implements</span> <span class="token class-name">StsTokenService</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> REGION <span class="token operator">=</span> <span class="token string">"oss-cn-beijing"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> BUCKET <span class="token operator">=</span> <span class="token string">"chiris-test"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> ENDPOINT <span class="token operator">=</span> <span class="token string">"sts.cn-beijing.aliyuncs.com"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> ACCESS_KEY_ID <span class="token operator">=</span> <span class="token string">"access key id"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> ACCESS_KEY_SECRET <span class="token operator">=</span> <span class="token string">"acccess key secret"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> ROLE_ARN <span class="token operator">=</span> <span class="token string">"role arn"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> ROLE_SESSION_NAME <span class="token operator">=</span> <span class="token string">"roleName"</span><span class="token punctuation">;</span>
+    <span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> <span class="token class-name">String</span> POLICY <span class="token operator">=</span> <span class="token string">"{\n"</span> <span class="token operator">+</span>
+            <span class="token string">"    \"Version\": \"1\", \n"</span> <span class="token operator">+</span>
+            <span class="token string">"    \"Statement\": [\n"</span> <span class="token operator">+</span>
+            <span class="token string">"        {\n"</span> <span class="token operator">+</span>
+            <span class="token string">"            \"Action\": [\n"</span> <span class="token operator">+</span>
+            <span class="token string">"                \"oss:PutObject\"\n"</span> <span class="token operator">+</span>
+            <span class="token string">"            ], \n"</span> <span class="token operator">+</span>
+            <span class="token string">"            \"Resource\": [\n"</span> <span class="token operator">+</span>
+            <span class="token string">"                \"acs:oss:*:*:bucket-name/*\" \n"</span> <span class="token operator">+</span>
+            <span class="token string">"            ], \n"</span> <span class="token operator">+</span>
+            <span class="token string">"            \"Effect\": \"Allow\"\n"</span> <span class="token operator">+</span>
+            <span class="token string">"        }\n"</span> <span class="token operator">+</span>
+            <span class="token string">"    ]\n"</span> <span class="token operator">+</span>
+            <span class="token string">"}"</span><span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@Override</span>
+    <span class="token keyword">public</span> <span class="token class-name">StsTokenVo</span> <span class="token function">getStsToken</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token class-name">DefaultProfile</span><span class="token punctuation">.</span><span class="token function">addEndpoint</span><span class="token punctuation">(</span><span class="token string">""</span><span class="token punctuation">,</span> <span class="token string">""</span><span class="token punctuation">,</span> <span class="token string">"Sts"</span><span class="token punctuation">,</span> ENDPOINT<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">DefaultProfile</span> profile <span class="token operator">=</span> <span class="token class-name">DefaultProfile</span><span class="token punctuation">.</span><span class="token function">getProfile</span><span class="token punctuation">(</span><span class="token string">""</span><span class="token punctuation">,</span> ACCESS_KEY_ID<span class="token punctuation">,</span> ACCESS_KEY_SECRET<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">DefaultAcsClient</span> client <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">DefaultAcsClient</span><span class="token punctuation">(</span>profile<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">AssumeRoleRequest</span> request <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">AssumeRoleRequest</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            request<span class="token punctuation">.</span><span class="token function">setSysMethod</span><span class="token punctuation">(</span><span class="token class-name">MethodType</span><span class="token punctuation">.</span>POST<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            request<span class="token punctuation">.</span><span class="token function">setRoleArn</span><span class="token punctuation">(</span>ROLE_ARN<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            request<span class="token punctuation">.</span><span class="token function">setRoleSessionName</span><span class="token punctuation">(</span>ROLE_SESSION_NAME<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            request<span class="token punctuation">.</span><span class="token function">setPolicy</span><span class="token punctuation">(</span>POLICY<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            request<span class="token punctuation">.</span><span class="token function">setDurationSeconds</span><span class="token punctuation">(</span><span class="token number">3600L</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">final</span> <span class="token class-name">AssumeRoleResponse</span> response <span class="token operator">=</span> client<span class="token punctuation">.</span><span class="token function">getAcsResponse</span><span class="token punctuation">(</span>request<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">String</span> expiration <span class="token operator">=</span> response<span class="token punctuation">.</span><span class="token function">getCredentials</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getExpiration</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">String</span> accessKeyId <span class="token operator">=</span> response<span class="token punctuation">.</span><span class="token function">getCredentials</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getAccessKeyId</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">String</span> accessKeySecret <span class="token operator">=</span> response<span class="token punctuation">.</span><span class="token function">getCredentials</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getAccessKeySecret</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">String</span> stsToken <span class="token operator">=</span> response<span class="token punctuation">.</span><span class="token function">getCredentials</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">getSecurityToken</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token class-name">StsTokenVo</span> token <span class="token operator">=</span> <span class="token class-name">StsTokenVo</span><span class="token punctuation">.</span><span class="token function">builder</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">region</span><span class="token punctuation">(</span>REGION<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">bucket</span><span class="token punctuation">(</span>BUCKET<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">accessKeyId</span><span class="token punctuation">(</span>accessKeyId<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">accessKeySecret</span><span class="token punctuation">(</span>accessKeySecret<span class="token punctuation">)</span>
+                    <span class="token punctuation">.</span><span class="token function">stsToken</span><span class="token punctuation">(</span>stsToken<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">expiration</span><span class="token punctuation">(</span>expiration<span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">build</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> token<span class="token punctuation">;</span>
+
+        <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span><span class="token class-name">ClientException</span> e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            e<span class="token punctuation">.</span><span class="token function">printStackTrace</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">return</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>再来个controller</p> 
+<pre><code class="prism language-java"><span class="token annotation punctuation">@RestController</span>
+<span class="token annotation punctuation">@RequestMapping</span><span class="token punctuation">(</span><span class="token string">"/sts"</span><span class="token punctuation">)</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">StsTokenController</span> <span class="token punctuation">{<!-- --></span>
+
+    <span class="token annotation punctuation">@Resource</span>
+    <span class="token keyword">private</span> <span class="token class-name">StsTokenService</span> stsTokenService<span class="token punctuation">;</span>
+
+    <span class="token annotation punctuation">@GetMapping</span><span class="token punctuation">(</span><span class="token string">""</span><span class="token punctuation">)</span>
+    <span class="token annotation punctuation">@CrossOrigin</span>
+    <span class="token keyword">public</span> <span class="token class-name">StsTokenVo</span> <span class="token function">getStsToken</span><span class="token punctuation">(</span><span class="token class-name">HttpServletResponse</span> response<span class="token punctuation">)</span> <span class="token keyword">throws</span> <span class="token class-name">IOException</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token class-name">StsTokenVo</span> stsToken <span class="token operator">=</span> stsTokenService<span class="token punctuation">.</span><span class="token function">getStsToken</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>stsToken <span class="token operator">!=</span> <span class="token keyword">null</span><span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">return</span> stsToken<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        response<span class="token punctuation">.</span><span class="token function">setStatus</span><span class="token punctuation">(</span><span class="token number">500</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        response<span class="token punctuation">.</span><span class="token function">getWriter</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span><span class="token string">"get sts token failed"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> <span class="token keyword">null</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>测试一下：<br> <img src="https://images2.imgbox.com/5f/c6/Ea9GMyNB_o.png" alt="在这里插入图片描述"><br> 返回的结果中会生成一个临时的accessKeyId, accessKeySecret 以及一个临时的SecurityToken,同时也需要封装一下bucket和域名，这样的话可以在后端配置，不用在前端写死。</p> 
+<h3><a id="3_Vuejs__204"></a>3. Vue.js 实现分片上传与断点上传</h3> 
+<p>获取到stsToken后，就可以来做分片上传与断点上传啦！利用阿里云sdk实现文件分片上传很简单。<br> （1） 安装依赖</p> 
+<pre><code class="prism language-java">npm install ali<span class="token operator">-</span>oss <span class="token operator">--</span>save。
+</code></pre> 
+<p>(2) 需要一个文件上传的组件，这里使用element-ui的el-upload组件</p> 
+<pre><code class="prism language-html"><span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>template</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>div</span> <span class="token attr-name">class</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>upload<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>el-upload</span>
+      <span class="token attr-name">class</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>upload-demo<span class="token punctuation">"</span></span>
+      <span class="token attr-name">drag</span>
+      <span class="token attr-name">:auto-upload</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>false<span class="token punctuation">"</span></span>
+      <span class="token attr-name">action</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span><span class="token punctuation">"</span></span>
+      <span class="token attr-name">:file-list</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>fileList<span class="token punctuation">"</span></span>
+      <span class="token attr-name">:on-change</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>onChange<span class="token punctuation">"</span></span>
+      <span class="token attr-name">multiple</span><span class="token punctuation">&gt;</span></span>
+      <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>i</span> <span class="token attr-name">class</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>el-icon-upload<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span><span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>i</span><span class="token punctuation">&gt;</span></span>
+      <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>div</span> <span class="token attr-name">class</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>el-upload__text<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>将文件拖到此处，或<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>em</span><span class="token punctuation">&gt;</span></span>点击上传<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>em</span><span class="token punctuation">&gt;</span></span><span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>div</span><span class="token punctuation">&gt;</span></span>
+     <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>el-upload</span><span class="token punctuation">&gt;</span></span>
+
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>el-button</span> <span class="token attr-name">@click</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>doUpload<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span>upload<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>el-button</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>el-button</span> <span class="token attr-name">@click</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">"</span>resume<span class="token punctuation">"</span></span><span class="token punctuation">&gt;</span></span> continue<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>el-button</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>div</span><span class="token punctuation">&gt;</span></span>
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>template</span><span class="token punctuation">&gt;</span></span>
+在这里插入代码片
+</code></pre> 
+<p>(3)引入OSS 对象,并申明一个全局变量ossClient 和 tempCheckPoint (数组，记录了已经完成上传的分片及其对应的etag)如果将ossClient申明为vue的属性，可以完成上传，但是无法实现断点续传，具体的原因应该是和Vue的生命周期有关。</p> 
+<pre><code class="prism language-javascript"><span class="token keyword">const</span> <span class="token constant">OSS</span> <span class="token operator">=</span> <span class="token function">require</span><span class="token punctuation">(</span><span class="token string">'ali-oss'</span><span class="token punctuation">)</span>
+<span class="token keyword">let</span>  ossClient
+<span class="token keyword">let</span> tempCheckpoint
+
+</code></pre> 
+<p>（4） 每次上传时最好是能重新new 一个ossClient，上传以前需要先获取StsToken,在项目中可以将StsToken根据他的过期时间缓存在cookie中，避免不必要的网络请求，分片上传和断点续传主要是使用multipartUpload,方法</p> 
+<pre><code class="prism language-javascript"><span class="token keyword">async</span> <span class="token function">doMultipartUpload</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span><span class="token punctuation">{<!-- --></span>
+          <span class="token keyword">let</span> file <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>fileList<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>raw
+          <span class="token keyword">let</span> key <span class="token operator">=</span> <span class="token string">'/test/'</span> <span class="token operator">+</span> file<span class="token punctuation">.</span>name
+          <span class="token keyword">let</span> result <span class="token operator">=</span> <span class="token keyword">await</span> ossClient<span class="token punctuation">.</span><span class="token function">multipartUpload</span><span class="token punctuation">(</span>key<span class="token punctuation">,</span> file<span class="token punctuation">,</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function-variable function">progress</span><span class="token operator">:</span> <span class="token keyword">function</span> <span class="token punctuation">(</span><span class="token parameter">p<span class="token punctuation">,</span> checkpoint</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+              tempCheckpoint <span class="token operator">=</span> checkpoint
+              console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span> <span class="token string">"p: "</span> <span class="token operator">+</span> p<span class="token punctuation">)</span>     <span class="token comment">// 打印上传百分比</span>
+              console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>tempCheckpoint<span class="token punctuation">)</span>
+            <span class="token punctuation">}</span><span class="token punctuation">,</span>
+            
+          <span class="token punctuation">}</span><span class="token punctuation">)</span>
+
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">'result : '</span><span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>result<span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">'check point'</span><span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>tempCheckpoint<span class="token punctuation">)</span>
+        <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span>e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>e<span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>tempCheckpoint<span class="token punctuation">)</span>
+        <span class="token punctuation">}</span>
+
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+</code></pre> 
+<p>（5）断点续传</p> 
+<pre><code class="prism language-javascript"><span class="token keyword">async</span> <span class="token function">resume</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">let</span> file <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>fileList<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>raw
+        <span class="token keyword">let</span> key <span class="token operator">=</span> <span class="token string">'/test/'</span> <span class="token operator">+</span> file<span class="token punctuation">.</span>name
+        <span class="token keyword">let</span> result <span class="token operator">=</span> <span class="token keyword">await</span> ossClient<span class="token punctuation">.</span><span class="token function">multipartUpload</span><span class="token punctuation">(</span>key<span class="token punctuation">,</span> file<span class="token punctuation">,</span> <span class="token punctuation">{<!-- --></span>
+          <span class="token function-variable function">progress</span><span class="token operator">:</span> <span class="token keyword">function</span> <span class="token punctuation">(</span><span class="token parameter">p<span class="token punctuation">,</span> checkpoint</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            tempCheckpoint <span class="token operator">=</span> checkpoint
+            console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>p<span class="token punctuation">)</span>
+
+          <span class="token punctuation">}</span><span class="token punctuation">,</span>
+          
+          checkpoint<span class="token operator">:</span> tempCheckpoint
+        <span class="token punctuation">}</span><span class="token punctuation">)</span>
+
+        console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">'resumeUpload success'</span><span class="token punctuation">)</span>
+        console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>result<span class="token punctuation">)</span>
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+</code></pre> 
+<p>断点续传时需要携带上之前保存的tempCheckPoint，具体如何保存看实际应用场景。multipartUpload方法的更多参数可以参见 <a href="https://github.com/ali-sdk/ali-oss?spm=a2c4g.11186623.0.0.41501cd5t0s7jB#multipartuploadname-file-options">参数说明</a>checkpoint 的结构如下图所示：<br> <img src="https://images2.imgbox.com/6c/d5/YiKZHbxT_o.png" alt="在这里插入图片描述"><br> 其中donePart保存了已经上传的分片<br> <img src="https://images2.imgbox.com/29/e2/FErgYfmf_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="4__297"></a>4. 总结</h3> 
+<p><img src="https://images2.imgbox.com/10/52/NgtN7Syu_o.png" alt="在这里插入图片描述"></p> 
+<p>观察控制台可以看到分文件被拆分成了多个分片并行的上传，再在开始上传时客户端会先发送一个初始化的请求，并生成一个全局id<br> <img src="https://images2.imgbox.com/7f/5e/9XGRhyPE_o.png" alt="在这里插入图片描述"><br> 全部非分片上传完成之后，客户端会发送最后一个合并请求。oss服务器会根据全局uploadID和partNumber来合并文件碎片。<img src="https://images2.imgbox.com/70/d6/WUrHrAyr_o.png" alt="在这里插入图片描述"><br> <em>重要：</em> 使用aliyun-sdk需要对bucket做跨域配置，如下：否则会报没有权限的错误！<br> <img src="https://images2.imgbox.com/f0/d2/qh8vYver_o.png" alt="在这里插入图片描述"></p> 
+<h3><a id="5_305"></a>5.完整代码</h3> 
+<pre><code class="prism language-javascript"><span class="token operator">&lt;</span>template<span class="token operator">&gt;</span>
+  <span class="token operator">&lt;</span>div <span class="token keyword">class</span><span class="token operator">=</span><span class="token string">"upload"</span><span class="token operator">&gt;</span>
+    <span class="token operator">&lt;</span>el<span class="token operator">-</span>upload
+      <span class="token keyword">class</span><span class="token operator">=</span><span class="token string">"upload-demo"</span>
+      drag
+      <span class="token operator">:</span>auto<span class="token operator">-</span>upload<span class="token operator">=</span><span class="token string">"false"</span>
+      action<span class="token operator">=</span><span class="token string">""</span>
+      <span class="token operator">:</span>file<span class="token operator">-</span>list<span class="token operator">=</span><span class="token string">"fileList"</span>
+      <span class="token operator">:</span>on<span class="token operator">-</span>change<span class="token operator">=</span><span class="token string">"onChange"</span>
+      multiple<span class="token operator">&gt;</span>
+      <span class="token operator">&lt;</span>i <span class="token keyword">class</span><span class="token operator">=</span><span class="token string">"el-icon-upload"</span><span class="token operator">&gt;</span><span class="token operator">&lt;</span><span class="token operator">/</span>i<span class="token operator">&gt;</span>
+      <span class="token operator">&lt;</span>div <span class="token keyword">class</span><span class="token operator">=</span><span class="token string">"el-upload__text"</span><span class="token operator">&gt;</span>将文件拖到此处，或<span class="token operator">&lt;</span>em<span class="token operator">&gt;</span>点击上传<span class="token operator">&lt;</span><span class="token operator">/</span>em<span class="token operator">&gt;</span><span class="token operator">&lt;</span><span class="token operator">/</span>div<span class="token operator">&gt;</span>
+      <span class="token operator">&lt;</span><span class="token operator">/</span>el<span class="token operator">-</span>upload<span class="token operator">&gt;</span>
+
+    <span class="token operator">&lt;</span>el<span class="token operator">-</span>button @click<span class="token operator">=</span><span class="token string">"doUpload"</span><span class="token operator">&gt;</span>upload<span class="token operator">&lt;</span><span class="token operator">/</span>el<span class="token operator">-</span>button<span class="token operator">&gt;</span>
+    <span class="token operator">&lt;</span>el<span class="token operator">-</span>button @click<span class="token operator">=</span><span class="token string">"resume"</span><span class="token operator">&gt;</span> <span class="token keyword">continue</span><span class="token operator">&lt;</span><span class="token operator">/</span>el<span class="token operator">-</span>button<span class="token operator">&gt;</span>
+  <span class="token operator">&lt;</span><span class="token operator">/</span>div<span class="token operator">&gt;</span>
+<span class="token operator">&lt;</span><span class="token operator">/</span>template<span class="token operator">&gt;</span>
+
+<span class="token operator">&lt;</span>script<span class="token operator">&gt;</span>
+  <span class="token keyword">import</span> http <span class="token keyword">from</span> <span class="token string">"../util/http"</span><span class="token punctuation">;</span>
+  <span class="token keyword">const</span> <span class="token constant">OSS</span> <span class="token operator">=</span> <span class="token function">require</span><span class="token punctuation">(</span><span class="token string">'ali-oss'</span><span class="token punctuation">)</span>
+  <span class="token keyword">let</span>  ossClient
+  <span class="token keyword">let</span> tempCheckpoint
+  <span class="token keyword">export</span> <span class="token keyword">default</span> <span class="token punctuation">{<!-- --></span>
+    name<span class="token operator">:</span> <span class="token string">"Upload"</span><span class="token punctuation">,</span>
+    <span class="token function">data</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+      <span class="token keyword">return</span> <span class="token punctuation">{<!-- --></span>
+        fileList<span class="token operator">:</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+        ossConfig<span class="token operator">:</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span><span class="token punctuation">,</span>
+      <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span><span class="token punctuation">,</span>
+    methods<span class="token operator">:</span> <span class="token punctuation">{<!-- --></span>
+      <span class="token keyword">async</span> <span class="token function">doUpload</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token keyword">this</span><span class="token punctuation">.</span>fileList<span class="token punctuation">.</span>length <span class="token operator">===</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+          <span class="token function">alert</span><span class="token punctuation">(</span><span class="token string">"please select file"</span><span class="token punctuation">)</span>
+          <span class="token keyword">return</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>ossClient <span class="token operator">==</span> <span class="token keyword">null</span><span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+          <span class="token keyword">let</span> ossConfig
+          <span class="token keyword">await</span> <span class="token keyword">this</span><span class="token punctuation">.</span><span class="token function">getStsToken</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">then</span><span class="token punctuation">(</span><span class="token parameter">res</span> <span class="token operator">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>res<span class="token punctuation">.</span>status <span class="token operator">===</span> <span class="token number">200</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+              <span class="token keyword">let</span> data <span class="token operator">=</span> res<span class="token punctuation">.</span>data
+              ossConfig <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+                region<span class="token operator">:</span> data<span class="token punctuation">.</span>region<span class="token punctuation">,</span>
+                accessKeyId<span class="token operator">:</span> data<span class="token punctuation">.</span>accessKeyId<span class="token punctuation">,</span>
+                accessKeySecret<span class="token operator">:</span> data<span class="token punctuation">.</span>accessKeySecret<span class="token punctuation">,</span>
+                stsToken<span class="token operator">:</span> data<span class="token punctuation">.</span>stsToken<span class="token punctuation">,</span>
+                bucket<span class="token operator">:</span> data<span class="token punctuation">.</span>bucket
+              <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+              <span class="token function">alert</span><span class="token punctuation">(</span><span class="token string">'sts token get failed'</span><span class="token punctuation">)</span>
+            <span class="token punctuation">}</span>
+          <span class="token punctuation">}</span><span class="token punctuation">)</span>
+          ossClient <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">OSS</span><span class="token punctuation">(</span>ossConfig<span class="token punctuation">)</span>
+        <span class="token punctuation">}</span>
+
+        <span class="token keyword">await</span> <span class="token keyword">this</span><span class="token punctuation">.</span><span class="token function">doMultipartUpload</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+      <span class="token function">onChange</span><span class="token punctuation">(</span><span class="token parameter">file</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">this</span><span class="token punctuation">.</span>fileList<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">=</span> file
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+      <span class="token function">getStsToken</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> <span class="token function">http</span><span class="token punctuation">(</span><span class="token punctuation">{<!-- --></span>
+          method<span class="token operator">:</span> <span class="token string">'get'</span><span class="token punctuation">,</span>
+          url<span class="token operator">:</span> <span class="token string">'/sts'</span>
+        <span class="token punctuation">}</span><span class="token punctuation">)</span>
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+      <span class="token keyword">async</span> <span class="token function">doMultipartUpload</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">try</span><span class="token punctuation">{<!-- --></span>
+          <span class="token keyword">let</span> file <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>fileList<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>raw
+          <span class="token keyword">let</span> key <span class="token operator">=</span> <span class="token string">'/test/'</span> <span class="token operator">+</span> file<span class="token punctuation">.</span>name
+          <span class="token keyword">let</span> result <span class="token operator">=</span> <span class="token keyword">await</span> ossClient<span class="token punctuation">.</span><span class="token function">multipartUpload</span><span class="token punctuation">(</span>key<span class="token punctuation">,</span> file<span class="token punctuation">,</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function-variable function">progress</span><span class="token operator">:</span> <span class="token keyword">function</span> <span class="token punctuation">(</span><span class="token parameter">p<span class="token punctuation">,</span> checkpoint</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+              tempCheckpoint <span class="token operator">=</span> checkpoint
+              console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span> <span class="token string">"p: "</span> <span class="token operator">+</span> p<span class="token punctuation">)</span>     <span class="token comment">// 打印上传百分比</span>
+              console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>tempCheckpoint<span class="token punctuation">)</span>
+            <span class="token punctuation">}</span><span class="token punctuation">,</span>
+            partsSize<span class="token operator">:</span> <span class="token number">1000</span> <span class="token operator">*</span> <span class="token number">1024</span> <span class="token operator">*</span> <span class="token number">1024</span>
+          <span class="token punctuation">}</span><span class="token punctuation">)</span>
+
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">'result : '</span><span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>result<span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">'check point'</span><span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>tempCheckpoint<span class="token punctuation">)</span>
+        <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">(</span>e<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>e<span class="token punctuation">)</span>
+          console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>tempCheckpoint<span class="token punctuation">)</span>
+        <span class="token punctuation">}</span>
+
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+      <span class="token keyword">async</span> <span class="token function">resume</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">let</span> file <span class="token operator">=</span> <span class="token keyword">this</span><span class="token punctuation">.</span>fileList<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>raw
+        <span class="token keyword">let</span> key <span class="token operator">=</span> <span class="token string">'/test/'</span> <span class="token operator">+</span> file<span class="token punctuation">.</span>name
+        <span class="token keyword">let</span> result <span class="token operator">=</span> <span class="token keyword">await</span> ossClient<span class="token punctuation">.</span><span class="token function">multipartUpload</span><span class="token punctuation">(</span>key<span class="token punctuation">,</span> file<span class="token punctuation">,</span> <span class="token punctuation">{<!-- --></span>
+          <span class="token function-variable function">progress</span><span class="token operator">:</span> <span class="token keyword">function</span> <span class="token punctuation">(</span><span class="token parameter">p<span class="token punctuation">,</span> checkpoint</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            tempCheckpoint <span class="token operator">=</span> checkpoint
+            console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>p<span class="token punctuation">)</span>
+
+          <span class="token punctuation">}</span><span class="token punctuation">,</span>
+          partSize<span class="token operator">:</span> <span class="token number">50</span> <span class="token operator">*</span> <span class="token number">1024</span> <span class="token operator">*</span> <span class="token number">1024</span><span class="token punctuation">,</span>
+          checkpoint<span class="token operator">:</span> tempCheckpoint
+        <span class="token punctuation">}</span><span class="token punctuation">)</span>
+
+        console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">'resumeUpload success'</span><span class="token punctuation">)</span>
+        console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span>result<span class="token punctuation">)</span>
+      <span class="token punctuation">}</span><span class="token punctuation">,</span>
+	<span class="token punctuation">}</span><span class="token punctuation">,</span>
+
+
+  <span class="token punctuation">}</span>
+<span class="token operator">&lt;</span><span class="token operator">/</span>script<span class="token operator">&gt;</span>
+
+<span class="token operator">&lt;</span>style scoped type<span class="token operator">=</span><span class="token string">"less"</span><span class="token operator">&gt;</span>
+  <span class="token punctuation">.</span>upload<span class="token punctuation">{<!-- --></span>
+    width<span class="token operator">:</span> <span class="token number">400</span>px<span class="token punctuation">;</span>
+    height<span class="token operator">:</span> <span class="token number">300</span>px<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+<span class="token operator">&lt;</span><span class="token operator">/</span>style<span class="token operator">&gt;</span>
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/aa7a1dacc3e22f0f0b6a82c3d3a1ea94/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Python报错处理libpng warning: iCCP: cHRM chunk does not match sRGB</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e55831dffc750f4f47a936cd4acaf9a5/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">arduino2048小游戏源代码解析（超详细）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

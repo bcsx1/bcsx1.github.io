@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>RocketMQ 是怎么保证消息不丢失的 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="RocketMQ 是怎么保证消息不丢失的" />
+<meta property="og:description" content="*大家项目中选择rocketMQ来作为消息中间件的原因很多都是为了保证消息不丢失吧，那rocketMQ是怎么做到的呢，应该如何做才能避免消息丢失，一起来看看吧～～
+首先我们知道rocketmq的一个消息从生产到最终的消费过程需要经历总共三个阶段，或者说会经过三个地方，分别是producer的发送端、broker的持久化机制、以及consumer的消费端
+从生产者producer的角度：消息生产之后传递到broker，如果消息未能正确的存储到broker中，算作消息丢失
+从broker的角度：消息默认保存到broker的内存中，异步保存到磁盘上，如果发生宕机、磁盘崩溃会造成消息丢失
+从消费者consumer的角度：消息完成了持久化之后，consumer拉取之后未能成功消费且未反馈给broker，这样算作消息丢失，可能消费过程异常或者网络抖动造成消息丢失
+生产者角度：消费生产之后传递到broker，如果消息未能正确的保存到broker中，算作消息丢失
+从生产者的角度，生产了消息就是要通过网络发送到broker，其实只需要保证一点，就是确认这个消息已经成功发送到broker上了
+生产者只需要接收发送消息返回的确认响应即可，就可以代表消息发送成功
+代码示例：
+DefaultMQProducer mqProducer=new DefaultMQProducer(&#34;test&#34;);// 设置 nameSpace地址mqProducer.setNamesrvAddr(&#34;namesrvAddr&#34;);mqProducer.start();Message msg = new Message(&#34;topic&#34; /* Topic */, &#34;Captain&#34;.getBytes(RemotingHelper.DEFAULT_CHARSET) /* Message body */);// 发送消息到Brokertry { SendResult sendResult = mqProducer.send(msg);} catch (Exception e) { e.printStackTrace();} 当然，发送消息也分为同步和异步两种，消息发送成功之后会返回下面这四种不同的响应状态
+SEND_OK
+消息发送成功，但是也并不意味这完全代表不会丢失消息，这还要取决于broker的刷盘方式
+这个下面在broker方面会说，需要启动SYNC_MASTER或SYNC_FLUSH。（也就是同步）
+FLUSH_DISK_TIMEOUT
+如果Broker设置MessageStoreConfig的FlushDiskType = SYNC_FLUSH（默认为ASYNC_FLUSH），并且Broker没有在MessageStoreConfig的syncFlushTimeout（默认为5秒）内完成刷新磁盘，得到这个状态
+也就是此时刷盘超时，未能在规定时间内落到硬盘上，检查设置是否合理、硬盘大小等情况
+FLUSH_SLAVE_TIMEOUT
+如果Broker的角色是SYNC_MASTER（默认为ASYNC_MASTER），并且从属Broker未在MessageStoreConfig的syncFlushTimeout（默认为5秒）内完成与主服务器的同步，返回这个结果
+主从同步时间默认也是5秒，需要完成主从同步，这个下面在说broker的时候也会说到，你想啊，要是master挂了或者磁盘崩溃了，这是不是也不能百分百保证消息不丢失
+SLAVE_NOT_AVAILABLE
+如果Broker的角色是SYNC_MASTER（默认为ASYNC_MASTER），但没有配置slave Broker，返回这个状态
+这个在保证消息绝对不丢失的情况下是不允许存在的，这个状态也是属于需要处理的，没有可靠的slave，也就意味着没有可靠的备份数据，所以这种情况也需要考虑
+另外呢，上面还说了一种异步的消息发送方式，这种一般是用于链路较长，对于时间比较敏感的业务
+这种情况下需要特别注意的就是我们需要设置消息发送完成的回调，这样才能更好的保证消息不丢失 采取事务消息的投递方式，并不能保证消息100%投递成功到了Broker，但是如果消息发送Ack失败的话，此消息会存储在CommitLog当中，但是对ConsumerQueue是不可见的
+可以在日志中查看到这条异常的消息，严格意义上来讲，也并没有完全丢失
+broker：消息默认保存到broker的内存中，异步保存到磁盘上，如果发生宕机、磁盘崩溃会造成消息丢失
+顺序消费这个场景其实不是特别的常见，但是也是必不可少的，因为在某些业务场景下顺序是很关键的，保证消息的消费顺序也是很关键
+消息到了broker之后，默认是优先保存到broker的内存中，然后立刻返回响应给生产者producer，然后broker自己定期将消息批量的异步的保存到硬盘上
+有的小伙伴一小子就发现了问题不是那么简单，消息来了之后还没保存到硬盘，就直接返回了，broker直接宕机崩溃了，那这消息岂不无迹可寻了
+这样的优点是提高交互的效率，同时减少IO的次数，问题就是会造成消息丢失
+如果我们想要保证消息不丢失，那就需要保证消息成功保存到broker之后才可以返回，只需要将消息的保存机制修改为同步刷盘的方式，也就是只有消息保存到broker的磁盘成功之后，才会返回响应
+## 默认情况为 ASYNC_FLUSH flushDiskType = SYNC_FLUSH 如果broker未能在规定的同步时间（默认5秒）完成刷盘，将返回FLUSH_DISK_TIMEOUT给生产者" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8045e2cb10e4086acc0e2f524e08649f/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-10-28T14:16:56+08:00" />
+<meta property="article:modified_time" content="2022-10-28T14:16:56+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">RocketMQ 是怎么保证消息不丢失的</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <article class="baidu_pl"> 
+ <div id="article_content" class="article_content clearfix"> 
+  <div id="content_views" class="htmledit_views"> 
+   <p>*大家项目中选择rocketMQ来作为消息中间件的原因很多都是为了保证消息不丢失吧，那rocketMQ是怎么做到的呢，应该如何做才能避免消息丢失，一起来看看吧～～</p> 
+  </div> 
+ </div> 
+</article> 
+<p>首先我们知道<a href="https://so.csdn.net/so/search?q=rocketmq&amp;spm=1001.2101.3001.7020" target="_blank" class="hl hl-1" rel="noopener noreferrer">rocketmq</a>的一个消息从生产到最终的消费过程需要经历总共三个阶段，或者说会经过三个地方，分别是<strong>producer的发送端、broker的持久化机制、以及consumer的消费端</strong></p> 
+<p><img alt="图片" src="https://images2.imgbox.com/5f/31/Fm7OWRsF_o.png"></p> 
+<p><strong>从生产者producer的角度：消息生产之后传递到broker，如果消息未能正确的存储到broker中，算作消息丢失</strong></p> 
+<p><strong>从broker的角度：消息默认保存到broker的内存中，异步保存到磁盘上，如果发生宕机、磁盘崩溃会造成消息丢失</strong></p> 
+<p><strong>从消费者consumer的角度：消息完成了持久化之后，consumer拉取之后未能成功消费且未反馈给broker，这样算作消息丢失，可能消费过程异常或者网络抖动造成消息丢失</strong></p> 
+<blockquote> 
+ <p>生产者角度：消费生产之后传递到broker，如果消息未能正确的保存到broker中，算作消息丢失</p> 
+</blockquote> 
+<p>从生产者的角度，生产了消息就是要通过网络发送到broker，其实只需要保证一点，就是确认这个消息已经成功发送到broker上了</p> 
+<p>生产者只需要接收发送消息返回的确认响应即可，就可以代表消息发送成功</p> 
+<p><strong>代码示例：</strong></p> 
+<pre class=""><code class="hljs language-typescript"><span class="hljs-title class_">DefaultMQProducer</span> mqProducer=<span class="hljs-keyword">new</span> <span class="hljs-title class_">DefaultMQProducer</span>(<span class="hljs-string">"test"</span>);</code><code class="hljs language-scss"><span class="hljs-comment">// 设置 nameSpace地址</span></code><code class="hljs language-scss">mqProducer<span class="hljs-selector-class">.setNamesrvAddr</span>("namesrvAddr");</code><code class="hljs language-scss">mqProducer<span class="hljs-selector-class">.start</span>();</code><code class="hljs language-java"><span class="hljs-type">Message</span> <span class="hljs-variable">msg</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Message</span>(<span class="hljs-string">"topic"</span> <span class="hljs-comment">/* Topic */</span>,</code><code class="hljs language-scss">        "Captain"<span class="hljs-selector-class">.getBytes</span>(RemotingHelper.DEFAULT_CHARSET) <span class="hljs-comment">/* Message body */</span></code><code class="hljs language-undefined">);</code><code class="hljs language-scss"><span class="hljs-comment">// 发送消息到Broker</span></code><code class="hljs language-erlang"><span class="hljs-keyword">try</span> {<!-- --></code><code class="hljs language-java">    <span class="hljs-type">SendResult</span> <span class="hljs-variable">sendResult</span> <span class="hljs-operator">=</span> mqProducer.send(msg);</code><code class="hljs language-php">} <span class="hljs-keyword">catch</span> (<span class="hljs-built_in">Exception</span> e) {<!-- --></code><code class="hljs language-scss">    e<span class="hljs-selector-class">.printStackTrace</span>();</code><code class="hljs language-undefined">}</code>
+ 
+ <div class="hljs-button {2}"></div></pre> 
+<p>当然，发送消息也分为同步和异步两种，消息发送成功之后会返回下面这四种不同的响应状态</p> 
+<p><strong>SEND_OK</strong></p> 
+<p>消息发送成功，但是也并不意味这完全代表不会丢失消息，这还要取决于broker的刷盘方式</p> 
+<p>这个下面在broker方面会说，需要启动SYNC_MASTER或SYNC_FLUSH。（也就是同步）</p> 
+<p><strong>FLUSH_DISK_TIMEOUT</strong></p> 
+<p>如果Broker设置MessageStoreConfig的FlushDiskType = SYNC_FLUSH（默认为ASYNC_FLUSH），并且Broker没有在MessageStoreConfig的syncFlushTimeout（默认为5秒）内完成刷新磁盘，得到这个状态</p> 
+<p>也就是此时刷盘超时，未能在规定时间内落到硬盘上，检查设置是否合理、硬盘大小等情况</p> 
+<p><strong>FLUSH_SLAVE_TIMEOUT</strong></p> 
+<p>如果Broker的角色是SYNC_MASTER（默认为ASYNC_MASTER），并且从属Broker未在MessageStoreConfig的syncFlushTimeout（默认为5秒）内完成与主服务器的同步，返回这个结果</p> 
+<p>主从同步时间默认也是5秒，需要完成主从同步，这个下面在说broker的时候也会说到，你想啊，要是master挂了或者磁盘崩溃了，这是不是也不能百分百保证消息不丢失</p> 
+<p><strong>SLAVE_NOT_AVAILABLE</strong></p> 
+<p>如果Broker的角色是SYNC_MASTER（默认为ASYNC_MASTER），但没有配置slave Broker，返回这个状态</p> 
+<p></p> 
+<p>这个在保证消息绝对不丢失的情况下是不允许存在的，这个状态也是属于需要处理的，没有可靠的slave，也就意味着没有可靠的备份数据，所以这种情况也需要考虑</p> 
+<p></p> 
+<p><img alt="图片" src="https://images2.imgbox.com/ba/1d/dN2mqbPr_o.png"></p> 
+<p></p> 
+<p>另外呢，上面还说了一种异步的消息发送方式，这种一般是用于链路较长，对于时间比较敏感的业务</p> 
+<p>这种情况下需要特别注意的就是我们需要设置消息发送完成的回调，这样才能更好的保证消息不丢失 </p> 
+<p>采取事务消息的投递方式，并不能保证消息100%投递成功到了Broker，但是如果消息发送Ack失败的话，此消息会存储在CommitLog当中，但是对ConsumerQueue是不可见的</p> 
+<p>可以在日志中查看到这条异常的消息，严格意义上来讲，也并没有完全丢失</p> 
+<blockquote> 
+ <p>broker：消息默认保存到broker的<a href="https://so.csdn.net/so/search?q=%E5%86%85%E5%AD%98&amp;spm=1001.2101.3001.7020" target="_blank" class="hl hl-1" rel="noopener noreferrer">内存</a>中，异步保存到磁盘上，如果发生宕机、磁盘崩溃会造成消息丢失</p> 
+</blockquote> 
+<p>顺序消费这个场景其实不是特别的常见，但是也是必不可少的，因为在某些业务场景下顺序是很关键的，保证消息的消费顺序也是很关键</p> 
+<p>消息到了broker之后，默认是优先保存到broker的内存中，然后立刻返回响应给生产者producer，然后broker自己定期将消息批量的异步的保存到硬盘上</p> 
+<p>有的小伙伴一小子就发现了问题不是那么简单，消息来了之后还没保存到硬盘，就直接返回了，broker直接宕机崩溃了，那这消息岂不无迹可寻了</p> 
+<p><strong>这样的优点是提高交互的效率，同时减少IO的次数，问题就是会造成消息丢失</strong></p> 
+<p></p> 
+<p>如果我们想要保证消息不丢失，那就需要保证消息成功保存到broker之后才可以返回，只需要将消息的保存机制修改为同步刷盘的方式，也就是只有消息保存到broker的磁盘成功之后，才会返回响应</p> 
+<pre><code class="hljs language-crystal"><span class="hljs-comment">## 默认情况为 ASYNC_FLUSH </span></code><code class="hljs language-undefined">flushDiskType = SYNC_FLUSH</code>
+ 
+ <div class="hljs-button {2}"></div></pre> 
+<p>如果broker未能在规定的同步时间（默认5秒）完成刷盘，将返回<strong>FLUSH_DISK_TIMEOUT</strong>给生产者</p> 
+<p></p> 
+<p>上面也介绍了这个了<strong>FLUSH_DISK_TIMEOUT</strong>了</p> 
+<p></p> 
+<p>一般在系统中为了保证可用性，broker通常采用的都是一主master多从slave的部署方式，属于<strong>集群部署</strong></p> 
+<p></p> 
+<p>为了保证消息不丢失，消息需要复制到slave节点，其实默认的情况下，消息写入到broker之后就会返回成功</p> 
+<p></p> 
+<p><strong>但是！如果master突然宕机或者磁盘崩溃了，那么这个消息就彻底丢失了，没有备份，所以呢，这里还需要把master和slave的异步复制改成同步复制</strong></p> 
+<pre><code class="hljs language-crystal"><span class="hljs-comment">## master 节点配置</span></code><code class="hljs language-undefined">flushDiskType = SYNC_FLUSH</code><code class="hljs language-undefined">brokerRole=SYNC_MASTER</code>
+<code class="hljs language-crystal"><span class="hljs-comment">## slave 节点配置</span></code><code class="hljs language-undefined">brokerRole=slave</code><code class="hljs language-undefined">flushDiskType = SYNC_FLUSH</code>
+ 
+ <div class="hljs-button {2}"></div></pre> 
+<p><strong>也就是只有slave也刷盘到磁盘成功之后，才会给producer返回成功</strong></p> 
+<p></p> 
+<p>当然你要这里说，master和slave也可能同时宕机，同时磁盘崩溃，那最终还是无法满足百分百保证消息的不丢失</p> 
+<p></p> 
+<p><img alt="图片" src="https://images2.imgbox.com/e8/67/9BJZxR1J_o.png"></p> 
+<p></p> 
+<p>这种问题啊，其实就像是TCP的三次交互一样，三次交互之后一定保证客户端和服务端通信成功了吗，答案是不一定</p> 
+<p><strong>我们只能在有限的资源下尽量的去满足系统的稳定性</strong></p> 
+<blockquote> 
+ <p>consumer：消息完成了持久化之后，consumer拉取之后未能成功消费且未反馈给broker，这样算作消息丢失，可能消费过程异常或者网络抖动造成消息丢失</p> 
+</blockquote> 
+<p>消费者从broker拉取消息，然后进行相应的业务的消费，消费成功会返回一个消费成功的状态给broker，broker如果没收到确认信息，消费者下次拉取重新拉取该消息</p> 
+<pre class=""><code class="hljs language-scss"><span class="hljs-comment">// 注册回调实现类来处理从broker拉取回来的消息</span></code><code class="hljs language-scss">consumer<span class="hljs-selector-class">.registerMessageListener</span>(new MessageListenerConcurrently() {<!-- --></code><code class="hljs language-scss">    <span class="hljs-keyword">@Override</span></code><code class="hljs language-typescript">    <span class="hljs-keyword">public</span> <span class="hljs-title class_">ConsumeConcurrentlyStatus</span> <span class="hljs-title function_">consumeMessage</span>(<span class="hljs-params">List&lt;MessageExt&gt; msgs, ConsumeConcurrentlyContext context</span>) {<!-- --></code><code class="hljs language-scss">        <span class="hljs-comment">// 标记该消息已经被成功消费</span></code><code class="hljs language-kotlin">        <span class="hljs-keyword">return</span> ConsumeConcurrentlyStatus.CONSUME_SUCCESS;</code><code class="hljs language-undefined">    }</code><code class="hljs language-undefined">});</code>
+
+ 
+ <div class="hljs-button {2}"></div></pre> 
+<p><strong>consumer自身可以维护一个持久化的offset</strong>，对应MessageQueue里面的min offset，标记已经成功消费或者已经成功发回到broker的消息下标</p> 
+<p>如果consumer消费失败，会把这个消息发回给broker，发回成功后，更新自己的offset</p> 
+<p>如果发回给broker时，broker挂掉了，那么consumer也会定时重试这个操作</p> 
+<p>即使consumer和broker一起挂掉了，消息也不会丢失，因为consumer里面的offset会定时持久化，重启之后，继续拉取offset之前的消息到本地，重新消费</p> 
+<div> 
+ <div></div> 
+</div> 
+<pre><code>&lt;/article&gt;
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/c68fbb69acff4b3812726208b9594746/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">50行代码的微信公众号抢号脚本</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/62a9debd5593b5b80680b497266b5b20/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">使用python脚本实现对apk进行签名</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

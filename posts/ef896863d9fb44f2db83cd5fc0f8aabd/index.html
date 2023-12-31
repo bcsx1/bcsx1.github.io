@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Endless lseek导致的SQL异常 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Endless lseek导致的SQL异常" />
+<meta property="og:description" content="最近碰到同事咨询的一个问题，在执行一个函数时，发现会一直卡在那里。
+strace抓了下发现会话一直在执行lseek，大致情况如下：
+16:13:55.451832 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000037&gt; 16:13:55.477216 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000026&gt; 16:13:55.502579 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000026&gt; 16:13:55.528162 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000024&gt; 16:13:55.553714 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000025&gt; 16:13:55.579242 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000022&gt; ...... % time seconds usecs/call calls errors syscall ------ ----------- ----------- --------- --------- ---------------- 0.00 0.000000 0 124 lseek ------ ----------- ----------- --------- --------- ---------------- 100." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/ef896863d9fb44f2db83cd5fc0f8aabd/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-02-23T16:09:20+08:00" />
+<meta property="article:modified_time" content="2023-02-23T16:09:20+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Endless lseek导致的SQL异常</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>最近碰到同事咨询的一个问题，在执行一个函数时，发现会一直卡在那里。</p> 
+<p></p> 
+<p>strace抓了下发现会话一直在执行lseek，大致情况如下：</p> 
+<pre>16:13:55.451832 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000037&gt;
+16:13:55.477216 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000026&gt;
+16:13:55.502579 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000026&gt;
+16:13:55.528162 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000024&gt;
+16:13:55.553714 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000025&gt;
+16:13:55.579242 lseek(33, 0, SEEK_END) = 1368064 &lt;0.000022&gt;
+......
+
+
+% time seconds usecs/call calls errors syscall
+------ ----------- ----------- --------- --------- ----------------
+0.00 0.000000 0 124 lseek
+------ ----------- ----------- --------- --------- ----------------
+100.00 0.000000 124 total</pre> 
+<p></p> 
+<p>而当手动去取消掉会话时也能发现，是卡在了其中一个insert语句：</p> 
+<pre>[postgres@xxx/(rasesql)himsdpsods][02-22.16:13:24]M=# select pgawr_snap('cron based snapshot',59451);
+^CCancel request sent
+ERROR: 57014: canceling statement due to user request
+CONTEXT: SQL statement "INSERT INTO pgawr_indexes
+( snapid, idx_scan, idx_tup_read, idx_tup_fetch, idx_blks_read,
+idx_blks_hit, index_name_id, table_name_id)
+SELECT
+spid as snapid,
+i.idx_scan as idx_scan,
+i.idx_tup_read as idx_tup_read,
+i.idx_tup_fetch as idx_tup_fetch,
+ii.idx_blks_read as idx_blks_read,
+ii.idx_blks_hit as idx_blks_hit,
+n1.nameid,
+n2.nameid
+FROM
+pg_stat_all_indexes i
+join pg_statio_all_indexes ii on i.indexrelid = ii.indexrelid
+join pgawr_names n1 on i.schemaname ||'.'|| i.indexrelname=n1.name
+join pgawr_names n2 on i.schemaname ||'.'|| i.relname=n2.name"
+PL/pgSQL function pgawr_snap(character varying,bigint) line 104 at SQL statement
+LOCATION: ProcessInterrupts, postgres.c:3203
+Time: 203994.651 ms (03:23.995)</pre> 
+<p></p> 
+<p>当然分析这种函数执行慢的，最常用的还是auto_explain，可以在会话中设置来打印函数中具体执行的情况：</p> 
+<pre>load 'auto_explain';
+
+
+set client_min_messages='log';
+set auto_explain.log_min_duration = 0;
+set auto_explain.log_analyze = true;
+set auto_explain.log_verbose = true;
+set auto_explain.log_buffers = true;
+set auto_explain.log_nested_statements = true;</pre> 
+<p></p> 
+<p>根据上面得到的信息发现文件句柄33对应的恰好也是该SQL中的一张表，而lseek(33, 0, SEEK_END) = 1368064的返回值也的确是和该数据文件的大小一致，说明的确是扫描完该表了。</p> 
+<p>那就有点奇怪了，这个SQL也很简单，而且单独拿出来执行也都没问题，为什么会一直卡在lseek这个数据文件这里呢？</p> 
+<p></p> 
+<p>上网搜了下，发现有个类似的bug：BUG #15455: Endless lseek，其中的情况和我这个有些类似：</p> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/9a/4f/Z2wUkjUA_o.png"></p> 
+<p></p> 
+<p></p> 
+<p>但是往后看了malilist里面的讨论也是不了了之，最终也没有个结论。。。</p> 
+<p></p> 
+<p>哎，没有办法，只能自己接着分析了。</p> 
+<p></p> 
+<p>为了方便查看，我这里把SQL简写了，insert也换成select。</p> 
+<pre>[postgres@xxx/(rasesql)himsdpsods][02-22.16:40:10]M=# EXPLAIN ANALYZE SELECT
+-&gt;   i.idx_scan         as idx_scan,
+-&gt;   i.idx_tup_read     as idx_tup_read,
+-&gt;   i.idx_tup_fetch    as idx_tup_fetch,
+-&gt;   ii.idx_blks_read   as idx_blks_read,
+-&gt; ii.idx_blks_hit    as idx_blks_hit,
+-&gt;   n1.nameid
+-&gt;  FROM
+-&gt;   pg_stat_all_indexes i
+-&gt;   join pg_statio_all_indexes ii on i.indexrelid = ii.indexrelid
+-&gt;   join pgawr_names n1 on i.schemaname ||'.'|| i.indexrelname=n1.name;
+                                                            QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=1805.21..3055.18 rows=3 width=44) (actual time=0.381..0.384 rows=0 loops=1)
+   Join Filter: ((((n.nspname)::text || '.'::text) || (i.relname)::text) = (n1.name)::text)
+   -&gt;  Seq Scan on pgawr_names n1  (cost=0.00..228.00 rows=1 width=44) (actual time=0.380..0.381 rows=0 loops=1)
+   -&gt;  Nested Loop  (cost=1805.21..2815.83 rows=502 width=136) (never executed)
+         -&gt;  Hash Join  (cost=1804.92..2585.91 rows=502 width=140) (never executed)
+               Hash Cond: (c.relnamespace = n.oid)
+               -&gt;  Nested Loop  (cost=1801.01..2580.62 rows=502 width=80) (never executed)
+                     -&gt;  Hash Join  (cost=1800.73..2057.32 rows=900 width=12) (never executed)
+                           Hash Cond: (x.indexrelid = x_1.indexrelid)
+                           -&gt;  Hash Join  (cost=766.65..1005.74 rows=2267 width=8) (never executed)
+                                 Hash Cond: (x.indrelid = c.oid)
+                                 -&gt;  Seq Scan on pg_index x  (cost=0.00..224.09 rows=5709 width=8) (never executed)
+                                 -&gt;  Hash  (cost=715.81..715.81 rows=4067 width=8) (never executed)
+                                       -&gt;  Seq Scan on pg_class c  (cost=0.00..715.81 rows=4067 width=8) (never executed)
+                                             Filter: (relkind = ANY ('{r,t,m}'::"char"[]))
+                           -&gt;  Hash  (cost=1005.74..1005.74 rows=2267 width=4) (never executed)
+                                 -&gt;  Hash Join  (cost=766.65..1005.74 rows=2267 width=4) (never executed)
+                                       Hash Cond: (x_1.indrelid = c_1.oid)
+                                       -&gt;  Seq Scan on pg_index x_1  (cost=0.00..224.09 rows=5709 width=8) (never executed)
+                                       -&gt;  Hash  (cost=715.81..715.81 rows=4067 width=8) (never executed)
+                                             -&gt;  Seq Scan on pg_class c_1  (cost=0.00..715.81 rows=4067 width=8) (never executed)
+                                                   Filter: (relkind = ANY ('{r,t,m}'::"char"[]))
+                     -&gt;  Index Scan using pg_class_oid_index on pg_class i  (cost=0.29..0.58 rows=1 width=68) (never executed)
+                           Index Cond: (oid = x.indexrelid)
+               -&gt;  Hash  (cost=2.85..2.85 rows=85 width=68) (never executed)
+                     -&gt;  Seq Scan on pg_namespace n  (cost=0.00..2.85 rows=85 width=68) (never executed)
+         -&gt;  Index Only Scan using pg_class_oid_index on pg_class i_1  (cost=0.29..0.46 rows=1 width=4) (never executed)
+               Index Cond: (oid = i.oid)
+               Heap Fetches: 0</pre> 
+<p></p> 
+<p>可以看到卡住的SQL拿出来单独执行是没有问题的，但是仔细观察可以发现，该执行计划中很多never executed的节点，说明下面的这些部分实际都没有执行，那是因为pgawr_names这张表是空的，因此对于这个嵌套循环来说，被驱动的部分其实就没有必要执行了。</p> 
+<p></p> 
+<p>而查看完该函数的内容之后发现，在执行这个SQL之前是有往pgawr_names这张表里面插入数据的。</p> 
+<p></p> 
+<p>这样一下子就有思路了：因为在同一个会话中，前一条SQL往pgawr_names表里面插入了大量数据，而表的统计信息在会话提交前是不会更新的。</p> 
+<p></p> 
+<pre>[postgres@xxx/(rasesql)himsdpsods][02-22.16:54:40]M=# begin;
+BEGIN
+Time: 0.128 ms
+
+
+[postgres@xxx/(rasesql)himsdpsods][02-22.16:55:11]M=# select n_live_tup,last_analyze from pg_stat_all_tables where relname = 'pgawr_names';
+n_live_tup | last_analyze
+------------+-------------------------------
+0 | 2023-02-22 15:09:43.348236+08
+(1 row)
+
+
+Time: 11.319 ms
+[postgres@xxx/(rasesql)himsdpsods][02-22.16:55:27]M=# insert into pgawr_names (name)
+-&gt; select distinct i.schemaname ||'.'|| i.indexrelname
+-&gt; from pg_stat_all_indexes i
+-&gt; left join pgawr_names on i.schemaname ||'.'|| i.indexrelname=name
+-&gt; where
+-&gt; name is null;
+INSERT 0 5709
+Time: 207.526 ms
+
+
+[postgres@xxx/(rasesql)himsdpsods][02-22.16:55:41]M=# ANALYZE pgawr_names ;
+ANALYZE
+Time: 73.666 ms
+
+
+[postgres@xxx/(rasesql)himsdpsods][02-22.16:55:46]M=# select n_live_tup,last_analyze from pg_stat_all_tables where relname = 'pgawr_names';
+n_live_tup | last_analyze
+------------+-------------------------------
+0 | 2023-02-22 15:09:43.348236+08
+(1 row)
+
+
+Time: 0.876 ms</pre> 
+<p></p> 
+<p>既然如此，看来前面看到的会话一直卡在lseek其实是执行计划后面的嵌套循环太多导致的，我们可以把pgawr_names表中手动插入较少的数据来验证下：</p> 
+<pre>[postgres@xxx:6266/(rasesql)himsdpsods][02-22.17:02:00]M=# begin;
+BEGIN
+Time: 0.141 ms
+[postgres@xxx:6266/(rasesql)himsdpsods][02-22.17:02:02]M=# select n_live_tup,last_analyze from pg_stat_all_tables where relname = 'pgawr_names';
+ n_live_tup |         last_analyze
+------------+-------------------------------
+          0 | 2023-02-22 17:01:53.272047+08
+(1 row)
+
+
+Time: 11.615 ms
+[postgres@xxx:6266/(rasesql)himsdpsods][02-22.17:02:03]M=# insert into pgawr_names(name) select md5(random()::text) from generate_series(1,200);
+INSERT 0 200
+Time: 52.083 ms
+[postgres@xxx:6266/(rasesql)himsdpsods][02-22.17:02:28]M=# EXPLAIN ANALYZE SELECT
+-&gt;   i.idx_scan         as idx_scan,
+-&gt;   i.idx_tup_read     as idx_tup_read,
+-&gt;   i.idx_tup_fetch    as idx_tup_fetch,
+-&gt;   ii.idx_blks_read   as idx_blks_read,
+-&gt; ii.idx_blks_hit    as idx_blks_hit,
+-&gt;   n1.nameid
+-&gt;  FROM
+-&gt;   pg_stat_all_indexes i
+-&gt;   join pg_statio_all_indexes ii on i.indexrelid = ii.indexrelid
+-&gt;   join pgawr_names n1 on i.schemaname ||'.'|| i.indexrelname=n1.name;
+                                                                          QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=1805.21..3055.18 rows=3 width=44) (actual time=5618.220..5618.229 rows=0 loops=1)
+   Join Filter: ((((n.nspname)::text || '.'::text) || (i.relname)::text) = (n1.name)::text)
+   Rows Removed by Join Filter: 1141800
+   -&gt;  Seq Scan on pgawr_names n1  (cost=0.00..228.00 rows=1 width=44) (actual time=0.014..0.417 rows=200 loops=1)
+   -&gt;  Nested Loop  (cost=1805.21..2815.83 rows=502 width=136) (actual time=0.071..26.143 rows=5709 loops=200)
+         -&gt;  Hash Join  (cost=1804.92..2585.91 rows=502 width=140) (actual time=0.069..16.342 rows=5709 loops=200)
+               Hash Cond: (c.relnamespace = n.oid)
+               -&gt;  Nested Loop  (cost=1801.01..2580.62 rows=502 width=80) (actual time=0.068..14.519 rows=5709 loops=200)
+                     -&gt;  Hash Join  (cost=1800.73..2057.32 rows=900 width=12) (actual time=0.066..4.280 rows=5709 loops=200)
+                           Hash Cond: (x.indexrelid = x_1.indexrelid)
+                           -&gt;  Hash Join  (cost=766.65..1005.74 rows=2267 width=8) (actual time=0.028..2.815 rows=5709 loops=200)
+                                 Hash Cond: (x.indrelid = c.oid)
+                                 -&gt;  Seq Scan on pg_index x  (cost=0.00..224.09 rows=5709 width=8) (actual time=0.002..0.833 rows=5709 loops=200)
+                                 -&gt;  Hash  (cost=715.81..715.81 rows=4067 width=8) (actual time=5.083..5.085 rows=4070 loops=1)
+                                       Buckets: 4096  Batches: 1  Memory Usage: 191kB
+                                       -&gt;  Seq Scan on pg_class c  (cost=0.00..715.81 rows=4067 width=8) (actual time=0.010..4.506 rows=4070 loops=1)
+                                             Filter: (relkind = ANY ('{r,t,m}'::"char"[]))
+                                             Rows Removed by Filter: 6170
+                           -&gt;  Hash  (cost=1005.74..1005.74 rows=2267 width=4) (actual time=7.443..7.445 rows=5709 loops=1)
+                                 Buckets: 8192 (originally 4096)  Batches: 1 (originally 1)  Memory Usage: 265kB
+                                 -&gt;  Hash Join  (cost=766.65..1005.74 rows=2267 width=4) (actual time=4.328..6.637 rows=5709 loops=1)
+                                       Hash Cond: (x_1.indrelid = c_1.oid)
+                                       -&gt;  Seq Scan on pg_index x_1  (cost=0.00..224.09 rows=5709 width=8) (actual time=0.005..1.006 rows=5709 loops=1)
+                                       -&gt;  Hash  (cost=715.81..715.81 rows=4067 width=8) (actual time=4.312..4.313 rows=4070 loops=1)
+                                             Buckets: 4096  Batches: 1  Memory Usage: 191kB
+                                             -&gt;  Seq Scan on pg_class c_1  (cost=0.00..715.81 rows=4067 width=8) (actual time=0.009..3.746 rows=4070 loops=1)
+                                                   Filter: (relkind = ANY ('{r,t,m}'::"char"[]))
+                                                   Rows Removed by Filter: 6170
+                     -&gt;  Index Scan using pg_class_oid_index on pg_class i  (cost=0.29..0.58 rows=1 width=68) (actual time=0.001..0.001 rows=1 loops=1141800)
+                           Index Cond: (oid = x.indexrelid)
+               -&gt;  Hash  (cost=2.85..2.85 rows=85 width=68) (actual time=0.038..0.039 rows=85 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 17kB
+                     -&gt;  Seq Scan on pg_namespace n  (cost=0.00..2.85 rows=85 width=68) (actual time=0.010..0.023 rows=85 loops=1)
+         -&gt;  Index Only Scan using pg_class_oid_index on pg_class i_1  (cost=0.29..0.46 rows=1 width=4) (actual time=0.001..0.001 rows=1 loops=1141800)
+               Index Cond: (oid = i.oid)
+               Heap Fetches: 1141800
+ Planning Time: 3.383 ms
+ Execution Time: 5618.715 ms
+(38 rows)
+
+
+Time: 5623.090 ms (00:05.623)</pre> 
+<p></p> 
+<p>发现果然如此，仅仅插入了200条数据而已，循环次数就达到了1141800次(5709*200)。而在原先的函数中往pgawr_names表中插入了有5000多条数据，这意味着至少要循环接近3千万次，这也是为什么会觉得SQL一直卡住在执行lseek的原因了。</p> 
+<p></p> 
+<p>回头再去看BUG #15455: Endless lseek，其实也是类似的原因，由于在会话中表数据量变化较多，而统计信息无法更新，同时SQL中有嵌套循环，导致性能异常，陷入了endless lseek中。</p> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/da/14/k0wduOps_o.png"></p> 
+<p></p> 
+<p></p> 
+<p>对此我们需要注意了，如果在同一个事务中先对某张表进行大量的增删操作，又由于其统计信息在事务结束前是不会更新的，而恰好该事务后面又有相关查询使用了该表，可能会对性能产生巨大影响，而如果该SQL中又包含较多嵌套循环，那么你也可能陷入看上去无休无止的lseek中了~</p> 
+<p></p> 
+<p><strong>参考链接：</strong><a href="https://www.postgresql.org/message-id/15455-7429982393b511ab%40postgresql.org" rel="nofollow" title="PostgreSQL: BUG #15455: Endless lseek">PostgreSQL: BUG #15455: Endless lseek</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/bc2221d01f8a3327813e1839dd066984/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">TDengine 发布主流时序数据库对比分析报告，与 InfluxDB、TimescaleDB 展开全面对比测试</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/9ff6d84d3ac57644ee511871a0b7e784/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">【kubernetes】k8s v1.20高可用多master节点部署</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

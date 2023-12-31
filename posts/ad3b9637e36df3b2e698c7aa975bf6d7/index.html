@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Linux V4L2子系统分析（一） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Linux V4L2子系统分析（一）" />
+<meta property="og:description" content="1.概述 Linux系统上的Video设备多种多样，如通过Camera Host控制器接口连接的摄像头，通过USB总线连接的摄像头等。为了兼容更多的硬件，Linux内核抽象了V4L2（Video for Linux Two）子系统。V4L2子系统是Linux内核中关于Video（视频）设备的API接口，是V4L（Video for Linux）子系统的升级版本。V4L2子系统向上为虚拟文件系统提供了统一的接口，应用程序可通过虚拟文件系统访问Video设备。V4L2子系统向下给Video设备提供接口，同时管理所有Video设备。Video设备又分为主设备和从设备，对于Camera来说，Camera Host控制器为主设备，负责图像数据的接收和传输，从设备为Camera Sensor，一般为I2C接口，可通过从设备控制Camera采集图像的行为，如图像的大小、图像的FPS等。主设备可通过v4l2_subdev_call的宏调用从设备提供的方法，反过来从设备可以调用主设备的notify方法通知主设备某些事件发生了。
+2.V4L2子系统 V4L（Video for Linux）是Linux内核中关于视频设备的API接口，涉及视频设备的音频和视频信息采集及处理、视频设备的控制。V4L出现于Linux内核2.1版本，经过修改bug和添加功能，Linux内核2.5版本推出了V4L2（Video for Linux Two）子系统，功能更多且更稳定。V4L2的主设备号是81，次设备号范围0~255，这些次设备号又分为多类设备，如视频设备（次设备号范围0-63）、Radio（收音机）设备（次设备号范围64-127）、Teletext设备（次设备号范围192-223）、VBI设备（次设备号范围224-255）。V4L2设备对应的设备节点有/dev/videoX、/dev/vbiX、/dev/radioX。这里只讨论视频设备，视频设备对应的设备节点是/dev/videoX。视频设备以高频头或Camera为输入源，Linux内核驱动该类设备，接收相应的视频信息并处理。
+2.1.V4L2主设备数据结构 V4L2主设备实例使用struct v4l2_device结构体表示，v4l2_device是V4L2子系统的入口，管理着V4L2子系统的主设备和从设备。简单设备可以仅分配这个结构体，但在大多数情况下，都会将这个结构体嵌入到一个更大的结构体中。需要与媒体框架整合的驱动必须手动设置dev-&gt;driver_data，指向包含v4l2_device结构体实例的驱动特定设备结构体。这可以在注册V4L2设备实例前通过dev_set_drvdata()函数完成。同时必须设置v4l2_device结构体的mdev域，指向适当的初始化并注册过的media_device实例。
+对于视频设备，Camera控制器可以视为主设备，接在Camera控制器上的摄像头可以视为从设备。V4L2子系统使用v4l2_device结构体管理设备，设备的具体操作方法根据设备类型决定，若是视频设备，则需要注册video_device结构体，并提供相应的操作方法。
+[include/media/v4l2-device.h] struct v4l2_device { struct device *dev; // 父设备指针 #if defined(CONFIG_MEDIA_CONTROLLER) // 多媒体设备配置选项 // 用于运行时数据流的管理， struct media_device *mdev; #endif // 注册的子设备的v4l2_subdev结构体都挂载此链表中 struct list_head subdevs; // 同步用的自旋锁 spinlock_t lock; // 独一无二的设备名称，默认使用driver name &#43; bus ID char name[V4L2_DEVICE_NAME_SIZE]; // 被一些子设备回调的通知函数，但这个设置与子设备相关。子设备支持的任何通知必须在 // include/media/&lt;subdevice&gt;.h 中定义一个消息头。 void (*notify)(struct v4l2_subdev *sd, unsigned int notification, void *arg); // 提供子设备（主要是video和ISP设备）在用户空间的特效操作接口， // 比如改变输出图像的亮度、对比度、饱和度等等 struct v4l2_ctrl_handler *ctrl_handler; // 设备优先级状态 struct v4l2_prio_state prio; /* BKL replacement mutex." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/ad3b9637e36df3b2e698c7aa975bf6d7/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-04-03T13:18:43+08:00" />
+<meta property="article:modified_time" content="2021-04-03T13:18:43+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Linux V4L2子系统分析（一）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h4><a id="1_0"></a>1.概述</h4> 
+<p>Linux系统上的Video设备多种多样，如通过Camera Host控制器接口连接的摄像头，通过USB总线连接的摄像头等。为了兼容更多的硬件，Linux内核抽象了V4L2（Video for Linux Two）子系统。V4L2子系统是Linux内核中关于Video（视频）设备的API接口，是V4L（Video for Linux）子系统的升级版本。V4L2子系统向上为虚拟文件系统提供了统一的接口，应用程序可通过虚拟文件系统访问Video设备。V4L2子系统向下给Video设备提供接口，同时管理所有Video设备。Video设备又分为主设备和从设备，对于Camera来说，Camera Host控制器为主设备，负责图像数据的接收和传输，从设备为Camera Sensor，一般为I2C接口，可通过从设备控制Camera采集图像的行为，如图像的大小、图像的FPS等。主设备可通过<code>v4l2_subdev_call</code>的宏调用从设备提供的方法，反过来从设备可以调用主设备的<code>notify</code>方法通知主设备某些事件发生了。</p> 
+<p><img src="https://images2.imgbox.com/61/66/J1YzcNFX_o.png" alt="V4L2框架"></p> 
+<h4><a id="2V4L2_4"></a>2.V4L2子系统</h4> 
+<p>V4L（Video for Linux）是Linux内核中关于视频设备的API接口，涉及视频设备的音频和视频信息采集及处理、视频设备的控制。V4L出现于Linux内核2.1版本，经过修改bug和添加功能，Linux内核2.5版本推出了V4L2（Video for Linux Two）子系统，功能更多且更稳定。V4L2的主设备号是81，次设备号范围0~255，这些次设备号又分为多类设备，如视频设备（次设备号范围0-63）、Radio（收音机）设备（次设备号范围64-127）、Teletext设备（次设备号范围192-223）、VBI设备（次设备号范围224-255）。V4L2设备对应的设备节点有<code>/dev/videoX、/dev/vbiX、/dev/radioX</code>。这里只讨论视频设备，视频设备对应的设备节点是<code>/dev/videoX</code>。视频设备以高频头或Camera为输入源，Linux内核驱动该类设备，接收相应的视频信息并处理。</p> 
+<h5><a id="21V4L2_7"></a>2.1.V4L2主设备数据结构</h5> 
+<p>V4L2主设备实例使用<code>struct v4l2_device</code>结构体表示，<code>v4l2_device</code>是V4L2子系统的入口，管理着V4L2子系统的主设备和从设备。简单设备可以仅分配这个结构体，但在大多数情况下，都会将这个结构体嵌入到一个更大的结构体中。需要与媒体框架整合的驱动必须手动设置<code>dev-&gt;driver_data</code>，指向包含<code>v4l2_device</code>结构体实例的驱动特定设备结构体。这可以在注册V4L2设备实例前通过<code>dev_set_drvdata()</code>函数完成。同时必须设置<code>v4l2_device</code>结构体的<code>mdev</code>域，指向适当的初始化并注册过的<code>media_device</code>实例。<br> 对于视频设备，Camera控制器可以视为主设备，接在Camera控制器上的摄像头可以视为从设备。V4L2子系统使用<code>v4l2_device</code>结构体管理设备，设备的具体操作方法根据设备类型决定，若是视频设备，则需要注册<code>video_device</code>结构体，并提供相应的操作方法。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>device<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token keyword">struct</span> v4l2_device <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">;</span>  <span class="token comment">// 父设备指针</span>
+    <span class="token macro property">#<span class="token directive keyword">if</span> defined(CONFIG_MEDIA_CONTROLLER)  </span><span class="token comment">// 多媒体设备配置选项</span>
+        <span class="token comment">// 用于运行时数据流的管理，</span>
+        <span class="token keyword">struct</span> media_device <span class="token operator">*</span>mdev<span class="token punctuation">;</span>
+    <span class="token macro property">#<span class="token directive keyword">endif</span></span>
+        <span class="token comment">// 注册的子设备的v4l2_subdev结构体都挂载此链表中</span>
+        <span class="token keyword">struct</span> list_head subdevs<span class="token punctuation">;</span>
+        <span class="token comment">// 同步用的自旋锁</span>
+        spinlock_t lock<span class="token punctuation">;</span>
+        <span class="token comment">// 独一无二的设备名称，默认使用driver name + bus ID</span>
+        <span class="token keyword">char</span> name<span class="token punctuation">[</span>V4L2_DEVICE_NAME_SIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>
+        <span class="token comment">// 被一些子设备回调的通知函数，但这个设置与子设备相关。子设备支持的任何通知必须在</span>
+        <span class="token comment">// include/media/&lt;subdevice&gt;.h 中定义一个消息头。</span>
+        <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>notify<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> notification<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>arg<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 提供子设备（主要是video和ISP设备）在用户空间的特效操作接口，</span>
+        <span class="token comment">// 比如改变输出图像的亮度、对比度、饱和度等等</span>
+        <span class="token keyword">struct</span> v4l2_ctrl_handler <span class="token operator">*</span>ctrl_handler<span class="token punctuation">;</span>
+        <span class="token comment">// 设备优先级状态</span>
+        <span class="token keyword">struct</span> v4l2_prio_state prio<span class="token punctuation">;</span>
+        <span class="token comment">/* BKL replacement mutex. Temporary solution only. */</span>
+        <span class="token keyword">struct</span> mutex ioctl_lock<span class="token punctuation">;</span>
+        <span class="token comment">// struct v4l2_device结构体的引用计数，等于0时才释放</span>
+        <span class="token keyword">struct</span> kref ref<span class="token punctuation">;</span>
+        <span class="token comment">// 引用计数ref为0时，调用release函数进行释放资源和清理工作</span>
+        <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>release<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>使用<code>v4l2_device_register</code>注册<code>v4l2_device</code>结构体.如果<code>v4l2_dev-&gt;name</code>为空，则它将被设置为从<code>dev</code>中衍生出的值（为了更加精确，形式为驱动名后跟<code>bus_id</code>）。如果在调用<code>v4l2_device_register</code>前已经设置好了，则不会被修改。如果<code>dev</code>为NULL，则必须在调用<code>v4l2_device_register</code>前设置<code>v4l2_dev-&gt;name</code>。可以基于驱动名和驱动的全局<code>atomic_t</code>类型的实例编号，通过<code>v4l2_device_set_name()</code>设置<code>name</code>。这样会生成类似<code>ivtv0</code>、<code>ivtv1</code>等名字。若驱动名以数字结尾，则会在编号和驱动名间插入一个破折号，如：<code>cx18-0</code>、<code>cx18-1</code>等。<code>dev</code>参数通常是一个指向<code>pci_dev</code>、<code>usb_interface</code>或<code>platform_device</code>的指针，很少使其为NULL，除非是一个ISA设备或者当一个设备创建了多个PCI设备，使得<code>v4l2_dev</code>无法与一个特定的父设备关联。<br> 使用<code>v4l2_device_unregister</code>卸载<code>v4l2_device</code>结构体。如果<code>dev-&gt;driver_data</code>域指向 <code>v4l2_dev</code>，将会被重置为NULL。主设备注销的同时也会自动注销所有子设备。如果你有一个热插拔设备（如USB设备），则当断开发生时，父设备将无效。由于<code>v4l2_device</code>有一个指向父设备的指针必须被清除，同时标志父设备<br> 已消失，所以必须调用<code>v4l2_device_disconnect</code>函数清理<code>v4l2_device</code>中指向父设备的<code>dev</code>指针。<code>v4l2_device_disconnect</code>并不注销主设备，因此依然要调用<code>v4l2_device_unregister</code>函数注销主设备。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>device<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 注册v4l2_device结构体，并初始化v4l2_device结构体</span>
+    <span class="token comment">// dev-父设备结构体指针，若为NULL，在注册之前设备名称name必须被设置，</span>
+    <span class="token comment">// v4l2_dev-v4l2_device结构体指针</span>
+    <span class="token comment">// 返回值-0成功，小于0-失败</span>
+    <span class="token keyword">int</span> <span class="token function">v4l2_device_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span>
+
+    <span class="token comment">// 卸载注册的v4l2_device结构体</span>
+    <span class="token comment">// v4l2_dev-v4l2_device结构体指针</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_device_unregister</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span>
+
+    <span class="token comment">// 设置设备名称，填充v4l2_device结构体中的name成员</span>
+    <span class="token comment">// v4l2_dev-v4l2_device结构体指针</span>
+    <span class="token comment">// basename-设备名称基本字符串</span>
+    <span class="token comment">// instance-设备计数，调用v4l2_device_set_name后会自加1</span>
+    <span class="token comment">// 返回值-返回设备计数自加1的值</span>
+    <span class="token keyword">int</span> <span class="token function">v4l2_device_set_name</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">,</span> 
+            <span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span>basename<span class="token punctuation">,</span> atomic_t <span class="token operator">*</span>instance<span class="token punctuation">)</span>
+
+    <span class="token comment">// 热插拔设备断开时调用此函数</span>
+    <span class="token comment">// v4l2_dev-v4l2_device结构体指针</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_device_disconnect</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>同一个硬件的情况下。如<code>ivtvfb</code>驱动是一个使用<code>ivtv</code>硬件的帧缓冲驱动，同时<code>alsa</code>驱动也使用此硬件。可以使用如下例程遍历所有注册的设备：</p> 
+<pre><code class="prism language-c">    <span class="token keyword">static</span> <span class="token keyword">int</span> <span class="token function">callback</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>p<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev <span class="token operator">=</span> <span class="token function">dev_get_drvdata</span><span class="token punctuation">(</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* 测试这个设备是否已经初始化 */</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>v4l2_dev <span class="token operator">==</span> <span class="token constant">NULL</span><span class="token punctuation">)</span>
+            <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+        <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+        <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token keyword">int</span> <span class="token function">iterate</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span>p<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">struct</span> device_driver <span class="token operator">*</span>drv<span class="token punctuation">;</span>
+        <span class="token keyword">int</span> err<span class="token punctuation">;</span>
+
+        <span class="token comment">/* 在PCI 总线上查找ivtv驱动。
+        pci_bus_type是全局的. 对于USB总线使用usb_bus_type。 */</span>
+        drv <span class="token operator">=</span> <span class="token function">driver_find</span><span class="token punctuation">(</span><span class="token string">"ivtv"</span><span class="token punctuation">,</span> <span class="token operator">&amp;</span>pci_bus_type<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">/* 遍历所有的ivtv设备实例 */</span>
+        err <span class="token operator">=</span> <span class="token function">driver_for_each_device</span><span class="token punctuation">(</span>drv<span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">,</span> p<span class="token punctuation">,</span> callback<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">put_driver</span><span class="token punctuation">(</span>drv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> err<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre> 
+<p>有时你需要一个设备实例的运行计数。这个通常用于映射一个设备实例到一个模块选择数组的索引。推荐方法如下：</p> 
+<pre><code class="prism language-c">    <span class="token keyword">static</span> atomic_t drv_instance <span class="token operator">=</span> <span class="token function">ATOMIC_INIT</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">static</span> <span class="token keyword">int</span> <span class="token function">drv_probe</span><span class="token punctuation">(</span><span class="token keyword">struct</span> pci_dev <span class="token operator">*</span>pdev<span class="token punctuation">,</span> <span class="token keyword">const</span> <span class="token keyword">struct</span> pci_device_id <span class="token operator">*</span>pci_id<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+        state<span class="token operator">-&gt;</span>instance <span class="token operator">=</span> <span class="token function">atomic_inc_return</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>drv_instance<span class="token punctuation">)</span> <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre> 
+<p>如果有多个设备节点，对于热插拔设备，知道何时注销<code>v4l2_device</code>结构体就比较困难。为此<code>v4l2_device</code>有引用计数支持。当调用<code>video_register_device</code>时增加引用计数，而设备节点释放时减小引用计数。当引用计数为零，则<code>v4l2_device</code>的<code>release</code>回调将被执行。可以在此时做最后的清理工作。如果创建了其他设备节点（比如ALSA），则你可以通过以下函数手动增减引用计数：</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>device<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 增加引用计数</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_device_get</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 减少引用计数</span>
+    <span class="token keyword">int</span> <span class="token function">v4l2_device_put</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>由于引用技术初始化为1，需要在<code>disconnect</code>回调（对于USB设备）中调用<code>v4l2_device_put</code>，或者<code>remove</code>回调（例如对于PCI设备），否则引用计数将永远不会为0。</p> 
+<h5><a id="22V4L2_123"></a>2.2.V4L2从设备数据结构</h5> 
+<p>V4L2从设备使用<code>struct v4l2_subdev</code>结构体表示。一个V4L2主设备可能对应多个V4L2从设备，所有主设备对应的从设备都挂到<code>v4l2_device</code>结构体的<code>subdevs</code>链表中。对于视频设备，从设备就是摄像头，通常情况下是I2C设备，主设备可通过I2C总线控制从设备，例如控制摄像头的焦距、闪光灯等。<code>struct v4l2_subdev</code>结构体重要成员示意图如下图所示。<code>struct v4l2_subdev_video_ops</code>将在《Linux V4L2子系统-Video设备框架分析（二）》中介绍。</p> 
+<p><img src="https://images2.imgbox.com/57/a5/543LZuk6_o.png" alt="v4l2_subdev结构体示意"></p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token macro property">#<span class="token directive keyword">define</span> V4L2_SUBDEV_FL_IS_I2C		(1U &lt;&lt; 0)  </span><span class="token comment">// 从设备是I2C设备</span>
+    <span class="token macro property">#<span class="token directive keyword">define</span> V4L2_SUBDEV_FL_IS_SPI		(1U &lt;&lt; 1)  </span><span class="token comment">// 从设备是SPI设备</span>
+    <span class="token macro property">#<span class="token directive keyword">define</span> V4L2_SUBDEV_FL_HAS_DEVNODE	(1U &lt;&lt; 2)  </span><span class="token comment">// 从设备需要设备节点</span>
+    <span class="token macro property">#<span class="token directive keyword">define</span> V4L2_SUBDEV_FL_HAS_EVENTS	(1U &lt;&lt; 3)  </span><span class="token comment">// 从设备会产生事件</span>
+
+    <span class="token keyword">struct</span> v4l2_subdev <span class="token punctuation">{<!-- --></span>
+    <span class="token macro property">#<span class="token directive keyword">if</span> defined(CONFIG_MEDIA_CONTROLLER)  </span><span class="token comment">// 多媒体配置选项</span>
+        <span class="token keyword">struct</span> media_entity entity<span class="token punctuation">;</span>
+    <span class="token macro property">#<span class="token directive keyword">endif</span></span>
+        <span class="token keyword">struct</span> list_head list<span class="token punctuation">;</span>  <span class="token comment">// 子设备串联链表</span>
+        <span class="token keyword">struct</span> module <span class="token operator">*</span>owner<span class="token punctuation">;</span>  <span class="token comment">// 属于那个模块，一般指向i2c_lient驱动模块</span>
+        bool owner_v4l2_dev<span class="token punctuation">;</span>
+        <span class="token comment">// 标志位，确定该设备属于那种设备，由V4L2_SUBDEV_FL_IS_XX宏确定</span>
+        u32 flags<span class="token punctuation">;</span>
+        <span class="token comment">// 指向主设备的v4l2_device结构体</span>
+        <span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">;</span>
+        <span class="token comment">// v4l2子设备的操作函数集合</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_ops <span class="token operator">*</span>ops<span class="token punctuation">;</span>
+        <span class="token comment">// 提供给v4l2框架的操作函数，只有v4l2框架会调用，驱动不使用</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_internal_ops <span class="token operator">*</span>internal_ops<span class="token punctuation">;</span>
+        <span class="token comment">// 从设备的控制接口</span>
+        <span class="token keyword">struct</span> v4l2_ctrl_handler <span class="token operator">*</span>ctrl_handler<span class="token punctuation">;</span>
+        <span class="token comment">// 从设备的名称，必须独一无二</span>
+        <span class="token keyword">char</span> name<span class="token punctuation">[</span>V4L2_SUBDEV_NAME_SIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>
+        <span class="token comment">// 从设备组的ID，由驱动定义，相似的从设备可以编为一组，</span>
+        u32 grp_id<span class="token punctuation">;</span>
+        <span class="token comment">// 从设备私有数据指针，一般指向i2c_client的设备结构体dev</span>
+        <span class="token keyword">void</span> <span class="token operator">*</span>dev_priv<span class="token punctuation">;</span>
+        <span class="token comment">// 主设备私有数据指针，一般指向v4l2_device嵌入的结构体</span>
+        <span class="token keyword">void</span> <span class="token operator">*</span>host_priv<span class="token punctuation">;</span>
+        <span class="token comment">// 指向video设备结构体</span>
+        <span class="token keyword">struct</span> video_device <span class="token operator">*</span>devnode<span class="token punctuation">;</span>
+        <span class="token comment">// 指向物理设备</span>
+        <span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">;</span>
+        <span class="token comment">// 将所有从设备连接到全局subdev_list链表或notifier-&gt;done链表</span>
+        <span class="token keyword">struct</span> list_head async_list<span class="token punctuation">;</span>
+        <span class="token comment">// 指向struct v4l2_async_subdev，用于异步事件</span>
+        <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span>asd<span class="token punctuation">;</span>
+        <span class="token comment">// 指向管理的notifier，用于主设备和从设备的异步关联</span>
+        <span class="token keyword">struct</span> v4l2_async_notifier <span class="token operator">*</span>notifier<span class="token punctuation">;</span>
+        <span class="token comment">/* common part of subdevice platform data */</span>
+        <span class="token keyword">struct</span> v4l2_subdev_platform_data <span class="token operator">*</span>pdata<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+    <span class="token comment">// 提供给v4l2框架的操作函数，只有v4l2框架会调用，驱动不使用</span>
+    <span class="token keyword">struct</span> v4l2_subdev_internal_ops <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// v4l2_subdev注册时回调此函数，使v4l2_dev指向主设备的v4l2_device结构体</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>registered<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// v4l2_subdev卸载时回调此函数</span>
+        <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>unregistered<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 应用调用open打开从设备节点时调用此函数</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>open<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_subdev_fh <span class="token operator">*</span>fh<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 应用调用close时调用此函数</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>close<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_subdev_fh <span class="token operator">*</span>fh<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>使用<code>v4l2_subdev_init</code>初始化<code>v4l2_subdev</code>结构体。然后必须用一个唯一的名字初始化<code>subdev-&gt;name</code>，同时初始化模块的<code>owner</code>域。若从设备是I2C设备，则可使用<code>v4l2_i2c_subdev_init</code>函数进行初始化，该函数内部会调用<code>v4l2_subdev_init</code>，同时设置<code>flags</code>、<code>owner</code>、<code>dev</code>、<code>name</code>等成员。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 初始化v4l2_subdev结构体</span>
+    <span class="token comment">// ops-v4l2子设备的操作函数集合指针，保存到v4l2_subdev结构体的ops成员中</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_subdev_init</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+		    <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_ops <span class="token operator">*</span>ops<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>common<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 初始化V4L2从设备为I2C设备的v4l2_subdev结构体</span>
+    <span class="token comment">// sd-v4l2_subdev结构体指针</span>
+    <span class="token comment">// client-i2c_client结构体指针</span>
+    <span class="token comment">// ops-v4l2子设备的操作函数集合指针，保存到v4l2_subdev结构体的ops成员中</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_i2c_subdev_init</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> 
+        <span class="token keyword">struct</span> i2c_client <span class="token operator">*</span>client<span class="token punctuation">,</span>
+		<span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_ops <span class="token operator">*</span>ops<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>若需同媒体框架整合，必须调用<code>media_entity_init</code>初始化<code>v4l2_subdev</code>结构体中的<code>media_entity</code>结构体（entity域）。<code>pads</code>数组必须预先初始化。无须手动设置<code>media_entity</code>的<code>type</code>和<code>name</code>域，但如有必要，<code>revision</code>域必须初始化。当（任何）从设备节点被打开/关闭，对<code>entity</code>的引用将被自动获取/释放。在从设备被注销之后，使用<code>media_entity_cleanup</code>清理<code>media_entity</code>结构体。如果从设备驱动趋向于处理视频并整合进了媒体框架，必须使用<code>v4l2_subdev_pad_ops</code>替代<code>v4l2_subdev_video_ops</code>实现格式相关的功能。这种情况下，子设备驱动应该设置<code>link_validate</code>域，以提供它自身的链接验证函数。链接验证函数应对管道（两端链接的都是V4L2从设备）中的每个链接调用。驱动还要负责验证子设备和视频节点间格式配置的正确性。如果<code>link_validate</code>操作没有设置，默认的<code>v4l2_subdev_link_validate_default</code>函数将会被调用。这个函数保证宽、高和媒体总线像素格式在链接的收发两端都一致。子设备驱动除了它们自己的检测外，也可以自由使用这个函数以执行上面提到的检查。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>media<span class="token operator">-</span>entity<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 初始化v4l2_subdev结构体中的media_entity结构体</span>
+    <span class="token comment">// entity-要初始化的media_entity结构体指针</span>
+    <span class="token comment">// num_pads-源pad的数量，与驱动子设备结构相关</span>
+    <span class="token comment">// pads-media_pad结构体数组，通常pad被嵌入到驱动自定义的结构体里面，</span>
+    <span class="token comment">//      数组地址被传递给该参数，pad需提前初始化</span>
+    <span class="token comment">// extra_links-函数会根据num_pads分配media_link数目，该参数则指明除了预分</span>
+                   配的数量之外还需要多少额外的media_link数目
+    <span class="token comment">// 返回值 0-成功，小于0-失败</span>
+    <span class="token keyword">int</span> <span class="token function">media_entity_init</span><span class="token punctuation">(</span><span class="token keyword">struct</span> media_entity <span class="token operator">*</span>entity<span class="token punctuation">,</span> u16 num_pads<span class="token punctuation">,</span>
+            <span class="token keyword">struct</span> media_pad <span class="token operator">*</span>pads<span class="token punctuation">,</span> u16 extra_links<span class="token punctuation">)</span>
+
+    <span class="token comment">// 清理media_entity结构体</span>
+    <span class="token comment">// entity-media_entity结构体指针</span>
+    <span class="token keyword">void</span> <span class="token function">media_entity_cleanup</span><span class="token punctuation">(</span><span class="token keyword">struct</span> media_entity <span class="token operator">*</span>entity<span class="token punctuation">)</span>
+
+    <span class="token comment">// v4l2-subdev pad层级的操作函数</span>
+    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+	<span class="token keyword">struct</span> v4l2_subdev_pad_ops <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_ENUM_MBUS_CODE命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>enum_mbus_code<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+				      <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+				      <span class="token keyword">struct</span> v4l2_subdev_mbus_code_enum <span class="token operator">*</span>code<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_ENUM_FRAME_SIZE命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>enum_frame_size<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+				       <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+				       <span class="token keyword">struct</span> v4l2_subdev_frame_size_enum <span class="token operator">*</span>fse<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_ENUM_FRAME_INTERVAL命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>enum_frame_interval<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+					   <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+					   <span class="token keyword">struct</span> v4l2_subdev_frame_interval_enum <span class="token operator">*</span>fie<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_G_FMT命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_fmt<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+			       <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+			       <span class="token keyword">struct</span> v4l2_subdev_format <span class="token operator">*</span>format<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_S_FMT命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_fmt<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+			       <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+			       <span class="token keyword">struct</span> v4l2_subdev_format <span class="token operator">*</span>format<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_G_SELECTION命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_selection<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+				     <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+				     <span class="token keyword">struct</span> v4l2_subdev_selection <span class="token operator">*</span>sel<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_S_SELECTION命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_selection<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+				     <span class="token keyword">struct</span> v4l2_subdev_pad_config <span class="token operator">*</span>cfg<span class="token punctuation">,</span>
+				     <span class="token keyword">struct</span> v4l2_subdev_selection <span class="token operator">*</span>sel<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_G_EDID命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_edid<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_edid <span class="token operator">*</span>edid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_S_EDID命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_edid<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_edid <span class="token operator">*</span>edid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_DV_TIMINGS_CAP命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>dv_timings_cap<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_dv_timings_cap <span class="token operator">*</span>cap<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">// ioctl VIDIOC_SUBDEV_ENUM_DV_TIMINGS命令处理函数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>enum_dv_timings<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_enum_dv_timings <span class="token operator">*</span>timings<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token macro property">#<span class="token directive keyword">ifdef</span> CONFIG_MEDIA_CONTROLLER</span>
+		<span class="token comment">// 用于多媒体控制器检查属于管道的链接是否可以用于流</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>link_validate<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">struct</span> media_link <span class="token operator">*</span>link<span class="token punctuation">,</span>
+				     <span class="token keyword">struct</span> v4l2_subdev_format <span class="token operator">*</span>source_fmt<span class="token punctuation">,</span>
+				     <span class="token keyword">struct</span> v4l2_subdev_format <span class="token operator">*</span>sink_fmt<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token macro property">#<span class="token directive keyword">endif</span> </span><span class="token comment">/* CONFIG_MEDIA_CONTROLLER */</span>
+		<span class="token comment">// 获取当前低级媒体总线帧参数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_frame_desc<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> pad<span class="token punctuation">,</span>
+				      <span class="token keyword">struct</span> v4l2_mbus_frame_desc <span class="token operator">*</span>fd<span class="token punctuation">)</span><span class="token punctuation">;</span>	      
+		<span class="token comment">// 设置低级媒体总线帧参数</span>
+		<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_frame_desc<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> pad<span class="token punctuation">,</span>
+				      <span class="token keyword">struct</span> v4l2_mbus_frame_desc <span class="token operator">*</span>fd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>从设备必须向V4L2子系统注册<code>v4l2_subdev</code>结构体，使用<code>v4l2_device_register_subdev</code>注册，使用<code>v4l2_device_unregister_subdev</code>注销。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>device<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 向V4L2子系统注册v4l2_subdev结构体</span>
+    <span class="token comment">// v4l2_dev-主设备v4l2_device结构体指针</span>
+    <span class="token comment">// sd-从设备v4l2_subdev结构体指针</span>
+    <span class="token comment">// 返回值 0-成功，小于0-失败</span>
+    <span class="token keyword">int</span> <span class="token function">v4l2_device_register_subdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">,</span>
+                    <span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span>
+
+    <span class="token comment">// 从V4L2子系统注销v4l2_subdev结构体</span>
+    <span class="token comment">// sd-从设备v4l2_subdev结构体指针    </span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_device_unregister_subdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>V4L2从设备驱动都必须有一个<code>v4l2_subdev</code>结构体。这个结构体可以单独代表一个简单的从设备，也可以嵌入到一个更大的结构体中，与更多设备状态信息保存在一起。通常有一个下级设备结构体（比如：<code>i2c_client</code>）包含了内核创建的设备数据。建议使用<code>v4l2_set_subdevdata()</code>将这个结构体的指针保存在<code>v4l2_subdev</code>的私有数据域(<code>dev_priv</code>)中。这使得通过<code>v4l2_subdev</code>找到实际的低层总线特定设备数据变得容易。同时也需要一个从低层结构体获取<code>v4l2_subdev</code>指针的方法。对于常用的<code>i2c_client</code>结构体，<code>i2c_set_clientdata</code>函数可用于保存一个<code>v4l2_subdev</code>指针，<code>i2c_get_clientdata</code>可以获取一个<code>v4l2_subdev</code>指针；对于其他总线可能需要使用其他相关函数。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 将i2c_client的指针保存到v4l2_subdev结构体的dev_priv成员中</span>
+    <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">v4l2_set_subdevdata</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>p<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        sd<span class="token operator">-&gt;</span>dev_priv <span class="token operator">=</span> p<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token punctuation">[</span>include<span class="token operator">/</span>linux<span class="token operator">/</span>i2c<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 可以将v4l2_subdev结构体指针保存到i2c_client中dev成员的driver_data中</span>
+    <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">i2c_set_clientdata</span><span class="token punctuation">(</span><span class="token keyword">struct</span> i2c_client <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>data<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token function">dev_set_drvdata</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>dev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">// 获取i2c_client结构体中dev成员的driver_data，一般指向v4l2_subdev</span>
+    <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token operator">*</span><span class="token function">i2c_get_clientdata</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">struct</span> i2c_client <span class="token operator">*</span>dev<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> <span class="token function">dev_get_drvdata</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>dev<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre> 
+<p>主设备驱动中也应保存每个子设备的私有数据，比如一个指向特定主设备的各设备私有数据的指针。为此<code>v4l2_subdev</code>结构体提供主设备私有数据域(<code>host_priv</code>)，并可通过<code>v4l2_get_subdev_hostdata</code>和 <code>v4l2_set_subdev_hostdata</code>访问。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token operator">*</span><span class="token function">v4l2_get_subdev_hostdata</span><span class="token punctuation">(</span><span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> sd<span class="token operator">-&gt;</span>host_priv<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">v4l2_set_subdev_hostdata</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>p<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        sd<span class="token operator">-&gt;</span>host_priv <span class="token operator">=</span> p<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre> 
+<p>每个<code>v4l2_subdev</code>都包含子设备驱动需要实现的函数指针（如果对此设备不适用，可为NULL），具体在<code>v4l2_subdev_ops</code>结构体当中。由于子设备可完成许多不同的工作，而在一个庞大的函数指针结构体中通常仅有少数有用的函数实现其功能肯定不合适。所以，函数指针根据其实现的功能被分类，每一类都有自己的函数指针结构体，如<code>v4l2_subdev_core_ops</code>、<code>v4l2_subdev_audio_ops</code>、<code>v4l2_subdev_video_ops</code>等等。<code>v4l2_subdev_video_ops</code>在视频设备中（第二章中）详细介绍。顶层函数指针结构体包含了指向各类函数指针结构体的指针，如果子设备驱动不支持该类函数中的任何一个功能，则指向该类结构体的指针为NULL。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">/* v4l2从设备的操作函数集合，从设备根据自身设备类型选择实现，
+       其中core函数集通常可用于所有子设备，其他类别的实现依赖于
+       子设备。如视频设备可能不支持音频操作函数，反之亦然。这样的
+       设置在限制了函数指针数量的同时，还使增加新的操作函数和分类
+       变得较为容易。 */</span>
+    <span class="token keyword">struct</span> v4l2_subdev_ops <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 从设备的通用操作函数集合，进行初始化、reset、控制等操作</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_core_ops	<span class="token operator">*</span>core<span class="token punctuation">;</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_tuner_ops	<span class="token operator">*</span>tuner<span class="token punctuation">;</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_audio_ops	<span class="token operator">*</span>audio<span class="token punctuation">;</span>  <span class="token comment">// 音频设备</span>
+        <span class="token comment">// 视频设备，后面详细描述</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_video_ops	<span class="token operator">*</span>video<span class="token punctuation">;</span>  
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_vbi_ops	<span class="token operator">*</span>vbi<span class="token punctuation">;</span>    <span class="token comment">// VBI设备</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_ir_ops		<span class="token operator">*</span>ir<span class="token punctuation">;</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_sensor_ops	<span class="token operator">*</span>sensor<span class="token punctuation">;</span>
+        <span class="token keyword">const</span> <span class="token keyword">struct</span> v4l2_subdev_pad_ops	<span class="token operator">*</span>pad<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+    <span class="token comment">// 适用于所有v4l2从设备的操作函数集合</span>
+    <span class="token keyword">struct</span> v4l2_subdev_core_ops <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// IO引脚复用配置</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>s_io_pin_config<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> size_t n<span class="token punctuation">,</span>
+                        <span class="token keyword">struct</span> v4l2_subdev_io_pin_config <span class="token operator">*</span>pincfg<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 初始化从设备的某些寄存器，使其恢复默认</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>init<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> u32 val<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 加载固件</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>load_fw<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 复位</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>reset<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> u32 val<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 设置GPIO引脚输出值</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>s_gpio<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> u32 val<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 设置从设备的电源状态，0-省电模式，1-正常操作模式</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>s_power<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span> <span class="token keyword">int</span> on<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 中断函数，被主设备的中断函数调用</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>interrupt_service_routine<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+                            u32 status<span class="token punctuation">,</span> bool <span class="token operator">*</span>handled<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>使用<code>v4l2_device_register_subdev</code>注册从设备后，就可以调用<code>v4l2_subdev_ops</code>中的方法了。可以通过<code>v4l2_subdev</code>直接调用，也可以使用内核提供的宏定义<code>v4l2_subdev_call</code>间接调用某一个方法。若要调用多个从设备的同一个方法，则可使用<code>v4l2_device_call_all</code>宏定义。</p> 
+<pre><code class="prism language-c">    <span class="token comment">// 直接调用</span>
+    err <span class="token operator">=</span> sd<span class="token operator">-&gt;</span>ops<span class="token operator">-&gt;</span>video<span class="token operator">-&gt;</span><span class="token function">g_std</span><span class="token punctuation">(</span>sd<span class="token punctuation">,</span> <span class="token operator">&amp;</span>norm<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 使用宏定义调用，这个宏将会做NULL指针检查，如果su为NULL，则返回-ENODEV；</span>
+    <span class="token comment">// 如果sd-&gt;ops-&gt;video或sd-&gt;ops-&gt;video-&gt;g_std为NULL，则返回-ENOIOCTLCMD；</span>
+    <span class="token comment">// 否则将返回sd-&gt;ops-&gt;video-&gt;g_std的调用的实际结果</span>
+	err <span class="token operator">=</span> <span class="token function">v4l2_subdev_call</span><span class="token punctuation">(</span>sd<span class="token punctuation">,</span> video<span class="token punctuation">,</span> g_std<span class="token punctuation">,</span> <span class="token operator">&amp;</span>norm<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>subdev<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token macro property">#<span class="token directive keyword">define</span> v4l2_subdev_call(sd, o, f, args...)				\
+	(!(sd) ? -ENODEV : (((sd)-&gt;ops-&gt;o &amp;&amp; (sd)-&gt;ops-&gt;o-&gt;f) ?	\
+		(sd)-&gt;ops-&gt;o-&gt;f((sd) , ##args) : -ENOIOCTLCMD))</span>
+
+
+    <span class="token function">v4l2_device_call_all</span><span class="token punctuation">(</span>v4l2_dev<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> video<span class="token punctuation">,</span> g_std<span class="token punctuation">,</span> <span class="token operator">&amp;</span>norm<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>device<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token macro property">#<span class="token directive keyword">define</span> v4l2_device_call_all(v4l2_dev, grpid, o, f, args...)		\
+	do {								\
+		struct v4l2_subdev *__sd;				\
+		__v4l2_device_call_subdevs_p(v4l2_dev, __sd,		\
+			!(grpid) || __sd-&gt;grp_id == (grpid), o, f ,	\
+			##args);					\
+	} while (0)</span>
+</code></pre> 
+<p>如果子设备需要通知它的<code>v4l2_device</code>主设备一个事件，可以调用<code>v4l2_subdev_notify(sd,notification, arg)</code>。这个宏检查是否有一个<code>notify</code>回调被注册，如果没有，返回<code>-ENODEV</code>。否则返回 <code>notify</code>调用结果。<code>notify</code>回调函数由主设备提供。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>device<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 从设备通知主设备，最终回调到v4l2_device的notify函数</span>
+    <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">v4l2_subdev_notify</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">,</span>
+                        <span class="token keyword">unsigned</span> <span class="token keyword">int</span> notification<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>arg<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>sd <span class="token operator">&amp;&amp;</span> sd<span class="token operator">-&gt;</span>v4l2_dev <span class="token operator">&amp;&amp;</span> sd<span class="token operator">-&gt;</span>v4l2_dev<span class="token operator">-&gt;</span>notify<span class="token punctuation">)</span>
+            sd<span class="token operator">-&gt;</span>v4l2_dev<span class="token operator">-&gt;</span><span class="token function">notify</span><span class="token punctuation">(</span>sd<span class="token punctuation">,</span> notification<span class="token punctuation">,</span> arg<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre> 
+<p>使用<code>v4l2_subdev</code>的好处在于它是一个通用结构体，且不包含任何底层硬件信息。所有驱动可以包含多个I2C总线的从设备，但也有从设备是通过GPIO控制。这个区别仅在配置设备时有关系，一旦子设备注册完成，对于v4l2子系统来说就完全透明了。</p> 
+<h5><a id="23V4L2_415"></a>2.3.V4L2主设备和从设备匹配过程分析</h5> 
+<p>V4L2主设备和从设备采用异步的匹配方法。首先介绍一下异步匹配用到的方法。主设备使用<code>v4l2_async_notifier_register</code>函数进行异步匹配，匹配到从设备，则调用<code>v4l2_device_register_subdev</code>函数注册从设备，使用<code>v4l2_async_notifier_unregister</code>函数异步取消匹配。从设备使用<code>v4l2_async_register_subdev</code>函数异步匹配主设备，若匹配到主设备，则调用<code>v4l2_device_register_subdev</code>函数注册从设备，使用<code>v4l2_async_unregister_subdev</code>函数异步取消匹配。<br> 匹配的方法由<code>v4l2_async_subdev</code>结构体决定，主设备可以有多个<code>v4l2_async_subdev</code>结构体，也说明主设备有多种匹配从设备的方法。<code>match_type</code>表示匹配方式，由枚举<code>v4l2_async_match_type</code>定义，具体有使用设备名称匹配-<code>V4L2_ASYNC_MATCH_DEVNAME</code>、使用I2C adapter ID and address进行匹配-<code>V4L2_ASYNC_MATCH_I2C</code>等。联合体<code>match</code>中包含了具体的匹配信息，根据匹配方式进行设置。<code>v4l2_async_notifier</code>管理整个匹配过程，未匹配的<code>v4l2_async_subdev</code>结构体被挂到<code>waiting</code>链表，匹配完成的挂到<code>done</code>链表同时调用<code>bound</code>函数进行绑定。</p> 
+<pre><code class="prism language-c">    <span class="token punctuation">[</span>include<span class="token operator">/</span>media<span class="token operator">/</span>v4l2<span class="token operator">-</span>async<span class="token punctuation">.</span>h<span class="token punctuation">]</span>
+    <span class="token comment">// 主设备和从设备的匹配方式 </span>
+    <span class="token keyword">enum</span> v4l2_async_match_type <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 传统的匹配方式，使用v4l2_async_subdev的match方法进行匹配</span>
+        V4L2_ASYNC_MATCH_CUSTOM<span class="token punctuation">,</span>  
+        <span class="token comment">// 使用设备名称进行匹配</span>
+        V4L2_ASYNC_MATCH_DEVNAME<span class="token punctuation">,</span>
+        <span class="token comment">// 使用I2C adapter ID and address进行匹配</span>
+        V4L2_ASYNC_MATCH_I2C<span class="token punctuation">,</span>
+        <span class="token comment">// 使用firmware node 进行匹配</span>
+        V4L2_ASYNC_MATCH_OF<span class="token punctuation">,</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+    <span class="token keyword">struct</span> v4l2_async_subdev <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">// 匹配方式</span>
+        <span class="token keyword">enum</span> v4l2_async_match_type match_type<span class="token punctuation">;</span>
+        <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 设备树匹配方式</span>
+                <span class="token keyword">const</span> <span class="token keyword">struct</span> device_node <span class="token operator">*</span>node<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> of<span class="token punctuation">;</span>
+            <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 设备名称匹配方式</span>
+                <span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span>name<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> device_name<span class="token punctuation">;</span>
+            <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 使用I2C adapter ID and address进行匹配</span>
+                <span class="token keyword">int</span> adapter_id<span class="token punctuation">;</span>
+                <span class="token keyword">unsigned</span> <span class="token keyword">short</span> address<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> i2c<span class="token punctuation">;</span>
+            <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token comment">// 传统的匹配方式</span>
+                bool <span class="token punctuation">(</span><span class="token operator">*</span>match<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span><span class="token punctuation">,</span>
+                        <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">void</span> <span class="token operator">*</span>priv<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span> custom<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> match<span class="token punctuation">;</span>
+        <span class="token comment">// v4l2-async核心层使用，将此结构体挂入到notifier的waiting链表，驱动不可使用</span>
+        <span class="token keyword">struct</span> list_head list<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 主设备注册一个notifier，用于异步的和从设备进行匹配</span>
+    <span class="token keyword">int</span> <span class="token function">v4l2_async_notifier_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">,</span>
+                    <span class="token keyword">struct</span> v4l2_async_notifier <span class="token operator">*</span>notifier<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 主设备注销notifier</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_async_notifier_unregister</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_async_notifier <span class="token operator">*</span>notifier<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    
+    <span class="token comment">// 从设备异步注册v4l2_subdev，用于异步的和主设备进行匹配</span>
+    <span class="token keyword">int</span> <span class="token function">v4l2_async_register_subdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 从设备注销</span>
+    <span class="token keyword">void</span> <span class="token function">v4l2_async_unregister_subdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">struct</span> v4l2_async_notifier <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">unsigned</span> <span class="token keyword">int</span> num_subdevs<span class="token punctuation">;</span>  <span class="token comment">// subdevices的数量</span>
+        <span class="token comment">// 指针数组，指向subdevice descriptors</span>
+        <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span><span class="token operator">*</span>subdevs<span class="token punctuation">;</span>  
+        <span class="token comment">// 指向struct v4l2_device</span>
+        <span class="token keyword">struct</span> v4l2_device <span class="token operator">*</span>v4l2_dev<span class="token punctuation">;</span>
+        <span class="token comment">// v4l2_async_subdev的链表，等待匹配drivers</span>
+        <span class="token keyword">struct</span> list_head waiting<span class="token punctuation">;</span>
+        <span class="token comment">// 已经probed的v4l2_subdev链表</span>
+        <span class="token keyword">struct</span> list_head done<span class="token punctuation">;</span>
+        <span class="token comment">// 挂在全局的notifiers链表上</span>
+        <span class="token keyword">struct</span> list_head list<span class="token punctuation">;</span>
+        <span class="token comment">// 驱动匹配到从设备后调用此函数</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>bound<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_async_notifier <span class="token operator">*</span>notifier<span class="token punctuation">,</span>
+                <span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>subdev<span class="token punctuation">,</span>
+                <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span>asd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 所有从设备被probed成功，调用此函数</span>
+        <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>complete<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_async_notifier <span class="token operator">*</span>notifier<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 从设备注销时调用此函数</span>
+        <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>unbind<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> v4l2_async_notifier <span class="token operator">*</span>notifier<span class="token punctuation">,</span>
+                <span class="token keyword">struct</span> v4l2_subdev <span class="token operator">*</span>subdev<span class="token punctuation">,</span>
+                <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span>asd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>以imx6ull为例分析主设备和从设备的匹配过程。v4L2主设备和从设备的匹配过程可通过分析<code>v4l2_async_notifier_register</code>函数得到。可总结如下：<br> （1）首先初始化需要匹配的<code>v4l2_async_notifier</code>结构体，主要设备匹配方式、<code>bound</code>函数和指向<code>v4l2_async_subdev</code>结构体的指针。<br> （2）设置<code>v4l2_async_notifier</code>的<code>v4l2_dev</code>指针指向主设备的<code>v4l2_device</code>结构体。<br> （3）遍历<code>subdevs</code>指向的<code>v4l2_async_subdev</code>结构体，全部挂入<code>waiting</code>链表。<br> （4）将<code>v4l2_async_notifier</code>结构体挂入到全局的<code>notifier_list</code>链表。<br> （5）遍历<code>subdev_list</code>链表（所有的从设备都挂到<code>subdev_list</code>链表中），和<code>waiting</code>链表中的每一个<code>v4l2_async_subdev</code>结构体进行匹配。<br> （6）若匹配成功，则将<code>v4l2_async_subdev</code>从<code>waiting</code>链表中删除，设置从设备<code>V4l2_subdev</code>结构体的<code>notifier</code>和<code>asd</code>成员，使其指向<code>mx6s_csi_dev</code>结构体中的<code>v4l2_async_notifier</code>和<code>v4l2_async_subdev</code>结构体。<br> （7）<strong>调用<code>bound</code>函数，也就是使主设备<code>mx6s_csi_dev</code>结构体中的<code>sd</code>成员指向了从设备的<code>v4l2_subdev</code>结构体，从而完成了主设备和从设备进行绑定。</strong><br> （8）将匹配成功的从设备<code>V4l2_subdev</code>结构体从全局的<code>subdev_list</code>链表中移除，同时添加到<code>v4l2_async_notifier</code>的<code>done</code>链表中。<br> （9）调用<code>v4l2_device_register_subdev</code>注册从设备。</p> 
+<p><img src="https://images2.imgbox.com/2b/88/JeARvy0z_o.png" alt="V4L2设备匹配过程"></p> 
+<pre><code class="prism language-c">    v4l2_async_notifier_register
+        <span class="token comment">// num_subdevs为0或num_subdevs大于128，返回错误</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>notifier<span class="token operator">-&gt;</span>num_subdevs <span class="token operator">||</span> notifier<span class="token operator">-&gt;</span>num_subdevs <span class="token operator">&gt;</span> V4L2_MAX_SUBDEVS<span class="token punctuation">)</span>
+		    <span class="token keyword">return</span> <span class="token operator">-</span>EINVAL<span class="token punctuation">;</span>
+        <span class="token comment">// notifier-&gt;v4l2_dev指向v4l2_device结构体指针v4l2_dev</span>
+        notifier<span class="token operator">-&gt;</span>v4l2_dev <span class="token operator">=</span> v4l2_dev<span class="token punctuation">;</span>
+        
+        <span class="token keyword">for</span> <span class="token punctuation">(</span>i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> notifier<span class="token operator">-&gt;</span>num_subdevs<span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            asd <span class="token operator">=</span> notifier<span class="token operator">-&gt;</span>subdevs<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">;</span>
+            <span class="token keyword">switch</span> <span class="token punctuation">(</span>asd<span class="token operator">-&gt;</span>match_type<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_CUSTOM<span class="token punctuation">:</span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_DEVNAME<span class="token punctuation">:</span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_I2C<span class="token punctuation">:</span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_OF<span class="token punctuation">:</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+                <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+            <span class="token punctuation">}</span>
+            <span class="token comment">// 将指针数组subdevs指向的v4l2_async_subdev结构体挂入</span>
+            <span class="token comment">// notifier的waiting链表</span>
+            <span class="token function">list_add_tail</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>asd<span class="token operator">-&gt;</span>list<span class="token punctuation">,</span> <span class="token operator">&amp;</span>notifier<span class="token operator">-&gt;</span>waiting<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">mutex_lock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>list_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">// 加锁，保护全局链表</span>
+        <span class="token comment">// 将v4l2_async_notifier挂到全局链表notifier_list</span>
+        <span class="token function">list_add</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>notifier<span class="token operator">-&gt;</span>list<span class="token punctuation">,</span> <span class="token operator">&amp;</span>notifier_list<span class="token punctuation">)</span><span class="token punctuation">;</span>   
+
+        <span class="token comment">// 遍历subdev_list链表，所有从设备的v4l2_subdev结构体都挂到subdev_list链表</span>
+        <span class="token function">list_for_each_entry_safe</span><span class="token punctuation">(</span>sd<span class="token punctuation">,</span> tmp<span class="token punctuation">,</span> <span class="token operator">&amp;</span>subdev_list<span class="token punctuation">,</span> async_list<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">int</span> ret<span class="token punctuation">;</span>
+            <span class="token comment">// 判断子设备的v4l2_subdev是否和主设备的notifier匹配，</span>
+            <span class="token comment">// 匹配则返回v4l2_async_subdev结构体</span>
+            asd <span class="token operator">=</span> <span class="token function">v4l2_async_belongs</span><span class="token punctuation">(</span>notifier<span class="token punctuation">,</span> sd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>asd<span class="token punctuation">)</span>
+                <span class="token keyword">continue</span><span class="token punctuation">;</span>
+            <span class="token comment">// 匹配成功，调用bound函数，注册从设备的v4l2_subdev结构体</span>
+            ret <span class="token operator">=</span> <span class="token function">v4l2_async_test_notify</span><span class="token punctuation">(</span>notifier<span class="token punctuation">,</span> sd<span class="token punctuation">,</span> asd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token function">mutex_unlock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>list_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">return</span> ret<span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">mutex_unlock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>list_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+    v4l2_async_belongs
+        <span class="token comment">// 定义匹配的函数指针</span>
+        bool <span class="token punctuation">(</span><span class="token operator">*</span>match<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span><span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 遍历waiting链表，取出v4l2_async_subdev结构体</span>
+        <span class="token function">list_for_each_entry</span><span class="token punctuation">(</span>asd<span class="token punctuation">,</span> <span class="token operator">&amp;</span>notifier<span class="token operator">-&gt;</span>waiting<span class="token punctuation">,</span> list<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">// 确认匹配方式</span>
+            <span class="token keyword">switch</span> <span class="token punctuation">(</span>asd<span class="token operator">-&gt;</span>match_type<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_CUSTOM<span class="token punctuation">:</span>
+                match <span class="token operator">=</span> asd<span class="token operator">-&gt;</span>match<span class="token punctuation">.</span>custom<span class="token punctuation">.</span>match<span class="token punctuation">;</span>
+                <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>match<span class="token punctuation">)</span>
+                    <span class="token keyword">return</span> asd<span class="token punctuation">;</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_DEVNAME<span class="token punctuation">:</span>
+                match <span class="token operator">=</span> match_devname<span class="token punctuation">;</span>  <span class="token comment">// 设备名称匹配方法</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_I2C<span class="token punctuation">:</span>  <span class="token comment">// I2C匹配方法</span>
+                match <span class="token operator">=</span> match_i2c<span class="token punctuation">;</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token keyword">case</span> V4L2_ASYNC_MATCH_OF<span class="token punctuation">:</span>  <span class="token comment">// 设备树的匹配方法</span>
+                match <span class="token operator">=</span> match_of<span class="token punctuation">;</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+                <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+            <span class="token punctuation">}</span>
+
+            <span class="token comment">// 根据匹配方式，调用相应的匹配方法</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">match</span><span class="token punctuation">(</span>sd<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> asd<span class="token punctuation">)</span><span class="token punctuation">)</span>
+                <span class="token keyword">return</span> asd<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token keyword">return</span> <span class="token constant">NULL</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 根据设备名称匹配，</span>
+    <span class="token keyword">static</span> bool <span class="token function">match_devname</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span>asd<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> <span class="token operator">!</span><span class="token function">strcmp</span><span class="token punctuation">(</span>asd<span class="token operator">-&gt;</span>match<span class="token punctuation">.</span>device_name<span class="token punctuation">.</span>name<span class="token punctuation">,</span> <span class="token function">dev_name</span><span class="token punctuation">(</span>dev<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">// 对比i2c_client的adapter_id和address</span>
+    <span class="token keyword">static</span> bool <span class="token function">match_i2c</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span>asd<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+    <span class="token macro property">#<span class="token directive keyword">if</span> IS_ENABLED(CONFIG_I2C)</span>
+        <span class="token keyword">struct</span> i2c_client <span class="token operator">*</span>client <span class="token operator">=</span> <span class="token function">i2c_verify_client</span><span class="token punctuation">(</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> client <span class="token operator">&amp;&amp;</span>
+            asd<span class="token operator">-&gt;</span>match<span class="token punctuation">.</span>i2c<span class="token punctuation">.</span>adapter_id <span class="token operator">==</span> client<span class="token operator">-&gt;</span>adapter<span class="token operator">-&gt;</span>nr <span class="token operator">&amp;&amp;</span>
+            asd<span class="token operator">-&gt;</span>match<span class="token punctuation">.</span>i2c<span class="token punctuation">.</span>address <span class="token operator">==</span> client<span class="token operator">-&gt;</span>addr<span class="token punctuation">;</span>
+    <span class="token macro property">#<span class="token directive keyword">else</span></span>
+        <span class="token keyword">return</span> false<span class="token punctuation">;</span>
+    <span class="token macro property">#<span class="token directive keyword">endif</span></span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">// 对比设备树节点</span>
+    <span class="token keyword">static</span> bool <span class="token function">match_of</span><span class="token punctuation">(</span><span class="token keyword">struct</span> device <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> v4l2_async_subdev <span class="token operator">*</span>asd<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">return</span> dev<span class="token operator">-&gt;</span>of_node <span class="token operator">==</span> asd<span class="token operator">-&gt;</span>match<span class="token punctuation">.</span>of<span class="token punctuation">.</span>node<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    v4l2_async_test_notify
+        <span class="token comment">// 从waiting链表中移除</span>
+        <span class="token function">list_del</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>asd<span class="token operator">-&gt;</span>list<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        sd<span class="token operator">-&gt;</span>asd <span class="token operator">=</span> asd<span class="token punctuation">;</span>
+        sd<span class="token operator">-&gt;</span>notifier <span class="token operator">=</span> notifier<span class="token punctuation">;</span>
+        <span class="token comment">// bound非空，则调用bound函数，bound函数的主要作用是设置主设备的v4l2_subdev指针，</span>
+        <span class="token comment">// 使其指向匹配的从设备的v4l2_subdev结构体，从而完成主设备到从设备的绑定</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>notifier<span class="token operator">-&gt;</span>bound<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            ret <span class="token operator">=</span> notifier<span class="token operator">-&gt;</span><span class="token function">bound</span><span class="token punctuation">(</span>notifier<span class="token punctuation">,</span> sd<span class="token punctuation">,</span> asd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">// 将subdevice从async_list链表中移除后挂到done链表中</span>
+        <span class="token function">list_move</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>sd<span class="token operator">-&gt;</span>async_list<span class="token punctuation">,</span> <span class="token operator">&amp;</span>notifier<span class="token operator">-&gt;</span>done<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 注册从设备v4l2_subdev结构体</span>
+        <span class="token function">v4l2_device_register_subdev</span><span class="token punctuation">(</span>notifier<span class="token operator">-&gt;</span>v4l2_dev<span class="token punctuation">,</span> sd<span class="token punctuation">)</span>
+        <span class="token comment">// 如果waiting链表无等待的v4l2_async_subdev，且complete非空</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">list_empty</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>notifier<span class="token operator">-&gt;</span>waiting<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> notifier<span class="token operator">-&gt;</span>complete<span class="token punctuation">)</span>
+            <span class="token keyword">return</span> notifier<span class="token operator">-&gt;</span><span class="token function">complete</span><span class="token punctuation">(</span>notifier<span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">// 调用完成函数</span>
+</code></pre> 
+<h4><a id="_624"></a>参考资料</h4> 
+<ol><li>https://blog.csdn.net/kickxxx/article/details/8484498</li><li>https://blog.csdn.net/weixin_44139476/article/details/107021395</li><li>内核文档-v4l2-framework_zh_CN.txt</li><li>Linux内核4.1版本源码</li><li>Android驱动开发权威指南</li><li>Android驱动开发与移植实战详解</li><li>https://linuxtv.org/downloads/v4l-dvb-apis/driver-api/v4l2-subdev.html</li></ol>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/4590ab050c813cab2d3c084af880d262/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">oracle数据库的dump,Oracle数据库数据导出dump方式-Oracle</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5f400ca5e8a19dce7f2a0c01c451d4dd/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Apache 源码安装详细教程</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.路径规划算法解析及实现 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="3.路径规划算法解析及实现" />
+<meta property="og:description" content="星火计划2.0基础课：https://apollo.baidu.com/community/online-course/2
+星火计划2.0专项课：https://apollo.baidu.com/community/online-course/12
+APOLLO中Planning主要分为两个步骤：
+首先进行路径规划，然后进行速度规划。对于路径规划主要是针对于静态环境的规划，比如道路、静止或低速的障碍物，会产生对障碍物进行绕行的路径；对于速度规划，主要是针对于动态环境的规划，比如道路中中高速的障碍物，会对障碍物产生绕行或超越。主路的规划算法任务配置在lane_follow_config.pb.txt这个配置文件中，该配置文件首先进行路径规划，即红框中内容，其中所有以DECIDER为结尾的，都是Apollo中的决策器，所有以OPTIMIZER为结尾的都是Apollo中的优化器。路径规划和速度规划每个又分为两个部分，一个是决策和优化，先进行路径决策再进行路径优化，先进行速度决策，再进行速度优化。
+现在来具体讲一下其中每一个task是做什么的:
+第一个Task是LANE_CHANGE_DECIDER,主要是换道的决策，首先会判断由参考线生成器产生的参考线的数量，如果只有一条参考线就不会进行换道，如果参考线生成器产生多条的参考线，还会继续判断换道的条件，比如车辆的前方和后方有没有障碍物，或者旁边车道有没有障碍物，是否达到了换道的距离，当所有条件满足后，里面会产生一个换道的决策。
+第二个Task是PATH_REUSE_DECIDER是路径重用的决策，主要可以判断是否可以重用上一帧的路径，因为路径规划中每一帧都在进行规划，假如感知到障碍物边界不稳定，那么每一帧规划路径会随着障碍物的边界会上下跳动，这样会带来的问题就是行驶上的不稳定，路线也会跟着障碍物进行上下跳动。所以Apollo设计了一种路径重用的决策，如果上一帧路径没有与障碍物发生碰撞就会复用上一帧的路径，这样就不会进行上述的重新路径规划了，会直接跳到速度规划部分，如果上一帧路径和障碍物存在碰撞，就会进行重新路径规划。
+第三个Task是PATH_BORROW_DECIDER是否借道的决策，主要是处理自车道前方有一个阻挡自车行驶的障碍物的场景，它会来决策是否要借助旁边车道来进行绕行，这里决策也是要一些判断的条件，比如是否只有一条车道，如果只有一条车道就没法借道了，比如自车前方是否有左侧道路的障碍物，这个障碍物是否远离路口，如果这个障碍物离路口比较近，就不会产生一个借道的决策。这个障碍物是否是长期存在的，就避免其是一个临时停车的障碍物，这个障碍物是否是长期存在的，就排除其是一个临时停车的障碍物，以及旁边车道是实线还是虚线，当条件满足后会产生一个向左或者向右借道的决策。
+下一个决策：
+Task是PATH_BOUNDS_DECIDER,主要处理的是SL坐标系内确定车辆可行驶的确定边界，即路径可以走的边界范围，会利用前几个决策，产生对于每个候选路径的边界。
+下一个是优化算法：
+Task:PIECEWISE_JERK_PATH_OPTIMIZER对每个边界规划出一个最优的路径,规划出一条没有碰撞且平滑的路径，这个算法后面会详细的介绍。
+算法会对每一个决策产生一个最优的路径，PATH_ASSESSMENT_DECIDER,会对路径进行评价，会从路径中选出一条最优的路径，最优路径的选择也是遵循一些规则，比如路径是否会对障碍物碰撞，如果会碰撞就会排除该路径；路径长度，哪一条路径更短；路径是否会停在对向车道上，哪条路径可以更早的回到自车道上。
+Task是PATH_DECIDER,是对每个障碍物去赋予决策，如上图所示，对于前方障碍物选择绕行，对于左前方障碍物，选择停止。该决策主要用于速度规划上。
+下面来讲解基于二次规划的路径规划算法
+二次规划是用于求解目标函数为二次型的，约束为线性约束的问题。二次规划的标准型如上图所示。其中x为优化的变量，我们要求解满足最小值时的x，其是一组n维的向量，P是一个二次项的系数，其为一个正定矩阵，正定是为了保证xTPx大于0，才能有极小值点。q为n维的实数向量，A为m*n的矩阵，m是约束函数的个数，A为约束函数一次项的系数，l和u分别是m维的向量，主要是约束函数取得了上边界和下边界。
+二次规划是成熟的一类优化问题，里面有很多现成的开源求解器，比如osqp，qpOASES.
+对于所有二次规划问题，其设计步骤都是一样的。
+首先定义优化变量(即标准型里的x)，然后设计目标函数，然后设计约束，最后代入求解器求解。
+接下来看Apollo的二次规划算法是如何设计的。
+首先定义优化变量，由于路径规划算法在参考线的frenet坐标系进行规划，采用，s和l分别表示沿着参考线和垂直参考线的坐标，然后将障碍物分别投影到sl坐标系上
+即把S这条线拉直了，在s方向分别以固定的间隔▲s选取路径规划的点，比如s0,s1,s2…..sn-1,从0到n-1就是路径规划的长度。选取每个间隔点对应的l作为优化的变量，再将l的一阶导和二阶导也作为优化的变量，最后就会得到x(二次规划的优化向量)，其包含了三个部分：l，一阶导，二阶导
+定义完优化变量，来设计目标函数：
+首先来表述期望路径是什么样的：
+因此可以得到目标函数：
+对每个点cost求和，前面的w为对应的惩罚项。其中包含一个对三阶导的惩罚，三阶导由以下公式求得：
+目标函数一次项，二次项系数(q,P)以矩阵形式表示为：
+接下来讲解二次函数的约束是如何设置的：
+路径规划首先要满足一些硬性的约束要求
+其次要根据当前状态，满足主车的横向速度/加速度/加加速度的运动学限制要求：
+首先要讲一下对于曲率的约束，因为车辆行驶时有着最大曲率的限制，根据曲率的坐标转换公式(Frenet公式)，l的二阶导和轨迹的曲率有一些关系，但是这里没办法直接得到曲率的公式应用于约束函数。因为约束函数只能做一次项，所以要对曲率和二阶导的函数关系进行简化，首先需要做一些假设，假设轨迹几乎沿着参考线规划：
+假设θ-θref等于0.
+由于曲率实际上是很小的，远远小于1，所以两个曲率相乘可以近似看作0.
+则此时二阶导的公式简化为：
+由车辆运动学可知，车辆可行驶的最大曲率为：
+（最大前轮转角除以轴距），前轮最大转角对于每个车辆也是固定的，其和方向盘转角存在一个固定比例的关系。则二阶导的约束为：
+另外轨迹还要满足曲率变化率的要求，即使得曲率变化率满足方向盘能打得过来。
+这里还要做一些假设：
+同时假设，速度是恒定的:
+然后代入三阶导公式，即：
+最后总结一下：
+即每个点的二阶导要是连续的，同时也要可导的。(三阶导积分可以得到二阶导，二阶导积分可以得到一阶导，一阶导积分可以得到l，所以每两个点之间的三阶导值是恒定的，二阶导，一阶导的值是连续可导的，所以这样的一个曲线就是每两个点之间满足三阶导恒定的多项式的关系式)
+将优化变量的约束和等式约束转化为约束矩阵A
+其分别包含，l，一阶导，二阶导，三阶导，然后是满足运动学连续的函数关系式，最后是起点的硬性约束。
+最后将算法代入求解器求解：
+求解主要包括了四个步骤，第一步是设置求解器的参数，在SolverDefaultSettings里面包含了一些求解器的默认参数。
+然后是计算Q,P系数矩阵，即计算二次规划的q和p的系数。
+红线是分别计算P，A和q的系数的函数。
+计算完之后，构造OSQP求解器进行求解：
+主要通过调用osqp_setup这个函数，把数据导进去就可以自动进行求解。
+最后获取优化结果：
+红线分别是获得优化值，获得优化变量的取值。
+接下来讲解路径规划算法的执行过程：
+整个路径规划首先从参考线平滑开始，首先其会产生ReferenceLineInfo这样一个类，保存所有的ReferenceLine的计算结果。接下来在路径规划部分按顺序依次执行每个任务。这里的任务包含了决策器和优化器的任务，这里每个决策器或优化器的入口函数都是Process函数：
+求解的结果保存在reference_line或reference_line_info中。
+第一个换道决策器，主要产生是否换道的状态:
+主要产生是否换道的状态，它产生的状态会保存在injector中，其在planning中是一个单一类，其保存的变量会贯穿planning始终，也就是可以在不同帧之间进行共用。(因为换道也是要贯穿好几帧进行的决策)
+接下来是借道决策，其保存的变量在reference_line_info中，如果产生借道决策，后面的值设置为true，另外会把借道的状态向左或向右保存到injector中
+第三步是产生路径边界，根据现有决策在参考线上采样，获得每个点的在l方向上的可行驶区域，其包含了四种边界：
+最后将所有路径边界通过setCandidatePathBoundarier保存在reference_line_info中
+接下来是路径优化
+其主要通过调用piecewise_jerk_problem去进行优化求解(其是二次规划求解器的一个类)，这里会设置二次优化问题的一个权重以及一些约束，最后调用Optimize函数去进行一个优化的求解。这里通过从reference_line_info获得候选路径，把每条路径生成的边界，保存在该变量中。
+最后选择最优路径，其会调用ComparePathData函数，两两比较每一条path哪个更优，将最优的path保存在reference_line_info中(mutable_path_data中)，同时把这个path中阻塞的最近的障碍物放入blocking_obstacle中，也是供速度规划进行进一步的处理。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/44bf725ecc4a642cb67e9db20d79dfca/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-02-03T18:51:59+08:00" />
+<meta property="article:modified_time" content="2023-02-03T18:51:59+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">3.路径规划算法解析及实现</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div> 
+ <div style="margin-left:0in;"> 
+  <div style="margin-left:0in;"> 
+   <p style="margin-left:0;">星火计划2.0基础课：https://apollo.baidu.com/community/online-course/2<br> 星火计划2.0专项课：https://apollo.baidu.com/community/online-course/12</p> 
+   <p style="margin-left:0;">APOLLO中Planning主要分为两个步骤：</p> 
+   <p style="margin-left:0;"><img alt="" height="870" src="https://images2.imgbox.com/64/e1/PWbihj0F_o.png" width="1200"></p> 
+   <p style="margin-left:0;">首先进行路径规划，然后进行速度规划。对于路径规划主要是针对于静态环境的规划，比如道路、静止或低速的障碍物，会产生对障碍物进行绕行的路径；对于速度规划，主要是针对于动态环境的规划，比如道路中中高速的障碍物，会对障碍物产生绕行或超越。主路的规划算法任务配置在lane_follow_config.pb.txt这个配置文件中，该配置文件首先进行路径规划，即红框中内容，其中所有以DECIDER为结尾的，都是Apollo中的决策器，所有以OPTIMIZER为结尾的都是Apollo中的优化器。路径规划和速度规划每个又分为两个部分，一个是决策和优化，先进行路径决策再进行路径优化，先进行速度决策，再进行速度优化。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">现在来具体讲一下其中每一个task是做什么的:<br>  </p> 
+   <p style="margin-left:0;"><img alt="" height="628" src="https://images2.imgbox.com/8f/3a/1pTV31pX_o.png" width="1200"></p> 
+   <p style="margin-left:0;">第一个Task是LANE_CHANGE_DECIDER,主要是换道的决策，首先会判断由参考线生成器产生的参考线的数量，如果只有一条参考线就不会进行换道，如果参考线生成器产生多条的参考线，还会继续判断换道的条件，比如车辆的前方和后方有没有障碍物，或者旁边车道有没有障碍物，是否达到了换道的距离，当所有条件满足后，里面会产生一个换道的决策。</p> 
+   <p style="margin-left:0;"><img alt="" height="591" src="https://images2.imgbox.com/13/41/MTgqodQ6_o.png" width="941"></p> 
+   <p style="margin-left:0;">第二个Task是PATH_REUSE_DECIDER是路径重用的决策，主要可以判断是否可以重用上一帧的路径，因为路径规划中每一帧都在进行规划，假如感知到障碍物边界不稳定，那么每一帧规划路径会随着障碍物的边界会上下跳动，这样会带来的问题就是行驶上的不稳定，路线也会跟着障碍物进行上下跳动。所以Apollo设计了一种路径重用的决策，如果上一帧路径没有与障碍物发生碰撞就会复用上一帧的路径，这样就不会进行上述的重新路径规划了，会直接跳到速度规划部分，如果上一帧路径和障碍物存在碰撞，就会进行重新路径规划。</p> 
+   <p style="margin-left:0;"><img alt="" height="712" src="https://images2.imgbox.com/2a/08/ajt1h4wg_o.png" width="887"></p> 
+   <p style="margin-left:0;">第三个Task是PATH_BORROW_DECIDER是否借道的决策，主要是处理自车道前方有一个阻挡自车行驶的障碍物的场景，它会来决策是否要借助旁边车道来进行绕行，这里决策也是要一些判断的条件，比如是否只有一条车道，如果只有一条车道就没法借道了，比如自车前方是否有左侧道路的障碍物，这个障碍物是否远离路口，如果这个障碍物离路口比较近，就不会产生一个借道的决策。这个障碍物是否是长期存在的，就避免其是一个临时停车的障碍物，这个障碍物是否是长期存在的，就排除其是一个临时停车的障碍物，以及旁边车道是实线还是虚线，当条件满足后会产生一个向左或者向右借道的决策。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">下一个决策：</p> 
+   <p style="margin-left:0;"><img alt="" height="784" src="https://images2.imgbox.com/6d/ce/4QOxfwOZ_o.png" width="1200"></p> 
+   <p style="margin-left:0;">Task是PATH_BOUNDS_DECIDER,主要处理的是SL坐标系内确定车辆可行驶的确定边界，即路径可以走的边界范围，会利用前几个决策，产生对于每个候选路径的边界。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">下一个是优化算法：</p> 
+   <p style="margin-left:0;"><img alt="" height="752" src="https://images2.imgbox.com/56/17/olgX0HMo_o.png" width="1200"></p> 
+   <p style="margin-left:0;">Task:PIECEWISE_JERK_PATH_OPTIMIZER对每个边界规划出一个最优的路径,规划出一条没有碰撞且平滑的路径，这个算法后面会详细的介绍。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"><img alt="" height="742" src="https://images2.imgbox.com/14/cc/qdtMci0m_o.png" width="764"></p> 
+   <p style="margin-left:0;">算法会对每一个决策产生一个最优的路径，PATH_ASSESSMENT_DECIDER,会对路径进行评价，会从路径中选出一条最优的路径，最优路径的选择也是遵循一些规则，比如路径是否会对障碍物碰撞，如果会碰撞就会排除该路径；路径长度，哪一条路径更短；路径是否会停在对向车道上，哪条路径可以更早的回到自车道上。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"><img alt="" height="734" src="https://images2.imgbox.com/41/ae/pmwiT95S_o.png" width="537"></p> 
+   <p style="margin-left:0;">Task是PATH_DECIDER,是对每个障碍物去赋予决策，如上图所示，对于前方障碍物选择绕行，对于左前方障碍物，选择停止。该决策主要用于速度规划上。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">下面来讲解基于二次规划的路径规划算法</p> 
+   <p style="margin-left:0;"><img alt="" height="687" src="https://images2.imgbox.com/0c/73/23794nk9_o.png" width="1200"></p> 
+   <p style="margin-left:0;">二次规划是用于求解目标函数为二次型的，约束为线性约束的问题。二次规划的标准型如上图所示。其中x为优化的变量，我们要求解满足最小值时的x，其是一组n维的向量，P是一个二次项的系数，其为一个正定矩阵，正定是为了保证xTPx大于0，才能有极小值点。q为n维的实数向量，A为m*n的矩阵，m是约束函数的个数，A为约束函数一次项的系数，l和u分别是m维的向量，主要是约束函数取得了上边界和下边界。</p> 
+   <p style="margin-left:0;">二次规划是成熟的一类优化问题，里面有很多现成的开源求解器，比如osqp，qpOASES.</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">对于所有二次规划问题，其设计步骤都是一样的。</p> 
+   <p style="margin-left:0;">首先定义优化变量(即标准型里的x)，然后设计目标函数，然后设计约束，最后代入求解器求解。</p> 
+   <p style="margin-left:0;"><img alt="" height="378" src="https://images2.imgbox.com/80/15/Hh9Luahx_o.png" width="223"></p> 
+   <p style="margin-left:0;">接下来看Apollo的二次规划算法是如何设计的。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">首先定义优化变量，由于路径规划算法在参考线的frenet坐标系进行规划，采用，s和l分别表示沿着参考线和垂直参考线的坐标，然后将障碍物分别投影到sl坐标系上</p> 
+   <p style="margin-left:0;"><img alt="" height="797" src="https://images2.imgbox.com/11/03/wCc0U2q1_o.png" width="818"></p> 
+   <p style="margin-left:0;">即把S这条线拉直了，在s方向分别以固定的间隔▲s选取路径规划的点，比如s0,s1,s2…..sn-1,从0到n-1就是路径规划的长度。选取每个间隔点对应的l作为优化的变量，再将l的一阶导和二阶导也作为优化的变量，最后就会得到x(二次规划的优化向量)，其包含了三个部分：l，一阶导，二阶导</p> 
+   <p style="margin-left:0;"><img alt="" height="364" src="https://images2.imgbox.com/6f/83/Tg4TUJva_o.png" width="812"></p> 
+   <p style="margin-left:0;"> 定义完优化变量，来设计目标函数：</p> 
+   <p style="margin-left:0;">首先来表述期望路径是什么样的：</p> 
+   <p style="margin-left:0;"><img alt="" height="331" src="https://images2.imgbox.com/37/0f/CY2m1REW_o.png" width="850"></p> 
+   <p style="margin-left:0;">因此可以得到目标函数：</p> 
+   <p style="margin-left:0;"><img alt="" height="117" src="https://images2.imgbox.com/82/27/GBMtIU7a_o.png" width="1200"></p> 
+   <p style="margin-left:0;">对每个点cost求和，前面的w为对应的惩罚项。其中包含一个对三阶导的惩罚，三阶导由以下公式求得：</p> 
+   <p style="margin-left:0;"><img alt="" height="95" src="https://images2.imgbox.com/3f/70/VKI0umIw_o.png" width="234"></p> 
+   <p style="margin-left:0;">目标函数一次项，二次项系数(q,P)以矩阵形式表示为：</p> 
+   <p style="margin-left:0;"><img alt="" height="714" src="https://images2.imgbox.com/ae/13/l9Hl9Z45_o.png" width="1200"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">接下来讲解二次函数的约束是如何设置的：</p> 
+   <p style="margin-left:0;">路径规划首先要满足一些硬性的约束要求</p> 
+   <p style="margin-left:0;"><img alt="" height="205" src="https://images2.imgbox.com/42/22/JobWCxvP_o.png" width="781"></p> 
+   <p style="margin-left:0;">其次要根据当前状态，满足主车的横向速度/加速度/加加速度的运动学限制要求：</p> 
+   <p style="margin-left:0;"><img alt="" height="288" src="https://images2.imgbox.com/07/30/9CSW3rzW_o.png" width="1165"></p> 
+   <p style="margin-left:0;">首先要讲一下对于曲率的约束，因为车辆行驶时有着最大曲率的限制，根据曲率的坐标转换公式(Frenet公式)，l的二阶导和轨迹的曲率有一些关系，但是这里没办法直接得到曲率的公式应用于约束函数。因为约束函数只能做一次项，所以要对曲率和二阶导的函数关系进行简化，首先需要做一些假设，假设轨迹几乎沿着参考线规划：</p> 
+   <p style="margin-left:0;"><img alt="" height="211" src="https://images2.imgbox.com/9d/a5/eiqx2ZrU_o.png" width="462"></p> 
+   <p style="margin-left:0;">假设θ-θref等于0.</p> 
+   <p style="margin-left:0;">由于曲率实际上是很小的，远远小于1，所以两个曲率相乘可以近似看作0.</p> 
+   <p style="margin-left:0;">则此时二阶导的公式简化为：</p> 
+   <p style="margin-left:0;"><img alt="" height="197" src="https://images2.imgbox.com/41/be/JGicEXIt_o.png" width="479"></p> 
+   <p style="margin-left:0;">由车辆运动学可知，车辆可行驶的最大曲率为：</p> 
+   <p style="margin-left:0;"><img alt="" height="201" src="https://images2.imgbox.com/a9/24/eyD6cYaM_o.png" width="482"></p> 
+   <p style="margin-left:0;">（最大前轮转角除以轴距），前轮最大转角对于每个车辆也是固定的，其和方向盘转角存在一个固定比例的关系。则二阶导的约束为：</p> 
+   <p style="margin-left:0;"><img alt="" height="93" src="https://images2.imgbox.com/9b/98/HjvuMOZg_o.png" width="530"></p> 
+   <p style="margin-left:0;">另外轨迹还要满足曲率变化率的要求，即使得曲率变化率满足方向盘能打得过来。</p> 
+   <p style="margin-left:0;"><img alt="" height="110" src="https://images2.imgbox.com/db/74/XD2ZxSQf_o.png" width="308"></p> 
+   <p style="margin-left:0;">这里还要做一些假设：</p> 
+   <p style="margin-left:0;"><img alt="" height="221" src="https://images2.imgbox.com/bf/ed/KPusGnoy_o.png" width="878"></p> 
+   <p style="margin-left:0;">同时假设，速度是恒定的:</p> 
+   <p style="margin-left:0;"><img alt="" height="122" src="https://images2.imgbox.com/31/42/v3QLvCVQ_o.png" width="202"></p> 
+   <p style="margin-left:0;">然后代入三阶导公式，即：</p> 
+   <p style="margin-left:0;"><img alt="" height="122" src="https://images2.imgbox.com/d8/63/ZkbzGvw0_o.png" width="421"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">最后总结一下：</p> 
+   <p style="margin-left:0;"><img alt="" height="518" src="https://images2.imgbox.com/45/a2/nTQXHv1o_o.png" width="1189"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"><img alt="" height="554" src="https://images2.imgbox.com/42/49/od7Q2ho1_o.png" width="1200"></p> 
+   <p style="margin-left:0;">即每个点的二阶导要是连续的，同时也要可导的。(三阶导积分可以得到二阶导，二阶导积分可以得到一阶导，一阶导积分可以得到l，所以每两个点之间的三阶导值是恒定的，二阶导，一阶导的值是连续可导的，所以这样的一个曲线就是每两个点之间满足三阶导恒定的多项式的关系式)</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">将优化变量的约束和等式约束转化为约束矩阵A</p> 
+   <p style="margin-left:0;"><img alt="" height="760" src="https://images2.imgbox.com/27/a5/lnePEwjs_o.png" width="1200"></p> 
+   <p style="margin-left:0;">其分别包含，l，一阶导，二阶导，三阶导，然后是满足运动学连续的函数关系式，最后是起点的硬性约束。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">最后将算法代入求解器求解：</p> 
+   <p style="margin-left:0;"><img alt="" height="763" src="https://images2.imgbox.com/16/77/veLesVgC_o.png" width="1200"></p> 
+   <p style="margin-left:0;">求解主要包括了四个步骤，第一步是设置求解器的参数，在SolverDefaultSettings里面包含了一些求解器的默认参数。</p> 
+   <p style="margin-left:0;"><img alt="" height="666" src="https://images2.imgbox.com/bb/da/OWJc4wGI_o.png" width="572"></p> 
+   <p style="margin-left:0;">然后是计算Q,P系数矩阵，即计算二次规划的q和p的系数。</p> 
+   <p style="margin-left:0;">红线是分别计算P，A和q的系数的函数。</p> 
+   <p style="margin-left:0;">计算完之后，构造OSQP求解器进行求解：</p> 
+   <p style="margin-left:0;"><img alt="" height="95" src="https://images2.imgbox.com/cc/30/ijwvW98A_o.png" width="443"></p> 
+   <p style="margin-left:0;">主要通过调用osqp_setup这个函数，把数据导进去就可以自动进行求解。</p> 
+   <p style="margin-left:0;">最后获取优化结果：</p> 
+   <p style="margin-left:0;"><img alt="" height="531" src="https://images2.imgbox.com/b3/8c/lYNSMx5U_o.png" width="811"></p> 
+   <p style="margin-left:0;">红线分别是获得优化值，获得优化变量的取值。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">接下来讲解路径规划算法的执行过程：</p> 
+   <p style="margin-left:0;"><img alt="" height="276" src="https://images2.imgbox.com/48/03/dGKVGgvm_o.png" width="1200"></p> 
+   <p style="margin-left:0;">整个路径规划首先从参考线平滑开始，首先其会产生ReferenceLineInfo这样一个类，保存所有的ReferenceLine的计算结果。接下来在路径规划部分按顺序依次执行每个任务。这里的任务包含了决策器和优化器的任务，这里每个决策器或优化器的入口函数都是Process函数：</p> 
+   <p style="margin-left:0;"><img alt="" height="183" src="https://images2.imgbox.com/25/d1/Do5Bm0Ft_o.png" width="907"></p> 
+   <p style="margin-left:0;"><img alt="" height="246" src="https://images2.imgbox.com/c1/11/iqscFaH7_o.png" width="809"></p> 
+   <p style="margin-left:0;">求解的结果保存在reference_line或reference_line_info中。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">第一个换道决策器，主要产生是否换道的状态:</p> 
+   <p style="margin-left:0;"><img alt="" height="193" src="https://images2.imgbox.com/b0/aa/FZsXEpel_o.png" width="544"></p> 
+   <p style="margin-left:0;">主要产生是否换道的状态，它产生的状态会保存在injector中，其在planning中是一个单一类，其保存的变量会贯穿planning始终，也就是可以在不同帧之间进行共用。(因为换道也是要贯穿好几帧进行的决策)</p> 
+   <p style="margin-left:0;">接下来是借道决策，其保存的变量在reference_line_info中，如果产生借道决策，后面的值设置为true，另外会把借道的状态向左或向右保存到injector中</p> 
+   <p style="margin-left:0;"><img alt="" height="192" src="https://images2.imgbox.com/1a/61/nF3QEcVu_o.png" width="530"></p> 
+   <p style="margin-left:0;"><img alt="" height="191" src="https://images2.imgbox.com/c0/17/y9ZPmBAk_o.png" width="517"></p> 
+   <p style="margin-left:0;">第三步是产生路径边界，根据现有决策在参考线上采样，获得每个点的在l方向上的可行驶区域，其包含了四种边界：</p> 
+   <p style="margin-left:0;"><img alt="" height="209" src="https://images2.imgbox.com/24/47/D1l6oomF_o.png" width="1188"></p> 
+   <p style="margin-left:0;">最后将所有路径边界通过setCandidatePathBoundarier保存在reference_line_info中</p> 
+   <p style="margin-left:0;"><img alt="" height="101" src="https://images2.imgbox.com/57/e3/W4PFoMQq_o.png" width="488"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">接下来是路径优化</p> 
+   <p style="margin-left:0;"><img alt="" height="380" src="https://images2.imgbox.com/ec/52/zVldose5_o.png" width="1145"></p> 
+   <p style="margin-left:0;">其主要通过调用piecewise_jerk_problem去进行优化求解(其是二次规划求解器的一个类)，这里会设置二次优化问题的一个权重以及一些约束，最后调用Optimize函数去进行一个优化的求解。这里通过从reference_line_info获得候选路径，把每条路径生成的边界，保存在该变量中。</p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;"></p> 
+   <p style="margin-left:0;">最后选择最优路径，其会调用ComparePathData函数，两两比较每一条path哪个更优，将最优的path保存在reference_line_info中(mutable_path_data中)，同时把这个path中阻塞的最近的障碍物放入blocking_obstacle中，也是供速度规划进行进一步的处理。</p> 
+   <p style="margin-left:0;"><img alt="" height="243" src="https://images2.imgbox.com/51/ed/vQYQSeXk_o.png" width="1200"></p> 
+  </div> 
+ </div> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/5c7c566e05f8e97bdb088bd4e71e9217/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">VScode禁止格式化时大写PX转换为小写px</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/90bb831981fc269782e60aacb2395b7e/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">PyTorch常用代码段合集</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

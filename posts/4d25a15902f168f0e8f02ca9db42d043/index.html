@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Android Https相关完全解析 当OkHttp遇到Https - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Android Https相关完全解析 当OkHttp遇到Https" />
+<meta property="og:description" content="转载请标明出处： http://blog.csdn.net/lmj623565791/article/details/48129405； 本文出自:【张鸿洋的博客】
+一、概述 其实这篇文章理论上不限于okhttp去访问自签名的网站，不过接上篇博文了，就叫这个了。首先要了解的事，okhttp默认情况下是支持https协议的网站的，比如https://www.baidu.com，https://github.com/hongyangAndroid/okhttp-utils等，你可以直接通过okhttp请求试试。不过要注意的是，支持的https的网站基本都是CA机构颁发的证书，默认情况下是可以信任的。
+当然我们今天要说的是自签名的网站，什么叫自签名呢？就是自己通过keytool去生成一个证书，然后使用，并不是CA机构去颁发的。使用自签名证书的网站，大家在使用浏览器访问的时候，一般都是报风险警告，好在有个大名鼎鼎的网站就是这么干的，https://kyfw.12306.cn/otn/，点击进入12306的购票页面就能看到了。
+如下界面：
+大家可以尝试拿okhttp访问下:
+OkHttpClientManager.getAsyn (&#34;https://kyfw.12306.cn/otn/&#34;, callack); 会爆出如下错误
+javax.net.ssl.SSLHandshakeException: java.security.cert.CertPathValidatorException: Trust anchor for certification path not found. 好了，本篇博文当然不是去说如何去访问12306，而是以12306为例子来说明如何去访问自签名证书的网站。因为部分开发者app与自己服务端交互的时候可能也会遇到自签名证书的。甚至在开发安全级别很高的app时，需要用到双向证书的验证。
+那么本篇博文的基本内容包含：
+https一些相关的知识okhttp访问自签名https网站如何构建一个支持https的服务器（这里主要为了测试多个证书的时候，如何去加载）如何进行双向证书验证 二、Https相关知识 关于特别理论的东西大家可以百度下自己去了解下，这里就简单说一下，HTTPS相当于HTTP的安全版本了，为什么安全呢？
+因为它在HTTP的之下加入了SSL (Secure Socket Layer)，安全的基础就靠这个SSL了。SSL位于TCP/IP和HTTP协议之间，那么它到底能干嘛呢？
+它能够：
+认证用户和服务器，确保数据发送到正确的客户机和服务器；(验证证书)加密数据以防止数据中途被窃取；（加密）维护数据的完整性，确保数据在传输过程中不被改变。（摘要算法） 以上3条来自百度
+下面我们简单描述下HTTPS的工作原理，大家就能对应的看到上面3条作用的身影了：
+HTTPS在传输数据之前需要客户端（浏览器）与服务端（网站）之间进行一次握手，在握手过程中将确立双方加密传输数据的密码信息。握手过程的简单描述如下：
+浏览器将自己支持的一套加密算法、HASH算法发送给网站。网站从中选出一组加密算法与HASH算法，并将自己的身份信息以证书的形式发回给浏览器。证书里面包含了网站地址，加密公钥，以及证书的颁发机构等信息。浏览器获得网站证书之后，开始验证证书的合法性，如果证书信任，则生成一串随机数字作为通讯过程中对称加密的秘钥。然后取出证书中的公钥，将这串数字以及HASH的结果进行加密，然后发给网站。网站接收浏览器发来的数据之后，通过私钥进行解密，然后HASH校验，如果一致，则使用浏览器发来的数字串使加密一段握手消息发给浏览器。浏览器解密，并HASH校验，没有问题，则握手结束。接下来的传输过程将由之前浏览器生成的随机密码并利用对称加密算法进行加密。 握手过程中如果有任何错误，都会使加密连接断开，从而阻止了隐私信息的传输。
+ok，以上的流程不一定完全正确，基本就是这样，当然如果有明显错误欢迎指出。
+根据上面的流程，我们可以看到服务器端会有一个证书，在交互过程中客户端需要去验证证书的合法性，对于权威机构颁发的证书当然我们会直接认为合法。对于自己造的证书，那么我们就需要去校验合法性了，也就是说我们只需要让OkhttpClient去信任这个证书就可以畅通的进行通信了。
+当然，对于自签名的网站的访问，网上的部分的做法是直接设置信任所有的证书，对于这种做法肯定是有风险的，所以这里我们不去介绍了，有需要自己去查。
+下面我们去考虑，如何让OkHttpClient去信任我们的证书，接下里的例子就是靠12306这个福利站点了。
+首先导出12306的证书，这里12306提供了下载地址：12306证书点击下载
+下载完成，解压拿到里面的srca.cer，一会需要使用。ps:即使没有提供下载，也可以通过浏览器导出的，自行百度。
+三、代码 （一）、访问自签名的网站 首先把我们下载的srca.cer放到assets文件夹下，其实你可以随便放哪，反正能读取到就行。
+然后在我们的OkHttpClientManager里面添加如下的方法：
+public void setCertificates(InputStream... certificates) { try { CertificateFactory certificateFactory = CertificateFactory.getInstance(&#34;X.509&#34;); KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType()); keyStore.load(null); int index = 0; for (InputStream certificate : certificates) { String certificateAlias = Integer." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/4d25a15902f168f0e8f02ca9db42d043/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2015-09-12T11:25:53+08:00" />
+<meta property="article:modified_time" content="2015-09-12T11:25:53+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Android Https相关完全解析 当OkHttp遇到Https</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <blockquote> 
+ <p>转载请标明出处： <br> <a href="http://blog.csdn.net/lmj623565791/article/details/48129405">http://blog.csdn.net/lmj623565791/article/details/48129405</a>； <br> 本文出自:<a href="http://blog.csdn.net/lmj623565791/">【张鸿洋的博客】</a></p> 
+</blockquote> 
+<h4 id="一概述">一、概述</h4> 
+<p>其实这篇文章理论上不限于okhttp去访问自签名的网站，不过接上篇博文了，就叫这个了。首先要了解的事，okhttp默认情况下是支持https协议的网站的，比如<code>https://www.baidu.com</code>，<code>https://github.com/hongyangAndroid/okhttp-utils</code>等，你可以直接通过okhttp请求试试。不过要注意的是，支持的https的网站基本都是CA机构颁发的证书，默认情况下是可以信任的。</p> 
+<p>当然我们今天要说的是自签名的网站，什么叫自签名呢？就是自己通过<code>keytool</code>去生成一个证书，然后使用，并不是CA机构去颁发的。使用自签名证书的网站，大家在使用浏览器访问的时候，一般都是报风险警告，好在有个大名鼎鼎的网站就是这么干的，<code>https://kyfw.12306.cn/otn/</code>，点击进入12306的购票页面就能看到了。</p> 
+<p>如下界面：</p> 
+<p><img src="https://images2.imgbox.com/7c/fc/jm5OoVxx_o.png" width="400px"></p> 
+<p>大家可以尝试拿okhttp访问下:</p> 
+<pre class="prettyprint"><code class="language-java hljs ">OkHttpClientManager.getAsyn
+    (<span class="hljs-string">"https://kyfw.12306.cn/otn/"</span>, callack);</code></pre> 
+<p>会爆出如下错误</p> 
+<pre class="prettyprint"><code class="language-xml hljs ">javax.net.ssl.SSLHandshakeException: 
+    java.security.cert.CertPathValidatorException: 
+        Trust anchor for certification path not found.</code></pre> 
+<p>好了，本篇博文当然不是去说如何去访问12306，而是以12306为例子来说明如何去访问自签名证书的网站。因为部分开发者app与自己服务端交互的时候可能也会遇到自签名证书的。甚至在开发安全级别很高的app时，需要用到双向证书的验证。</p> 
+<p>那么本篇博文的基本内容包含：</p> 
+<ul><li>https一些相关的知识</li><li>okhttp访问自签名https网站</li><li>如何构建一个支持https的服务器（这里主要为了测试多个证书的时候，如何去加载）</li><li>如何进行双向证书验证</li></ul> 
+<h4 id="二https相关知识">二、Https相关知识</h4> 
+<p>关于特别理论的东西大家可以百度下自己去了解下，这里就简单说一下，HTTPS相当于HTTP的安全版本了，为什么安全呢？</p> 
+<p>因为它在HTTP的之下加入了SSL (Secure Socket Layer)，安全的基础就靠这个SSL了。SSL位于TCP/IP和HTTP协议之间，那么它到底能干嘛呢？</p> 
+<p>它能够：</p> 
+<ul><li>认证用户和服务器，确保数据发送到正确的客户机和服务器；(验证证书)</li><li>加密数据以防止数据中途被窃取；（加密）</li><li>维护数据的完整性，确保数据在传输过程中不被改变。（摘要算法）</li></ul> 
+<blockquote> 
+ <p>以上3条来自百度</p> 
+</blockquote> 
+<p>下面我们简单描述下HTTPS的工作原理，大家就能对应的看到上面3条作用的身影了：</p> 
+<p>HTTPS在传输数据之前需要客户端（浏览器）与服务端（网站）之间进行一次握手，在握手过程中将确立双方加密传输数据的密码信息。握手过程的简单描述如下：</p> 
+<ol><li>浏览器将自己支持的一套加密算法、HASH算法发送给网站。</li><li>网站从中选出一组加密算法与HASH算法，并将自己的身份信息以证书的形式发回给浏览器。证书里面包含了网站地址，加密公钥，以及证书的颁发机构等信息。</li><li>浏览器获得网站证书之后，开始验证证书的合法性，如果证书信任，则生成一串随机数字作为通讯过程中对称加密的秘钥。然后取出证书中的公钥，将这串数字以及HASH的结果进行加密，然后发给网站。</li><li>网站接收浏览器发来的数据之后，通过私钥进行解密，然后HASH校验，如果一致，则使用浏览器发来的数字串使加密一段握手消息发给浏览器。</li><li>浏览器解密，并HASH校验，没有问题，则握手结束。接下来的传输过程将由之前浏览器生成的随机密码并利用对称加密算法进行加密。</li></ol> 
+<p>握手过程中如果有任何错误，都会使加密连接断开，从而阻止了隐私信息的传输。</p> 
+<blockquote> 
+ <p>ok，以上的流程不一定完全正确，基本就是这样，当然如果有明显错误欢迎指出。</p> 
+</blockquote> 
+<p>根据上面的流程，我们可以看到服务器端会有一个证书，在交互过程中客户端需要去验证证书的合法性，对于权威机构颁发的证书当然我们会直接认为合法。对于自己造的证书，那么我们就需要去校验合法性了，也就是说我们只需要让OkhttpClient去信任这个证书就可以畅通的进行通信了。</p> 
+<p>当然，对于自签名的网站的访问，网上的部分的做法是直接设置信任所有的证书，对于这种做法肯定是有风险的，所以这里我们不去介绍了，有需要自己去查。</p> 
+<p>下面我们去考虑，如何让OkHttpClient去信任我们的证书，接下里的例子就是靠12306这个福利站点了。</p> 
+<p>首先导出12306的证书，这里12306提供了下载地址：<a href="https://kyfw.12306.cn/otn/" rel="nofollow">12306证书点击下载</a></p> 
+<p>下载完成，解压拿到里面的<code>srca.cer</code>，一会需要使用。ps:即使没有提供下载，也可以通过浏览器导出的，自行百度。</p> 
+<h4 id="三代码">三、代码</h4> 
+<h5 id="一访问自签名的网站">（一）、访问自签名的网站</h5> 
+<p>首先把我们下载的<code>srca.cer</code>放到assets文件夹下，其实你可以随便放哪，反正能读取到就行。</p> 
+<p>然后在我们的<code>OkHttpClientManager</code>里面添加如下的方法：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">setCertificates</span>(InputStream... certificates)
+{
+    <span class="hljs-keyword">try</span>
+    {
+        CertificateFactory certificateFactory = CertificateFactory.getInstance(<span class="hljs-string">"X.509"</span>);
+        KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        keyStore.load(<span class="hljs-keyword">null</span>);
+        <span class="hljs-keyword">int</span> index = <span class="hljs-number">0</span>;
+        <span class="hljs-keyword">for</span> (InputStream certificate : certificates)
+        {
+            String certificateAlias = Integer.toString(index++);
+            keyStore.setCertificateEntry(certificateAlias, certificateFactory.generateCertificate(certificate));
+
+            <span class="hljs-keyword">try</span>
+            {
+                <span class="hljs-keyword">if</span> (certificate != <span class="hljs-keyword">null</span>)
+                    certificate.close();
+            } <span class="hljs-keyword">catch</span> (IOException e)
+            {
+            }
+        }
+
+        SSLContext sslContext = SSLContext.getInstance(<span class="hljs-string">"TLS"</span>);
+
+        TrustManagerFactory trustManagerFactory = 
+            TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()); 
+
+        trustManagerFactory.init(keyStore);
+        sslContext.init
+            (   
+                <span class="hljs-keyword">null</span>, 
+                trustManagerFactory.getTrustManagers(), 
+                <span class="hljs-keyword">new</span> SecureRandom()
+            );
+       mOkHttpClient.setSslSocketFactory(sslContext.getSocketFactory());
+
+
+    } <span class="hljs-keyword">catch</span> (Exception e)
+    {
+        e.printStackTrace();
+    } 
+
+}</code></pre> 
+<p>为了代码可读性，我把异常捕获的部分简化了，可以看到我们提供了一个方法传入InputStream流，InputStream就对应于我们证书的输入流。</p> 
+<p>代码内部，我们：</p> 
+<ul><li>构造CertificateFactory对象，通过它的<code>generateCertificate(is)</code>方法得到Certificate。</li><li>然后讲得到的<code>Certificate</code>放入到keyStore中。</li><li>接下来利用keyStore去初始化我们的<code>TrustManagerFactory</code></li><li>由<code>trustManagerFactory.getTrustManagers</code>获得<code>TrustManager[]</code>初始化我们的<code>SSLContext</code></li><li>最后，设置我们mOkHttpClient.setSslSocketFactory即可。</li></ul> 
+<p>这样就完成了我们代码的编写，其实挺短的，当客户端进行SSL连接时，就可以根据我们设置的证书去决定是否新人服务端的证书。</p> 
+<p>记得在Application中进行初始化：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">MyApplication</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Application</span>
+{<!-- --></span>
+   <span class="hljs-annotation">@Override</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">onCreate</span>()
+    {
+        <span class="hljs-keyword">super</span>.onCreate();
+
+        <span class="hljs-keyword">try</span>
+        {
+            OkHttpClientManager.getInstance()
+                    .setCertificates(getAssets().open(<span class="hljs-string">"srca.cer"</span>));
+        } <span class="hljs-keyword">catch</span> (IOException e)
+        {
+            e.printStackTrace();
+        }
+
+
+}
+</code></pre> 
+<p>然后尝试以下代码访问12306的网站：</p> 
+<pre class="prettyprint"><code class="language-java hljs "> OkHttpClientManager.getAsyn(<span class="hljs-string">"https://kyfw.12306.cn/otn/"</span>, <span class="hljs-keyword">new</span> OkHttpClientManager.ResultCallback&lt;String&gt;()
+{
+    <span class="hljs-annotation">@Override</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">onError</span>(Request request, Exception e)
+    {
+        e.printStackTrace();
+    }
+
+    <span class="hljs-annotation">@Override</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">onResponse</span>(String u)
+    {
+        mTv.setText(u);
+    }
+});</code></pre> 
+<p>这样即可访问成功。完整代码已经更新至：<a href="https://github.com/hongyangAndroid/okhttp-utils">https://github.com/hongyangAndroid/okhttp-utils</a>，可以下载里面的sample进行测试，里面包含12306的证书。</p> 
+<p>ok，到这就可以看到使用Okhttp可以很方便的应对自签名的网站的访问，只需要拿到包含公钥的证书即可。</p> 
+<hr> 
+<h5 id="二使用字符串替代证书">（二）、使用字符串替代证书</h5> 
+<p>下面继续，有些人可能觉得把证书copy到assets下还是觉得不舒服，其实我们还可以将证书中的内容提取出来，写成字符串常量，这样就不需要证书根据着app去打包了。</p> 
+<pre class="prettyprint"><code class="language-java hljs ">zhydeMacBook-Pro:temp zhy$ keytool -printcert -rfc -file srca.cer
+-----BEGIN CERTIFICATE-----
+MIICmjCCAgOgAwIBAgIIbyZr5/jKH6QwDQYJKoZIhvcNAQEFBQAwRzELMAkGA1UEBhMCQ04xKTAn
+BgNVBAoTIFNpbm9yYWlsIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MQ0wCwYDVQQDEwRTUkNBMB4X
+DTA5MDUyNTA2NTYwMFoXDTI5MDUyMDA2NTYwMFowRzELMAkGA1UEBhMCQ04xKTAnBgNVBAoTIFNp
+bm9yYWlsIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MQ0wCwYDVQQDEwRTUkNBMIGfMA0GCSqGSIb3
+DQEBAQUAA4GNADCBiQKBgQDMpbNeb34p0GvLkZ6t72/OOba4mX2K/eZRWFfnuk8e5jKDH+<span class="hljs-number">9</span>BgCb2
+<span class="hljs-number">9</span>bSotqPqTbxXWPxIOz8EjyUO3bfR5pQ8ovNTOlks2rS5BdMhoi4sUjCKi5ELiqtyww/XgY5iFqv6
+D4Pw9QvOUcdRVSbPWo1DwMmH75It6pk/rARIFHEjWwIDAQABo4GOMIGLMB8GA1UdIwQYMBaAFHle
+tne34lKDQ+<span class="hljs-number">3</span>HUYhMY4UsAENYMAwGA1UdEwQFMAMBAf8wLgYDVR0fBCcwJTAjoCGgH4YdaHR0cDov
+LzE5Mi4xNjguOS4xNDkvY3JsMS5jcmwwCwYDVR0PBAQDAgH+MB0GA1UdDgQWBBR5XrZ3t+JSg0Pt
+x1GITGOFLABDWDANBgkqhkiG9w0BAQUFAAOBgQDGrAm2U/of1LbOnG2bnnQtgcVaBXiVJF8LKPaV
+<span class="hljs-number">23</span>XQ96HU8xfgSZMJS6U00WHAI7zp0q208RSUft9wDq9ee<span class="hljs-comment">///VOhzR6Tebg9QfyPSohkBrhXQenvQ</span>
+og555S+C3eJAAVeNCTeMS3N/M5hzBRJAoffn3qoYdAO1Q8bTguOi+<span class="hljs-number">2849</span>A==
+-----END CERTIFICATE-----</code></pre> 
+<p>使用<code>keytool</code>命令，以rfc样式输出。<code>keytool</code>命令是JDK里面自带的。</p> 
+<p>有了这个字符串以后，我们就不需要srca.cer这个文件了，直接编写以下代码：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">MyApplication</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Application</span>
+{<!-- --></span>
+    <span class="hljs-keyword">private</span> String CER_12306 = <span class="hljs-string">"-----BEGIN CERTIFICATE-----\n"</span> +
+            <span class="hljs-string">"MIICmjCCAgOgAwIBAgIIbyZr5/jKH6QwDQYJKoZIhvcNAQEFBQAwRzELMAkGA1UEBhMCQ04xKTAn\n"</span> +
+            <span class="hljs-string">"BgNVBAoTIFNpbm9yYWlsIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MQ0wCwYDVQQDEwRTUkNBMB4X\n"</span> +
+            <span class="hljs-string">"DTA5MDUyNTA2NTYwMFoXDTI5MDUyMDA2NTYwMFowRzELMAkGA1UEBhMCQ04xKTAnBgNVBAoTIFNp\n"</span> +
+            <span class="hljs-string">"bm9yYWlsIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MQ0wCwYDVQQDEwRTUkNBMIGfMA0GCSqGSIb3\n"</span> +
+            <span class="hljs-string">"DQEBAQUAA4GNADCBiQKBgQDMpbNeb34p0GvLkZ6t72/OOba4mX2K/eZRWFfnuk8e5jKDH+9BgCb2\n"</span> +
+            <span class="hljs-string">"9bSotqPqTbxXWPxIOz8EjyUO3bfR5pQ8ovNTOlks2rS5BdMhoi4sUjCKi5ELiqtyww/XgY5iFqv6\n"</span> +
+            <span class="hljs-string">"D4Pw9QvOUcdRVSbPWo1DwMmH75It6pk/rARIFHEjWwIDAQABo4GOMIGLMB8GA1UdIwQYMBaAFHle\n"</span> +
+            <span class="hljs-string">"tne34lKDQ+3HUYhMY4UsAENYMAwGA1UdEwQFMAMBAf8wLgYDVR0fBCcwJTAjoCGgH4YdaHR0cDov\n"</span> +
+            <span class="hljs-string">"LzE5Mi4xNjguOS4xNDkvY3JsMS5jcmwwCwYDVR0PBAQDAgH+MB0GA1UdDgQWBBR5XrZ3t+JSg0Pt\n"</span> +
+            <span class="hljs-string">"x1GITGOFLABDWDANBgkqhkiG9w0BAQUFAAOBgQDGrAm2U/of1LbOnG2bnnQtgcVaBXiVJF8LKPaV\n"</span> +
+            <span class="hljs-string">"23XQ96HU8xfgSZMJS6U00WHAI7zp0q208RSUft9wDq9ee///VOhzR6Tebg9QfyPSohkBrhXQenvQ\n"</span> +
+            <span class="hljs-string">"og555S+C3eJAAVeNCTeMS3N/M5hzBRJAoffn3qoYdAO1Q8bTguOi+2849A==\n"</span> +
+            <span class="hljs-string">"-----END CERTIFICATE-----"</span>;
+
+    <span class="hljs-annotation">@Override</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">onCreate</span>()
+    {
+        <span class="hljs-keyword">super</span>.onCreate();
+
+        OkHttpClientManager.getInstance()
+                .setCertificates(<span class="hljs-keyword">new</span> Buffer()
+                        .writeUtf8(CER_12306)
+                        .inputStream());
+}</code></pre> 
+<p>注意Buffer是okio包下的，okhttp依赖okio。</p> 
+<p>ok，这样就省去将cer文件一起打包进入apk了。</p> 
+<hr> 
+<p>接下来介绍，如何去生成证书以及在tomcat服务器下使用自签名证书部署服务。如果大家没这方面需要可以简单了解下。</p> 
+<h4 id="四tomcat下使用自签名证书部署服务">四、tomcat下使用自签名证书部署服务</h4> 
+<p>首先自行下载个tomcat的压缩包。</p> 
+<p>既然我们要支持https，那么肯定需要个证书，如何生成证书呢？使用keytool非常简单。</p> 
+<h5 id="一生成证书">（一）生成证书</h5> 
+<pre class="prettyprint"><code class="language-xml hljs ">zhydeMacBook-Pro:temp zhy$ keytool -genkey -alias zhy_server -keyalg RSA -keystore zhy_server.jks -validity 3600 -storepass 123456
+您的名字与姓氏是什么?
+  [Unknown]:  zhang
+您的组织单位名称是什么?
+  [Unknown]:  zhang
+您的组织名称是什么?
+  [Unknown]:  zhang
+您所在的城市或区域名称是什么?
+  [Unknown]:  xian
+您所在的省/市/自治区名称是什么?
+  [Unknown]:  shanxi
+该单位的双字母国家/地区代码是什么?
+  [Unknown]:  cn
+CN=zhang, OU=zhang, O=zhang, L=xian, ST=shanxi, C=cn是否正确?
+  [否]:  y
+
+输入 <span class="hljs-tag">&lt;<span class="hljs-title">zhy_server</span>&gt;</span> 的密钥口令
+    (如果和密钥库口令相同, 按回车):   </code></pre> 
+<p>使用以上命令即可生成一个证书请求文件<code>zhy_server.jks</code>，注意密钥库口令为：<code>123456</code>.</p> 
+<p>接下来利用<code>zhy_server.jks</code>来签发证书：</p> 
+<pre class="prettyprint"><code class="language-java hljs ">zhydeMacBook-Pro:temp zhy$ keytool -export -alias zhy_server 
+ -file zhy_server.cer 
+ -keystore zhy_server.jks 
+ -storepass <span class="hljs-number">123456</span> </code></pre> 
+<p>即可生成包含公钥的证书<code>zhy_server.cer</code>。</p> 
+<h5 id="二配置tomcat">(二)、配置Tomcat</h5> 
+<p>找到<code>tomcat/conf/sever.xml</code>文件，并以文本形式打开。</p> 
+<p>在Service标签中，加入：</p> 
+<pre class="prettyprint"><code class="language-xml hljs "><span class="hljs-tag">&lt;<span class="hljs-title">Connector</span> <span class="hljs-attribute">SSLEnabled</span>=<span class="hljs-value">"true"</span> <span class="hljs-attribute">acceptCount</span>=<span class="hljs-value">"100"</span> <span class="hljs-attribute">clientAuth</span>=<span class="hljs-value">"false"</span> 
+    <span class="hljs-attribute">disableUploadTimeout</span>=<span class="hljs-value">"true"</span> <span class="hljs-attribute">enableLookups</span>=<span class="hljs-value">"true"</span> <span class="hljs-attribute">keystoreFile</span>=<span class="hljs-value">""</span> <span class="hljs-attribute">keystorePass</span>=<span class="hljs-value">"123456"</span> <span class="hljs-attribute">maxSpareThreads</span>=<span class="hljs-value">"75"</span> 
+    <span class="hljs-attribute">maxThreads</span>=<span class="hljs-value">"200"</span> <span class="hljs-attribute">minSpareThreads</span>=<span class="hljs-value">"5"</span> <span class="hljs-attribute">port</span>=<span class="hljs-value">"8443"</span> 
+    <span class="hljs-attribute">protocol</span>=<span class="hljs-value">"org.apache.coyote.http11.Http11NioProtocol"</span> <span class="hljs-attribute">scheme</span>=<span class="hljs-value">"https"</span> 
+    <span class="hljs-attribute">secure</span>=<span class="hljs-value">"true"</span> <span class="hljs-attribute">sslProtocol</span>=<span class="hljs-value">"TLS"</span>
+      /&gt;</span> </code></pre> 
+<p>注意keystoreFile的值为我们刚才生成的jks文件的路径：<code>/Users/zhy/ <br> temp/zhy_server.jks</code>(填写你的路径).keystorePass值为密钥库密码:<code>123456</code>。</p> 
+<p>然后启动即可，对于命令行启动，依赖环境变量JAVA_HOME；如果在MyEclispe等IDE下启动就比较随意了。</p> 
+<p>启动成功以后，打开浏览器输入url:<code>https://localhost:8443/</code>即可看到证书不可信任的警告了。选择打死也要进入，即可进入tomcat默认的主页：</p> 
+<p><img src="https://images2.imgbox.com/23/42/eND0wOjY_o.png" width="330px"></p> 
+<p>如果你在此tomcat中部署了项目，即可按照如下url方式访问： <br> <code>https://192.168.1.103:8443/项目名/path</code>，没有部署也没关系，直接拿默认的主页进行测试了，拿它的html字符串。</p> 
+<p>对于访问，还需要说么，我们刚才已经生成了<code>zhy_server.cer</code>证书。你可以选择copy到assets，或者通过命令拿到内部包含的字符串。我们这里选择copy。</p> 
+<p>依然选择在Application中设置信任证书：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">MyApplication</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Application</span>
+{<!-- --></span>
+    <span class="hljs-keyword">private</span> String CER_12306 = <span class="hljs-string">"省略..."</span>;
+
+    <span class="hljs-annotation">@Override</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">onCreate</span>()
+    {
+        <span class="hljs-keyword">super</span>.onCreate();
+
+        <span class="hljs-keyword">try</span>
+        {
+            OkHttpClientManager.getInstance()
+            .setCertificates(
+                    <span class="hljs-keyword">new</span> Buffer()
+                    .writeUtf8(CER_12306).inputStream(),
+                     getAssets().open(<span class="hljs-string">"zhy_server.cer"</span>)
+                    );
+        } <span class="hljs-keyword">catch</span> (IOException e)
+        {
+            e.printStackTrace();
+        }
+
+    }
+}</code></pre> 
+<p>ok，这样就能正常访问你部署的https项目中的服务了，没有部署项目的尝试拿<code>https://服务端ip:8443/</code>测试即可。</p> 
+<p>注意：不要使用localhost，真机测试保证手机和服务器在同一局域网段内。</p> 
+<p>ok，到此我们介绍完了如果搭建https服务和如何访问，基本上可以应付极大部分的需求了。当然还是极少数的应用需要双向证书验证，比如银行、金融类app，我们一起来了解下。</p> 
+<h4 id="五双向证书验证">五、双向证书验证</h4> 
+<p>首先对于双向证书验证，也就是说，客户端也会有个“kjs文件”，服务器那边会同时有个“cer文件”与之对应。</p> 
+<p>我们已经生成了<code>zhy_server.kjs</code>和<code>zhy_server.cer</code>文件。</p> 
+<p>接下来按照生成证书的方式，再生成一对这样的文件，我们命名为:<code>zhy_client.kjs</code>,<code>zhy_client.cer</code>.</p> 
+<h5 id="一配置服务端">（一）配置服务端</h5> 
+<p>首先我们配置服务端：</p> 
+<p>服务端的配置比较简单，依然是刚才的Connector标签，不过需要添加些属性。</p> 
+<pre class="prettyprint"><code class="language-xml hljs "> <span class="hljs-tag">&lt;<span class="hljs-title">Connector</span>  其他属性与前面一致  
+    <span class="hljs-attribute">clientAuth</span>=<span class="hljs-value">"true"</span>
+    <span class="hljs-attribute">truststoreFile</span>=<span class="hljs-value">"/Users/zhy/temp/zhy_client.cer"</span> 
+      /&gt;</span> </code></pre> 
+<p>将<code>clientAuth</code>设置为true，并且多添加一个属性truststoreFile，理论上值为我们的cer文件。这么加入以后，尝试启动服务器，会发生错误：<code>Invalid keystore format</code>。说keystore的格式不合法。</p> 
+<p>我们需要对zhy_client.cer执行以下步骤，将证书添加到kjs文件中。</p> 
+<pre class="prettyprint"><code class="language-xml hljs ">keytool -import -alias zhy_client 
+    -file zhy_client.cer -keystore zhy_client_for_sever.jks</code></pre> 
+<p>接下里修改server.xml为：</p> 
+<pre class="prettyprint"><code class="language-xml hljs "> <span class="hljs-tag">&lt;<span class="hljs-title">Connector</span>  其他属性与前面一致 
+    <span class="hljs-attribute">clientAuth</span>=<span class="hljs-value">"true"</span>
+    <span class="hljs-attribute">truststoreFile</span>=<span class="hljs-value">"/Users/zhy/temp/zhy_client_for_sever.jks"</span> 
+      /&gt;</span> </code></pre> 
+<p>此时启动即可。</p> 
+<p>此时再拿浏览器已经无法访问到我们的服务了，会显示<code>基于证书的身份验证失败</code>。</p> 
+<p>我们将目标来到客户端，即我们的Android端，我们的Android端，如何设置kjs文件呢。</p> 
+<h5 id="二配置app端">（二）配置app端</h5> 
+<p>目前我们app端依靠的应该是<code>zhy_client.kjs</code>。</p> 
+<p>ok，大家还记得，我们在支持https的时候调用了这么俩行代码：</p> 
+<pre class="prettyprint"><code class="language-java hljs ">sslContext.init(<span class="hljs-keyword">null</span>, trustManagerFactory.getTrustManagers(), 
+    <span class="hljs-keyword">new</span> SecureRandom());
+mOkHttpClient.setSslSocketFactory(sslContext.getSocketFactory());</code></pre> 
+<p>注意sslContext.init的第一个参数我们传入的是null，第一个参数的类型实际上是<code>KeyManager[] km</code>,主要就用于管理我们客户端的key。</p> 
+<p>于是代码可以这么写：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">setCertificates</span>(InputStream... certificates)
+{
+    <span class="hljs-keyword">try</span>
+    {
+        CertificateFactory certificateFactory = CertificateFactory.getInstance(<span class="hljs-string">"X.509"</span>);
+        KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        keyStore.load(<span class="hljs-keyword">null</span>);
+        <span class="hljs-keyword">int</span> index = <span class="hljs-number">0</span>;
+        <span class="hljs-keyword">for</span> (InputStream certificate : certificates)
+        {
+            String certificateAlias = Integer.toString(index++);
+            keyStore.setCertificateEntry(certificateAlias, certificateFactory.generateCertificate(certificate));
+
+            <span class="hljs-keyword">try</span>
+            {
+                <span class="hljs-keyword">if</span> (certificate != <span class="hljs-keyword">null</span>)
+                    certificate.close();
+            } <span class="hljs-keyword">catch</span> (IOException e)
+            {
+            }
+        }
+
+        SSLContext sslContext = SSLContext.getInstance(<span class="hljs-string">"TLS"</span>);
+        TrustManagerFactory trustManagerFactory = TrustManagerFactory.
+                getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trustManagerFactory.init(keyStore);
+
+        <span class="hljs-comment">//初始化keystore</span>
+        KeyStore clientKeyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        clientKeyStore.load(mContext.getAssets().open(<span class="hljs-string">"zhy_client.jks"</span>), <span class="hljs-string">"123456"</span>.toCharArray());
+
+        KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        keyManagerFactory.init(clientKeyStore, <span class="hljs-string">"123456"</span>.toCharArray());
+
+        sslContext.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), <span class="hljs-keyword">new</span> SecureRandom());
+        mOkHttpClient.setSslSocketFactory(sslContext.getSocketFactory());
+
+
+    } <span class="hljs-keyword">catch</span> (Exception e)
+    {
+        e.printStackTrace();
+    } 
+
+}</code></pre> 
+<p>核心代码其实就是：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-comment">//初始化keystore</span>
+KeyStore clientKeyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+clientKeyStore.load(mContext.getAssets().open(<span class="hljs-string">"zhy_client.jks"</span>), <span class="hljs-string">"123456"</span>.toCharArray());
+
+KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+keyManagerFactory.init(clientKeyStore, <span class="hljs-string">"123456"</span>.toCharArray());
+
+sslContext.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), <span class="hljs-keyword">new</span> SecureRandom());
+</code></pre> 
+<p>然而此时启动会报错：<code>java.io.IOException: Wrong version of key store.</code></p> 
+<p>为什么呢？ </p> 
+<p>因为：Java平台默认识别jks格式的证书文件，但是android平台只识别bks格式的证书文件。</p> 
+<p>这么就纠结了，我们需要将我们的jks文件转化为bks文件，怎么转化呢？</p> 
+<p>这里的方式可能比较多，大家可以百度，我推荐一种方式：</p> 
+<p>–</p> 
+<p>去<a href="http://sourceforge.net/projects/portecle/files/" rel="nofollow">Portecle</a>下载<a href="http://sourceforge.net/projects/portecle/files/latest/download?source=files" rel="nofollow">Download portecle-1.9.zip (3.4 MB)</a>。</p> 
+<p>解压后，里面包含<code>bcprov.jar</code>文件，使用jave -jar bcprov.jar即可打开GUI界面。</p> 
+<p><img src="https://images2.imgbox.com/a2/27/HZfXopfM_o.gif" width="420px"></p> 
+<p>按照上图即可将<code>zhy_client.jks</code>转化为<code>zhy_client.bks</code>。</p> 
+<p>然后将<code>zhy_client.bks</code>拷贝到assets目录下，修改代码为：</p> 
+<pre class="prettyprint"><code class="language-java hljs "><span class="hljs-comment">//初始化keystore</span>
+KeyStore clientKeyStore = KeyStore.getInstance(<span class="hljs-string">"BKS"</span>);
+clientKeyStore.load(mContext.getAssets().open(<span class="hljs-string">"zhy_client.bks"</span>), <span class="hljs-string">"123456"</span>.toCharArray());
+
+KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+keyManagerFactory.init(clientKeyStore, <span class="hljs-string">"123456"</span>.toCharArray());
+
+sslContext.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), <span class="hljs-keyword">new</span> SecureRandom());</code></pre> 
+<p>再次运行即可。然后就成功的做到了双向的验证，关于双向这块大家了解下即可。</p> 
+<p>源码都在<a href="https://github.com/hongyangAndroid/okhttp-utils">https://github.com/hongyangAndroid/okhttp-utils</a>之中。</p> 
+<p>ok，到此本篇博文就结束了，文章相当的长~~ 关于okhttp在https协议下的使用，应该没什么问题。</p> 
+<p>ps：如果大家对okhttp-utils有任何建议，非常欢迎提出，最近根据大家的需求修改相当频繁~~</p> 
+<hr> 
+<p>欢迎关注我的微博： <br> <a href="http://weibo.com/u/3165018720" rel="nofollow">http://weibo.com/u/3165018720</a></p> 
+<hr> 
+<blockquote> 
+ <p>群号：<font color="red">463081660</font>，欢迎入群</p> 
+ <p>微信公众号：hongyangAndroid <br> （欢迎关注，第一时间推送博文信息） <br> <img src="https://images2.imgbox.com/e2/00/HX5bdJvw_o.jpg" width="200px"></p> 
+</blockquote> 
+<h4 id="参考">参考</h4> 
+<ul><li><a href="http://blog.csdn.net/hfeng101/article/details/10163627">http://blog.csdn.net/hfeng101/article/details/10163627</a></li><li><a href="http://www.ibm.com/developerworks/cn/java/j-lo-socketkeytool/index.html?ca=drs" rel="nofollow">http://www.ibm.com/developerworks/cn/java/j-lo-socketkeytool/index.html?ca=drs</a></li><li><a href="http://sourceforge.net/projects/portecle/files/" rel="nofollow">http://sourceforge.net/projects/portecle/files/</a></li><li><a href="http://blog.sina.com.cn/s/blog_7035c6ac01017hrx.html" rel="nofollow">http://blog.sina.com.cn/s/blog_7035c6ac01017hrx.html</a></li><li><a href="http://blog.csdn.net/cuker919/article/details/7599969">http://blog.csdn.net/cuker919/article/details/7599969</a></li><li><a href="http://www.cnblogs.com/devinzhang/archive/2012/02/28/2371631.html" rel="nofollow">http://www.cnblogs.com/devinzhang/archive/2012/02/28/2371631.html</a></li><li><a href="http://baike.baidu.com/link?url=eIodqEk7ATgau_jo74PvQdgqb_L6cajJWT9e7SzQrKfAomVY_05KB_dKyZYf-kbjupt_u9Bi0rn8l9wmnQobTa" rel="nofollow">http://baike.baidu.com/link?url=eIodqEk7ATgau_jo74PvQdgqb_L6cajJWT9e7SzQrKfAomVY_05KB_dKyZYf-kbjupt_u9Bi0rn8l9wmnQobTa</a></li><li><a href="https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/com/squareup/okhttp/recipes/CustomTrust.java">https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/com/squareup/okhttp/recipes/CustomTrust.java</a></li><li><a href="http://blog.csdn.net/raptor/article/details/18896375">http://blog.csdn.net/raptor/article/details/18896375</a></li><li><a href="http://blog.csdn.net/raptor/article/details/18898937">http://blog.csdn.net/raptor/article/details/18898937</a></li><li><a href="http://nelenkov.blogspot.com/2011/12/using-custom-certificate-trust-store-on.html" rel="nofollow">http://nelenkov.blogspot.com/2011/12/using-custom-certificate-trust-store-on.html</a></li></ul>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2d4d1bc24969999bb72988efd776d739/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">dedecms调用友情链接代码</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/ad68320dabb3ac566facd9e4e0bc750b/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Ubuntu分区方案（菜鸟方案、常用方案和进阶方案）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

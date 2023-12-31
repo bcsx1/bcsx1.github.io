@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Linux零拷贝解析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Linux零拷贝解析" />
+<meta property="og:description" content="目录
+先备知识
+物理内存
+虚拟内存
+内核空间和用户空间
+内核空间
+用户空间
+DMA传输
+上下文切换
+传统IO执行流程
+零拷贝实现的几种方式
+用户态直接I/O
+mmap&#43;write实现的零拷贝
+sendfile实现的零拷贝（用户不可见）
+sendfile&#43;DMA scatter/gather实现的零拷贝
+splice
+写时复制
+总结
+JAVA零拷贝API
+Java NIO对mmap的支持
+Java NIO对sendfile的支持
+其它的零拷贝实现
+Netty零拷贝
+RocketMQ和Kafka对比
+零拷贝（Zero-copy）技术指在计算机执行操作时，CPU 不需要先将数据从一个内存区域复制到另一个内存区域（例：CPU拷贝数据从内核缓冲区到用户缓冲区），从而可以减少CPU上下文切换以及 CPU 的拷贝时间。
+它的作用是在数据报从网络设备到用户程序空间传递的过程中，减少数据拷贝次数（CPU拷贝），减少系统调用，实现 CPU 的零参与，彻底消除 CPU 在这方面的负载。
+实现零拷贝用到的最主要技术是 DMA 数据传输技术和内存区域映射技术（mmap）。
+零拷贝机制可以减少数据在内核缓冲区和用户进程缓冲区之间反复的 I/O 拷贝操作。零拷贝机制可以减少用户进程地址空间和内核地址空间之间因为上下文切换而带来的 CPU 开销。 先备知识 物理内存 物理内存，我们平时所称的内存也叫随机访问存储器（ random-access memory ）也叫 RAM 。而 RAM 分为两类：
+一类是静态 RAM（ SRAM ），这类 SRAM 用于 CPU 高速缓存 L1Cache，L2Cache，L3Cache。其特点是访问速度快，访问速度为 1 - 30 个时钟周期，但是容量小，造价高。 另一类则是动态 RAM ( DRAM )，这类 DRAM 用于我们常说的主存上，其特点的是访问速度慢（相对高速缓存），访问速度为 50 - 200 个时钟周期，但是容量大，造价便宜些（相对高速缓存）。 内存由一个一个的存储器模块（memory module）组成，它们插在主板的扩展槽上。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/cdeecea97c06da7e5b75e197936b595c/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-11-19T17:51:19+08:00" />
+<meta property="article:modified_time" content="2022-11-19T17:51:19+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Linux零拷贝解析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p id="main-toc"><strong>目录</strong></p> 
+<p id="%E5%85%88%E5%A4%87%E7%9F%A5%E8%AF%86-toc" style="margin-left:0px;"><a href="#%E5%85%88%E5%A4%87%E7%9F%A5%E8%AF%86" rel="nofollow">先备知识</a></p> 
+<p id="%E7%89%A9%E7%90%86%E5%86%85%E5%AD%98-toc" style="margin-left:40px;"><a href="#%E7%89%A9%E7%90%86%E5%86%85%E5%AD%98" rel="nofollow">物理内存</a></p> 
+<p id="%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98-toc" style="margin-left:40px;"><a href="#%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98" rel="nofollow">虚拟内存</a></p> 
+<p id="%E5%86%85%E6%A0%B8%E7%A9%BA%E9%97%B4%E5%92%8C%E7%94%A8%E6%88%B7%E7%A9%BA%E9%97%B4-toc" style="margin-left:40px;"><a href="#%E5%86%85%E6%A0%B8%E7%A9%BA%E9%97%B4%E5%92%8C%E7%94%A8%E6%88%B7%E7%A9%BA%E9%97%B4" rel="nofollow">内核空间和用户空间</a></p> 
+<p id="%E5%86%85%E6%A0%B8%E7%A9%BA%E9%97%B4-toc" style="margin-left:80px;"><a href="#%E5%86%85%E6%A0%B8%E7%A9%BA%E9%97%B4" rel="nofollow">内核空间</a></p> 
+<p id="%E7%94%A8%E6%88%B7%E7%A9%BA%E9%97%B4-toc" style="margin-left:80px;"><a href="#%E7%94%A8%E6%88%B7%E7%A9%BA%E9%97%B4" rel="nofollow">用户空间</a></p> 
+<p id="DMA%E4%BC%A0%E8%BE%93-toc" style="margin-left:40px;"><a href="#DMA%E4%BC%A0%E8%BE%93" rel="nofollow">DMA传输</a></p> 
+<p id="%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2-toc" style="margin-left:40px;"><a href="#%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2" rel="nofollow">上下文切换</a></p> 
+<p id="%E4%BC%A0%E7%BB%9FIO%E6%89%A7%E8%A1%8C%E6%B5%81%E7%A8%8B-toc" style="margin-left:0px;"><a href="#%E4%BC%A0%E7%BB%9FIO%E6%89%A7%E8%A1%8C%E6%B5%81%E7%A8%8B" rel="nofollow">传统IO执行流程</a></p> 
+<p id="%E9%9B%B6%E6%8B%B7%E8%B4%9D%E5%AE%9E%E7%8E%B0%E7%9A%84%E5%87%A0%E7%A7%8D%E6%96%B9%E5%BC%8F-toc" style="margin-left:0px;"><a href="#%E9%9B%B6%E6%8B%B7%E8%B4%9D%E5%AE%9E%E7%8E%B0%E7%9A%84%E5%87%A0%E7%A7%8D%E6%96%B9%E5%BC%8F" rel="nofollow">零拷贝实现的几种方式</a></p> 
+<p id="%E7%94%A8%E6%88%B7%E6%80%81%E7%9B%B4%E6%8E%A5I%2FO-toc" style="margin-left:40px;"><a href="#%E7%94%A8%E6%88%B7%E6%80%81%E7%9B%B4%E6%8E%A5I%2FO" rel="nofollow">用户态直接I/O</a></p> 
+<p id="mmap%2Bwrite%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D-toc" style="margin-left:40px;"><a href="#mmap%2Bwrite%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D" rel="nofollow">mmap+write实现的零拷贝</a></p> 
+<p id="sendfile%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D%EF%BC%88%E7%94%A8%E6%88%B7%E4%B8%8D%E5%8F%AF%E8%A7%81%EF%BC%89-toc" style="margin-left:40px;"><a href="#sendfile%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D%EF%BC%88%E7%94%A8%E6%88%B7%E4%B8%8D%E5%8F%AF%E8%A7%81%EF%BC%89" rel="nofollow">sendfile实现的零拷贝（用户不可见）</a></p> 
+<p id="sendfile%2BDMA%20scatter%2Fgather%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D-toc" style="margin-left:40px;"><a href="#sendfile%2BDMA%20scatter%2Fgather%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D" rel="nofollow">sendfile+DMA scatter/gather实现的零拷贝</a></p> 
+<p id="splice-toc" style="margin-left:40px;"><a href="#splice" rel="nofollow">splice</a></p> 
+<p id="%E5%86%99%E6%97%B6%E5%A4%8D%E5%88%B6-toc" style="margin-left:40px;"><a href="#%E5%86%99%E6%97%B6%E5%A4%8D%E5%88%B6" rel="nofollow">写时复制</a></p> 
+<p id="%E6%80%BB%E7%BB%93-toc" style="margin-left:40px;"><a href="#%E6%80%BB%E7%BB%93" rel="nofollow">总结</a></p> 
+<p id="JAVA%E9%9B%B6%E6%8B%B7%E8%B4%9DAPI-toc" style="margin-left:0px;"><a href="#JAVA%E9%9B%B6%E6%8B%B7%E8%B4%9DAPI" rel="nofollow">JAVA零拷贝API</a></p> 
+<p id="Java%20NIO%E5%AF%B9mmap%E7%9A%84%E6%94%AF%E6%8C%81-toc" style="margin-left:40px;"><a href="#Java%20NIO%E5%AF%B9mmap%E7%9A%84%E6%94%AF%E6%8C%81" rel="nofollow">Java NIO对mmap的支持</a></p> 
+<p id="Java%20NIO%E5%AF%B9sendfile%E7%9A%84%E6%94%AF%E6%8C%81-toc" style="margin-left:40px;"><a href="#Java%20NIO%E5%AF%B9sendfile%E7%9A%84%E6%94%AF%E6%8C%81" rel="nofollow">Java NIO对sendfile的支持</a></p> 
+<p id="%E5%85%B6%E5%AE%83%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D%E5%AE%9E%E7%8E%B0-toc" style="margin-left:40px;"><a href="#%E5%85%B6%E5%AE%83%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D%E5%AE%9E%E7%8E%B0" rel="nofollow">其它的零拷贝实现</a></p> 
+<p id="Netty%E9%9B%B6%E6%8B%B7%E8%B4%9D-toc" style="margin-left:80px;"><a href="#Netty%E9%9B%B6%E6%8B%B7%E8%B4%9D" rel="nofollow">Netty零拷贝</a></p> 
+<p id="RocketMQ%E5%92%8CKafka%E5%AF%B9%E6%AF%94-toc" style="margin-left:80px;"><a href="#RocketMQ%E5%92%8CKafka%E5%AF%B9%E6%AF%94" rel="nofollow">RocketMQ和Kafka对比</a></p> 
+<hr id="hr-toc"> 
+<p></p> 
+<p>零拷贝（Zero-copy）技术指在计算机执行操作时，CPU 不需要先将数据从一个内存区域复制到另一个内存区域（例：CPU拷贝数据从内核缓冲区到用户缓冲区），从而可以减少CPU上下文切换以及 CPU 的拷贝时间。</p> 
+<p>它的作用是在数据报从网络设备到用户程序空间传递的过程中，<strong>减少数据拷贝次数（CPU拷贝）</strong>，<strong>减少系统调用</strong>，实现 CPU 的零参与，彻底消除 CPU 在这方面的负载。</p> 
+<p>实现零拷贝用到的最主要技术是 DMA 数据传输技术和内存区域映射技术（mmap）。</p> 
+<ul><li>零拷贝机制可以<strong>减少数据在内核缓冲区和用户进程缓冲区之间反复的 I/O 拷贝操作</strong>。</li><li>零拷贝机制可以减少用户进程地址空间和内核地址空间之间因为上下文切换而带来的 CPU 开销。</li></ul> 
+<h2 id="%E5%85%88%E5%A4%87%E7%9F%A5%E8%AF%86">先备知识</h2> 
+<h3 id="%E7%89%A9%E7%90%86%E5%86%85%E5%AD%98">物理内存</h3> 
+<p>物理内存，我们平时所称的内存也叫<strong>随机访问存储器</strong>（ random-access memory ）也叫 <strong>RAM </strong>。而 RAM 分为两类：</p> 
+<ul><li>一类是静态 RAM（ <code>SRAM</code> ），这类 SRAM 用于 CPU 高速缓存 L1Cache，L2Cache，L3Cache。其特点是访问速度快，访问速度为 1 - 30 个时钟周期，但是容量小，造价高。</li></ul> 
+<ul><li>另一类则是动态 RAM ( <code>DRAM</code> )，这类 DRAM 用于我们常说的主存上，其特点的是访问速度慢（相对高速缓存），访问速度为 50 - 200 个时钟周期，但是容量大，造价便宜些（相对高速缓存）。</li></ul> 
+<p>内存由一个一个的存储器模块（memory module）组成，它们插在主板的扩展槽上。</p> 
+<p>常见的存储器模块通常以 64 位为单位（ 8 个字节）传输数据到存储控制器上或者从存储控制器传出数据。</p> 
+<p><strong>多个存储器模块连接到存储控制器上，就聚合成了主存。</strong><img alt="" height="688" src="https://images2.imgbox.com/70/7a/zMRWuIOG_o.png" width="1190"></p> 
+<p>DRAM 芯片就包装在存储器模块中，每个存储器模块中包含 8 个 DRAM 芯片，依次编号为 0 - 7 </p> 
+<p> <img alt="" height="383" src="https://images2.imgbox.com/c3/31/SkGl0rEA_o.png" width="988"></p> 
+<h3 id="%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98">虚拟内存</h3> 
+<p><strong>虚拟内存</strong> 使得应用程序认为它拥有连续的可用的内存（一个连续完整的地址空间），而实际上，它通常是被分隔成多个物理内存碎片，还有部分暂时存储在外部磁盘存储器上，在需要时进行数据交换。</p> 
+<p>与没有使用虚拟内存技术的系统相比，使用这种技术的系统使得大型程序的编写变得更容易，对真正的物理内存（例如 RAM）的使用也更有效率。目前，大多数操作系统都使用了虚拟内存，如 Windows 家族的“虚拟内存”；Linux 的“交换空间”等。</p> 
+<p></p> 
+<p>现代处理器使用的是一种称为 <strong>虚拟寻址(Virtual Addressing)</strong> 的寻址方式。<strong>使用虚拟寻址，CPU 需要将虚拟地址翻译成物理地址，这样才能访问到真实的物理内存。</strong> </p> 
+<p>实际上完成虚拟地址转换为物理地址转换的硬件是 CPU 中含有一个被称为<strong>内存管理单元（Memory Management Unit, MMU）</strong> 的硬件。如下图所示：</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/3f/5f/QUTJq41K_o.png"></p> 
+<p> 通过虚拟地址访问内存有以下优势：</p> 
+<ul><li>程序可以使用一系列相邻的虚拟地址来访问物理内存中不相邻的大内存缓冲区。</li><li>程序可以使用一系列虚拟地址来访问大于可用物理内存的内存缓冲区。当物理内存的供应量变小时，内存管理器会将物理内存页（通常大小为 4 KB）保存到磁盘文件。数据或代码页会根据需要在物理内存与磁盘之间移动。</li><li>不同进程使用的虚拟地址彼此隔离。一个进程中的代码无法更改正在由另一进程或操作系统使用的物理内存。</li></ul> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/fb/61/ty09bNJK_o.png"></p> 
+<h3 id="%E5%86%85%E6%A0%B8%E7%A9%BA%E9%97%B4%E5%92%8C%E7%94%A8%E6%88%B7%E7%A9%BA%E9%97%B4">内核空间和用户空间</h3> 
+<p>操作系统的核心是内核，独立于普通的应用程序，可以访问受保护的内存空间，也有访问底层硬件设备的权限。为了避免用户进程直接操作内核，保证内核安全，操作系统将虚拟内存划分为两部分，一部分是内核空间（Kernel-space），一部分是用户空间（User-space）。 在 Linux 系统中，内核模块运行在内核空间，对应的进程处于内核态；而用户程序运行在用户空间，对应的进程处于用户态。</p> 
+<p>操作系统为每个进程都分配了内存空间，一部分是用户空间，一部分是内核空间。<strong>内核空间是操作系统内核访问的区域，是受保护的内存空间，而用户空间是用户应用程序访问的内存区域。</strong></p> 
+<h4 id="%E5%86%85%E6%A0%B8%E7%A9%BA%E9%97%B4">内核空间</h4> 
+<p><strong>主要提供进程调度、内存分配、连接硬件资源等功能</strong></p> 
+<p>内核空间总是驻留在内存中，它是为操作系统的内核保留的。应用程序是不允许直接在该区域进行读写或直接调用内核代码定义的函数的。按访问权限可以分为进程私有和进程共享两块区域。</p> 
+<ul><li>进程私有的虚拟内存：每个进程都有单独的内核栈、页表、task 结构以及 mem_map 结构等。</li><li>进程共享的虚拟内存：属于所有进程共享的内存区域，包括物理存储器、内核数据和内核代码区域。</li></ul> 
+<h4 id="%E7%94%A8%E6%88%B7%E7%A9%BA%E9%97%B4">用户空间</h4> 
+<p>每个普通的用户进程都有一个单独的用户空间，处于用户态的进程不能访问内核空间中的数据，也不能直接调用内核函数的 ，因此要进行系统调用的时候，就要将进程切换到内核态才行。用户空间包括以下几个内存区域：</p> 
+<ul><li>运行时栈：由编译器自动释放，存放函数的参数值，局部变量和方法返回值等。栈区是从高地址位向低地址位增长的，是一块连续的内在区域，最大容量是由系统预先定义好的，申请的栈空间超过这个界限时会提示溢出，用户能从栈中获取的空间较小。</li><li>运行时堆：用于存放进程运行中被动态分配的内存段，位于 BSS 和栈中间的地址位。由卡发人员申请分配（malloc）和释放（free）。堆是从低地址位向高地址位增长，采用链式存储结构。频繁地 malloc/free 造成内存空间的不连续，产生大量碎片。当申请堆空间时，库函数按照一定的算法搜索可用的足够大的空间。因此堆的效率比栈要低的多。</li><li>代码段：存放 CPU 可以执行的机器指令，该部分内存只能读不能写。通常代码区是共享的，即其它执行程序可调用它。假如机器中有数个进程运行相同的一个程序，那么它们就可以使用同一个代码段。</li><li>未初始化的数据段：存放未初始化的全局变量，BSS 的数据在程序开始执行之前被初始化为 0 或 NULL。</li><li>已初始化的数据段：存放已初始化的全局变量，包括静态全局变量、静态局部变量以及常量。</li><li><strong>内存映射区域</strong>：例如将动态库，共享内存等虚拟空间的内存映射到物理空间的内存，一般是 mmap 函数所分配的虚拟内存空间。</li></ul> 
+<h3 id="DMA%E4%BC%A0%E8%BE%93">DMA传输</h3> 
+<p>DMA 的全称叫直接内存存取（Direct Memory Access），是一种允许外围设备（硬件子系统）直接访问系统主内存的机制。也就是说，基于 DMA 访问方式，系统主内存于硬盘或网卡之间的数据传输可以绕开 CPU 的全程调度。目前大多数的硬件设备，包括磁盘控制器、网卡、显卡以及声卡等都支持 DMA 技术。</p> 
+<p><img alt="" height="517" src="https://images2.imgbox.com/18/56/ofUgpLM7_o.png" width="992"></p> 
+<p>数据读取操作的流程如下：</p> 
+<ol><li>用户进程向 CPU 发起 read（） 系统调用读取数据，由<strong>用户态切换为内核态</strong>，然后一直阻塞等待数据的返回。</li><li>CPU 在接收到指令以后对 DMA 磁盘控制器发起调度指令。</li><li>DMA 磁盘控制器对磁盘发起 I/O 请求，将<strong>磁盘数据先放入磁盘控制器缓冲区</strong>，CPU 全程不参与此过程。</li><li><strong>数据读取完成后，DMA 磁盘控制器会接受到磁盘的通知，将数据从磁盘控制器缓冲区拷贝到内核缓冲区。</strong></li><li>DMA 磁盘控制器向 CPU 发出数据读完的信号，由 CPU 负责将数据从内核缓冲区拷贝到用户缓冲区。</li><li>用户进程由内核态切换回用户态，解除阻塞状态，然后等待 CPU 的下一个执行时间钟。</li></ol> 
+<h3 id="%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2">上下文切换</h3> 
+<ul><li> <p>什么是CPU上下文？</p> </li></ul> 
+<blockquote> 
+ <p>CPU 寄存器，是CPU内置的容量小、但速度极快的内存。而程序计数器，则是用来存储 CPU 正在执行的指令位置、或者即将执行的下一条指令位置。它们都是 CPU 在运行任何任务前，必须的依赖环境，因此叫做CPU上下文。</p> 
+</blockquote> 
+<ul><li> <p>什么是<strong>CPU上下文切换</strong>？</p> </li></ul> 
+<blockquote> 
+ <p>它是指先把前一个任务的CPU上下文（也就是CPU寄存器和程序计数器）保存起来，然后加载新任务的上下文到这些寄存器和程序计数器，最后再跳转到程序计数器所指的新位置，运行新任务。</p> 
+</blockquote> 
+<p>一般我们说的<strong>上下文切换</strong>，就是指内核（操作系统的核心）在CPU上对进程或者线程进行切换。进程从用户态到内核态的转变，需要通过<strong>系统调用</strong>来完成。系统调用的过程，会发生<strong>CPU上下文的切换</strong>。</p> 
+<blockquote> 
+ <p>CPU 寄存器里原来用户态的指令位置，需要先保存起来。接着，为了执行内核态代码，CPU 寄存器需要更新为内核态指令的新位置。最后才是跳转到内核态运行内核任务。</p> 
+</blockquote> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/c1/33/OI2bqNST_o.png"></p> 
+<h2 id="%E4%BC%A0%E7%BB%9FIO%E6%89%A7%E8%A1%8C%E6%B5%81%E7%A8%8B">传统IO执行流程</h2> 
+<p>传统的IO流程，包括read和write的过程。</p> 
+<ul><li> <p><code>read</code>：把数据从磁盘读取到内核缓冲区，再拷贝到用户缓冲区</p> </li><li> <p><code>write</code>：先把数据写入到socket缓冲区，最后写入网卡设备。</p> </li></ul> 
+<p><img alt="" height="780" src="https://images2.imgbox.com/bf/35/KfzFDfOY_o.png" width="1200"></p> 
+<ul><li> <p>用户应用进程调用read函数，向操作系统发起IO调用，<strong>上下文从用户态转为内核态（切换1）</strong></p> </li><li> <p>DMA控制器把数据从磁盘中，读取到内核缓冲区。</p> </li><li> <p>CPU把内核缓冲区数据，拷贝到用户应用缓冲区，<strong>上下文从内核态转为用户态（切换2）</strong>，read函数返回</p> </li><li> <p>用户应用进程通过write函数，发起IO调用，<strong>上下文从用户态转为内核态（切换3）</strong></p> </li><li> <p>CPU将用户缓冲区中的数据，拷贝到socket缓冲区</p> </li><li> <p>DMA控制器把数据从socket缓冲区，拷贝到网卡设备，<strong>上下文从内核态切换回用户态（切换4）</strong>，write函数返回</p> </li></ul> 
+<p>从流程图可以看出，<strong>传统IO的读写流程</strong>，包括了4次上下文切换（4次用户态和内核态的切换），4次数据拷贝（<strong>两次CPU拷贝以及两次的DMA拷贝</strong>)</p> 
+<h2 id="%E9%9B%B6%E6%8B%B7%E8%B4%9D%E5%AE%9E%E7%8E%B0%E7%9A%84%E5%87%A0%E7%A7%8D%E6%96%B9%E5%BC%8F">零拷贝实现的几种方式</h2> 
+<p>在 Linux 中零拷贝技术主要有 3 个实现思路：<strong>用户态直接 I/O、减少数据拷贝次数以及写时复制技术。</strong></p> 
+<ul><li>用户态直接 I/O：应用程序可以直接访问硬件存储，操作系统内核只是辅助数据传输。这种方式依旧存在用户空间和内核空间的上下文切换，硬件上的数据直接拷贝至了用户空间，不经过内核空间。因此，直接 I/O 不存在内核空间缓冲区和用户空间缓冲区之间的数据拷贝。</li><li>减少数据拷贝次数：在数据传输过程中，避免数据在用户空间缓冲区和系统内核空间缓冲区之间的CPU拷贝，以及数据在系统内核空间内的CPU拷贝，这也是当前主流零拷贝技术的实现思路。</li><li>写时复制技术：写时复制指的是当多个进程共享同一块数据时，如果其中一个进程需要对这份数据进行修改，那么将其拷贝到自己的进程地址空间中，如果只是数据读取操作则不需要进行拷贝操作。</li></ul> 
+<h3 id="%E7%94%A8%E6%88%B7%E6%80%81%E7%9B%B4%E6%8E%A5I%2FO">用户态直接I/O</h3> 
+<p>用户态直接 I/O 使得应用进程或运行在用户态（user space）下的库函数直接访问硬件设备，数据直接跨过内核进行传输，内核在数据传输过程除了进行必要的虚拟存储配置工作之外，不参与任何其他工作，这种方式能够直接绕过内核，极大提高了性能。</p> 
+<p><img alt="" height="595" src="https://images2.imgbox.com/b0/c3/CaWLycKg_o.png" width="937"></p> 
+<p>用户态直接 I/O 只能适用于不需要内核缓冲区处理的应用程序，这些<strong>应用程序通常在进程地址空间有自己的数据缓存机制，称为自缓存应用程序</strong>，如<strong>数据库管理系统就是一个代表</strong>。其次，这种零拷贝机制会直接操作磁盘 I/O，由于 CPU 和磁盘 I/O 之间的执行时间差距，会造成大量资源的浪费，解决方案是配合异步 I/O 使用。</p> 
+<h3 id="mmap%2Bwrite%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D">mmap+write实现的零拷贝</h3> 
+<p> mmap 的函数原型如下：</p> 
+<pre><code class="language-cpp">void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+</code></pre> 
+<ul><li> <p>addr：指定映射的虚拟内存地址</p> </li><li> <p>length：映射的长度</p> </li><li> <p>prot：映射内存的保护模式</p> </li><li> <p>flags：指定映射的类型</p> </li><li> <p>fd:进行映射的文件句柄</p> </li><li> <p>offset:文件偏移量</p> </li></ul> 
+<p>使用 mmap 的目的是<strong>将内核中读缓冲区（read buffer）的地址与用户空间的缓冲区（user buffer）进行映射</strong>，从而实现内核缓冲区与应用程序内存的共享，省去了将数据从内核读缓冲区（read buffer）拷贝到用户缓冲区（user buffer）的过程，然而内核读缓冲区（read buffer）仍需将数据到内核写缓冲区（socket buffer）</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/f5/dd/hvClwADP_o.png"></p> 
+<ul><li> <p>用户进程通过<code>mmap方法</code>向操作系统内核发起IO调用，<strong>上下文从用户态切换为内核态</strong>。</p> </li><li> <p>CPU利用DMA控制器，把数据从硬盘中拷贝到内核缓冲区。</p> </li><li> <p><strong>上下文从内核态切换回用户态</strong>，mmap方法返回。</p> </li><li> <p>用户进程通过<code>write</code>方法向操作系统内核发起IO调用，<strong>上下文从用户态切换为内核态</strong>。</p> </li><li> <p>CPU将内核缓冲区的数据拷贝到的socket缓冲区。</p> </li><li> <p>CPU利用DMA控制器，把数据从socket缓冲区拷贝到网卡，<strong>上下文从内核态切换回用户态</strong>，write调用返回。</p> </li></ul> 
+<p>可以发现，<code>mmap+write</code>实现的零拷贝，I/O发生了<strong>4</strong>次用户空间与内核空间的上下文切换，以及3次数据拷贝。其中3次数据拷贝中，包括了<strong>2次DMA拷贝和1次CPU拷贝</strong>。</p> 
+<p><strong>mmap 主要的用处是提高 I/O 性能，特别是针对大文件</strong>。对于小文件，内存映射文件反而会导致碎片空间的浪费，因为内存映射总是要对齐页边界，最小单位是 4 KB，一个 5 KB 的文件将会映射占用 8 KB 内存，也就会浪费 3 KB 内存。</p> 
+<p>mmap 的拷贝虽然减少了 1 次拷贝，提升了效率，但也存在一些隐藏的问题。当 mmap 一个文件时，如果这个文件被另一个进程所截获，那么 write 系统调用会因为访问非法地址被 SIGBUS 信号终止，SIGBUS 默认会杀死进程并产生一个 coredump，服务器可能因此被终止。</p> 
+<h3 id="sendfile%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D%EF%BC%88%E7%94%A8%E6%88%B7%E4%B8%8D%E5%8F%AF%E8%A7%81%EF%BC%89">sendfile实现的零拷贝（用户不可见）</h3> 
+<p><code>sendfile</code>是Linux2.1内核版本后引入的一个系统调用函数，API如下：</p> 
+<pre><code class="language-cpp">ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+</code></pre> 
+<ul><li> <p>out_fd:为待写入内容的文件描述符，一个socket描述符。，</p> </li><li> <p>in_fd:为待读出内容的文件描述符，必须是真实的文件，不能是socket和管道。</p> </li><li> <p>offset：指定从读入文件的哪个位置开始读，如果为NULL，表示文件的默认起始位置。</p> </li><li> <p>count：指定在fdout和fdin之间传输的字节数。</p> </li></ul> 
+<p>sendfile表示在两个文件描述符之间传输数据，它是在<strong>操作系统内核</strong>中操作的，<strong>避免了数据从内核缓冲区和用户缓冲区之间的拷贝操作</strong>，因此可以使用它来实现零拷贝。</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/13/4d/BOZY1sTv_o.png"></p> 
+<ol><li> <p>用户进程发起sendfile系统调用，<strong>上下文（切换1）从用户态转向内核态</strong></p> </li><li> <p>DMA控制器，把数据从硬盘中拷贝到内核缓冲区。</p> </li><li> <p>CPU将读缓冲区中数据拷贝到socket缓冲区</p> </li><li> <p>DMA控制器，异步把数据从socket缓冲区拷贝到网卡，</p> </li><li> <p><strong>上下文（切换2）从内核态切换回用户态</strong>，sendfile调用返回。</p> </li></ol> 
+<p>可以发现，<code>sendfile</code>实现的零拷贝，I/O发生了<strong>2</strong>次用户空间与内核空间的上下文切换，以及3次数据拷贝。其中3次数据拷贝中，包括了<strong>2次DMA拷贝和1次CPU拷贝</strong>。</p> 
+<h3 id="sendfile%2BDMA%20scatter%2Fgather%E5%AE%9E%E7%8E%B0%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D">sendfile+DMA scatter/gather实现的零拷贝</h3> 
+<p>linux 2.4版本之后，对<code>sendfile</code>做了优化升级，引入SG-DMA技术，其实就是<strong>对DMA拷贝加入了<code>scatter/gather</code>操作</strong>，它可以<strong>直接从内核空间缓冲区中将数据读取到网卡</strong>。使用这个特点搞零拷贝，即还可以多省去<strong>一次CPU拷贝</strong>。</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/0f/3b/eDHyLokl_o.png"></p> 
+<ol><li> <p>用户进程发起sendfile系统调用，<strong>上下文（切换1）从用户态转向内核态</strong></p> </li><li> <p>DMA控制器，把数据从硬盘中拷贝到内核缓冲区。</p> </li><li> <p>CPU把内核缓冲区中的<strong>文件描述符信息</strong>（包括内核缓冲区的内存地址和偏移量）发送到socket缓冲区</p> </li><li> <p>DMA控制器根据文件描述符信息，直接把数据从内核缓冲区拷贝到网卡</p> </li><li> <p><strong>上下文（切换2）从内核态切换回用户态</strong>，sendfile调用返回。</p> </li></ol> 
+<p>可以发现，<code>sendfile+DMA scatter/gather</code>实现的零拷贝，I/O发生了<strong>2</strong>次用户空间与内核空间的上下文切换，以及2次数据拷贝。其中2次数据拷贝都是包<strong>DMA拷贝</strong>。这就是真正的 <strong>零拷贝（Zero-copy)</strong> 技术，全程都没有通过CPU来搬运数据，所有的数据都是通过DMA来进行传输的。</p> 
+<p>sendfile + DMA gather copy 拷贝方式同样存在用户程序不能对数据进行修改的问题，而且本身需要硬件的支持，它<strong>只适用于将数据从文件拷贝到 socket 套接字上的传输过程。</strong></p> 
+<h3 id="splice">splice</h3> 
+<p>Linux 在 2.6.17 版本引入 splice 系统调用，不仅不需要硬件支持，还实现了两个文件描述符之间的数据零拷贝。</p> 
+<pre><code class="language-cpp">#include &lt;fcntl.h&gt;
+ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);</code></pre> 
+<p>fd_in参数是待输入描述符。如果它是一个管道文件描述符，则off_in必须设置为NULL；否则off_in表示从输入数据流的何处开始读取，此时若为NULL，则从输入数据流的当前偏移位置读入。</p> 
+<p>fd_out/off_out与上述相同，不过是用于输出。</p> 
+<p>len参数指定移动数据的长度。</p> 
+<p>flags参数则控制数据如何移动：</p> 
+<ul><li>SPLICE_F_NONBLOCK：splice 操作不会被阻塞。然而，如果文件描述符没有被设置为不可被阻塞方式的 I/O ，那么调用 splice 有可能仍然被阻塞。</li><li>SPLICE_F_MORE：告知操作系统内核下一个 splice 系统调用将会有更多的数据传来。</li><li>SPLICE_F_MOVE：如果输出是文件，这个值则会使得操作系统内核尝试从输入管道缓冲区直接将数据读入到输出地址空间，这个数据传输过程没有任何数据拷贝操作发生。</li></ul> 
+<p><img alt="" height="644" src="https://images2.imgbox.com/1d/e8/JzxOCkJI_o.png" width="948"></p> 
+<ol><li>用户进程通过 splice() 函数向内核（kernel）发起系统调用，上下文从用户态（user space）切换为内核态（kernel space）。</li><li>CPU 利用 DMA 控制器将数据从主存或硬盘拷贝到内核空间（kernel space）的读缓冲区（read buffer）。</li><li>CPU 在内核空间的读缓冲区（read buffer）和网络缓冲区（socket buffer）之间建立管道（pipeline）。</li><li>CPU 利用 DMA 控制器将数据从网络缓冲区（socket buffer）拷贝到网卡进行数据传输。</li><li>上下文从内核态（kernel space）切换回用户态（user space），splice 系统调用执行返回。</li></ol> 
+<p><strong>splice 拷贝方式也同样存在用户程序不能对数据进行修改的问题。除此之外，它使用了 Linux 的管道缓冲机制，可以用于任意两个文件描述符中传输数据，但是它的两个文件描述符参数中有一个必须是管道设备。</strong></p> 
+<h3 id="%E5%86%99%E6%97%B6%E5%A4%8D%E5%88%B6">写时复制</h3> 
+<p>在某些情况下，内核缓冲区可能被多个进程所共享，如果某个进程想要这个共享区进行 write 操作，由于 write 不提供任何的锁操作，那么就会对共享区中的数据造成破坏，<strong>写时复制的引入就是 Linux 用来保护数据的。</strong></p> 
+<p>写时复制指的是<strong>当多个进程共享同一块数据时，如果其中一个进程需要对这份数据进行修改，那么就需要将其拷贝到自己的进程地址空间中。</strong>这样做并不影响其他进程对这块数据的操作，每个进程要修改的时候才会进行拷贝，所以叫写时拷贝。这种方法在某种程度上能够降低系统开销，如果某个进程永远不会对所访问的数据进行更改，那么也就永远不需要拷贝。</p> 
+<h3 id="%E6%80%BB%E7%BB%93">总结</h3> 
+<p>无论是传统 I/O 拷贝方式还是引入零拷贝的方式，2 次 DMA Copy 是都少不了的，因为两次 DMA 都是依赖硬件完成的。下面从 CPU 拷贝次数、DMA 拷贝次数以及系统调用几个方面总结一下上述几种 I/O 拷贝方式的差别。</p> 
+<table><thead><tr><th>拷贝方式</th><th>CPU拷贝</th><th>DMA拷贝</th><th>系统调用</th><th>上下文切换</th></tr></thead><tbody><tr><td>传统方式（read + write）</td><td>2</td><td>2</td><td>read / write</td><td>4</td></tr><tr><td>内存映射（mmap + write）</td><td>1</td><td>2</td><td>mmap / write</td><td>4</td></tr><tr><td>sendfile</td><td>1</td><td>2</td><td>sendfile</td><td>2</td></tr><tr><td>sendfile + DMA gather copy</td><td>0</td><td>2</td><td>sendfile</td><td>2</td></tr><tr><td>splice</td><td>0</td><td>2</td><td>splice</td><td>2</td></tr></tbody></table> 
+<h2 id="JAVA%E9%9B%B6%E6%8B%B7%E8%B4%9DAPI">JAVA零拷贝API</h2> 
+<p>在 Java NIO 中的<strong>通道（<span style="color:#fe2c24;">Channel</span>）就相当于操作系统的内核空间（<span style="color:#fe2c24;">kernel space</span>）的缓冲区</strong>，而<strong>缓冲区（<span style="color:#fe2c24;">Buffer</span>）对应的相当于操作系统的用户空间（user space）中的用户缓冲区（<span style="color:#fe2c24;">user buffer</span>）</strong>。</p> 
+<ul><li>通道（Channel）是<strong>全双工</strong>的（双向传输），它既可能是读缓冲区（read buffer），也可能是网络缓冲区（socket buffer）。</li><li>缓冲区（Buffer）分为堆内存（HeapBuffer）和堆外内存（DirectBuffer），这是通过 malloc() 分配出来的用户态内存。<strong>堆外内存（DirectBuffer）在使用后需要应用程序手动回收，而堆内存（HeapBuffer）的数据在 GC 时可能会被自动回收。</strong> 
+  <ul><li>因此，在使用 HeapBuffer 读写数据时，为了<strong>避免缓冲区数据因为 GC 而丢失</strong>，</li><li>NIO 会先把 HeapBuffer 内部的数据拷贝到一个临时的 DirectBuffer 中的本地内存（native memory），这个拷贝涉及到 sun.misc.Unsafe.copyMemory() 的调用，背后的实现原理与 memcpy() 类似。</li><li>最后，将临时生成的 DirectBuffer 内部的数据的内存地址传给 I/O 调用函数，这样就避免了再去访问 Java 对象处理 I/O 读写。</li></ul></li></ul> 
+<h3 id="Java%20NIO%E5%AF%B9mmap%E7%9A%84%E6%94%AF%E6%8C%81">Java NIO对mmap的支持</h3> 
+<p>MappedByteBuffer 是 NIO 基于内存映射（mmap）这种零拷贝方式的提供的一种实现，它继承自 ByteBuffer。</p> 
+<p>FileChannel 定义了一个 map() 方法，它可以把一个文件从 position 位置开始的 size 大小的区域映射为内存映像文件。抽象方法 map() 方法在 FileChannel 中的定义如下：</p> 
+<pre><code class="language-java">public abstract MappedByteBuffer map(MapMode mode,
+                                         long position, long size)
+        throws IOException;</code></pre> 
+<ul><li>mode：FileChannel.MapMode 类中定义的常量之一，限定内存映射区域（MappedByteBuffer）对内存映像文件的访问模式，包括<strong>只可读（READ_ONLY）、可读可写（READ_WRITE）和写时拷贝（PRIVATE）</strong>三种模式。 
+  <ul><li>只读：任何修改结果缓冲区的尝试都将导致抛出java.nio.ReadOnlyBufferException。（MapMode.READ_ONLY）</li><li>读/写：对生成的缓冲区所做的更改最终将传播到文件;它们可能对映射同一文件的其他程序可见，也可能不可见。（MapMode.READ_WRITE）</li><li>私有：对生成的缓冲区所做的更改不会传播到文件，并且对映射同一文件的其他程序不可见;相反，它们将导致创建缓冲区的修改部分的私有副本。（MapMode.PRIVATE）</li></ul></li><li>position：文件映射的起始地址，对应内存映射区域（MappedByteBuffer）的首地址。必须是非负数</li><li>size：文件映射的字节长度，从 position 往后的字节数，对应内存映射区域（MappedByteBuffer）的大小。必须为非负数且不大于Integer.MAX_VALUE</li></ul> 
+<p>MappedByteBuffer 相比 ByteBuffer 新增了 fore()、load() 和 isLoad() 三个重要的方法：</p> 
+<ul><li>fore()：对于处于 READ_WRITE 模式下的缓冲区，把对缓冲区内容的修改强制刷新到本地文件。</li><li>load()：将缓冲区的内容载入物理内存中，并返回这个缓冲区的引用。</li><li>isLoaded()：如果缓冲区的内容在物理内存中，则返回 true，否则返回 false。</li></ul> 
+<pre><code class="language-java">package create;
+
+
+import java.io.IOException;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+
+import static java.nio.channels.FileChannel.MapMode.READ_ONLY;
+import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
+
+public class Solution {
+    private final static String CONTENT = "Zero copy implemented by MappedByteBuffer";
+    private final static String FILE_NAME = "E:\\mmap.txt";
+
+    public static void main(String[] args) throws IOException {
+        new Solution().readAndWrite();
+    }
+
+    public void readAndWrite() {
+        Path path = Paths.get(FILE_NAME);
+
+        byte[] bytes = CONTENT.getBytes(StandardCharsets.UTF_8);
+        try (
+                FileChannel writeChannel = FileChannel.open(path, StandardOpenOption.READ,
+                        StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+                FileChannel readChannel = FileChannel.open(path, StandardOpenOption.READ);
+        ) {
+            MappedByteBuffer mappedByteBuffer = writeChannel.map(READ_WRITE, 0, bytes.length);
+            if (mappedByteBuffer != null) {
+                mappedByteBuffer.put(bytes);
+                mappedByteBuffer.force();
+            }
+            MappedByteBuffer buffer = readChannel.map(READ_ONLY, 0, bytes.length);
+            byte[] readFile = new byte[buffer.capacity()];
+            buffer.get(readFile, 0, buffer.capacity());
+            
+            System.out.println(new String(readFile));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+}</code></pre> 
+<p>map() 方法通过本地方法 map0() <strong>为文件分配一块虚拟内存，作为它的内存映射区域</strong>，然后返回这块内存映射区域的起始地址。</p> 
+<ol><li>文件映射需要在 Java 堆中创建一个 MappedByteBuffer 的实例。如果第一次文件映射导致 OOM，则手动触发垃圾回收，休眠 100ms 后再尝试映射，如果失败则抛出异常。</li><li>通过 Util 的 newMappedByteBuffer （可读可写）方法或者 newMappedByteBufferR（仅读） 方法方法反射创建一个 DirectByteBuffer 实例，其中 DirectByteBuffer 是 MappedByteBuffer 的子类。</li></ol> 
+<p>map() 方法返回的是内存映射区域的起始地址，通过（起始地址 + 偏移量）就可以获取指定内存的数据。这样一定程度上替代了 read() 或 write() 方法，底层直接采用 sun.misc.Unsafe 类的 getByte() 和 putByte() 方法对数据进行读写。</p> 
+<pre><code class="language-java">private native long map0(int prot, long position, long mapSize) throws IOException;</code></pre> 
+<h3 id="Java%20NIO%E5%AF%B9sendfile%E7%9A%84%E6%94%AF%E6%8C%81">Java NIO对sendfile的支持</h3> 
+<p>FileChannel 是一个用于文件读写、映射和操作的通道，同时它在<strong>并发环境下是线程安全</strong>的，基于 FileInputStream、FileOutputStream 或者 RandomAccessFile 的 getChannel() 方法可以创建并打开一个文件通道。</p> 
+<p>FileChannel 定义了 transferFrom() 和 transferTo() 两个抽象方法，它通过在通道和通道之间建立连接实现数据传输的。底层就是sendfile() 系统调用函数。</p> 
+<ul><li>transferTo()：通过 FileChannel 把文件里面的源数据写入一个 WritableByteChannel 的目的通道。</li></ul> 
+<pre><code class="language-java">public abstract long transferTo(long position, long count, WritableByteChannel target)
+        throws IOException;</code></pre> 
+<ul><li>transferFrom()：把一个源通道 ReadableByteChannel 中的数据读取到当前 FileChannel 的文件里面。</li></ul> 
+<pre><code class="language-java">public abstract long transferFrom(ReadableByteChannel src, long position, long count)
+        throws IOException;
+</code></pre> 
+<pre><code class="language-java">package create;
+
+
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+
+
+public class Solution {
+    private final static String CONTENT = "Zero copy implemented by MappedByteBuffer";
+    private static final String SOURCE_FILE = "E:\\source.txt";
+    private static final String TARGET_FILE = "E:\\target.txt";
+
+    public static void main(String[] args) throws IOException {
+        new Solution().readAndWrite();
+    }
+
+    public void readAndWrite() {
+
+        try (
+                FileChannel read = FileChannel.open(Paths.get(SOURCE_FILE),
+                        StandardOpenOption.READ, StandardOpenOption.CREATE);
+                FileChannel write = FileChannel.open(Paths.get(TARGET_FILE),
+                        StandardOpenOption.WRITE, StandardOpenOption.CREATE)
+        ) {
+//            read.transferTo(read.position(), read.size(), write);
+            write.transferFrom(read, read.position(), read.size());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+    }
+
+}</code></pre> 
+<h3 id="%E5%85%B6%E5%AE%83%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D%E5%AE%9E%E7%8E%B0">其它的零拷贝实现</h3> 
+<h4 id="Netty%E9%9B%B6%E6%8B%B7%E8%B4%9D">Netty零拷贝</h4> 
+<p>Netty 中的零拷贝和上面提到的操作系统层面上的零拷贝不太一样, 我们所说的 Netty 零拷贝完全是基于（Java 层面）用户态的，它的更多的是偏向于数据操作优化这样的概念，具体表现在以下几个方面：</p> 
+<ul><li>Netty 通过 DefaultFileRegion 类对 java.nio.channels.FileChannel 的 tranferTo() 方法进行包装，在文件传输时可以将文件缓冲区的数据直接发送到目的通道（Channel）</li><li>ByteBuf 可以通过 wrap 操作把字节数组、ByteBuf、ByteBuffer 包装成一个 ByteBuf 对象, 进而避免了拷贝操作</li><li>ByteBuf 支持 slice 操作, 因此可以将 ByteBuf 分解为多个共享同一个存储区域的 ByteBuf，避免了内存的拷贝</li><li>Netty 提供了 CompositeByteBuf 类，它可以将多个 ByteBuf 合并为一个逻辑上的 ByteBuf，避免了各个 ByteBuf 之间的拷贝</li></ul> 
+<p>其中第 1 条属于操作系统层面的零拷贝操作，后面 3 条只能算用户层面的数据操作优化。</p> 
+<h4 id="RocketMQ%E5%92%8CKafka%E5%AF%B9%E6%AF%94">RocketMQ和Kafka对比</h4> 
+<p>RocketMQ 选择了 mmap + write 这种零拷贝方式，适用于业务级消息这种小块文件的数据持久化和传输；而 Kafka 采用的是 sendfile 这种零拷贝方式，适用于系统日志消息这种高吞吐量的大块文件的数据持久化和传输。但是值得注意的一点是，Kafka 的索引文件使用的是 mmap + write 方式，数据文件使用的是 sendfile 方式。</p> 
+<table><thead><tr><th>消息队列</th><th>零拷贝方式</th><th>优点</th><th>缺点</th></tr></thead><tbody><tr><td>RocketMQ</td><td>mmap + write</td><td>适用于小块文件传输，频繁调用时，效率很高</td><td>不能很好的利用 DMA 方式，会比 sendfile 多消耗 CPU，内存安全性控制复杂，需要避免 JVM Crash 问题</td></tr><tr><td>Kafka</td><td>sendfile</td><td>可以利用 DMA 方式，消耗 CPU 较少，大块文件传输效率高，无内存安全性问题</td><td>小块文件效率低于 mmap 方式，只能是 BIO 方式传输，不能使用 NIO 方式</td></tr></tbody></table>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/8214ffe238136d21ac3f6003cc9c4cd6/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">QTableWidget中如何清空行，并保持行仍可再写入数据</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/0b4cd8860fb321b761af47c4c7456436/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">如何安装与配置Node.js</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

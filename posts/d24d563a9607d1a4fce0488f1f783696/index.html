@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Flink_探究Flink on YARN模式下TaskManager的内存分配 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Flink_探究Flink on YARN模式下TaskManager的内存分配" />
+<meta property="og:description" content="原文地址：
+https://www.jianshu.com/p/4e4c188f5d7b
+一个问题 我们使用如下的参数提交了Flink on YARN作业（per-job模式）。
+/opt/flink-1.9.0/bin/flink run \ --detached \ --jobmanager yarn-cluster \ --yarnname &#34;x.y.z&#34; \ --yarnjobManagerMemory 2048 \ --yarntaskManagerMemory 4096 \ --yarnslots 2 \ --parallelism 20 \ --class x.y.z \ xyz-1.0.jar 该作业启动了10个TaskManager，并正常运行。来到该任务的Web界面，随便打开一个TaskManager页面，看看它的内存情况。
+可见，虽然我们在参数中设置了TaskManager的内存为4GB大，但是上图显示的JVM堆大小只有2.47GB，另外还有一项“Flink Managed Memory”为1.78GB。在用VisualVM监控YarnTaskExecutorRunner时，会发现其JVM内存参数被如下设置：
+显然Xmx&#43;MaxDirectMemorySize才是我们在启动参数中设定的TM内存大小（4GB）。那么为什么会这样设置？“Flink Managed Memory”又是什么鬼？下面就来弄懂这些问题。
+TaskManager内存布局 如下图所示。
+为了减少object overhead，Flink主要采用序列化的方式存储各种对象。序列化存储的最小单位叫做MemorySegment，底层为字节数组，大小由taskmanager.memory.segment-size参数指定，默认32KB大。下面分别介绍各块内存：
+网络缓存（Network Buffer）：用于网络传输及与网络相关的动作（shuffle、广播等）的内存块，由MemorySegment组成。从Flink 1.5版本之后，网络缓存固定分配在堆外，这样可以充分利用零拷贝等技术。与它相关的三个参数及我们的设定值如下： # 网络缓存占TM内存的默认比例，默认0.1 taskmanager.network.memory.fraction: 0.15 # 网络缓存的最小值和最大值 ，默认64MB和1GB taskmanager.network.memory.min: 128mb taskmanager.network.memory.max: 1gb 托管内存（Flink Managed Memory）：用于所有Flink内部算子逻辑的内存分配，以及中间数据的存储，同样由MemorySegment组成，并通过Flink的MemoryManager组件管理。它默认在堆内分配，如果开启堆外内存分配的开关，也可以在堆内、堆外同时分配。与它相关的两个参数如下： # 堆内托管内存占TM堆内内存的比例，默认0.7 taskmanager.memory.fraction: 0.7 # 是否允许分配堆外托管内存，默认不允许 taskmanager.memory.off-heap: false 由此也可见，Flink的内存管理不像Spark一样区分Storage和Execution内存，而是直接合二为一，更加灵活。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/d24d563a9607d1a4fce0488f1f783696/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-05-26T23:12:46+08:00" />
+<meta property="article:modified_time" content="2020-05-26T23:12:46+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Flink_探究Flink on YARN模式下TaskManager的内存分配</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>原文地址：</p> 
+<p><a href="https://www.jianshu.com/p/4e4c188f5d7b" rel="nofollow">https://www.jianshu.com/p/4e4c188f5d7b</a></p> 
+<p> </p> 
+<h4>一个问题</h4> 
+<p>我们使用如下的参数提交了Flink on YARN作业（per-job模式）。</p> 
+<pre><code>/opt/flink-1.9.0/bin/flink run \
+--detached \
+--jobmanager yarn-cluster \
+--yarnname "x.y.z" \
+--yarnjobManagerMemory 2048 \
+--yarntaskManagerMemory 4096 \
+--yarnslots 2 \
+--parallelism 20 \
+--class x.y.z \
+xyz-1.0.jar</code></pre> 
+<p> </p> 
+<p>该作业启动了10个TaskManager，并正常运行。来到该任务的Web界面，随便打开一个TaskManager页面，看看它的内存情况。</p> 
+<p><img alt="" src="https://images2.imgbox.com/38/23/pqOovyk0_o.png"></p> 
+<p>可见，虽然我们在参数中设置了TaskManager的内存为4GB大，但是上图显示的JVM堆大小只有2.47GB，另外还有一项“Flink Managed Memory”为1.78GB。在用VisualVM监控YarnTaskExecutorRunner时，会发现其JVM内存参数被如下设置：</p> 
+<p><img alt="" src="https://images2.imgbox.com/49/a7/fKx3kFRC_o.png"><br> 显然Xmx+MaxDirectMemorySize才是我们在启动参数中设定的TM内存大小（4GB）。那么为什么会这样设置？“Flink Managed Memory”又是什么鬼？下面就来弄懂这些问题。</p> 
+<p> </p> 
+<p> </p> 
+<h4>TaskManager内存布局</h4> 
+<p>如下图所示。</p> 
+<p><img alt="" src="https://images2.imgbox.com/4c/91/WyIDMRyU_o.png"></p> 
+<p>为了减少object overhead，Flink主要采用序列化的方式存储各种对象。序列化存储的最小单位叫做MemorySegment，底层为字节数组，大小由taskmanager.memory.segment-size参数指定，默认32KB大。下面分别介绍各块内存：</p> 
+<ul><li>网络缓存（Network Buffer）：用于网络传输及与网络相关的动作（shuffle、广播等）的内存块，由MemorySegment组成。从Flink 1.5版本之后，网络缓存固定分配在堆外，这样可以充分利用零拷贝等技术。与它相关的三个参数及我们的设定值如下：</li></ul> 
+<pre><code># 网络缓存占TM内存的默认比例，默认0.1
+taskmanager.network.memory.fraction: 0.15
+# 网络缓存的最小值和最大值 ，默认64MB和1GB
+taskmanager.network.memory.min: 128mb
+taskmanager.network.memory.max: 1gb</code></pre> 
+<ul><li>托管内存（Flink Managed Memory）：用于所有Flink内部算子逻辑的内存分配，以及中间数据的存储，同样由MemorySegment组成，并通过Flink的MemoryManager组件管理。它默认在堆内分配，如果开启堆外内存分配的开关，也可以在堆内、堆外同时分配。与它相关的两个参数如下：</li></ul> 
+<pre><code># 堆内托管内存占TM堆内内存的比例，默认0.7
+taskmanager.memory.fraction: 0.7
+# 是否允许分配堆外托管内存，默认不允许
+taskmanager.memory.off-heap: false</code></pre> 
+<p>由此也可见，Flink的内存管理不像Spark一样区分Storage和Execution内存，而是直接合二为一，更加灵活。</p> 
+<ul><li>空闲内存（Free）：虽然名为空闲，但实际上是存储用户代码和数据结构的，固定在堆内，可以理解为堆内内存除去托管内存后剩下的那部分。</li></ul> 
+<p>如果我们想知道文章开头的问题中各块内存的大小是怎么来的，最好的办法自然是去读源码。下面以Flink 1.9.0源码为例来探索。</p> 
+<h4> </h4> 
+<h4>TaskManager内存分配逻辑</h4> 
+<p>YARN per-job集群的启动入口位于o.a.f.yarn.YarnClusterDescriptor类中。</p> 
+<pre><code>    public ClusterClient&lt;ApplicationId&gt; deployJobCluster(
+        ClusterSpecification clusterSpecification,
+        JobGraph jobGraph,
+        boolean detached) throws ClusterDeploymentException {
+
+        // this is required because the slots are allocated lazily
+        jobGraph.setAllowQueuedScheduling(true);
+
+        try {
+            return deployInternal(
+                clusterSpecification,
+                "Flink per-job cluster",
+                getYarnJobClusterEntrypoint(),
+                jobGraph,
+                detached);
+        } catch (Exception e) {
+            throw new ClusterDeploymentException("Could not deploy Yarn job cluster.", e);
+        }
+    }</code></pre> 
+<p>其中，ClusterSpecification对象持有该集群的4个基本参数：JobManager内存大小、TaskManager内存大小、TaskManager数量、每个TaskManager的slot数。而deployInternal()方法在开头调用了o.a.f.yarn.AbstractYarnClusterDescriptor抽象类的validateClusterSpecification()方法，用于校验ClusterSpecification是否合法。</p> 
+<pre><code>    private void validateClusterSpecification(ClusterSpecification clusterSpecification) throws FlinkException {
+        try {
+            final long taskManagerMemorySize = clusterSpecification.getTaskManagerMemoryMB();
+            // We do the validation by calling the calculation methods here
+            // Internally these methods will check whether the cluster can be started with the provided
+            // ClusterSpecification and the configured memory requirements
+            final long cutoff = ContaineredTaskManagerParameters.calculateCutoffMB(flinkConfiguration, taskManagerMemorySize);
+            TaskManagerServices.calculateHeapSizeMB(taskManagerMemorySize - cutoff, flinkConfiguration);
+        } catch (IllegalArgumentException iae) {
+            throw new FlinkException("Cannot fulfill the minimum memory requirements with the provided " +
+                "cluster specification. Please increase the memory of the cluster.", iae);
+        }
+    }</code></pre> 
+<p>ClusterSpecification.getTaskManagerMemoryMB()方法返回的就是-ytm/--yarntaskManagerMemory参数设定的内存，最终反映在Flink代码中都是taskmanager.heap.size配置项的值。</p> 
+<p>接下来首先调用ContaineredTaskManagerParameters.calculateCutoffMB()方法，它负责计算一个承载TM的YARN Container需要预留多少内存给TM之外的逻辑来使用。</p> 
+<pre><code>    public static long calculateCutoffMB(Configuration config, long containerMemoryMB) {
+        Preconditions.checkArgument(containerMemoryMB &gt; 0);
+
+        // (1) check cutoff ratio
+        final float memoryCutoffRatio = config.getFloat(
+            ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_RATIO);
+
+        if (memoryCutoffRatio &gt;= 1 || memoryCutoffRatio &lt;= 0) {
+            throw new IllegalArgumentException("The configuration value '"
+                + ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_RATIO.key() + "' must be between 0 and 1. Value given="
+                + memoryCutoffRatio);
+        }
+
+        // (2) check min cutoff value
+        final int minCutoff = config.getInteger(
+            ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_MIN);
+
+        if (minCutoff &gt;= containerMemoryMB) {
+            throw new IllegalArgumentException("The configuration value '"
+                + ResourceManagerOptions.CONTAINERIZED_HEAP_CUTOFF_MIN.key() + "'='" + minCutoff
+                + "' is larger than the total container memory " + containerMemoryMB);
+        }
+
+        // (3) check between heap and off-heap
+        long cutoff = (long) (containerMemoryMB * memoryCutoffRatio);
+        if (cutoff &lt; minCutoff) {
+            cutoff = minCutoff;
+        }
+        return cutoff;
+    }</code></pre> 
+<p> </p> 
+<p>该方法的执行流程如下：</p> 
+<ol><li>获取containerized.heap-cutoff-ratio参数，它代表Container预留的非TM内存占设定的TM内存的比例，默认值0.25；</li><li>获取containerized.heap-cutoff-min参数，它代表Container预留的非TM内存的最小值，默认值600MB；</li><li>按比例计算预留内存，并保证结果不小于最小值。</li></ol> 
+<p>由此可见，<strong>在Flink on YARN时，我们设定的TM内存实际上是Container的内存</strong>。也就是说，一个TM能利用的总内存（包含堆内和堆外）是：</p> 
+<blockquote> 
+ <p>tm_total_memory = taskmanager.heap.size - max[containerized.heap-cutoff-min, taskmanager.heap.size * containerized.heap-cutoff-ratio]</p> 
+</blockquote> 
+<p>用文章开头给的参数实际计算一下：</p> 
+<blockquote> 
+ <p>tm_total_memory = 4096 - max[600, 4096 * 0.25] = 3072</p> 
+</blockquote> 
+<p> </p> 
+<p>接下来看TaskManagerServices.calculateHeapSizeMB()方法。</p> 
+<pre><code>    public static long calculateHeapSizeMB(long totalJavaMemorySizeMB, Configuration config) {
+        Preconditions.checkArgument(totalJavaMemorySizeMB &gt; 0);
+
+        // all values below here are in bytes
+
+        final long totalProcessMemory = megabytesToBytes(totalJavaMemorySizeMB);
+        final long networkReservedMemory = getReservedNetworkMemory(config, totalProcessMemory);
+        final long heapAndManagedMemory = totalProcessMemory - networkReservedMemory;
+
+        if (config.getBoolean(TaskManagerOptions.MEMORY_OFF_HEAP)) {
+            final long managedMemorySize = getManagedMemoryFromHeapAndManaged(config, heapAndManagedMemory);
+
+            ConfigurationParserUtils.checkConfigParameter(managedMemorySize &lt; heapAndManagedMemory, managedMemorySize,
+                TaskManagerOptions.MANAGED_MEMORY_SIZE.key(),
+                    "Managed memory size too large for " + (networkReservedMemory &gt;&gt; 20) +
+                        " MB network buffer memory and a total of " + totalJavaMemorySizeMB +
+                        " MB JVM memory");
+
+            return bytesToMegabytes(heapAndManagedMemory - managedMemorySize);
+        }
+        else {
+            return bytesToMegabytes(heapAndManagedMemory);
+        }
+    }</code></pre> 
+<p>为了简化问题及符合我们的实际应用，就不考虑开启堆外托管内存的情况了。这里涉及到了计算Network buffer大小的方法NettyShuffleEnvironmentConfiguration.calculateNetworkBufferMemory()。</p> 
+<pre><code>    public static long calculateNetworkBufferMemory(long totalJavaMemorySize, Configuration config) {
+        final int segmentSize = ConfigurationParserUtils.getPageSize(config);
+
+        final long networkBufBytes;
+        if (hasNewNetworkConfig(config)) {
+            float networkBufFraction = config.getFloat(NettyShuffleEnvironmentOptions.NETWORK_BUFFERS_MEMORY_FRACTION);
+            long networkBufSize = (long) (totalJavaMemorySize * networkBufFraction);
+            networkBufBytes = calculateNewNetworkBufferMemory(config, networkBufSize, totalJavaMemorySize);
+        } else {
+            // use old (deprecated) network buffers parameter
+            // 旧版逻辑，不再看了
+        }
+
+        return networkBufBytes;
+    }
+
+    private static long calculateNewNetworkBufferMemory(Configuration config, long networkBufSize, long maxJvmHeapMemory) {
+        float networkBufFraction = config.getFloat(NettyShuffleEnvironmentOptions.NETWORK_BUFFERS_MEMORY_FRACTION);
+        long networkBufMin = MemorySize.parse(config.getString(NettyShuffleEnvironmentOptions.NETWORK_BUFFERS_MEMORY_MIN)).getBytes();
+        long networkBufMax = MemorySize.parse(config.getString(NettyShuffleEnvironmentOptions.NETWORK_BUFFERS_MEMORY_MAX)).getBytes();
+
+        int pageSize = ConfigurationParserUtils.getPageSize(config);
+        checkNewNetworkConfig(pageSize, networkBufFraction, networkBufMin, networkBufMax);
+        long networkBufBytes = Math.min(networkBufMax, Math.max(networkBufMin, networkBufSize));
+
+        ConfigurationParserUtils.checkConfigParameter(/*...*/);
+
+        return networkBufBytes;
+    }</code></pre> 
+<p>由此可见，网络缓存的大小这样确定：</p> 
+<pre><code>network_buffer_memory = min[taskmanager.network.memory.max, max(askmanager.network.memory.min, tm_total_memory * taskmanager.network.memory.fraction)]</code></pre> 
+<p> </p> 
+<p>代入数值：</p> 
+<pre><code>network_buffer_memory = min[1024, max(128, 3072 * 0.15)] = 460.8</code></pre> 
+<p>也就是说，TM真正使用的堆内内存为：</p> 
+<pre><code>tm_heap_memory = tm_total_memory - network_buffer_memory = 3072 - 460.8 ≈ 2611</code></pre> 
+<p> </p> 
+<p>这完全符合VisualVM截图中的-Xms/-Xmx设定。</p> 
+<p>同理，可以看一下TaskManager UI中的网络缓存MemorySegment计数。</p> 
+<p><img alt="" src="https://images2.imgbox.com/97/b1/RsPVNzKN_o.png"></p> 
+<p>通过计算得知，网络缓存的实际值与上面算出来的network_buffer_memory值是非常接近的。</p> 
+<p>那么堆内托管内存的值是怎么计算出来的呢？前面提到了托管内存由MemoryManager管理，来看看TaskManagerServices.createMemoryManager()方法，它用设定好的参数来初始化一个MemoryManager。</p> 
+<p> </p> 
+<pre><code>    private static MemoryManager createMemoryManager(
+            TaskManagerServicesConfiguration taskManagerServicesConfiguration) throws Exception {
+        long configuredMemory = taskManagerServicesConfiguration.getConfiguredMemory();
+        MemoryType memType = taskManagerServicesConfiguration.getMemoryType();
+
+        final long memorySize;
+
+        boolean preAllocateMemory = taskManagerServicesConfiguration.isPreAllocateMemory();
+
+        if (configuredMemory &gt; 0) {
+            if (preAllocateMemory) {
+                LOG.info(/*...*/);
+            } else {
+                LOG.info(/*...*/);
+            }
+            memorySize = configuredMemory &lt;&lt; 20; // megabytes to bytes
+        } else {
+            // similar to #calculateNetworkBufferMemory(TaskManagerServicesConfiguration tmConfig)
+            float memoryFraction = taskManagerServicesConfiguration.getMemoryFraction();
+
+            if (memType == MemoryType.HEAP) {
+                long freeHeapMemoryWithDefrag = taskManagerServicesConfiguration.getFreeHeapMemoryWithDefrag();
+                // network buffers allocated off-heap -&gt; use memoryFraction of the available heap:
+                long relativeMemSize = (long) (freeHeapMemoryWithDefrag * memoryFraction);
+                if (preAllocateMemory) {
+                    LOG.info(/*...*/);
+                } else {
+                    LOG.info(/*...*/);
+                }
+                memorySize = relativeMemSize;
+            } else if (memType == MemoryType.OFF_HEAP) {
+                long maxJvmHeapMemory = taskManagerServicesConfiguration.getMaxJvmHeapMemory();
+                // The maximum heap memory has been adjusted according to the fraction (see
+                // calculateHeapSizeMB(long totalJavaMemorySizeMB, Configuration config)), i.e.
+                // maxJvmHeap = jvmTotalNoNet - jvmTotalNoNet * memoryFraction = jvmTotalNoNet * (1 - memoryFraction)
+                // directMemorySize = jvmTotalNoNet * memoryFraction
+                long directMemorySize = (long) (maxJvmHeapMemory / (1.0 - memoryFraction) * memoryFraction);
+                if (preAllocateMemory) {
+                    LOG.info(/*...*/);
+                } else {
+                    LOG.info(/*...*/);
+                }
+                memorySize = directMemorySize;
+            } else {
+                throw new RuntimeException("No supported memory type detected.");
+            }
+        }
+
+        // now start the memory manager
+        final MemoryManager memoryManager;
+        try {
+            memoryManager = new MemoryManager(
+                memorySize,
+                taskManagerServicesConfiguration.getNumberOfSlots(),
+                taskManagerServicesConfiguration.getPageSize(),
+                memType,
+                preAllocateMemory);
+        } catch (OutOfMemoryError e) {
+            // ...
+        }
+        return memoryManager;
+    }</code></pre> 
+<p> </p> 
+<p>简要叙述一下流程：</p> 
+<ol><li>获取taskmanager.memory.size参数，用来确定托管内存的绝对大小；</li><li>如果taskmanager.memory.size未设置，就继续获取前面提到过的taskmanager.memory.fraction参数；</li><li>只考虑堆内内存的情况，调用TaskManagerServicesConfiguration.getFreeHeapMemoryWithDefrag()方法，先主动触发GC，然后获取可用的堆内存量。可见，如果没有意外，程序初始化时该方法返回的值与前文的-Xms/-Xmx应该相同；</li><li>计算托管内存大小和其他参数，返回MemoryManager实例。</li></ol> 
+<p>一般来讲我们都不会简单粗暴地设置taskmanager.memory.size。所以：</p> 
+<pre><code>flink_managed_memory = tm_heap_memory * taskmanager.memory.fraction = 2611 * 0.7 ≈ 1827</code></pre> 
+<p>这就是TaskManager UI中显示的托管内存大小了。</p> 
+<p> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/c7962d915fe92dd92b9a269f19fcda7e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">leetcode--287寻找重复数（001）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f92f39326e89a8d5e6d390dfb9b58faa/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">ConcurrentHashMap实现线程安全的原理</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

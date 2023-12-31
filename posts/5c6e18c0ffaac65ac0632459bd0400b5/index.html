@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>NeuralGCM：AI天气预报进入下半场？ - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="NeuralGCM：AI天气预报进入下半场？" />
+<meta property="og:description" content="无意间看到Google又在ArXiv上发布了一篇基于AI的天气预报论文NeuralGCM（我为什么要说“又”？），着实被结果震惊了：
+中短期预报技巧与GraphCast和EC相当，同时大幅缓解AI模型的物理一致性问题。
+在预报时效最多5天的数据集上训练的模型可以稳定地模拟年代际气候变化。
+包含微分求解器和机器学习参数化方案的端到端模型，结构与数值模式高度一致。
+尽管仍是以ERA5为基准的AI预报模型，但以上每一点似乎都是重大突破。一起看看他们是如何做到的。
+目录
+1. NeuralGCM是什么：聊聊NeuralGCM和之前的AI气象大模型的区别。
+2. NeuralGCM的设计：非大气科学背景的读者敬请只看加粗部分或略过。
+3. NeuralGCM的评估：展示部分NeuralGCM的评估结果。基于AI的气候模拟来了！
+4. 讨论：喜闻乐见的吹水环节。
+1
+NeuralGCM是什么
+当看到AI模型被冠以GCM（General Circulation Models，大气环流模式）的字眼时，我意识到这可能是一篇不一样的论文。这里试图为不同背景的读者解释清楚NeuralGCM的特别之处。
+数值模式主要由两个部分组成：动力框架和物理过程参数化。前者用方程组描述大气变化的过程和不同物理量间的关系；后者用来计算一些前者无法描述的物理过程。例如，由于数值模式在求解动力方程组时需要将其离散化（在空间上表示为网格，ERA5和ECMWF预报就都是格点数据），必然遗漏了小于网格分辨率的物理过程，需要参数化方案来简单模拟。
+近期发表的盘古、GraphCast等AI模型实际上省略了这样的分解，将整个预报流程简化为图像预测任务，即输入上一时刻的格点大气状态，预报下一时刻的状态（见之前的公众号文章）。然而在此之前，已经有研究试验了更深入的数值模式-机器学习融合策略。一个典型的做法是用机器学习模型来代替部分参数化方案。其思路可以概括为：一些高分辨率的数值模式往往能够“分辨”较小尺度的物理过程，而受限于计算效率，实际业务中又常使用粗分辨率的数值模式。利用前者模拟的输入输出来训练一个基于机器学习的参数化方案嵌入到后者中，即可得到一个在某方面效果接近前者而速度不慢于甚至快于后者的混合模型。
+例如：
+机器学习对流参数化：doi.org/10.1073/pnas.1810286115
+机器学习边界层参数化：doi.org/10.1029/2022MS003034
+这样做的显著问题是，机器学习模型的训练是个独立的过程，其泛化性将在实际预报过程中受到很大挑战——训练集中反映的统计关系和实际应用场景可能有较大的区别。如果将这种范式称为“离线训练”，那么NeuralGCM的训练就是“在线”（online-training）的——代替参数化方案的模型与动力框架求解器共同参与训练过程，组成一个整体直接拟合目标：这个端到端模型的输入和输出就是ERA5的大气场，与盘古、GraphCast等一致。
+不得不提其技术实现：作者利用Google近两年发展的机器学习框架JAX，构建了基本方程组的自动微分模块和代表物理过程的神经网络优化模块。由于导数计算本就是JAX的拿手好戏，二者得以融为一体。
+简而言之，NeuralGCM是一个具有与数值模式类似的时间积分方案，由动力框架和神经网络组成，具有物理一致性且能长期稳定迭代预报的混合模型。
+2
+NeuralGCM的设计
+NeuralGCM与数值模式的结构已非常接近，可以拆解为下文几个部分：
+# 输入输出 模型输入分为三部分：外强迫（如海温，对气候模拟尤为重要），随机噪音（用于生成集合预报）和ERA5的大气场。输出则是预报的大气场。
+着重解释下图中的“Learned encoder”和“Learned decoder”。由于ERA5的数据是在等压面上提供的，而模型为了做谱展开，采用的是σ垂直坐标系（与大部分数值模式类似。简而言之，模型内部计算时垂直分层与ERA5不一致）。因此需要将变量垂直线性插值到σ坐标系上（encoder），预报完成后再插值回来（decoder）。但这种插值有一定误差，会导致虚假重力波等问题，因此这里的encoder和decoder不仅是线性插值，还包含一个可学习的神经网络，用于订正插值结果。这里的神经网络是个“单柱”模型，即每个格点独立订正垂直方向的插值。
+# 动力框架 动力框架包含的基本方程组如下图所示：
+左边分别为散度ζ、涡度δ、温度T、比湿q和表面气压Ps对时间的导数（水平风速可以从ζ、δ推导）。NeuralGCM的动力部分目标即是求解这些方程左侧项，来预报一个时间步长后这些量的变化，即前文结构图中的”Dynamic tendencies“。
+此外，诊断方程如下：
+方程左侧为诊断量，通俗理解，即这些量通过其他量来求得，而不是通过求其对时间的导数来更新。其中涉及垂直速度，气压，位势高度，虚温等变量。
+特别一提，对于降水，在NeuralGCM中以P-E形式出现：
+方程左侧为格点上的降水（Precipitation）减去蒸发（Evaporation），其值等于该格点上空水汽变化的垂直积分，而NeuralGCM预报了水汽，因此可以诊断P-E的值（论文Fig.H21与ERA5进行了对比）。
+其方程简化、半隐式时间积分方案、波数截断等细节请参照原文附录。这里只再提两点：
+训练了T62L32，T125L32，T253L32三种分辨率的模型，分别对应2.8°、1.4°和0.7°的输出分辨率。
+三种分辨率的步长分别为12、6、3.75分钟。
+# 物理过程参数化 参数化方案同样为单柱模型，不同格点间共享参数，由于其结构为全连接神经网络，其整体可以理解为1x1的卷积操作。
+模型输入包括上文基本方程组左侧的预报量及其水平梯度，还包括结构图中的Forcings，如地形、时间、经纬度、太阳辐射、海冰密集度和海表温度等（根据下垫面类别和模式分辨率有所不同，附录C.1、C4.2有介绍）。对于集合预报，输入还包括一组高斯噪声。
+模型输出与动力部分类似，为预报量的变化，即前文结构图中的“Physics tendencies&#34;。换句话说，基本方程和神经网络预报的变化项共同作用于预报量的演变。
+此外还有两点细节：
+Physics tendencies每隔30～60分钟更新一次，大于dynamic tendencies的步长；
+作者将physics tendencies输出缩放为观测抽样中tendencies的0.01倍。即手动控制使Physics tendencies对整体预报的影响幅度大约在1%左右。
+如此，我们简要提炼了NeuralGCM的架构。
+# 训练过程 这里主要谈NeuralGCM的优化设计，仍然将关键部分加粗。
+类似GraphCast，NeuralGCM训练开始时只预报6小时并计算loss；逐步增加到3~5天为止。当然，由于这里类似数值模式时间积分方案的设计，即使是6小时，也包含数十至上百个时间步的迭代。
+在等压面和等σ面上同时计算loss。在等σ面上计算loss可能是为了拆分任务，排除前文encoder和decoder的干扰，明确encoder和decoder的目标为垂直插值。
+对不同变量赋予不同权重，以使训练过程不至于被个别变量主导。
+由于预报时间越长，误差本身必然越大，因此对更长的预报时间赋予更小的权重，使得不同预报时间的loss接近。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5c6e18c0ffaac65ac0632459bd0400b5/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-21T22:30:05+08:00" />
+<meta property="article:modified_time" content="2023-12-21T22:30:05+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">NeuralGCM：AI天气预报进入下半场？</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <h3></h3> 
+ <p>无意间看到Google又在ArXiv上发布了一篇基于AI的天气预报论文NeuralGCM（我为什么要说“又”？），着实被结果震惊了：</p> 
+ <ol><li><p>中短期预报技巧与GraphCast和EC相当，同时<strong>大幅缓解AI模型的物理一致性问题</strong>。</p></li><li><p>在预报时效最多5天的数据集上训练的模型可以<strong>稳定地模拟年代际气候变化</strong>。</p></li><li><p>包含微分求解器和机器学习参数化方案的端到端模型，<strong>结构与数值模式高度一致</strong>。</p></li></ol> 
+ <p>尽管仍是以ERA5为基准的AI预报模型，但以上每一点似乎都是重大突破。一起看看他们是如何做到的。</p> 
+ <p>目录</p> 
+ <p><strong>1. NeuralGCM是什么：</strong>聊聊NeuralGCM和之前的AI气象大模型的区别。</p> 
+ <p><strong>2. NeuralGCM的设计：</strong>非大气科学背景的读者敬请只看加粗部分或略过。</p> 
+ <p><strong>3. NeuralGCM的评估：</strong>展示部分NeuralGCM的评估结果。基于AI的气候模拟来了！</p> 
+ <p><strong>4. 讨论：</strong>喜闻乐见的吹水环节。</p> 
+ <h4><br></h4> 
+ <p>1</p> 
+ <p>NeuralGCM是什么</p> 
+ <p>当看到AI模型被冠以GCM（General Circulation Models，大气环流模式）的字眼时，我意识到这可能是一篇不一样的论文。这里试图为不同背景的读者解释清楚NeuralGCM的特别之处。</p> 
+ <p><strong>数值模式主要由两个部分组成：动力框架和物理过程参数化。</strong>前者用方程组描述大气变化的过程和不同物理量间的关系；后者用来计算一些前者无法描述的物理过程。例如，由于数值模式在求解动力方程组时需要将其离散化（在空间上表示为网格，ERA5和ECMWF预报就都是格点数据），必然遗漏了小于网格分辨率的物理过程，需要参数化方案来简单模拟。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/c3/2a/ZezVUynh_o.png" alt="f048ff2dc0ad09a771494584af95008b.png"></p> 
+ <p>近期发表的盘古、GraphCast等AI模型实际上省略了这样的分解，将整个预报流程简化为图像预测任务，即输入上一时刻的格点大气状态，预报下一时刻的状态（见之前的公众号文章）。然而在此之前，已经有研究试验了更深入的数值模式-机器学习融合策略。一个典型的做法是用机器学习模型来代替部分参数化方案。其思路可以概括为：一些高分辨率的数值模式往往能够“分辨”较小尺度的物理过程，而受限于计算效率，实际业务中又常使用粗分辨率的数值模式。<strong>利用前者模拟的输入输出来训练一个基于机器学习的参数化方案嵌入到后者中，即可得到一个在某方面效果接近前者而速度不慢于甚至快于后者的混合模型。</strong></p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/e4/84/284Q6nmc_o.png" alt="24e10633f3cd83fa444e2c637df6978b.png"></p> 
+ <p style="text-align:left;">例如：</p> 
+ <ul><li><p style="text-align:left;">机器学习对流参数化：doi.org/10.1073/pnas.1810286115</p></li><li><p style="text-align:left;">机器学习边界层参数化：doi.org/10.1029/2022MS003034</p></li></ul> 
+ <p>这样做的显著问题是，机器学习模型的训练是个独立的过程，其泛化性将在实际预报过程中受到很大挑战——训练集中反映的统计关系和实际应用场景可能有较大的区别。如果将这种范式称为“离线训练”，<strong>那么NeuralGCM的训练就是“在线”（online-training）的——代替参数化方案的模型与动力框架求解器共同参与训练过程，组成一个整体直接拟合目标</strong>：这个端到端模型的输入和输出就是ERA5的大气场，与盘古、GraphCast等一致。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/2b/0c/XaaCexDb_o.png" alt="a52eafe1f97d8f0a9843ef48b5afebc9.png"></p> 
+ <p>不得不提其技术实现：作者利用Google近两年发展的机器学习框架JAX，构建了基本方程组的自动微分模块和代表物理过程的神经网络优化模块。由于导数计算本就是JAX的拿手好戏，二者得以融为一体。</p> 
+ <p>简而言之，<strong>NeuralGCM是一个具有与数值模式类似的时间积分方案，由动力框架和神经网络组成，具有物理一致性且能长期稳定迭代预报的混合模型。</strong></p> 
+ <p>2</p> 
+ <p>NeuralGCM的设计</p> 
+ <p>NeuralGCM与数值模式的结构已非常接近，可以拆解为下文几个部分：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/09/03/8iizjQwt_o.png" alt="c4d7b210e5231cd96e58b3a3139f0ed4.png"></p> 
+ <h5><strong>#</strong><strong> 输入输出</strong></h5> 
+ <p>模型输入分为三部分：外强迫（如海温，对气候模拟尤为重要），随机噪音（用于生成集合预报）和ERA5的大气场。输出则是预报的大气场。<strong></strong></p> 
+ <p>着重解释下图中的“Learned encoder”和“Learned decoder”。由于ERA5的数据是在等压面上提供的，而模型为了做谱展开，采用的是σ垂直坐标系（与大部分数值模式类似。简而言之，模型内部计算时垂直分层与ERA5不一致）。<strong>因此需要将变量垂直线性插值到σ坐标系上（encoder），预报完成后再插值回来（decoder）。</strong>但这种插值有一定误差，会导致虚假重力波等问题，<strong>因此这里的encoder和decoder不仅是线性插值，还包含一个可学习的神经网络，用于订正插值结果。</strong>这里的神经网络是个“单柱”模型，即每个格点独立订正垂直方向的插值。</p> 
+ <h5><strong># 动力框架</strong></h5> 
+ <p>动力框架包含的基本方程组如下图所示：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/30/db/sl8oYcNa_o.png" alt="c32d5e815cc93452f055e5a99b586981.png"></p> 
+ <p>左边分别为散度ζ、涡度δ、温度T、比湿q和表面气压Ps对时间的导数（水平风速可以从ζ、δ推导）。NeuralGCM的动力部分目标即是求解这些方程左侧项，来<strong>预报一个时间步长后这些量的变化，即前文结构图中的”Dynamic tendencies“</strong>。</p> 
+ <p>此外，诊断方程如下：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/13/24/lGonbY6E_o.png" alt="219507f8d5a5a6e681513152bc7daf40.png"></p> 
+ <p>方程左侧为诊断量，通俗理解，即这些量通过其他量来求得，而不是通过求其对时间的导数来更新。其中涉及垂直速度，气压，位势高度，虚温等变量。</p> 
+ <p>特别一提，对于降水，在NeuralGCM中以P-E形式出现：</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/b3/c4/4DsJB0vo_o.png" alt="b40a8d50cf065a47b8bbe1d12c582f1e.png"></p> 
+ <p>方程左侧为格点上的降水（Precipitation）减去蒸发（Evaporation），其值等于该格点上空水汽变化的垂直积分，而NeuralGCM预报了水汽，因此可以诊断P-E的值（论文Fig.H21与ERA5进行了对比）。</p> 
+ <p>其方程简化、半隐式时间积分方案、波数截断等细节请参照原文附录。这里只再提两点：</p> 
+ <ul><li><p>训练了T62L32，T125L32，T253L32<strong>三种分辨率的模型，分别对应2.8°、1.4°和0.7°的输出分辨率</strong>。</p></li><li><p>三种分辨率的步长分别为<strong>12、6、3.75分钟</strong>。</p></li></ul> 
+ <h5><strong># 物理过程参数化</strong></h5> 
+ <p><strong>参数化方案同样为单柱模型，不同格点间共享参数，由于其结构为全连接神经网络，其整体可以理解为1x1的卷积操作。</strong></p> 
+ <p>模型输入包括上文基本方程组左侧的预报量及其水平梯度，还包括结构图中的Forcings，如地形、时间、经纬度、太阳辐射、海冰密集度和海表温度等（根据下垫面类别和模式分辨率有所不同，附录C.1、C4.2有介绍）。对于集合预报，输入还包括一组高斯噪声。</p> 
+ <p><strong>模型输出与动力部分类似，为预报量的变化，即前文结构图中的“Physics tendencies"。</strong>换句话说，基本方程和神经网络预报的变化项共同作用于预报量的演变。</p> 
+ <p>此外还有两点细节：</p> 
+ <ul><li><p>Physics tendencies每隔30～60分钟更新一次，大于dynamic tendencies的步长；</p></li><li><p>作者将physics tendencies输出缩放为观测抽样中tendencies的0.01倍。即<strong>手动控制使Physics tendencies对整体预报的影响幅度大约在1%左右</strong>。</p></li></ul> 
+ <p>如此，我们简要提炼了NeuralGCM的架构。</p> 
+ <h5><strong># 训练过程</strong></h5> 
+ <p>这里主要谈NeuralGCM的优化设计，仍然将关键部分加粗。</p> 
+ <ul><li><p>类似GraphCast，<strong>NeuralGCM训练开始时只预报6小时并计算loss；逐步增加到3~5天为止</strong>。当然，由于这里类似数值模式时间积分方案的设计，即使是6小时，也包含数十至上百个时间步的迭代。</p></li><li><p>在等压面和等σ面上同时计算loss。在等σ面上计算loss可能是为了拆分任务，排除前文encoder和decoder的干扰，明确encoder和decoder的目标为垂直插值。</p></li><li><p><strong>对不同变量赋予不同权重</strong>，以使训练过程不至于被个别变量主导。</p></li><li><p>由于预报时间越长，误差本身必然越大，因此<strong>对更长的预报时间赋予更小的权重</strong>，使得不同预报时间的loss接近。</p></li></ul> 
+ <p>NeuralGCM的损失函数分为三类：</p> 
+ <ul><li><p><strong>Accuracy loss</strong>：使用MSE使预测更准确。随着预报时效的延长，大气的可预报性降低，如果模型预报出了某个小尺度波动，但位置出现了偏差，则观测和预报的两个位置的MSE都会增大（称为“双重惩罚”问题，这也是很多现有AI模型模糊化的根源之一），然而实际这样的预报是有意义的（比如预报海淀下雨，结果朝阳下了，总比压根没报雨好些）。因此，作者在计算MSE loss前，<strong>滤去了认为在不同预报时效上已没有可预报性的小尺度变化</strong>（即过滤了高波数分量），以避免双重惩罚。</p></li><li><p><strong>Sharpness loss</strong>：另一方面，为了解决模糊问题，作者直接在loss中计算各高度层各变量不同波长分量的能量与观测的差异，即强迫模型预报不同尺度的变化。这一项针对性地解决之前ECMWF一篇论文《On some limitations of data-driven weather forecasting models》中提及的问题。</p></li><li><p><strong>Bias loss</strong>：该项在计算MSE前，先对整个batch和各预报时长做平均，因此不针对个例，而是调整不同高度层、不同变量、不同波长的振幅。</p></li></ul> 
+ <p>此外，集合预报模型采用了CRPS（连续分级概率评分）作为损失项。</p> 
+ <p>在训练的最后阶段，作者还对decoder部分进行了微调，以解决谱空间与格点空间相互转换带来的高频噪声问题（附录G.5）。</p> 
+ <h4><br></h4> 
+ <p>3</p> 
+ <p>NeuralGCM的评估</p> 
+ <p>之前解读AI模型的文章几乎不涉及模型评估结果，但NeuralGCM有些特殊，值得一起看看。</p> 
+ <h5><strong># 中短期预报</strong></h5> 
+ <p><strong>NeuralGCM在短期预报上与GraphCast相当，而中期集合预报甚至超越ECMWF-ENS。</strong>此外还有如下优势：</p> 
+ <ul><li><p><strong>有效缓解了AI模型中期预报的模糊问题。</strong>无论是确定性预报和集合预报成员的可视化，还是功率谱分析的结果都表明，NeuralGCM在更长的预报时间上始终保持清晰，远优于GraphCast。这也有利于极端事件的预报。</p></li><li><p><strong>具有更强的物理一致性和可解释性。</strong>从降水预报的空间分布，地转风平衡和模型的泛化性角度看，NeuralGCM的预报相比GraphCast更加稳定。这显然也得益于动力框架提供的保障。</p></li></ul> 
+ <p>上一期推送的文末提到要继续讨论AI模型物理一致性的问题，因此NeuralGCM在中短期预报上评估的细节将在下一期一起讨论。这里我们再着重介绍下NeuralGCM的气候模拟能力。</p> 
+ <h5><strong># 气候模拟</strong></h5> 
+ <p><strong>尽管NeuralGCM只在3~5天预报时长上训练，但可以进行稳定的气候模拟。</strong>作者采用1.4°版本，以2019年37个不同时间数据作为初始场，其中35个提供了稳定了2年模拟（不太清楚作者对不稳定的定义，以及什么原因导致了不稳定）。</p> 
+ <p>从下图a可以看出，NeuralGCM模拟的全球850hPa平均温度不仅<strong>准确地模拟了季节循环，而且趋势与观测一致</strong>，远优于气候平均（1990-2019年平均）。NeuralGCM在可降水量、动能等指标上也有类似表现，<strong>对哈得莱环流、季风环流等气候现象的空间分布和季节循环也与观测一致</strong>。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/7e/a8/AIbbjFYv_o.png" alt="07cdfcc51b3a1c5e7a8039aa3dc9066a.png"></p> 
+ <p>不仅如此，NeuralGCM还可以用于气候变化预估。37次模拟中的22个在40年模拟上保持稳定。这里的模拟形式类似AMIP。对此稍作解释：</p> 
+ <p>GraphCast、盘古等模型可以称为“大气模式”，因为只考虑了大气本身的变化规律。而从长期（月、季、年际甚至年代际）角度，大气的变化取决于其他圈层，特别是下垫面的影响。例如大家可能耳熟能详的厄尔尼诺，就是赤道中东太平洋海表面温度的异常，是大气季节预测的重要预测因子。GraphCast、盘古的输入是大气的“初始条件”；而要进行长期模拟，关键则是把握“边界条件”，即其他圈层（大气的边界）对大气的影响。当然，这里长期模拟的目的不再是预报某次降水、降温、台风等，而是从统计上预估气候特征的变化，如全球平均气温的长期趋势。</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/67/97/Qb2uuSje_o.png" alt="ff187ad542c12cc14e97bc558cac9551.png"></p> 
+ <p>图片来源：https://www.energy.gov/science/doe-explainsearth-system-and-climate-models</p> 
+ <p>正因如此，气候变化预估不仅需要大气模式，还需要模拟海洋、冰雪、陆面、人类活动等的变化。而AMIP（Atmospheric Model Intercomparison Project，大气模式比较计划），则仅旨在测试大气模式本身的性能。其方式是以过去数十年观测到的海表面温度、海冰等作为“外强迫”，观察大气模式是否能在此基础上模拟过去的气候变化。</p> 
+ <p>前文展示的NeuralGCM结构中，“Forcings"即为这类外强迫。<strong>2.8°版本的NeuralGCM模拟的1981年以来全球平均气温变化展示了与ERA5一致的增温趋势，其年际震荡也与ERA5相近（见上上张图b）。显然，NeuralGCM有效学习了海温等外强迫对气候变化的影响。</strong>不仅如此，图c展示了不同高度层的40年温度变化线性趋势。NeuralGCM的集合平均与ERA5十分接近，甚至优于AMIP的大气数值模式（当然，这样的比较不太公平，毕竟NeuralGCM是在ERA5上训练的）。</p> 
+ <p>对于NeuralGCM的解读就到这里。原文共67页，本文必然遗漏了不少细节，但希望可以为有兴趣研读的朋友当作索引。</p> 
+ <h4><br></h4> 
+ <p>4</p> 
+ <p>讨论</p> 
+ <p>通篇看来，NeuralGCM最大的不同是以动力框架提供的物理关系为核心，进而从源头上解决了AI模型的最大问题：物理一致性。其带来的好处不言而喻：</p> 
+ <ul><li><p>不必如上篇推送中提及的模型一样在误差累积问题上做太多文章。相反，可以像数值模式一样根据空间分辨率设置相应的时间积分步长。即使是神经网络部分，也可以说拟合的是物理过程而不是统计关系。</p></li><li><p>保证输出的大气环流具备物理可解释性，与观测到的天气、气候现象始终保持一致。在物理方程的约束下，仅用3~5天预报时间的数据即可训练出在几十年模拟上保持稳定的模型。</p></li></ul> 
+ <p>当然，由于其监督学习的本质没有改变，其中仍然存在一些问题：</p> 
+ <ul><li><p>仍然以ERA5为基准训练模型。类似数值模式的动力框架置入NeuralGCM后，要超越数值模式的预报，某种程度上其成功的核心仍然是替代参数化方案的神经网络部分。同时，ERA5也依赖数值模式，则NeuralGCM的学习目标其实限于ERA5对观测的同化。换句话说，NeuralGCM的本质仍然是利用神经网络拟合观测，且上限仍受同化效果的约束。</p></li><li><p>仍存在大量“魔法数字”的设置。如不同变量损失的平衡，参数化方案输出的放缩，不同损失项的权重等。这些参数的影响很难评估。当然，对于次网格尺度过程而言，这些经验性超参数即使在数值模式中也不可避免。</p></li></ul> 
+ <p>进一步，我们可以从不同角度理解NeuralGCM的设计：</p> 
+ <ul><li><p>从AI角度，NeuralGCM将代表物理过程的基本方程组嵌入神经网络，训练出受物理约束的AI预报模型。</p></li><li><p>从数值模式角度，则是用神经网络代替数值模式中的参数化方案。</p></li><li><p>甚至，我们可以将NeuralGCM中的神经网络视作“订正模型”，只是将订正直接嵌入了数值模式的时间积分过程中，针对每一步的结果订正，而不是订正最终的输出。</p></li></ul> 
+ <p>更折衷的理解是，NeuralGCM将“统计拟合”的范畴从天气变化整体压缩到了更小的范围内，从而既以动力框架为主体，反映物理过程；又以神经网络替代繁杂的参数化方案。这充分利用了二者的不同特性：对可以清晰表达的过程用求解方程的形式解决，而对诸多无法明确表达的过程，则笼而统之用神经网络模拟，看起来是个非常合理的混合方案。类似我们定框架、做实验、写论文，最后请ChatGPT补充细节、润色文笔。</p> 
+ <p>NeuralGCM原文中有一句话：</p> 
+ <h3>ML atmospheric models also require considerably less code, for example GraphCast has 5417 lines vs 376578 lines for NOAA’s FV3 atmospheric model.</h3> 
+ <p>乍一看这种比较方式有点无厘头，甚至Fortran也躺枪了（数值模式基本是Fortran写的），但通读全论文后，发现代码行数某种程度上代表着迭代难度的降低。一直以来，数值模式技术是大气科学“皇冠上的明珠”。也正因为其复杂性，数值模式的进步可能正变得越发艰难。即便只考虑工程实现，几十万行代码也让人望而却步。如果机器学习与数值模式的深度融合之路能够走通，更低的成本和更快的速度，将会给数值试验带来极大便利。</p> 
+ <p>数值模式“静悄悄的革命”进程一直是以年代为单位考量的。而自从AI技术引入大气科学后，突破性（至少从形式上）的研究层出不穷，目不暇接，不用说跟上前沿发表论文，就连写公众号都有些力不从心……每项研究都是如此“不完美”，以至于可以花大量篇幅指出其中的不足，但他们的进化速度又是如此之快，以至于我能想到的每个突破口都有团队在攻克。不得不说这种“小步快跑”的崭新节奏成为大气科学研究领域一道新的风景。</p> 
+ <p>正如我们在第一篇推送中就提到的：要让AI与学科研究相辅相成；用神经网络压缩的不仅是数据的规律，还包括人类对物质世界的理解和刻画。Google与ECMWF的这次合作，为AI天气预报的“下半场”打开了大门。</p> 
+ <p style="text-align:left;">推荐阅读：</p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">我的2022届互联网校招分享</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">我的2021总结</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">浅谈算法岗和开发岗的区别</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">互联网校招研发薪资汇总</a></p> 
+ <p style="text-align:center;"><strong>公众号：</strong><strong>AI蜗牛车</strong></p> 
+ <p style="text-align:center;">保持谦逊、保持自律、保持进步</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/df/b9/bUieW2ep_o.jpg" alt="9fc282f82bc563f8631e9f591e419cd9.jpeg"></p> 
+ <p style="text-align:center;">发送【蜗牛】获取一份《手把手AI项目》（AI蜗牛车著）</p> 
+ <p style="text-align:center;">发送【1222】获取一份不错的leetcode刷题笔记</p> 
+ <p style="text-align:center;"><strong>发送【AI四大名著】获取四本经典AI电子书</strong></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/f5b245fe5b18ef16e8b4ee2ecd558f0f/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">C语言—每日选择题—Day59</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/3a86e53a2a2cc62f78f0f401c7eaf716/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">k8s中Chart模板流程控制if_with_range和变量</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

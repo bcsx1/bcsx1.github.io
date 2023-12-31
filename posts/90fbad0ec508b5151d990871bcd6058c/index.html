@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>深入理解 Docker 镜像 json 文件 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="深入理解 Docker 镜像 json 文件" />
+<meta property="og:description" content="很多时候，当大家谈论起Docker，经常会提到Docker作为容器解决方案，在虚拟化资源方面存在不小优势。轻量级虚拟化技术的优点暂且不谈，从软件生命周期来看，Docker在打包软件、分发软件方面的能力同样出众。而后者很大程度上依赖于Docker的镜像技术。
+Docker镜像技术提供了一套标准，创造性地使用Dockerfile来规范化Docker化应用的制作流程，结果产生的Docker镜像便于传输与管理，最终通过Docker镜像运行Docker容器，完成容器化应用的交付。
+经过本系列对于Docker镜像的镜像，大家应该已经清楚Docker镜像的存储、以及Docker镜像的内容。Docker镜像的内容，应该说包含两部分，除了镜像层中的文件之外，还包括一层镜像的json文件。镜像层文件的理解较为简单，但是Docker镜像的json文件理解起来就会稍显复杂。本文就带大家深入理解Docker镜像的json文件。
+我们一直提到“通过Docker镜像运行Docker容器”，如果仔细思考这句话，可能依然会存在一些疑惑。不难的理解是：Docker镜像层中的文件全部属于静态的磁盘文件，而Docker容器属于一个动态的产物，可以认为是一个或者多个运行中的进程。那么，静态的Docker镜像转换为动态的Docker容器背后肯定会有一些不为人知的秘密。我们不妨带着以下几个问题来思考Docker镜像的json文件：
+1.如何判定一个Docker镜像应该运行哪个进程，这部分信息存在哪？
+2.有了以上信息，将Docker镜像运行成Docker容器的行为是谁在主导？
+镜像的静态与容器的动态 这一次，我们依旧从动态和静态这两个词来看Docker镜像的前世今生。首先，Docker镜像的镜像层文件属于静态文件，当容器运行起来之后这部分内容将作为Docker容器的文件系统内容，提供Docker容器的文件系统视角。我们带着这样的观点，再来看Dockerfile的概念。
+在Dockerfile的原语中，大家肯定对ENV、VOLUME、EXPOSE以及CMD等命令非常熟悉。
+ENV MYPATH=/root：ENV命令在构建Docker镜像时，为镜像添加一个环境变量，以便该环境变量在启动Docker容器时作用于容器内的进程；这部分信息不应该以静态文件的形式被打入Docker的镜像层文件。
+VOLUME /data：VOLUME命令在构建Docker镜像时，为镜像添加一个数据卷标识，以便通过该镜像运行容器时为容器挂载一个数据卷；由于构建时真实的数据卷还不存在，所以这部分信息不应该以静态文件的形式被打入Docker的镜像层文件。
+EXPOSE 80：EXPOSE命令在构建Docker镜像时，记录容器内部实际监听的端口，以便在通过bridge模式配置Docker容器网络时，将该端口与宿主机进行一次DNAT转换；这部分信息属于Docker容器运行时所需要的信息，也不应该以静态文件的形式被打入Docker的镜像层文件。
+CMD [&#34;./run.sh&#34;]：CMD命令在构建Docker镜像时，记录启动Docker容器的执行命令入口，一般用以指定用户的应用程序；这部分配置信息更不应该以静态文件的形式被打入Docker的镜像层文件。
+Dockerfile中以上举例的4类命令，通过分析，我们得出初步的结论：Dockerfile的部分命令各自包含一类动态信息，这类信息不属于Docker镜像层中的文件内容。
+动态内容的存储 高移植性保障了Docker镜像的一次构建，多处运行，那么使得Docker容器可以顺利运行，Docker自然不会抛弃构建Docker镜像时的动态内容。因此，动态内容的存储就显得尤为重要。
+此时就是Docker镜像json文件登场的时机。构建Docker镜像时，所有动态的信息都会会记录进相应Docker镜像的json文件中。需要注意的是，虽然镜像的动态信息会被存储于Docker镜像的json文件中，但是并不代表json文件中仅存储动态信息,Dockerfile构建过程中，机会所有的操作都会会记录在json文件中.
+动态内容的执行 有了Docker镜像json文件来描述Docker容器的动态信息，那么json文件作为Docker镜像的一部分，在Docker体系中，由哪一模块来完成json文件中动态信息的解析与执行呢？
+如果大家清楚“每一个Docker容器都是Docker Daemon的子进程”的话，肯定会联想到Docker Daemon。答案正是Docker Daemon。站在启动容器的角度上，Docker Daemon的作用就是以下两点：
+1.将Docker镜像的镜像层文件作为Docker容器的rootfs。
+2.提取Docker镜像json文件中的动态文件，确定启动进程，并为之配置动态运行环境。
+Docker Daemon、Docker镜像以及Docker容器三者的简单示意图如下：
+通过上图，我们可以使用ubuntu:14.04镜像运行Docker容器时，前者的镜像层layer内容将作为容器的rootfs；而前者的json文件，会由Docker Daemon解析，并提取出其中的容器执行入口CMD信息，以及容器进程的环境变量ENV信息，最终初始化容器进程。当然，容器进程的执行入口来源于镜像提供的rootfs。假如此时ubuntu 14.04镜像的json文件中又含有VOLUME信息，那么Docker Daemon将会为Docker容器在宿主机上创建一个文件目录，并挂载到容器内部，实现镜像中VOLUME动态信息的运用，其他动态信息的运用也大同小异。
+Docker镜像json文件的真面目 全文分析至此，还是更多的从理论的角度阐述Docker镜像的json文件，那么现实情况中，此类json文件到底存的内容是什么呢？我们依然以ubuntu:14.04为例，揭开Docker镜像json文件的这面目。
+一个含有标签的Docker镜像一般会有一个或者多个层级镜像组合而成，而每个镜像层都会含有一个json文件。上图中，我们展现了ubuntu:14.04镜像中4个镜像层的具体情况，特别分析了镜像8251da35e7a7和e5855facec0b。通过查看这两个镜像的json文件，我们可以发现，两个json文件中的config属性中，除了理所应当不同的镜像ID之外，只有Cmd属性不同。由于镜像e5855facec0b是镜像8251da35e7a7的父镜像，同时构建子镜像的时候使用的Dockerfile命令为CMD [&#34;/bin/bash&#34;]，因此子镜像在父镜像json文件的基础上，更新config属性中的Cmd属性，完成自身json文件的生成。Docker镜像中父子镜像的json文件有很大的相似性，子镜像仅在父镜像json文件的基础上，修改运行自身对应的Dockerfile命令后造成的差异。
+镜像构建完毕，Docker镜像的镜像层layer文件以及json文件均准备完毕，那么当Docker Daemon通过此ubuntu:14.04镜像运行Docker容器时，首先提取最上层镜像的json文件，找到config属性中的Cmd命令，并在镜像层文件构成的容器rootfs中找到相应的执行程序，最终执行，完成容器的启动。（实际情况要更复杂，会涉及Entrypoint以及Cmd两部分的内容，本系列后续会深入深入两者的作用与区别）
+当然，除了Cmd之外，json文件的config 属性中同时还存在User、ExposedPorts、Entrypoint、NetworkDisabled等一系列启动容器时所需的动态信息。
+总结 Docker镜像的json文件扮演极其重要的角色，提供了静态镜像向动态容器的转化依据，同时清晰地记录了父子镜像之间的差异，基于此差异，后续Docker构建的cache机制才得以实现。
+欢迎关注[Docker源码分析]微信公众号，更多精彩即将呈现。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/90fbad0ec508b5151d990871bcd6058c/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2015-09-04T12:57:43+08:00" />
+<meta property="article:modified_time" content="2015-09-04T12:57:43+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">深入理解 Docker 镜像 json 文件</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>很多时候，当大家谈论起Docker，经常会提到Docker作为容器解决方案，在虚拟化资源方面存在不小优势。轻量级虚拟化技术的优点暂且不谈，从软件生命周期来看，Docker在打包软件、分发软件方面的能力同样出众。而后者很大程度上依赖于Docker的镜像技术。</p> 
+<p>Docker镜像技术提供了一套标准，创造性地使用Dockerfile来规范化Docker化应用的制作流程，结果产生的Docker镜像便于传输与管理，最终通过Docker镜像运行Docker容器，完成容器化应用的交付。</p> 
+<p>经过本系列对于Docker镜像的镜像，大家应该已经清楚Docker镜像的存储、以及Docker镜像的内容。Docker镜像的内容，应该说包含两部分，除了镜像层中的文件之外，还包括一层镜像的json文件。镜像层文件的理解较为简单，但是Docker镜像的json文件理解起来就会稍显复杂。本文就带大家深入理解Docker镜像的json文件。</p> 
+<p>我们一直提到“通过Docker镜像运行Docker容器”，如果仔细思考这句话，可能依然会存在一些疑惑。不难的理解是：Docker镜像层中的文件全部属于静态的磁盘文件，而Docker容器属于一个动态的产物，可以认为是一个或者多个运行中的进程。那么，静态的Docker镜像转换为动态的Docker容器背后肯定会有一些不为人知的秘密。我们不妨带着以下几个问题来思考Docker镜像的json文件：</p> 
+<p><strong>1.如何判定一个Docker镜像应该运行哪个进程，这部分信息存在哪？</strong></p> 
+<p><strong>2.有了以上信息，将Docker镜像运行成Docker容器的行为是谁在主导？</strong></p> 
+<h3 id="镜像的静态与容器的动态">镜像的静态与容器的动态</h3> 
+<p>这一次，我们依旧从<code>动态</code>和<code>静态</code>这两个词来看Docker镜像的前世今生。首先，Docker镜像的镜像层文件属于静态文件，当容器运行起来之后这部分内容将作为Docker容器的文件系统内容，提供Docker容器的文件系统视角。我们带着这样的观点，再来看Dockerfile的概念。</p> 
+<p>在Dockerfile的原语中，大家肯定对ENV、VOLUME、EXPOSE以及CMD等命令非常熟悉。</p> 
+<p><strong><code>ENV MYPATH=/root</code>：ENV命令在构建Docker镜像时，为镜像添加一个环境变量，以便该环境变量在启动Docker容器时作用于容器内的进程；这部分信息不应该以静态文件的形式被打入Docker的镜像层文件。</strong></p> 
+<p><strong><code>VOLUME /data</code>：VOLUME命令在构建Docker镜像时，为镜像添加一个数据卷标识，以便通过该镜像运行容器时为容器挂载一个数据卷；由于构建时真实的数据卷还不存在，所以这部分信息不应该以静态文件的形式被打入Docker的镜像层文件。</strong></p> 
+<p><strong><code>EXPOSE 80</code>：EXPOSE命令在构建Docker镜像时，记录容器内部实际监听的端口，以便在通过bridge模式配置Docker容器网络时，将该端口与宿主机进行一次DNAT转换；这部分信息属于Docker容器运行时所需要的信息，也不应该以静态文件的形式被打入Docker的镜像层文件。</strong></p> 
+<p><strong><code>CMD ["./run.sh"]</code>：CMD命令在构建Docker镜像时，记录启动Docker容器的执行命令入口，一般用以指定用户的应用程序；这部分配置信息更不应该以静态文件的形式被打入Docker的镜像层文件。</strong></p> 
+<p>Dockerfile中以上举例的4类命令，通过分析，我们得出初步的结论：<b><code>Dockerfile的部分命令各自包含一类动态信息，这类信息不属于Docker镜像层中的文件内容。</code></b></p> 
+<h3 id="动态内容的存储">动态内容的存储</h3> 
+<p>高移植性保障了Docker镜像的<code>一次构建，多处运行</code>，那么使得Docker容器可以顺利运行，Docker自然不会抛弃构建Docker镜像时的动态内容。因此，动态内容的存储就显得尤为重要。</p> 
+<p>此时就是<strong><code>Docker镜像json文件</code></strong>登场的时机。<strong><code>构建Docker镜像时，所有动态的信息都会会记录进相应Docker镜像的json文件中。</code></strong>需要注意的是，<strong><code>虽然镜像的动态信息会被存储于Docker镜像的json文件中，但是并不代表json文件中仅存储动态信息,Dockerfile构建过程中，机会所有的操作都会会记录在json文件中</code></strong>.</p> 
+<h3 id="动态内容的执行">动态内容的执行</h3> 
+<p>有了Docker镜像json文件来描述Docker容器的动态信息，那么json文件作为Docker镜像的一部分，在Docker体系中，由哪一模块来完成json文件中动态信息的解析与执行呢？</p> 
+<p>如果大家清楚“每一个Docker容器都是Docker Daemon的子进程”的话，肯定会联想到Docker Daemon。答案正是Docker Daemon。站在启动容器的角度上，Docker Daemon的作用就是以下两点：</p> 
+<p><strong>1.将Docker镜像的镜像层文件作为Docker容器的rootfs。</strong></p> 
+<p><strong>2.提取Docker镜像json文件中的动态文件，确定启动进程，并为之配置动态运行环境。</strong></p> 
+<p>Docker Daemon、Docker镜像以及Docker容器三者的简单示意图如下：</p> 
+<p><img src="https://images2.imgbox.com/59/85/geuhSCKT_o.jpg" alt="这里写图片描述" title=""></p> 
+<p>通过上图，我们可以使用ubuntu:14.04镜像运行Docker容器时，前者的镜像层layer内容将作为容器的rootfs；而前者的json文件，会由Docker Daemon解析，并提取出其中的容器执行入口CMD信息，以及容器进程的环境变量ENV信息，最终初始化容器进程。当然，容器进程的执行入口来源于镜像提供的rootfs。假如此时ubuntu 14.04镜像的json文件中又含有VOLUME信息，那么Docker Daemon将会为Docker容器在宿主机上创建一个文件目录，并挂载到容器内部，实现镜像中VOLUME动态信息的运用，其他动态信息的运用也大同小异。</p> 
+<h3 id="docker镜像json文件的真面目">Docker镜像json文件的真面目</h3> 
+<p>全文分析至此，还是更多的从理论的角度阐述Docker镜像的json文件，那么现实情况中，此类json文件到底存的内容是什么呢？我们依然以ubuntu:14.04为例，揭开Docker镜像json文件的这面目。</p> 
+<p><img class="" src="https://images2.imgbox.com/a0/54/BA9qjM2k_o.jpg" alt="image" width="882" height="665"></p> 
+<p>一个含有标签的Docker镜像一般会有一个或者多个层级镜像组合而成，而每个镜像层都会含有一个json文件。上图中，我们展现了ubuntu:14.04镜像中4个镜像层的具体情况，特别分析了镜像<code>8251da35e7a7</code>和<code>e5855facec0b</code>。通过查看这两个镜像的json文件，我们可以发现，两个json文件中的config属性中，除了理所应当不同的镜像ID之外，只有Cmd属性不同。由于镜像<code>e5855facec0b</code>是镜像<code>8251da35e7a7</code>的父镜像，同时构建子镜像的时候使用的Dockerfile命令为<code>CMD ["/bin/bash"]</code>，因此子镜像在父镜像json文件的基础上，更新config属性中的Cmd属性，完成自身json文件的生成。<b><code>Docker镜像中父子镜像的json文件有很大的相似性，子镜像仅在父镜像json文件的基础上，修改运行自身对应的Dockerfile命令后造成的差异。</code></b></p> 
+<p>镜像构建完毕，Docker镜像的镜像层layer文件以及json文件均准备完毕，那么当Docker Daemon通过此ubuntu:14.04镜像运行Docker容器时，首先提取最上层镜像的json文件，找到config属性中的Cmd命令，并在镜像层文件构成的容器rootfs中找到相应的执行程序，最终执行，完成容器的启动。（实际情况要更复杂，会涉及Entrypoint以及Cmd两部分的内容，本系列后续会深入深入两者的作用与区别）</p> 
+<p>当然，除了Cmd之外，json文件的config 属性中同时还存在User、ExposedPorts、Entrypoint、NetworkDisabled等一系列启动容器时所需的动态信息。</p> 
+<h3 id="总结">总结</h3> 
+<p>Docker镜像的json文件扮演极其重要的角色，提供了静态镜像向动态容器的转化依据，同时清晰地记录了父子镜像之间的差异，基于此差异，后续Docker构建的cache机制才得以实现。</p> 
+<p><img src="https://images2.imgbox.com/3d/e5/P7oDKncp_o.jpg" alt="这里写图片描述" title=""></p> 
+<p>欢迎关注[Docker源码分析]微信公众号，更多精彩即将呈现。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/8c18a96861cc7a942456f06d42848e5e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">npm ERR!无法安装任何包的解决办法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/65934e8cf2583a8baec7251a87877505/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">linux 开放端口</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

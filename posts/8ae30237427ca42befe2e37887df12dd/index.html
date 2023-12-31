@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【数据存储】【Redis】第二章：底层数据结构 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【数据存储】【Redis】第二章：底层数据结构" />
+<meta property="og:description" content="简单字符串 先简单了解一下C语言是怎么处理字符串的：
+在C语言中，字符串结束的标识是空字符，也就是’’，这会有一个问题，就是字符串的内容可能包括空字符串，这个时候是不是就没办法正确存取字符串的内容了，它有可能中途读取一半就完了。
+除此之外，它还不记录字符串的长度，这也会有一系列问题，
+如果需要获取字符串的长度通过遍历计数来获取的，这会导致它的时间复杂度会比较高。
+如果需要修改字符串，就要重新分配内存，不重新分配的话，字符串长度增大，超出给定的长度，这个时候会造成内存缓冲区溢出，字符串长度减小还会造成内存泄露。
+如果需要对两个字符串进行拼接，是通过调用strcat函数来实现的，如果没有给它分配足够长度的内存空间，就会直接导致缓冲区溢出。
+既然C语言处理字符串有这么多的弊端，那么Redis它是怎么处理字符串的呢？
+Redis专门创建了一种数据结构SDS，什么意思呢？simple dynamic string，简单字符串。
+官方代码：
+struct sdshdr{ int len; int free; char buf[]; } 这个对象有三个属性：
+len表示字符串的长度free表示还有多少长度剩余，就是下面buf数组中还有多少字符串未使用的字节数量buf[]表示存储的字符串 问题一：这种数据结构有什么优势呢？跟C语言相比，改进了哪些问题？
+长度和内存重新分配问题，C语言是不记录长度，而SDS它有len属性和free属性。
+len记录了字符串的长度，直接取值就可以了，不像C语言需要遍历。 如果需要对字符串进行修改的话，也不需要像C语言一样，直接重新分配内存，
+它可以通过len 属性检查内存空间是不是需要进行扩展内存，如果字符串长度增加，长度超过了len，就会增加相应的内存，接着修改。
+如果字符串长度缩短了，它也不会立马就重新分配内存，而是有一个free属性记录下来，等你后面什么时候用了，重新计算或者分配内存。
+结尾标识问题，C语言是以空字符串结尾标识的，而SDS是以len长度作为结尾标识的，避免了C语言无法正确读取字符串的问题。
+链表 Redis的list类型的键值对底层数据结构是由链表构成的，那么链表是什么呢？
+它是由一连串节点组成，没有顺序，不是连续的，每个节点由数据和一或两个用来指向上一个或下一个节点位置的链接组成，在每一个节点里存到下一个节点的指针，通过链表中的指针链接次序可以实现逻辑顺序。
+链表也分好几种：单向链表、双端链表、双向链表、有序链表以及有迭代器的链表
+单向链表：用户的操作（添加、删除、遍历）只能从链表头开始。向一个方向遍历，查找一个节点的时候从第一个节点开始访问下一个节点，一直访问到需要的位置，最后一个节点存储地址的部分指向空值。
+双端链表：双端链表相对于单端链表多了一个特性：对最后一个链接点的引用
+双向链表：单端链表只能从链表头开始正向遍历，双向链表可以逆向遍历，每个节点需要保存前一个节点和后一个节点的引用
+有序链表：插入元素时，将插入的元素与头结点及其后面的结点比较，找到合适的位置插入。
+有迭代器的链表：单链表的基本操作中，大部分要用到依次遍历单链表中的每一个元素。当你新增一个对单链表的操作并需要使用遍历时，你就得重新写一个for循环而实现遍历。所以将迭代（遍历）作为一种基本的ADT（抽象数据类型）操作。链表中用于处理遍历、访问和更新的方法封装到一个新的迭代器类中。
+跳跃表 跳跃表：跳跃表基于有序链表的扩展，在链表上建索引，每两个结点提取一个结点到上一级，我们把抽出来的那一级叫作索引，每个跳跃表节点的层高都是1至32之间的随机数。
+举例说明：
+比如给一个长度为7的有序链表，节点值依次是1-&gt;3-&gt;4-&gt;5。取出所有值为奇数的节点作为关键节点（索引），这个时候要插入一个值是2的新节点，就不需要将节点一个个比较，只要比较1,3,5，确定了值在1和3之间，就可以快速插入。
+加一层索引之后，查找一个结点需要遍历的结点个数减少了，虽然增加了50%的额外空间，但是查找效率提高了，同理再加一级索引，这种链表加多级索引的结构，就是跳跃表。
+索引是占内存的，原始链表中存储的可能是大的对象，索引结点只要存储关键值和几个指针，并不需要存储对象，当节点本身比较大或者元素数量比较多的时候，优势必然会被放大，而缺点则可以忽略。
+问题：当大量的新节点通过逐层比较，最终插入到原链表之后，上层的索引节点会慢慢的不够用，那么这个时候要怎么选取一部分节点提到上一层呢？
+抛硬币法：随机决定新节点是否选拔，每向上提拔一层的几率是50%。
+原因：跳跃表的删除和添加节点是无法预测的，不能保证索引绝对分步均匀，不过可以让大体趋于均匀。
+插入节点的工作流程：跳跃表插入操作的时间复杂度是O（logN），空间复杂度是 O（N）。
+第一步：新节点和上层索引节点逐个比较，找到原链表的插入位置，时间复杂度为O（logN）第二步：把索引插入到原链表，时间复杂度为O（1）第三步：随机决定新节点是否提升为上一级索引，结果为&#34;正面&#34;则提升，继续抛硬币，结果为&#34;反面&#34;则停止，时间复杂度为O（logN） 删除节点的工作流程：跳跃表删除操作的时间复杂度是O（logN）
+第一步：自上而下，查找第一次出现节点的索引，并逐层找到每一层对应的节点。时间复杂度为O（logN）第二步：删除每一层查找到的节点，如果该层只剩下1个节点，删除整个一层（原链表除外）。时间复杂度为O（logN） 跳跃表由zskiplistNode和skiplist两个结构组成，zskiplistNode用于表示跳跃表节点，zskiplist用于保存跳跃表节点的相关信息，比如节点的数量，以及指向表头节点和表尾节点的指针等等。
+字典 字典，顾名思义，通过字典（牛津字典等）前面的目录快速定位到所要查找的单词。
+在C 语言中没有这种数据结构，所以这种数据结构是Redis自己创造的，字典中的键都是唯一的，通过键可以对值来进行查询或更改。
+底层是通过哈希表实现的，而哈希表又基于数组，类似于key-value的结构形式进行存储的，它的值通过哈希函数映射为数组的下标。
+那什么是哈希函数呢？不急，我们慢慢道来。
+前面我们讲了通过数组的方式存储值，那么数组的值和数组的下标怎么建立关联关系呢？或者说，我们怎么通过数组的下标找到数组的值呢？
+在学习 ASCII 编码的时候，我们知道，a可以用97这个数值表示，b可以用98这个数值表示，以此类推，我们就可以通过单个字母用数字表达。
+有了字母，那么一个单词由多个字母组成，它又该如何表达呢？
+假设我有一本字典，它有10000个单词，我其中一个单词就是ab，使用ASCII编码进行表达。
+ab = 97 &#43; 98 = 195" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8ae30237427ca42befe2e37887df12dd/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-08-03T20:59:47+08:00" />
+<meta property="article:modified_time" content="2021-08-03T20:59:47+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【数据存储】【Redis】第二章：底层数据结构</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-dracula">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="_0"></a>简单字符串</h2> 
+<p>先简单了解一下C语言是怎么处理字符串的：</p> 
+<blockquote> 
+ <p>在C语言中，字符串结束的标识是空字符，也就是’’，这会有一个问题，就是字符串的内容可能包括空字符串，这个时候是不是就没办法正确存取字符串的内容了，它有可能中途读取一半就完了。</p> 
+</blockquote> 
+<p>除此之外，它还不记录字符串的长度，这也会有一系列问题，</p> 
+<blockquote> 
+ <p>如果需要获取字符串的长度通过遍历计数来获取的，这会导致它的时间复杂度会比较高。</p> 
+ <p>如果需要修改字符串，就要重新分配内存，不重新分配的话，字符串长度增大，超出给定的长度，这个时候会造成内存缓冲区溢出，字符串长度减小还会造成内存泄露。</p> 
+ <p>如果需要对两个字符串进行拼接，是通过调用strcat函数来实现的，如果没有给它分配足够长度的内存空间，就会直接导致缓冲区溢出。</p> 
+</blockquote> 
+<p>既然C语言处理字符串有这么多的弊端，那么Redis它是怎么处理字符串的呢？</p> 
+<p>Redis专门创建了一种数据结构SDS，什么意思呢？simple dynamic string，简单字符串。</p> 
+<p>官方代码：</p> 
+<pre><code class="prism language-java">struct sdshdr<span class="token punctuation">{<!-- --></span>
+
+<span class="token keyword">int</span> len<span class="token punctuation">;</span>
+
+<span class="token keyword">int</span> free<span class="token punctuation">;</span>
+
+<span class="token keyword">char</span> buf<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>这个对象有三个属性：</p> 
+<ul><li>len表示字符串的长度</li><li>free表示还有多少长度剩余，就是下面buf数组中还有多少字符串未使用的字节数量</li><li>buf[]表示存储的字符串</li></ul> 
+<p><strong>问题一：这种数据结构有什么优势呢？跟C语言相比，改进了哪些问题？</strong></p> 
+<blockquote> 
+ <p>长度和内存重新分配问题，C语言是不记录长度，而SDS它有len属性和free属性。</p> 
+ <p>len记录了字符串的长度，直接取值就可以了，不像C语言需要遍历。 如果需要对字符串进行修改的话，也不需要像C语言一样，直接重新分配内存，</p> 
+ <p>它可以通过len 属性检查内存空间是不是需要进行扩展内存，如果字符串长度增加，长度超过了len，就会增加相应的内存，接着修改。</p> 
+ <p>如果字符串长度缩短了，它也不会立马就重新分配内存，而是有一个free属性记录下来，等你后面什么时候用了，重新计算或者分配内存。</p> 
+ <p>结尾标识问题，C语言是以空字符串结尾标识的，而SDS是以len长度作为结尾标识的，避免了C语言无法正确读取字符串的问题。</p> 
+</blockquote> 
+<h2><a id="_51"></a>链表</h2> 
+<p>Redis的list类型的键值对底层数据结构是由链表构成的，那么链表是什么呢？</p> 
+<blockquote> 
+ <p>它是由一连串节点组成，没有顺序，不是连续的，每个节点由数据和一或两个用来指向上一个或下一个节点位置的链接组成，在每一个节点里存到下一个节点的指针，通过链表中的指针链接次序可以实现逻辑顺序。</p> 
+</blockquote> 
+<p>链表也分好几种：单向链表、双端链表、双向链表、有序链表以及有迭代器的链表</p> 
+<p><strong>单向链表</strong>：用户的操作（添加、删除、遍历）只能从链表头开始。向一个方向遍历，查找一个节点的时候从第一个节点开始访问下一个节点，一直访问到需要的位置，最后一个节点存储地址的部分指向空值。</p> 
+<p><strong>双端链表</strong>：双端链表相对于单端链表多了一个特性：对最后一个链接点的引用</p> 
+<p><strong>双向链表</strong>：单端链表只能从链表头开始正向遍历，双向链表可以逆向遍历，每个节点需要保存前一个节点和后一个节点的引用</p> 
+<p><strong>有序链表</strong>：插入元素时，将插入的元素与头结点及其后面的结点比较，找到合适的位置插入。</p> 
+<p><strong>有迭代器的链表</strong>：单链表的基本操作中，大部分要用到依次遍历单链表中的每一个元素。当你新增一个对单链表的操作并需要使用遍历时，你就得重新写一个for循环而实现遍历。所以将迭代（遍历）作为一种基本的ADT（抽象数据类型）操作。链表中用于处理遍历、访问和更新的方法封装到一个新的迭代器类中。</p> 
+<h3><a id="_71"></a>跳跃表</h3> 
+<p><strong>跳跃表</strong>：跳跃表基于有序链表的扩展，在链表上建索引，每两个结点提取一个结点到上一级，我们把抽出来的那一级叫作索引，每个跳跃表节点的层高都是1至32之间的随机数。</p> 
+<p><strong>举例说明：</strong></p> 
+<blockquote> 
+ <p>比如给一个长度为7的有序链表，节点值依次是1-&gt;3-&gt;4-&gt;5。取出所有值为奇数的节点作为关键节点（索引），这个时候要插入一个值是2的新节点，就不需要将节点一个个比较，只要比较1,3,5，确定了值在1和3之间，就可以快速插入。</p> 
+ <p>加一层索引之后，查找一个结点需要遍历的结点个数减少了，虽然增加了50%的额外空间，但是查找效率提高了，同理再加一级索引，这种链表加多级索引的结构，就是跳跃表。</p> 
+ <p>索引是占内存的，原始链表中存储的可能是大的对象，索引结点只要存储关键值和几个指针，并不需要存储对象，当节点本身比较大或者元素数量比较多的时候，优势必然会被放大，而缺点则可以忽略。</p> 
+</blockquote> 
+<p><strong>问题：当大量的新节点通过逐层比较，最终插入到原链表之后，上层的索引节点会慢慢的不够用，那么这个时候要怎么选取一部分节点提到上一层呢？</strong></p> 
+<p><strong>抛硬币法</strong>：随机决定新节点是否选拔，每向上提拔一层的几率是50%。</p> 
+<p><strong>原因</strong>：跳跃表的删除和添加节点是无法预测的，不能保证索引绝对分步均匀，不过可以让大体趋于均匀。</p> 
+<p><strong>插入节点的工作流程</strong>：跳跃表插入操作的时间复杂度是O（logN），空间复杂度是 O（N）。</p> 
+<ul><li>第一步：新节点和上层索引节点逐个比较，找到原链表的插入位置，时间复杂度为O（logN）</li><li>第二步：把索引插入到原链表，时间复杂度为O（1）</li><li>第三步：随机决定新节点是否提升为上一级索引，结果为"正面"则提升，继续抛硬币，结果为"反面"则停止，时间复杂度为O（logN）</li></ul> 
+<p><strong>删除节点的工作流程</strong>：跳跃表删除操作的时间复杂度是O（logN）</p> 
+<ul><li>第一步：自上而下，查找第一次出现节点的索引，并逐层找到每一层对应的节点。时间复杂度为O（logN）</li><li>第二步：删除每一层查找到的节点，如果该层只剩下1个节点，删除整个一层（原链表除外）。时间复杂度为O（logN）</li></ul> 
+<blockquote> 
+ <p>跳跃表由zskiplistNode和skiplist两个结构组成，zskiplistNode用于表示跳跃表节点，zskiplist用于保存跳跃表节点的相关信息，比如节点的数量，以及指向表头节点和表尾节点的指针等等。</p> 
+</blockquote> 
+<h3><a id="_102"></a>字典</h3> 
+<p>字典，顾名思义，通过字典（牛津字典等）前面的目录快速定位到所要查找的单词。</p> 
+<blockquote> 
+ <p>在C 语言中没有这种数据结构，所以这种数据结构是Redis自己创造的，字典中的键都是唯一的，通过键可以对值来进行查询或更改。</p> 
+ <p>底层是通过哈希表实现的，而哈希表又基于数组，类似于key-value的结构形式进行存储的，它的值通过哈希函数映射为数组的下标。</p> 
+</blockquote> 
+<p>那什么是哈希函数呢？不急，我们慢慢道来。</p> 
+<p>前面我们讲了通过数组的方式存储值，那么数组的值和数组的下标怎么建立关联关系呢？或者说，我们怎么通过数组的下标找到数组的值呢？</p> 
+<p>在学习 ASCII 编码的时候，我们知道，a可以用97这个数值表示，b可以用98这个数值表示，以此类推，我们就可以通过单个字母用数字表达。</p> 
+<p>有了字母，那么一个单词由多个字母组成，它又该如何表达呢？</p> 
+<blockquote> 
+ <p>假设我有一本字典，它有10000个单词，我其中一个单词就是ab，使用ASCII编码进行表达。</p> 
+ <p>ab = 97 + 98 = 195<br> 那么存储在数组中的下标为195，这就是字母表达的基本原理，但是如果只是这样还是远远不够的，因为会出现一个数组存储多个单词的情况。</p> 
+</blockquote> 
+<p><strong>举例说明</strong>：假设有个单词有 10 个字母，那么字典的某个单词为 zzzzzzzzzz ，转换为数字：zzzzzzzzzz = 26*10 = 260。</p> 
+<p><strong>补充说明</strong>：这个时候会发现我一本字典里10000个单词，在260这个范围内肯定是不够存储10000个单词的，10000/260=39（38.4补一位），一个数组项它要存储39个单词。</p> 
+<p><strong>解决方案</strong>：为了保证数值的唯一，让每个数组都能够只存储一个单词，进行升级， 将单词表示的数拆开，27 的幂乘以这些位数，有26个可能的字符，以及空格，一共27个。</p> 
+<p>ab = 97乘以27的一次幂加上98乘以27的零次幂 = 27*97 + 98 = 2717。解决了数组存储多个单词的问题，又引出新的问题数组分配大空间太多了。</p> 
+<p><strong>举例说明</strong>：假设有个单词有 10 个字母，那么字典的某个单词为 zzzzzzzzzz ，转换为数字：zzzzzzzzzz = 26的9次幂 = 7000000000000</p> 
+<p><strong>补充说明</strong>：数组中只有小部分存放了单词，其他空间都是空着的</p> 
+<p><strong>解决方案</strong>：将巨大的整数范围压缩到可接受的数组范围内，可以通过取余解决，一个整数被另一个整数除后的余数。</p> 
+<p><strong>举例说明</strong>：假设要把从0-99的数字（用large表示），压缩为从0-9的数字（用number表示），后者有10个数，所以变量range 的值为10，这个转换的表达式为：</p> 
+<p><strong>补充说明</strong>：number = large % range。当一个整数被 10 整除时，余数是在0-9之间，把从0-99的数压缩为从0-9的数，压缩率为 10 :1。</p> 
+<p>使用哈希函数向数组插入数据后，这个数组就是哈希表，它的值就是通过上面这种方式映射到数组的下标上的。</p> 
+<p>这也就是哈希函数的工作模式，它把一个大范围的数字哈希转化成一个小范围的数字，这个小范围的数对应着数组的下标。</p> 
+<p>但是这种工作模式会有一点问题：把大的数字范围压缩到小的数字范围，会有几个不同的单词哈希化到同一个数组下标，这就是所谓的哈希冲突。</p> 
+<p><strong>问题：那么如何解决哈希冲突呢？</strong></p> 
+<p><strong>开放地址法</strong>：指定的数组范围大小是存储数据的两倍，有一半的空间是空的。</p> 
+<blockquote> 
+ <p>当冲突产生时，通过（线性探测、二次探测以及再哈希法）方法找到数组的一个空位，把单词填入，不用哈希函数得到数组的下标。</p> 
+ <p>线性探测中，如果哈希函数计算的原始下标是x, 线性探测就是x+1, x+2, x+3, 以此类推，而在二次探测中，探测的过程是x+1,<br> x+4, x+9, x+16。这二种方式都会有聚集情况。</p> 
+</blockquote> 
+<p><strong>什么是聚集呢</strong>？当哈希表快要满的时候，每插入新的数据，都要频繁的探测插入位置，很多位置都被前面插入的数据所占用了，这称为聚集。</p> 
+<p><strong>再哈希法</strong>：依赖关键字的探测序列，把关键字用不同的哈希函数再做一遍哈希化，用这个结果作为步长，步长在整个探测中是不变的，不过不同的关键字使用不同的步长。</p> 
+<p><strong>链地址法</strong>：数组的每个数据项都创建一个子链表或子数组，那么数组内不直接存放单词，当产生冲突时，新的数据项直接存放到这个数组下标表示的链表中。</p> 
+<p><strong>整数集合</strong>：顾名思义，用来保存整数值类型的集合，保证元素不会重复。</p> 
+<p>定义：</p> 
+<pre><code class="prism language-java">typedef struct intset<span class="token punctuation">{<!-- --></span>
+
+<span class="token comment">//编码方式</span>
+
+uint32_t encoding<span class="token punctuation">;</span>
+
+<span class="token comment">//集合包含的元素数量</span>
+
+uint32_t length<span class="token punctuation">;</span>
+
+<span class="token comment">//保存元素的数组</span>
+
+int8_t contents<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+
+<span class="token punctuation">}</span>intset<span class="token punctuation">;</span>
+</code></pre> 
+<p>contents数组声明为int8_t类型，但是contents数组并不保存任何int8_t类型的值，真正类型由encoding决定。比如：</p> 
+<ul><li>encoding属性的值为INTSET_ENC_INT16，contents是int16_6类型的数组，数组里的每个项是int16_t类型的是整数值。</li><li>encoding属性的值为INTSET_ENC_INT32，contents是int32_t类型的数组，数组里的每个项是int32_t类型的整数值。</li><li>encoding属性的值为INTSET_ENC_INT64，contents是int64_t类型的数组，数组里的每个项是int64_t的整数值。</li></ul> 
+<blockquote> 
+ <p>新增的元素类型比原集合元素类型的长度大的时候，根据新元素类型增加整数集合底层数组的容量，给新元素分配空间，</p> 
+ <p>将底层数组现有的所有元素都转成与新元素相同类型的元素，把转换后的元素放到正确的位置，整个元素顺序是有序的，能极大地节省内存。</p> 
+</blockquote> 
+<h3><a id="_197"></a>压缩列表</h3> 
+<p>压缩列表，它是特殊编码的连续内存块组成的顺序型数据结构，压缩列表有任意多个节点（entry），每个节点有一个字节数组或者一个整数值。</p> 
+<blockquote> 
+ <p>压缩列表不是用某种算法对数据进行压缩，它将数据按照一定规则编码，放在一块连续的内存区域，目的是节省内存。</p> 
+</blockquote> 
+<p>压缩列表包含以下：</p> 
+<p><strong>zlbytes</strong>：记录整个压缩列表占用的内存字节数。</p> 
+<p><strong>zltail</strong>：记录压缩列表表尾节点距离压缩列表的初始地址有多少字节。</p> 
+<p><strong>zllen</strong>：记录压缩列表包含的节点数量。</p> 
+<p><strong>zlend</strong>：用来标记压缩列表的末端。</p> 
+<p><strong>entryX</strong>：列表的节点，包含</p> 
+<ul><li><strong>previous_entry_ength</strong>：记录压缩列表前一个字节的长度。</li><li><strong>encoding</strong>：节点的encoding保存的是节点的content的内容类型以及长度。</li><li><strong>content</strong>：content区域用于保存节点的内容，节点内容类型和长度由encoding决定。</li></ul> 
+<p><strong>总结：</strong></p> 
+<p><strong>简单字符串</strong>：SDS作为redis专门为字符串存取开发的数据结构，有获取字符串长度快，杜绝了缓存区的溢出，减少了修改字符串长度时所需的内存重分配次数，二进制安全，兼容部分C函数</p> 
+<p><strong>链表</strong>：用作列表键、发布与订阅、慢查询、监视器等功能实现。</p> 
+<p><strong>字典</strong>：用哈希表实现，字典有两个哈希表，一个正常使用，另一个用于rehash时使用，链地址法解决哈希冲突。</p> 
+<p><strong>跳跃表</strong>：表中的节点按照分值大小进行排序。</p> 
+<p><strong>整数集合</strong>：底层由数组构成，升级特性能尽可能的节省内存。</p> 
+<p><strong>压缩列表</strong>：顺序型数据结构。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3861a3aa6721a18a8f1f38041bc9b12e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">css实现波浪球效果图,使用css实现圆形波浪效果图</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/702ddd308f4d103eae6f700bfc6eb588/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">css找某个元素的下个子元素,CSS可以检测一个元素有多less个子元素？</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

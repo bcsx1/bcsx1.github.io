@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>KVM虚拟化 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="KVM虚拟化" />
+<meta property="og:description" content="KVM虚拟化 虚拟化技术 虚拟化技术就是对资源的抽象，如虚拟机，虚拟内存等
+虚拟化（Virtualization）技术最早出现在 20 世纪 60 年代的 IBM 大型机系统，在70年代的 System370 系列中逐渐流行起来，这些机器通过一种叫**虚拟机监控器（Virtual Machine Monitor，VMM）**的程序在物理硬件之上生成许多可以运行独立操作系统软件的虚拟机（Virtual Machine）实例
+VMM虚拟机监控器也叫做Hypervisor，就是为了虚拟化而引入的一个软件层。它向下掌控实际的物理资源，向上呈现出N份逻辑资源。
+虚拟机监控器运行的实际物理环境，称为宿主机；其上虚拟出来的逻辑主机，称为客户机。
+分类
+从资源提供角度分
+平台虚拟化：把CPU，内存，外设等作为资源提供给虚拟机使用。在同一个X86平台上面，可以虚拟多个X86平台，每个平台可以运行自己完全独立的操作系统。如QEMU，KVM，VMware等所管理的虚拟机操作系统虚拟化：如果把操作系统及其提供的系统调用作为资源，那虚拟化就表现为操作系统虚拟化，例如Linux容器虚拟化技术就是在同一个Linux操作系统之上，虚拟出多个同样的操作系统，每个应用程序认为自己运行在一个独立的OS。如LXC或Docker等所管理的容器 从虚拟化实现方式分
+Type I：虚拟机直接运行在系统硬件上，被称为裸机型，没有所谓的宿主机操作系统。他们直接控制硬件资源以及客户机。这种方案的性能处于主机虚拟化与操作系统虚拟化之间。如xen和vmware ESXType II：虚拟机运行在传统操作系统上，同样创建的是硬件全仿真实例，被称为**托管（宿主）**型。Hypervisor构建出一整套虚拟硬件平台，使用者根据需要安装新的操作系统和应用软件，底层和上层的操作系统可以完全无关化。简单的说这类VMM通常就是宿主机操作系统上的一个应用程序，像其他应用程序一样受宿主机操作系统的管理，通常抽象为进程。如VMware workstation、KVM。主机虚拟化中VM的应用程序调用硬件资源时需要经过:VM内核-&gt;Hypervisor-&gt;主机内核，相对来说，性能是几种虚拟化技术中最差的 Hypervisor管理工具的对比
+工具厂商主CPU目标CPU主系统目标系统qemuFebrice，BellardInter，AMD，ARMx86/x86-64/ARMWindows，Linux，Mac OSLinuxkvmRed HatInter/AMDx86/x86-64LinuxWindows/LinuxXen剑桥大学，Inter/AMDInter/AMDx86/x86-64Windows/Linux/SolarisWindows/LinuxHyper-V微软Inter/AMDx86/x86-64WindowsWindows/LinuxVMware ESXi ServerVMwareInter/AMDx86/x86-64裸机安装Windows/LinuxOracle VMOracleInter/AMDx86/x86-64裸机安装Windows/Linux KVM架构 KVM内核模块 它属于标准Linux内核的一部分，是一个专门提供虚拟化功能的模块，主要负责CPU和内存的虚拟化本质上，KVM是管理虚拟硬件设备的驱动，该驱动使用字符设备**/dev/kvm**（由KVM本身创建）作为管理接口，主要负责vCPU的创建，虚拟内存的分配，vCPU寄存器的读写以及vCPU的运行 QEMU QEMU是用户态工具，可以为客户机提供设备模拟的功能，包括模拟BIOS、数据总线、磁盘、网卡、显卡、声卡、键盘、鼠标等。
+我们知道KVM只负责CPU和内存的虚拟化，加载了它以后，用户就可以进一步通过工具创建虚拟机（KVM提供接口），但仅有KVM还是不够的，用户无法直接控制内核去做事情（KVM只提供接口，怎么创建虚拟机，分配vCPU等并不在它上面进行），还必须有个运行在用户空间的工具才行，KVM的开发者选择了比较成熟的开源虚拟化软件QEMU来作为这个工具，并对其进行了修改，最后形成了QEMU-KVM。
+在QEMU-KVM中，KVM运行在内核空间，QEMU运行在用户空间，实际模拟创建，管理各种虚拟硬件，QEMU将KVM整合了进来，通过/ioctl 调用 /dev/kvm，从而将CPU指令的部分交给内核模块来做，KVM实现了CPU和内存的虚拟化，但kvm不能虚拟其他硬件设备，因此qemu还有模拟IO设备（磁盘，网卡，显卡等）的作用，KVM加上QEMU后就是完整意义上的服务器虚拟化。但是，由于qemu模拟io设备效率不高的原因，现在常常采用半虚拟化的virtio方式来虚拟IO设备。
+KVM负责提供对cpu，内存的虚拟
+QEMU负责除CPU和内存外的其他设备的虚拟以及对各种虚拟设备的创建与调用
+libvirt libvirt是一套免费、开源的支持Linux下主流虚拟化管理程序的C函数库，其旨在为包括KVM在内的各种虚拟化管理程序提供一套方便、可靠的编程接口。 当前主流Linux平台上默认的虚拟化管理工具virt-manager,virsh等都是基于libvirt开发。libvirt是一个针对各种虚拟化平台的虚拟机管理的API库。一些常用的虚拟机管理工具如virsh（类似vim编辑器），virt-install，virt-manager等和云计算框架平台（如OpenStack，OpenNebula，Eucalyptus等）都在底层使用libvirt提供的应用程序接口。libvirt主要由三个部分组成：API库，一个守护进程 libvirtd 和一个默认命令行管理工具 virsh。 总结 QEMU是一个独立的虚拟化解决方案，并不依赖KVM（它本身自己可以做CPU和内存的模拟，只不过效率较低）。而KVM是另一套虚拟化解决方案，对CPU进行虚拟效率较高（采用了硬件辅助虚拟化），但本身不提供其他设备的虚拟化，借用了QEMU的代码进行了定制，所以KVM方案一定要依赖QEMU。即使后来RedHat后来开发了libvirt，也只能简单的认为libvirt是个虚拟机管理工具，仍然需要通过用户空间QEMU来与KVM进行交互。 KVM虚拟机部署 环境准备 Linux主机需要安装图形化桌面 最小化——&gt;图形
+yum groupinstall -y “GNOME 桌面”
+重启
+startx临时开启终端（不推荐）
+systemctl set-default graphical.targer
+[root@server1 ~]# systemctl get-default" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/fb7404708a0732ed017349de8e856251/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-02-11T22:51:57+08:00" />
+<meta property="article:modified_time" content="2022-02-11T22:51:57+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">KVM虚拟化</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="KVM_0"></a>KVM虚拟化</h2> 
+<h3><a id="_2"></a>虚拟化技术</h3> 
+<ul><li> <p>虚拟化技术就是<strong>对资源的抽象</strong>，如虚拟机，虚拟内存等</p> </li><li> <p>虚拟化（Virtualization）技术最早出现在 20 世纪 60 年代的 IBM 大型机系统，在70年代的 System370 系列中逐渐流行起来，这些机器通过一种叫**虚拟机监控器（Virtual Machine Monitor，VMM）**的程序在物理硬件之上生成许多可以运行独立操作系统软件的虚拟机（Virtual Machine）实例</p> </li><li> <p>VMM虚拟机监控器也叫做<strong>Hypervisor</strong>，就是为了虚拟化而引入的一个软件层。它向下掌控实际的物理资源，向上呈现出N份逻辑资源。</p> </li><li> <p>虚拟机监控器运行的实际物理环境，称为<strong>宿主机</strong>；其上虚拟出来的逻辑主机，称为<strong>客户机。</strong></p> </li><li> <p>分类</p> 
+  <ul><li> <p>从资源提供角度分</p> 
+    <ul><li><strong>平台虚拟化</strong>：把CPU，内存，外设等作为资源提供给虚拟机使用。在同一个X86平台上面，可以虚拟多个X86平台，每个平台可以运行自己完全独立的操作系统。如QEMU，KVM，VMware等所管理的虚拟机</li><li><strong>操作系统虚拟化</strong>：如果把操作系统及其提供的系统调用作为资源，那虚拟化就表现为操作系统虚拟化，例如Linux容器虚拟化技术就是在同一个Linux操作系统之上，虚拟出多个同样的操作系统，每个应用程序认为自己运行在一个独立的OS。如LXC或Docker等所管理的容器</li></ul> </li><li> <p>从虚拟化实现方式分</p> <p><img src="https://images2.imgbox.com/81/3c/W3WluDrT_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-evuMv5LW-1644590514274)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224142601421.png)]"></p> 
+    <ul><li>Type I：虚拟机直接运行在系统硬件上，被称为<strong>裸机</strong>型，没有所谓的宿主机操作系统。他们直接控制硬件资源以及客户机。这种方案的性能处于主机虚拟化与操作系统虚拟化之间。如xen和vmware ESX</li><li>Type II：虚拟机运行在传统操作系统上，同样创建的是硬件全仿真实例，被称为**托管（宿主）**型。Hypervisor构建出一整套虚拟硬件平台，使用者根据需要安装新的操作系统和应用软件，底层和上层的操作系统可以完全无关化。简单的说这类VMM通常就是宿主机操作系统上的一个应用程序，像其他应用程序一样受宿主机操作系统的管理，<strong>通常抽象为进程</strong>。如VMware workstation、KVM。主机虚拟化中VM的应用程序调用硬件资源时需要经过:<strong>VM内核-&gt;Hypervisor-&gt;主机内核</strong>，相对来说，性能是几种虚拟化技术中最差的</li></ul> </li></ul> </li><li> <p>Hypervisor管理工具的对比</p> </li></ul> 
+<table><thead><tr><th>工具</th><th>厂商</th><th>主CPU</th><th>目标CPU</th><th>主系统</th><th>目标系统</th></tr></thead><tbody><tr><td>qemu</td><td>Febrice，Bellard</td><td>Inter，AMD，ARM</td><td>x86/x86-64/ARM</td><td>Windows，Linux，Mac OS</td><td>Linux</td></tr><tr><td>kvm</td><td>Red Hat</td><td>Inter/AMD</td><td>x86/x86-64</td><td>Linux</td><td>Windows/Linux</td></tr><tr><td>Xen</td><td>剑桥大学，Inter/AMD</td><td>Inter/AMD</td><td>x86/x86-64</td><td>Windows/Linux/Solaris</td><td>Windows/Linux</td></tr><tr><td>Hyper-V</td><td>微软</td><td>Inter/AMD</td><td>x86/x86-64</td><td>Windows</td><td>Windows/Linux</td></tr><tr><td>VMware ESXi Server</td><td>VMware</td><td>Inter/AMD</td><td>x86/x86-64</td><td>裸机安装</td><td>Windows/Linux</td></tr><tr><td>Oracle VM</td><td>Oracle</td><td>Inter/AMD</td><td>x86/x86-64</td><td>裸机安装</td><td>Windows/Linux</td></tr></tbody></table> 
+<h3><a id="KVM_38"></a>KVM架构</h3> 
+<h4><a id="KVM_40"></a>KVM内核模块</h4> 
+<ul><li>它属于标准Linux内核的一部分，是一个专门提供虚拟化功能的模块，主要<strong>负责CPU和内存的虚拟化</strong></li><li>本质上，KVM是管理虚拟硬件设备的驱动，该驱动使用字符设备**/dev/kvm**（由KVM本身创建）作为<strong>管理接口</strong>，主要负责vCPU的创建，虚拟内存的分配，vCPU寄存器的读写以及vCPU的运行</li></ul> 
+<h4><a id="QEMU_45"></a>QEMU</h4> 
+<ul><li> <p><strong>QEMU是用户态工具</strong>，可以为客户机提供<strong>设备模拟</strong>的功能，包括模拟BIOS、数据总线、磁盘、网卡、显卡、声卡、键盘、鼠标等。</p> </li><li> <p>我们知道KVM只负责CPU和内存的虚拟化，加载了它以后，用户就可以进一步通过工具创建虚拟机（KVM提供接口），但仅有KVM还是不够的，用户无法直接控制内核去做事情（KVM只提供接口，怎么创建虚拟机，分配vCPU等并不在它上面进行），还必须有个运行在用户空间的工具才行，KVM的开发者选择了比较成熟的开源虚拟化软件QEMU来作为这个工具，并对其进行了修改，最后形成了QEMU-KVM。</p> </li><li> <p>在QEMU-KVM中，<strong>KVM运行在内核空间</strong>，<strong>QEMU运行在用户空间</strong>，实际模拟创建，管理各种虚拟硬件，QEMU将KVM整合了进来，通过/ioctl 调用 /dev/kvm，从而将CPU指令的部分交给内核模块来做，KVM实现了CPU和内存的虚拟化，但kvm不能虚拟其他硬件设备，因此qemu还有模拟IO设备（磁盘，网卡，显卡等）的作用，<strong>KVM加上QEMU后就是完整意义上的服务器虚拟化</strong>。但是，由于qemu模拟io设备效率不高的原因，现在常常采用半虚拟化的virtio方式来虚拟IO设备。</p> </li><li> <p><strong>KVM</strong>负责提供对<strong>cpu，内存的虚拟</strong></p> </li><li> <p><strong>QEMU</strong>负责除CPU和内存外的<strong>其他设备的虚拟</strong>以及对<strong>各种虚拟设备的创建与调用</strong></p> <p><img src="https://images2.imgbox.com/23/9e/JTmbCs1N_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-8kHeoKql-1644590514275)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224154333919.png)]"></p> </li></ul> 
+<h4><a id="libvirt_60"></a>libvirt</h4> 
+<ul><li>libvirt是一套免费、开源的支持Linux下主流虚拟化管理程序的C函数库，其旨在为包括KVM在内的各种虚拟化管理程序提供一套方便、可靠的编程接口。 当前主流Linux平台上默认的虚拟化管理工具virt-manager,virsh等都是基于libvirt开发。</li><li>libvirt是一个针对各种虚拟化平台的虚拟机管理的API库。一些常用的虚拟机管理工具如virsh（类似vim编辑器），virt-install，virt-manager等和云计算框架平台（如OpenStack，OpenNebula，Eucalyptus等）都在底层使用libvirt提供的应用程序接口。</li><li>libvirt主要由三个部分组成：API库，一个守护进程 libvirtd 和一个默认命令行管理工具 virsh。</li></ul> 
+<h4><a id="_66"></a>总结</h4> 
+<ul><li>QEMU是一个独立的虚拟化解决方案，并不依赖KVM（它本身自己可以做CPU和内存的模拟，只不过效率较低）。而KVM是另一套虚拟化解决方案，对CPU进行虚拟效率较高（采用了硬件辅助虚拟化），但本身不提供其他设备的虚拟化，借用了QEMU的代码进行了定制，所以KVM方案一定要依赖QEMU。即使后来RedHat后来开发了libvirt，也只能简单的认为libvirt是个虚拟机管理工具，仍然需要通过用户空间QEMU来与KVM进行交互。</li></ul> 
+<h3><a id="KVM_70"></a>KVM虚拟机部署</h3> 
+<h4><a id="_72"></a>环境准备</h4> 
+<ul><li>Linux主机需要安装<strong>图形化桌面</strong></li></ul> 
+<blockquote> 
+ <p>最小化——&gt;图形</p> 
+ <ul><li> <p>yum groupinstall -y “GNOME 桌面”</p> </li><li> <p>重启</p> </li><li> <p>startx临时开启终端（不推荐）</p> </li><li> <p>systemctl set-default graphical.targer</p> <p>[root@server1 ~]# systemctl get-default<br> graphical.target</p> </li></ul> 
+</blockquote> 
+<ul><li> <p>注意合理分配CPU，内存，磁盘空间等</p> </li><li> <p>确保开启硬件辅助虚拟化</p> <p><img src="https://images2.imgbox.com/6d/c4/xbQKMI2K_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-3lHTurEu-1644590514276)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224161856595.png)]"></p> </li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># lscpu|grep '虚拟化'</span>
+虚拟化：           VT<span class="token operator">-</span>x
+虚拟化类型：     完全
+</code></pre> 
+<ul><li>查看CPU支持的功能（vmx:INTEL的虚拟化功能|svm:AMD的虚拟化功能）</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># grep -E 'svm|vmx' /proc/cpuinfo </span>
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon nopl xtopology tsc_reliable nonstop_tsc eagerfpu pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow vnmi ept vpid fsgsbase tsc_adjust bmi1 avx2 smep bmi2 invpcid rdseed adx smap clflushopt xsaveopt xsavec xgetbv1 arat pku ospke md_clear spec_ctrl intel_stibp flush_l1d arch_capabilities
+</code></pre> 
+<h4><a id="kvm_109"></a>安装kvm</h4> 
+<pre><code class="prism language-powershell">清理干净KVM相关的预装环境
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># yum remove `rpm -qa |egrep 'qemu|virt|kvm'`</span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># rm -rf /var/lib/libvirt/</span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># rm -rf /etc/libvirt/</span>
+
+查看分组
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># yum grouplist</span>
+
+安装kvm分组（可译为虚拟化的包都会被安装）
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># yum install *qemu* *virt* librbd1-devel -y</span>
+
+开启libvirt
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl start libvirtd</span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl enable libvirtd</span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl status libvirtd</span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh list --all</span>
+ Id    名称                         状态
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+
+确保kvm模块已被加载
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># lsmod |grep kvm</span>
+kvm_intel             188740  0 
+kvm                   637515  1 kvm_intel
+irqbypass              13503  1 kvm
+
+设置防火墙规则
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl start firewalld.service </span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl enable firewalld.service </span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># firewall-cmd --zone=public --add-masquerade --permanent </span>
+success
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># firewall-cmd --zone=public --add-masquerade</span>
+success
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># firewall-cmd --zone=public --list-all </span>
+public <span class="token punctuation">(</span>active<span class="token punctuation">)</span>
+  target: default
+  icmp<span class="token operator">-</span><span class="token function">block-inversion</span>: no
+  interfaces: ens33
+  sources: 
+  services: dhcpv6<span class="token operator">-</span>client ssh
+  ports: 
+  protocols: 
+  masquerade: yes
+  forward<span class="token operator">-</span>ports: 
+  source<span class="token operator">-</span>ports: 
+  icmp<span class="token operator">-</span>blocks: 
+  rich rules: 
+</code></pre> 
+<h4><a id="Guest_OS_160"></a>Guest OS安装</h4> 
+<h5><a id="_162"></a>图形化安装</h5> 
+<ul><li>调出虚拟系统管理器</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virt-manager</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/e8/d2/ygT3bWdG_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-udOeBo8i-1644590514277)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224210105806.png)]"></p> 
+<ul><li>上传系统镜像</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># rz</span>
+
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># ls</span>
+anaconda<span class="token operator">-</span>ks<span class="token punctuation">.</span>cfg                   公共  视频  文档  音乐
+CentOS<span class="token operator">-</span>7<span class="token operator">-</span>x86_64<span class="token operator">-</span>Minimal<span class="token operator">-</span>2009<span class="token punctuation">.</span>iso  模板  图片  下载  桌面
+</code></pre> 
+<ul><li>使用镜像安装</li></ul> 
+<p><img src="https://images2.imgbox.com/5d/33/OYKHvpd3_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-zVuhEbwS-1644590514278)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224211531099.png)]"></p> 
+<p><img src="https://images2.imgbox.com/11/eb/dAYIOQVG_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-TfpGvlby-1644590514279)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224211605051.png)]"></p> 
+<p><img src="https://images2.imgbox.com/13/06/K9O6fP7S_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-ZM1rW4nh-1644590514279)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224211715726.png)]"></p> 
+<p><img src="https://images2.imgbox.com/19/56/B8GI5Ntv_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-efTIacru-1644590514280)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224211806367.png)]"></p> 
+<p><img src="https://images2.imgbox.com/55/d6/7ROSQ6b6_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-v7TlaHMy-1644590514280)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224211831558.png)]"></p> 
+<p><img src="https://images2.imgbox.com/9a/ba/yEjjlj36_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-e2zY9Ktj-1644590514281)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224211933970.png)]"></p> 
+<p><img src="https://images2.imgbox.com/17/7d/vpKMAUyH_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-gA36utF5-1644590514281)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224212044427.png)]"></p> 
+<p><img src="https://images2.imgbox.com/1d/27/Hvg6Cx3T_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-nCqmWlFA-1644590514282)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224212242379.png)]"></p> 
+<p><img src="https://images2.imgbox.com/df/29/ZRTQBh2X_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-n6BBH9K5-1644590514283)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224212642808.png)]"></p> 
+<ul><li>自定义配置（配置完成后点击：左上角开始安装）</li></ul> 
+<p><img src="https://images2.imgbox.com/f1/4f/qK33w6Cb_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-yL0kpWaH-1644590514283)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224213650937.png)]"></p> 
+<p><img src="https://images2.imgbox.com/fc/51/2H0O2jxC_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-V3XAn4zi-1644590514284)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224213916580.png)]"></p> 
+<p><img src="https://images2.imgbox.com/0f/d8/QXEYiD7x_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-73fMGMQ9-1644590514284)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224214524788.png)]"></p> 
+<ul><li>安装过程中可以参考CentOS7的安装</li></ul> 
+<p><img src="https://images2.imgbox.com/fe/68/0575zVcK_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-h283yiRA-1644590514285)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224221338233.png)]"></p> 
+<h5><a id="_228"></a>命令行安装</h5> 
+<ul><li>帮助信息</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virt-install --help</span>
+<span class="token comment"># 仅保留常用选型</span>
+usage: virt<span class="token operator">-</span>install <span class="token operator">--</span>name NAME <span class="token operator">--</span>memory MB STORAGE INSTALL <span class="token namespace">[options]</span>
+选项:
+  <span class="token operator">-</span>h<span class="token punctuation">,</span> <span class="token operator">--</span>help            show this help message and <span class="token keyword">exit</span>
+  <span class="token operator">-</span>n NAME<span class="token punctuation">,</span> <span class="token operator">--</span>name NAME  客户机实例名称
+  <span class="token operator">--</span>memory MEMORY       Configure guest memory allocation<span class="token punctuation">.</span> Ex:
+                        <span class="token operator">--</span>memory 1024 <span class="token punctuation">(</span>in MiB<span class="token punctuation">)</span>
+                        <span class="token operator">--</span>memory 512<span class="token punctuation">,</span>maxmemory=1024
+  <span class="token operator">--</span>vcpus VCPUS         Number of vcpus to configure <span class="token keyword">for</span> your guest<span class="token punctuation">.</span> Ex:
+                        <span class="token operator">--</span>vcpus 5
+                        <span class="token operator">--</span>vcpus 5<span class="token punctuation">,</span>maxvcpus=10<span class="token punctuation">,</span>cpuset=1<span class="token operator">-</span>4<span class="token punctuation">,</span>6<span class="token punctuation">,</span>8
+  <span class="token operator">--</span>cdrom CDROM         光驱安装介质
+  <span class="token operator">--</span>disk DISK           指定存储的各种选项。例如：
+                        <span class="token operator">--</span>disk size=10 <span class="token punctuation">(</span>在默认位置创建 10GiB 镜像<span class="token punctuation">)</span>
+                        <span class="token operator">--</span>disk <span class="token operator">/</span>my<span class="token operator">/</span>existing<span class="token operator">/</span>disk<span class="token punctuation">,</span>cache=none
+                        <span class="token operator">--</span>disk device=cdrom<span class="token punctuation">,</span>bus=scsi
+                        <span class="token operator">--</span>disk=?
+  <span class="token operator">-</span>w NETWORK<span class="token punctuation">,</span> <span class="token operator">--</span>network NETWORK
+                        配置客户机网络接口。例如：
+                        <span class="token operator">--</span>network bridge=mybr0
+                        <span class="token operator">--</span>network network=my_libvirt_virtual_net
+                        <span class="token operator">--</span>network 
+  <span class="token operator">--</span>graphics GRAPHICS   配置客户机显示设置。例如：
+                        <span class="token operator">--</span>graphics vnc
+                        <span class="token operator">--</span>graphics spice<span class="token punctuation">,</span>port=5901<span class="token punctuation">,</span>tlsport=5902
+                        <span class="token operator">--</span>graphics none
+                        <span class="token operator">--</span>graphics vnc<span class="token punctuation">,</span>password=foobar<span class="token punctuation">,</span>port=5910<span class="token punctuation">,</span>keymap=ja
+  <span class="token operator">--</span>arch ARCH           模拟 CPU 架构
+  <span class="token operator">--</span>autostart           主机启动时自动启动域。
+  <span class="token operator">--</span>noautoconsole       不要自动尝试连接到客户端控制台
+</code></pre> 
+<ul><li>安装示例</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virt-install \</span>
+	<span class="token operator">--</span>name=centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1 \
+	<span class="token operator">--</span>vcpus=1 \
+	<span class="token operator">--</span>ram=1024 \
+	<span class="token operator">--</span>arch=x86_64 \
+	<span class="token operator">--</span>os<span class="token operator">-</span><span class="token function">type</span>=linux \
+	<span class="token operator">--</span>os<span class="token operator">-</span>variant=rhel7 \
+	<span class="token operator">--</span>graphics vnc<span class="token punctuation">,</span>listen=0<span class="token punctuation">.</span>0<span class="token punctuation">.</span>0<span class="token punctuation">.</span>0<span class="token punctuation">,</span>port=5901<span class="token punctuation">,</span>keymap=en<span class="token operator">-</span>us \
+	<span class="token operator">--</span>disk path=<span class="token operator">/</span><span class="token keyword">var</span><span class="token operator">/</span>lib<span class="token operator">/</span>libvirt<span class="token operator">/</span>images<span class="token operator">/</span>centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1<span class="token punctuation">.</span>img<span class="token punctuation">,</span>size=3<span class="token punctuation">,</span>format=qcow2 \
+	<span class="token operator">--</span>cdrom=<span class="token operator">/</span>home<span class="token operator">/</span>CentOS<span class="token operator">-</span>7<span class="token operator">-</span>x86_64<span class="token operator">-</span>Minimal<span class="token operator">-</span>2009<span class="token punctuation">.</span>iso \
+	<span class="token operator">--</span>network bridge=virbr0
+</code></pre> 
+<table><thead><tr><th>选型（为空表示可追加）</th><th>可更换为</th></tr></thead><tbody><tr><td>–graphics vnc,listen=0.0.0.0,<br>port=5901,keymap=en-us</td><td>–nographics</td></tr><tr><td></td><td>–noautoconsole</td></tr><tr><td>–network bridge=virbr0</td><td>–bridge=virbr0</td></tr><tr><td>–ram=1024</td><td>–memory 512,maxmemory=1024</td></tr><tr><td>–vcpus=1</td><td>–vcpus 1,maxvcpus=4</td></tr><tr><td></td><td>–autostart</td></tr></tbody></table> 
+<h4><a id="_291"></a>基本使用</h4> 
+<ul><li>查看客户机</li></ul> 
+<pre><code class="prism language-powershell">查看正在运行的虚拟机
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh list </span>
+ Id    名称                         状态
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+
+查看所有虚拟机
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh list --all </span>
+ Id    名称                         状态
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+ <span class="token operator">-</span>     centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1                    关闭
+
+查看域信息
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh dominfo centos7.6-1</span>
+Id:             1
+名称：       centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1
+UUID:           92891b9c<span class="token operator">-</span>37cc<span class="token operator">-</span>4511<span class="token operator">-</span>9bf6<span class="token operator">-</span>59a8170c434c
+OS 类型：    hvm
+状态：       running
+CPU：          1
+CPU 时间：   20<span class="token punctuation">.</span>5s
+最大内存： 1048576 KiB
+使用的内存： 1048576 KiB
+持久：       是
+自动启动： 禁用
+管理的保存： 否
+安全性模式： none
+安全性 DOI： 0
+
+查看虚拟机资源占用情况
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virt-top</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/3c/9e/zpNkiuM2_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-WLBNUU9U-1644590514285)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211225171314781.png)]"></p> 
+<ul><li>启动客户机</li></ul> 
+<pre><code class="prism language-powershell">启动虚拟机
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh start centos7.6-1</span>
+域 centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1 已开始
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh list</span>
+ Id    名称                         状态
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+ 1     centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1                    running
+ 
+设置开机自启
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh autostart centos7.6-1</span>
+域 centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1标记为自动开始
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh dominfo centos7.6-1</span>
+Id:             1
+名称：       centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1
+UUID:           92891b9c<span class="token operator">-</span>37cc<span class="token operator">-</span>4511<span class="token operator">-</span>9bf6<span class="token operator">-</span>59a8170c434c
+OS 类型：    hvm
+状态：       running
+CPU：          1
+CPU 时间：   20<span class="token punctuation">.</span>7s
+最大内存： 1048576 KiB
+使用的内存： 1048576 KiB
+持久：       是
+自动启动： 启用
+管理的保存： 否
+安全性模式： none
+安全性 DOI： 0
+</code></pre> 
+<ul><li>修改配置文件/etc/libvirt/qemu/centos7.6-1.xml</li></ul> 
+<pre><code class="prism language-xml">文件位置/etc/libvirt/qemu/centos7.6-1.xml 
+[root@server5 ~]# head -20 /etc/libvirt/qemu/centos7.6-1.xml 
+<span class="token comment">&lt;!--
+WARNING: THIS IS AN AUTO-GENERATED FILE. CHANGES TO IT ARE LIKELY TO BE
+OVERWRITTEN AND LOST. Changes to this xml configuration should be made using:
+  virsh edit centos7.6-1	命令行修改方法
+or other application using the libvirt API.
+--&gt;</span>
+
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>domain</span> <span class="token attr-name">type</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>kvm<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>centos7.6-1<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>uuid</span><span class="token punctuation">&gt;</span></span>92891b9c-37cc-4511-9bf6-59a8170c434c<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>uuid</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>memory</span> <span class="token attr-name">unit</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>KiB<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>1048576<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>memory</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>currentMemory</span> <span class="token attr-name">unit</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>KiB<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>1048576<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>currentMemory</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>vcpu</span> <span class="token attr-name">placement</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>static<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>1<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>vcpu</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>os</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>type</span> <span class="token attr-name">arch</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>x86_64<span class="token punctuation">'</span></span> <span class="token attr-name">machine</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>pc-i440fx-rhel7.0.0<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>hvm<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>type</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>boot</span> <span class="token attr-name">dev</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>hd<span class="token punctuation">'</span></span><span class="token punctuation">/&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>os</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>features</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>acpi</span><span class="token punctuation">/&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>apic</span><span class="token punctuation">/&gt;</span></span>
+
+[root@server5 ~]# virsh edit centos7.6-1
+</code></pre> 
+<ul><li>网络配置文件/etc/libvirt/qemu/networks/</li></ul> 
+<pre><code class="prism language-xml">[root@server5 ~]# cd /etc/libvirt/qemu/networks/
+[root@server5 networks]# ls
+autostart  default.xml
+<span class="token comment">&lt;!--
+WARNING: THIS IS AN AUTO-GENERATED FILE. CHANGES TO IT ARE LIKELY TO BE
+OVERWRITTEN AND LOST. Changes to this xml configuration should be made using:
+  virsh net-edit default	命令行修改方法
+or other application using the libvirt API.
+--&gt;</span>
+
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>network</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>default<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>uuid</span><span class="token punctuation">&gt;</span></span>481578d7-6728-48fa-8569-09eac31a0273<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>uuid</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>forward</span> <span class="token attr-name">mode</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>nat<span class="token punctuation">'</span></span><span class="token punctuation">/&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>bridge</span> <span class="token attr-name">name</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>virbr0<span class="token punctuation">'</span></span> <span class="token attr-name">stp</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>on<span class="token punctuation">'</span></span> <span class="token attr-name">delay</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>0<span class="token punctuation">'</span></span><span class="token punctuation">/&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>mac</span> <span class="token attr-name">address</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>52:54:00:61:66:bb<span class="token punctuation">'</span></span><span class="token punctuation">/&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>ip</span> <span class="token attr-name">address</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>192.168.122.1<span class="token punctuation">'</span></span> <span class="token attr-name">netmask</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>255.255.255.0<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>dhcp</span><span class="token punctuation">&gt;</span></span>
+      <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>range</span> <span class="token attr-name">start</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>192.168.122.2<span class="token punctuation">'</span></span> <span class="token attr-name">end</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>192.168.122.254<span class="token punctuation">'</span></span><span class="token punctuation">/&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>dhcp</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>ip</span><span class="token punctuation">&gt;</span></span>
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>network</span><span class="token punctuation">&gt;</span></span>
+</code></pre> 
+<ul><li>存储池配置文件/etc/libvirt/storage/</li></ul> 
+<pre><code class="prism language-xml">[root@server5 ~]# cd /etc/libvirt/storage/
+[root@server5 storage]# ls
+autostart  home.xml
+[root@server5 storage]# vim home.xml 
+<span class="token comment">&lt;!--
+WARNING: THIS IS AN AUTO-GENERATED FILE. CHANGES TO IT ARE LIKELY TO BE
+OVERWRITTEN AND LOST. Changes to this xml configuration should be made using:
+  virsh pool-edit home
+or other application using the libvirt API.
+--&gt;</span>
+
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>pool</span> <span class="token attr-name">type</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>dir<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>home<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>uuid</span><span class="token punctuation">&gt;</span></span>74ccd74f-30ea-4462-bc85-ca363520a1cf<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>uuid</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>capacity</span> <span class="token attr-name">unit</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>bytes<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>0<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>capacity</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>allocation</span> <span class="token attr-name">unit</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>bytes<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>0<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>allocation</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>available</span> <span class="token attr-name">unit</span><span class="token attr-value"><span class="token punctuation attr-equals">=</span><span class="token punctuation">'</span>bytes<span class="token punctuation">'</span></span><span class="token punctuation">&gt;</span></span>0<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>available</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>source</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>source</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>target</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>path</span><span class="token punctuation">&gt;</span></span>/home<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>path</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>target</span><span class="token punctuation">&gt;</span></span>
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>pool</span><span class="token punctuation">&gt;</span></span>
+</code></pre> 
+<ul><li>CPU热添加</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@centos7.6-1 ~]</span><span class="token comment"># lscpu</span>
+Architecture:          x86_64
+CPU op<span class="token operator">-</span>mode<span class="token punctuation">(</span>s<span class="token punctuation">)</span>:        32<span class="token operator">-</span>bit<span class="token punctuation">,</span> 64<span class="token operator">-</span>bit
+Byte Order:            Little Endian
+CPU<span class="token punctuation">(</span>s<span class="token punctuation">)</span>:                1
+On<span class="token operator">-</span>line CPU<span class="token punctuation">(</span>s<span class="token punctuation">)</span> list:   0
+
+命令行添加
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh setvcpus centos7.6-1 2 --live</span>
+
+<span class="token namespace">[root@centos7.6-1 ~]</span><span class="token comment"># lscpu</span>
+Architecture:          x86_64
+CPU op<span class="token operator">-</span>mode<span class="token punctuation">(</span>s<span class="token punctuation">)</span>:        32<span class="token operator">-</span>bit<span class="token punctuation">,</span> 64<span class="token operator">-</span>bit
+Byte Order:            Little Endian
+CPU<span class="token punctuation">(</span>s<span class="token punctuation">)</span>:                2
+On<span class="token operator">-</span>line CPU<span class="token punctuation">(</span>s<span class="token punctuation">)</span> list:   0<span class="token punctuation">,</span>1
+</code></pre> 
+<ul><li>内存气球</li></ul> 
+<blockquote> 
+ <p>KVM内存气球技术可以对虚拟机使用的内存按需调节，从而提高内存的利用率。linux默认就支持内存气球</p> 
+</blockquote> 
+<ul><li> <p>半虚拟化驱动</p> 
+  <ul><li> <p>全虚拟化驱动</p> <p><img src="https://images2.imgbox.com/35/5f/7eLm7tFZ_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-1uLtb7IB-1644590514286)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230224504219.png)]"></p> </li><li> <p>半虚拟化驱动</p> <p>通过驱动对操作系统进行了修改，即Virtio技术，，虚拟机直接访问虚拟化层，步骤减少，转化效率高</p> <p><img src="https://images2.imgbox.com/20/6b/6VucgnSp_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-hwFZidyN-1644590514286)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230224702005.png)]"></p> </li><li> <p>配置半虚拟化驱动</p> 
+    <ul><li> <p>网络选择virtio</p> <p><img src="https://images2.imgbox.com/1d/2c/0JS7woO3_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-fEBkfDor-1644590514287)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211224213916580.png)]"></p> </li><li> <p>客户机查看是否支持半虚拟化驱动</p> </li></ul> <pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virt-what</span>
+kvm
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># ethtool -i eth0</span>
+driver: virtio_net
+version: 1<span class="token punctuation">.</span>0<span class="token punctuation">.</span>0
+firmware<span class="token operator">-</span>version: 
+expansion<span class="token operator">-</span>rom<span class="token operator">-</span>version: 
+bus<span class="token operator">-</span>info: 0000:00:03<span class="token punctuation">.</span>0
+supports<span class="token operator">-</span>statistics: no
+supports<span class="token operator">-</span>test: no
+supports<span class="token operator">-</span>eeprom<span class="token operator">-</span>access: no
+supports<span class="token operator">-</span><span class="token function">register-dump</span>: no
+supports<span class="token operator">-</span>priv<span class="token operator">-</span>flags: no
+</code></pre> 
+    <ul><li> <p>软件获取：<a href="http://www.linux-kvm.org/page/WindowsGuestDrivers/Download_Drivers" rel="nofollow">http://www.linux-kvm.org/page/WindowsGuestDrivers/Download_Drivers</a></p> <p><img src="https://images2.imgbox.com/3f/a4/8bEasHkn_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-qSvTD3op-1644590514287)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230225401023.png)]"></p> <p><img src="https://images2.imgbox.com/57/5f/gJpdfL2S_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-4ee9ERcO-1644590514287)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230225446479.png)]"></p> </li></ul> </li></ul> </li></ul> 
+<h4><a id="_522"></a>配置</h4> 
+<h5><a id="_524"></a>添加网卡</h5> 
+<ul><li> <p>virt-manager图形化配置</p> <p><img src="https://images2.imgbox.com/4a/81/iIBaK62G_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-qOvVG3Sd-1644590514288)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230231422646.png)]"></p> </li></ul> 
+<p><img src="https://images2.imgbox.com/ca/b0/t82PtE2e_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-JtrgtnTd-1644590514288)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230231722128.png)]"></p> 
+<p><img src="https://images2.imgbox.com/e9/89/zNAXgY1t_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-7kAaVii7-1644590514289)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20211230231837941.png)]"></p> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@localhost ~]</span><span class="token comment"># cd /etc/sysconfig/network-scripts/</span>
+<span class="token namespace">[root@localhost network-scripts]</span><span class="token comment"># ls</span>
+<span class="token namespace">[root@localhost network-scripts]</span><span class="token comment"># cp ifcfg-eth0 ifcfg-ens9</span>
+修改相应的配置文件
+</code></pre> 
+<ul><li>virsh命令行添加</li></ul> 
+<pre><code class="prism language-powershell">确保客户机运行
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh list</span>
+ Id    名称                         状态
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+ 1     centos7<span class="token punctuation">.</span>6<span class="token operator">-</span>1                    running
+
+查看已有网卡
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh domiflist centos7.6-1 </span>
+接口     类型     源        型号      MAC
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+vnet0      bridge     virbr0     virtio      52:54:00:65:4d:a5
+vnet1      network    default    rtl8139     52:54:00:9a:18:f7
+
+添加网卡
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh attach-interface centos7.6-1 \</span>
+	<span class="token operator">--</span><span class="token function">type</span> network \
+	<span class="token operator">--</span>source default \
+	<span class="token operator">--</span>model virtio \
+	<span class="token operator">--</span>config 
+成功附加接口
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh domiflist centos7.6-1</span>
+接口     类型     源        型号      MAC
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+vnet0      bridge     virbr0     virtio      52:54:00:65:4d:a5
+vnet1      network    default    rtl8139     52:54:00:9a:18:f7
+
+重启（需要先关机，再开机，才能生效）
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh domiflist centos7.6-1</span>
+接口     类型     源        型号      MAC
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+vnet0      bridge     virbr0     virtio      52:54:00:65:4d:a5
+vnet1      network    default    rtl8139     52:54:00:9a:18:f7
+vnet2      network    default    virtio      52:54:00:83:7b:f1
+</code></pre> 
+<ul><li>配置文件添加</li></ul> 
+<pre><code class="prism language-powershell">配置文件地址
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># cd /etc/libvirt/qemu/</span>
+<span class="token namespace">[root@server5 qemu]</span><span class="token comment"># vim centos7.6-1.xml </span>
+    &lt;<span class="token operator">/</span>interface&gt;
+    &lt;interface <span class="token function">type</span>=<span class="token string">'network'</span>&gt;
+      &lt;mac address=<span class="token string">'52:54:00:83:7b:f1'</span><span class="token operator">/</span>&gt;
+      &lt;source network=<span class="token string">'default'</span><span class="token operator">/</span>&gt;
+      &lt;model <span class="token function">type</span>=<span class="token string">'virtio'</span><span class="token operator">/</span>&gt;
+      &lt;address <span class="token function">type</span>=<span class="token string">'pci'</span> domain=<span class="token string">'0x0000'</span> bus=<span class="token string">'0x00'</span> slot=<span class="token string">'0x0a'</span> <span class="token keyword">function</span>=<span class="token string">'0x0'</span><span class="token operator">/</span>&gt;
+    &lt;<span class="token operator">/</span>interface&gt;
+</code></pre> 
+<h5><a id="_597"></a><mark>创建虚拟网络</mark></h5> 
+<p><strong>virt-manager添加网络</strong></p> 
+<p><img src="https://images2.imgbox.com/4f/3e/c87db5DK_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-2yLwOhoH-1644590514289)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220101144515355.png)]"></p> 
+<p><img src="https://images2.imgbox.com/46/3a/2LjiHYQT_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-2IMiSOZT-1644590514290)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220101144635362.png)]"></p> 
+<p><img src="https://images2.imgbox.com/5f/2d/CXC5mzFE_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-wL9OUfka-1644590514290)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102084757468.png)]"></p> 
+<p><img src="https://images2.imgbox.com/9d/56/4Kw5MdO0_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-QnWLuZeC-1644590514290)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102085136236.png)]"></p> 
+<p><img src="https://images2.imgbox.com/06/2b/rtahalj7_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-x29XC4VH-1644590514291)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102085500717.png)]"></p> 
+<p><img src="https://images2.imgbox.com/33/7d/uwR8WQ6n_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-ib0y4B1s-1644590514291)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102085543261.png)]"></p> 
+<p><img src="https://images2.imgbox.com/3a/7b/BmNrrhXM_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-He5zLtW3-1644590514291)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102085601153.png)]"></p> 
+<ul><li>验证网络可用性</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># ip a</span>
+8: virbr1: &lt;NO<span class="token operator">-</span>CARRIER<span class="token punctuation">,</span>BROADCAST<span class="token punctuation">,</span>MULTICAST<span class="token punctuation">,</span>UP&gt; mtu 1500 qdisc noqueue state DOWN <span class="token function">group</span> default qlen 1000
+    link<span class="token operator">/</span>ether 52:54:00:b6:35:e2 brd ff:ff:ff:ff:ff:ff
+    inet 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>1<span class="token operator">/</span>24 brd 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>255 scope global virbr1
+       valid_lft forever preferred_lft forever
+</code></pre> 
+<ul><li>xshell连接新创建的网络</li></ul> 
+<p><img src="https://images2.imgbox.com/e8/6a/8e2I8wEG_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-zRN9mrwj-1644590514292)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102090802404.png)]"></p> 
+<ul><li>生效：强制关机，再次开机</li></ul> 
+<pre><code class="prism language-powershell">查看ip地址
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># ip a</span>
+1: lo: &lt;LOOPBACK<span class="token punctuation">,</span>UP<span class="token punctuation">,</span>LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN <span class="token function">group</span> default qlen 1000
+    link<span class="token operator">/</span>loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127<span class="token punctuation">.</span>0<span class="token punctuation">.</span>0<span class="token punctuation">.</span>1<span class="token operator">/</span>8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1<span class="token operator">/</span>128 scope host 
+       valid_lft forever preferred_lft forever
+2: eth0: &lt;BROADCAST<span class="token punctuation">,</span>MULTICAST<span class="token punctuation">,</span>UP<span class="token punctuation">,</span>LOWER_UP&gt; mtu 1500 qdisc pfifo_fast state UP <span class="token function">group</span> default qlen 1000
+    link<span class="token operator">/</span>ether 52:54:00:80:94:b0 brd ff:ff:ff:ff:ff:ff
+3: eth1: &lt;BROADCAST<span class="token punctuation">,</span>MULTICAST<span class="token punctuation">,</span>UP<span class="token punctuation">,</span>LOWER_UP&gt; mtu 1500 qdisc pfifo_fast state UP <span class="token function">group</span> default qlen 1000
+    link<span class="token operator">/</span>ether 52:54:00:da:57:16 brd ff:ff:ff:ff:ff:ff
+    inet 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>150<span class="token operator">/</span>24 brd 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>255 scope global noprefixroute dynamic eth1
+       valid_lft 2714sec preferred_lft 2714sec
+    inet6 fe80::82c0:907:6163:5dd8<span class="token operator">/</span>64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+
+查看网关
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># ip route</span>
+default via 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>1 dev eth1 proto dhcp metric 100 
+192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>0<span class="token operator">/</span>24 dev eth1 proto kernel scope link src 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>150 metric 100
+
+ping网关
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># ping 192.168.10.1150</span>
+
+ping宿主机
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># ping 192.168.139.50</span>
+
+ping宿主机的网关
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># ping 192.168.139.2</span>
+
+ping域名
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># ping www.baidu.com</span>
+
+虚拟机连接
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># ssh root@192.168.10.150</span>
+The authenticity of host <span class="token string">'192.168.10.150 (192.168.10.150)'</span> can<span class="token string">'t be established.
+ECDSA key fingerprint is SHA256:0j755uJHNYtgaiAvD5muWjnq1Qxtuvo83VBMx2a85Wc.
+ECDSA key fingerprint is MD5:17:5d:03:0d:b8:f5:6d:86:06:6e:35:1d:51:e7:56:a9.
+Are you sure you want to continue connecting (yes/no)? yes
+Warning: Permanently added '</span>192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>10<span class="token punctuation">.</span>150<span class="token string">' (ECDSA) to the list of known hosts.
+root@192.168.10.150'</span>s password: 
+Last login: Sun Jan  2 19:48:52 2022
+<span class="token namespace">[root@localhost ~]</span><span class="token comment"># </span>
+</code></pre> 
+<p><strong>通过配置文件生成网络</strong></p> 
+<ul><li>编写网络配置文件</li></ul> 
+<pre><code class="prism language-powershell">获得网络编写模板文件
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># cd /etc/libvirt/qemu/networks/</span>
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># cp network1.xml network2.xml </span>
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># ls</span>
+autostart  default<span class="token punctuation">.</span>xml  network1<span class="token punctuation">.</span>xml  network2<span class="token punctuation">.</span>xml
+
+生成UUID
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># uuidgen</span>
+e63b6f45<span class="token operator">-</span>8c1a<span class="token operator">-</span>4378<span class="token operator">-</span>8d46<span class="token operator">-</span>18c8faab3271
+
+生成MAC地址
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># openssl rand -hex 6 |sed -r 's/(..)/\1:/g;s/.$//'</span>
+25:a4:<span class="token function">ac</span>:61:62:96
+<span class="token comment"># 该设备名为52:54:00:xx:xx:xx，可以只更改后面部分</span>
+
+修改配置文件
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># vim network2.xml </span>
+&lt;network&gt;
+  &lt;name&gt;network2&lt;<span class="token operator">/</span>name&gt;		自定义
+  &lt;uuid&gt;e63b6f45<span class="token operator">-</span>8c1a<span class="token operator">-</span>4378<span class="token operator">-</span>8d46<span class="token operator">-</span>18c8faab3271&lt;<span class="token operator">/</span>uuid&gt;	自生成
+  &lt;forward mode=<span class="token string">'nat'</span><span class="token operator">/</span>&gt;		网络模式
+  &lt;bridge name=<span class="token string">'virbr2'</span> stp=<span class="token string">'on'</span> delay=<span class="token string">'0'</span><span class="token operator">/</span>&gt;	自定义网桥名称
+  &lt;mac address=<span class="token string">'52:54:00:61:62:96'</span><span class="token operator">/</span>&gt;	自生成
+  &lt;domain name=<span class="token string">'network2'</span><span class="token operator">/</span>&gt;	同自定义name
+  &lt;ip address=<span class="token string">'192.168.20.1'</span> netmask=<span class="token string">'255.255.255.0'</span>&gt;
+    &lt;dhcp&gt;
+      &lt;range <span class="token function">start</span>=<span class="token string">'192.168.20.10'</span> <span class="token keyword">end</span>=<span class="token string">'192.168.20.250'</span><span class="token operator">/</span>&gt;
+    &lt;<span class="token operator">/</span>dhcp&gt;
+  &lt;<span class="token operator">/</span>ip&gt;
+&lt;<span class="token operator">/</span>network&gt;
+</code></pre> 
+<ul><li>基于配置文件生成网络</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 networks]</span><span class="token comment"># virsh net-define network2.xml </span>
+从 network2定义网络network2<span class="token punctuation">.</span>xml
+
+开启网络
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># virsh net-start network2 </span>
+网络 network2 已开始
+
+开机自启
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># virsh net-autostart network2 </span>
+网络network2标记为自动启动
+
+查看
+<span class="token namespace">[root@server5 networks]</span><span class="token comment"># virsh net-list --all</span>
+ 名称               状态     自动开始  持久
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+ default              活动     否           否
+ network1             活动     是           是
+ network2             活动     是           是
+</code></pre> 
+<p><img src="https://images2.imgbox.com/77/b3/qMN2jls0_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-yLmAXQDQ-1644590514292)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102213729662.png)]"></p> 
+<p><strong>桥接模式</strong></p> 
+<ul><li>停用NetworkManager并备份网卡文件</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl stop NetworkManager</span>
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># systemctl disable NetworkManager</span>
+
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># cp /etc/sysconfig/network-scripts/ifcfg-ens33 /root/</span>
+</code></pre> 
+<ul><li>创建网桥</li></ul> 
+<p><img src="https://images2.imgbox.com/5a/db/2jqfpxWV_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-Ykpdio50-1644590514292)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102215726735.png)]"></p> 
+<p><img src="https://images2.imgbox.com/23/32/EuN7fquj_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-Pyl2AeDf-1644590514293)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102215801701.png)]"></p> 
+<p><img src="https://images2.imgbox.com/c9/53/PiyJrQVj_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-kuPX0AWT-1644590514293)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102215843209.png)]"></p> 
+<p><img src="https://images2.imgbox.com/ec/35/bZmh6dCQ_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-DWyT1doh-1644590514293)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102215937957.png)]"></p> 
+<ul><li>查看</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># cd /etc/sysconfig/network-scripts/</span>
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># ls ifcfg-br1 </span>
+ifcfg<span class="token operator">-</span>br1
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># cat ifcfg-br1 </span>
+DEVICE=<span class="token string">"br1"</span>
+ONBOOT=<span class="token string">"no"</span>
+HOTPLUG=<span class="token string">"yes"</span>
+<span class="token function">TYPE</span>=<span class="token string">"Bridge"</span>
+BOOTPROTO=<span class="token string">"none"</span>
+IPADDR=<span class="token string">"192.168.139.50"</span>
+NETMASK=<span class="token string">"255.255.255.0"</span>
+GATEWAY=<span class="token string">"192.168.139.2"</span>
+IPV6INIT=<span class="token string">"yes"</span>
+IPV6_AUTOCONF=<span class="token string">"yes"</span>
+DHCPV6C=<span class="token string">"no"</span>
+STP=<span class="token string">"on"</span>
+DELAY=<span class="token string">"0.0"</span>
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># cat ifcfg-ens33 </span>
+DEVICE=<span class="token string">"ens33"</span>
+ONBOOT=<span class="token string">"no"</span>
+HOTPLUG=<span class="token string">"yes"</span>
+BRIDGE=<span class="token string">"br1"</span>
+<span class="token comment"># 该文件被修改了，所以之前要备份</span>
+</code></pre> 
+<ul><li>客户机使用网桥</li></ul> 
+<p><img src="https://images2.imgbox.com/b9/74/zuSJp88N_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-Qlbakl9T-1644590514294)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102220558920.png)]"></p> 
+<pre><code class="prism language-powershell">修改网卡文件
+<span class="token namespace">[root@localhost~]</span><span class="token comment"># cd /etc/sysconfig/network-scripts/</span>
+<span class="token namespace">[root@localhost network-scripts]</span><span class="token comment"># vim ifcfg-eth0</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/5b/98/brb4HMtK_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-fKsRtmR2-1644590514294)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102221749386.png)]"></p> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@localhost network-scripts]</span><span class="token comment"># systemctl restart network</span>
+</code></pre> 
+<p><img src="https://images2.imgbox.com/41/a3/mE8Uiu8V_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-CuW0Nl53-1644590514294)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102221945422.png)]"></p> 
+<p><strong>桥接模式改为net模式</strong></p> 
+<ul><li>客户机接口更改</li></ul> 
+<p><img src="https://images2.imgbox.com/8b/ca/55a7w017_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-8pCGgkLi-1644590514295)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102222333024.png)]"></p> 
+<ul><li>宿主机停止网桥接口</li></ul> 
+<p><img src="https://images2.imgbox.com/5e/b2/0xumeQNf_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-g5TaRmRO-1644590514295)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220102222432223.png)]"></p> 
+<ul><li>删除相关网卡文件</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># rm -rf ifcfg-br1 </span>
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># rm -rf ifcfg-ens33 </span>
+</code></pre> 
+<ul><li>恢复原网卡文件</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># mv /root/ifcfg-ens33 ./</span>
+
+重启网络
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># systemctl restart network</span>
+
+启动NetworkManager
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># systemctl start NetworkManager</span>
+<span class="token namespace">[root@server5 network-scripts]</span><span class="token comment"># systemctl enable NetworkManager</span>
+</code></pre> 
+<h5><a id="_855"></a>添加硬盘(热插拔)</h5> 
+<p><strong>virt-manager图形化添加</strong></p> 
+<p><img src="https://images2.imgbox.com/fa/83/jeiV1GeR_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-aQwCnYOU-1644590514295)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220104091411326.png)]"></p> 
+<p><img src="https://images2.imgbox.com/c0/3f/k6v5g5iI_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-aPvasbjR-1644590514296)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220104091503146.png)]"></p> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@guest ~]</span><span class="token comment"># lsblk</span>
+NAME            MAJ:MIN <span class="token function">RM</span>  SIZE RO <span class="token function">TYPE</span> MOUNTPOINT
+sr0              11:0    1 1024M  0 rom  
+vda             252:0    0    5G  0 disk 
+├─vda1          252:1    0    1G  0 part <span class="token operator">/</span>boot
+└─vda2          252:2    0    4G  0 part 
+  ├─centos<span class="token operator">-</span>root 253:0    0  3<span class="token punctuation">.</span>5G  0 lvm  <span class="token operator">/</span>
+  └─centos<span class="token operator">-</span>swap 253:1    0  512M  0 lvm  <span class="token namespace">[SWAP]</span>
+vdb             252:16   0    2G  0 disk 
+</code></pre> 
+<p><strong>virsh命令添加</strong></p> 
+<ul><li>创建并使用</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh list</span>
+ Id    名称                         状态
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+ 1     my1                            running
+
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh domblklist my1 </span>
+目标     源
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span><span class="token operator">-</span>
+vda        <span class="token operator">/</span><span class="token keyword">var</span><span class="token operator">/</span>lib<span class="token operator">/</span>libvirt<span class="token operator">/</span>images<span class="token operator">/</span>my1<span class="token punctuation">.</span>qcow2
+vdb        <span class="token operator">/</span><span class="token keyword">var</span><span class="token operator">/</span>lib<span class="token operator">/</span>libvirt<span class="token operator">/</span>images<span class="token operator">/</span>my1<span class="token operator">-</span>1<span class="token punctuation">.</span>qcow2
+hdb        <span class="token operator">-</span>
+
+创建磁盘
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># qemu-img create -f qcow2 /root/disk.img 1G</span>
+Formatting <span class="token string">'/root/disk.img'</span><span class="token punctuation">,</span> fmt=qcow2 size=1073741824 encryption=off cluster_size=65536 lazy_refcounts=off
+<span class="token comment"># 或者使用dd命令模式 dd if=/dev/zero of=/root/disk.img bs=1M count=1024</span>
+
+附加磁盘
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh attach-disk my1 --source=/root/disk.img --target vdc --cache writeback --subdriver qcow2</span>
+成功附加磁盘
+
+查看
+<span class="token namespace">[root@guest ~]</span><span class="token comment"># lsblk</span>
+NAME            MAJ:MIN <span class="token function">RM</span>  SIZE RO <span class="token function">TYPE</span> MOUNTPOINT
+sr0              11:0    1 1024M  0 rom  
+vda             252:0    0    5G  0 disk 
+├─vda1          252:1    0    1G  0 part <span class="token operator">/</span>boot
+└─vda2          252:2    0    4G  0 part 
+  ├─centos<span class="token operator">-</span>root 253:0    0  3<span class="token punctuation">.</span>5G  0 lvm  <span class="token operator">/</span>
+  └─centos<span class="token operator">-</span>swap 253:1    0  512M  0 lvm  <span class="token namespace">[SWAP]</span>
+vdb             252:16   0    2G  0 disk 
+vdc             252:32   0    1G  0 disk 
+</code></pre> 
+<ul><li>删除磁盘</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh detach-disk my1 vdc</span>
+成功分离磁盘
+</code></pre> 
+<ul><li>持久化附加磁盘</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh attach-disk my1 --source=/root/disk.img --target vdc --cache writeback --subdriver qcow2 --persistent</span>
+成功附加磁盘
+
+删除
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh detach-disk my1 vdc</span>
+成功分离磁盘
+</code></pre> 
+<h5><a id="_934"></a>存储池管理</h5> 
+<p><strong>查看存储池</strong></p> 
+<p><img src="https://images2.imgbox.com/5e/c6/CfYYkiiv_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-733W4zZX-1644590514296)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220104100637716.png)]"></p> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># virsh pool-list --all</span>
+ 名称               状态     自动开始
+<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">--</span>-<span class="token operator">-</span>
+ default              活动     是       
+ root                 活动     是      
+</code></pre> 
+<p><strong>添加本地存储池</strong></p> 
+<ul><li>创建目录</li></ul> 
+<pre><code class="prism language-powershell"><span class="token namespace">[root@server5 ~]</span><span class="token comment"># mkdir /home/storage</span>
+</code></pre> 
+<ul><li>添加</li></ul> 
+<p><img src="https://images2.imgbox.com/cd/3b/02T3tvfh_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-oOgte4aK-1644590514296)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220104101155744.png)]"></p> 
+<p><img src="https://images2.imgbox.com/ca/02/6v6M2wRb_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-cZVwuEVm-1644590514297)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220108151632281.png)]"></p> 
+<p><img src="https://images2.imgbox.com/a3/13/RJALURLg_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-mHrxpPY2-1644590514297)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220108151655170.png)]"></p> 
+<p><img src="https://images2.imgbox.com/ba/e2/iAjCzqFH_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-wOVYjizN-1644590514297)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220108151707777.png)]"></p> 
+<p><strong>添加网络存储池</strong></p> 
+<pre><code class="prism language-powershell">网络存储端
+<span class="token namespace">[root@server1 ~]</span><span class="token comment"># yum install -y nfs-utils.x86_64</span>
+<span class="token namespace">[root@server1 ~]</span><span class="token comment"># systemctl start nfs-server</span>
+<span class="token namespace">[root@server1 ~]</span><span class="token comment"># mkdir /home/nfs-storage</span>
+<span class="token namespace">[root@server1 ~]</span><span class="token comment"># vim /etc/exports </span>
+<span class="token namespace">[root@server1 ~]</span><span class="token comment"># cat /etc/exports </span>
+<span class="token operator">/</span>home<span class="token operator">/</span>nfs<span class="token operator">-</span>storage 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>139<span class="token punctuation">.</span>0<span class="token operator">/</span>24<span class="token punctuation">(</span>rw<span class="token punctuation">,</span>sync<span class="token punctuation">,</span>no_root_squash<span class="token punctuation">)</span>
+
+KVM虚拟机
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># showmount -e 192.168.139.10</span>
+Export list <span class="token keyword">for</span> 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>139<span class="token punctuation">.</span>10:
+<span class="token operator">/</span>home<span class="token operator">/</span>nfs<span class="token operator">-</span>storage 192<span class="token punctuation">.</span>168<span class="token punctuation">.</span>139<span class="token punctuation">.</span>0<span class="token operator">/</span>24
+<span class="token namespace">[root@server5 ~]</span><span class="token comment"># mkdir /home/remote-storage</span>
+</code></pre> 
+<ul><li>添加网络存储池</li></ul> 
+<p><img src="https://images2.imgbox.com/3f/6c/v0PYS9ol_o.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-hBzBd3ZD-1644590514298)(KVM%E8%99%9A%E6%8B%9F%E5%8C%96.assets/image-20220108212920084.png)]"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/adaf55f0af7124aaaaad855d17fcb78f/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">go语言用cookie实现登录（gin&#43;gorm）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/afee048e1744b2aa94fa9ed51247be4d/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">【JQuery Mobile移动应用开发实战】JQuery Mobile基础——列表控件的使用</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

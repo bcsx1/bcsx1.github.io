@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>如何使用一个数据库构建一个消耗大量IOPS的应用程序 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="如何使用一个数据库构建一个消耗大量IOPS的应用程序" />
+<meta property="og:description" content="​我很喜欢关于社交媒体和数据库的创作主意。所以，让我们以一个新的方向来探索：看看Twitch.tv或任何具有即时通讯功能的平台。如果你刚开始接触数据库，可以阅读之前的那篇文章：社交媒体中的“点赞”“喜欢”是如何存储在数据库中的？。
+那篇文章记录了我对数据库范式的探索。在过去的几周中，我一直在进行一场名为“ScyllaDB的开发者视角：构建应用程序”的演讲。我的目标是构建一个简单的应用程序，使用一个数据库来处理每秒1k/3k的操作。在这篇文章中，我将分享我所学到的知识。通过阅读本文，初学者开发者应该知道如何使用一个很酷的数据库构建一个消耗大量IOPS的应用程序。
+项目：Twitch Sentinel
+我决定开始一个涉及大数据导入的Twitch项目，我们称之为Twitch Sentinel。
+这个想法很简单：收集来自Twitch.tv上尽可能多频道的所有消息，存储这些数据，并从中获取一些指标。
+我的Twitch聊天屏幕截图。你能想象每秒存储超过1,000条消息吗？这听起来像是一个很酷的挑战。以下是你可以为你的研究生成的一些指标：
+特定主播每天收到多少条聊天消息。用户每天发送多少条消息。基于消息推断主播或用户在线的最可能的时间段。每小时消息峰值等等。 但你可能会问：“如果Twitch已经提供了分析面板，为什么我还要创建这个呢？”答案是：毫无用处的概念验证（PoCs），它们会教会你一些新东西！你以前创建过分析仪表板吗？使用过真正快速的数据库吗？思考过新的建模方式吗？如果没有，让我教你我对这个主题的了解！
+做出明智的决策
+当你开始一个新项目时，你应该知道代码的每一部分和你用来实现项目的工具都将直接影响项目的未来。同时，你选择的数据库也直接影响整个应用程序的性能。现在我们将检查与数据库的快速性和一致性相关的一些属性。
+ACID缩写
+如果你对数据建模感兴趣，你可能已经听说过ACID。如果没有，ACID是原子性（Atomicity）、一致性（Consistency）、隔离性（Isolation）和持久性（Durability）的缩写。这些缩写的每个部分构成了关系数据库中的事务。事务是一个单一的操作，告诉你的数据库如果ACID中的任何一个概念失败，你的查询将不会成功。让我们更深入地探讨一下：
+原子性： 事务中的每个部分都是唯一的，如果其中任何一个部分失败，它将失败并回滚到该数据的原始状态。一致性： 只有在符合特定模型的正确数据形式下，才能接受你的数据，这基于表建模、触发器、约束等。隔离性： 所有事务都是独立的，并不会干扰正在运行的事务。持久性： 如果事务完成，数据将持久保存，即使系统在此之后发生故障。 正如你所见，ACID为所有数据提供了一个有趣的安全保障，但这需要进行一些权衡：维护成本高，因为对于每个事务，你将会锁定（隔离）你的数据。它需要许多节点。如果你的目标是通过更高的吞吐量加快速度，ACID将阻碍你的计划，因为所有这些操作都需要成功。你甚至不能考虑灵活的模式，即“文档”，因为这将违反一致性属性。那么怎么办呢？我们只是用JSON或TXT作为我们的数据库吗？嗯，这并不是件坏事，但让我们用非关系数据库（即NoSQL）来实现。
+BASE缩写
+当我们转向NoSQL数据库时，可能最重要的事情就是要知道：有不同的范式，每个范式都擅长特定的领域。但在大多数NoSQL数据库范式之间存在一个共同点，即BASE属性。这个缩写代表：基本可用（Basically Available）、软状态（Soft State）和最终一致性（Eventually Consistency）。现在事情变得有趣了，因为这些属性允许你在数据上进行“较少的验证”，因为你从开发人员的角度保证了数据的完整性。但在谈论这个之前，让我们来了解一下它们的意义：
+基本可用： 你可以随时读取/写入数据库中的数据，但这并不意味着这些数据是最新的。软状态： 你可以根据需要灵活地调整模式，这成为开发人员的任务，而不是数据库管理员的任务。最终一致性： 所有的数据将在多个数据中心之间同步，直到达到所需的一致性级别。 看起来，BASE属性给我们提供了一个数据库，可以接收任何类型的数据，并尊重数据建模。它始终可用于查询，并且对于高数据插入来说是一个不错的选择。但也有权衡的方面：如果你需要强一致性的数据，可能不是最佳选择。复杂性较高，因为数据库建模被委托给了开发人员。如果你需要在集群中同步节点，数据冲突可能会是一个问题。现在我们对数据库可能具有的一些属性有了更多了解，所以现在是根据我们的项目来做决策的时候了。
+做出明智的决策
+ACID vs BASE？谁赢了？这取决于项目的类型！通常情况下，你可以在一个项目中使用多个数据库，所以这不是一个问题。但如果你只能选择一个，要明智地选择。明确一下：当你需要具备数据一致性、事务处理，而性能不是关键考虑因素时，应选择ACID。当你对IOPS有更高的需求并且对数据建模有把握时，应选择BASE。对于我们的项目，我们将从Twitch.tv接收大量的消息。我们需要快速存储和处理所有这些消息。因此，当然我们要放弃ACID的“安全保护”，转而采用BASE的“明智处理”xD考虑到这一点，我决定使用CQL和ScyllaDB，因为它可以处理我们每秒接收数百万条消息的想法，并且同时具备一致性和ACID的支持。如果Discord使用ScyllaDB来存储消息，为什么我们不能在Twitch上使用呢？
+将我们的想法建模成查询
+当你使用ScyllaDB时，你的主要关注点应该是你想要运行哪个查询。考虑到这一点，我们需要：
+存储消息并在必要时进行读取。经常从流列表中进行存储和读取。统计特定流中聊天用户发送的所有消息。 因此，我们的数据建模应该如下所示：没什么大不了的，这应该很简单。我们需要尽可能快的吞吐量，复杂的查询不能让我们获得这样的性能。以下是我们可以使用从此模型中检索的数据运行的一些查询：
+每个用户的消息数量（前5名）
+SELECT ​ chatter_id, chatter_username, count(*) AS msg_count FROM dev_sentinel.messages GROUP BY chatter_id, chatter_username ORDER BY msg_count DESC LIMIT 5 每个流媒体主播的唯一用户数量
+SELECT streamer_id, COUNT(DISTINCT chatter_id) AS unique_chatters FROM dev_sentinel.messages GROUP BY streamer_id ORDER BY unique_chatters DESC 给定用户的最早和最近的消息" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/aecead19ff6be9634f606a898d629fc4/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-07-21T09:32:22+08:00" />
+<meta property="article:modified_time" content="2023-07-21T09:32:22+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">如何使用一个数据库构建一个消耗大量IOPS的应用程序</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>​我很喜欢关于社交媒体和数据库的创作主意。所以，让我们以一个新的方向来探索：看看Twitch.tv或任何具有即时通讯功能的平台。如果你刚开始接触数据库，可以阅读之前的那篇文章：<a href="http://mp.weixin.qq.com/s?__biz=Mzg4MTc0MTc2Nw==&amp;mid=2247484447&amp;idx=1&amp;sn=e3770388d9e96932ddac679a4ae34ac4&amp;chksm=cf601eb7f81797a198cba02fdfe3b3a446050605671670aafb89a0f793147c39bb86f9bb8373&amp;scene=21#wechat_redirect" rel="nofollow">社交媒体中的“点赞”“喜欢”是如何存储在数据库中的？</a>。</p> 
+<p>那篇文章记录了我对数据库范式的探索。在过去的几周中，我一直在进行一场名为“ScyllaDB的开发者视角：构建应用程序”的演讲。我的目标是构建一个简单的应用程序，使用一个数据库来处理每秒1k/3k的操作。在这篇文章中，我将分享我所学到的知识。<strong>通过阅读本文，初学者开发者应该知道如何使用一个很酷的数据库构建一个消耗大量IOPS的应用程序。</strong></p> 
+<hr> 
+<p><strong>项目：Twitch Sentinel</strong></p> 
+<p>我决定开始一个涉及大数据导入的Twitch项目，我们称之为Twitch Sentinel。<br> 这个想法很简单：收集来自Twitch.tv上尽可能多频道的所有消息，存储这些数据，并从中获取一些指标。</p> 
+<p><img src="https://images2.imgbox.com/f9/a9/i6kUwwPA_o.png" alt=""></p> 
+<p>我的Twitch聊天屏幕截图。你能想象每秒存储超过1,000条消息吗？这听起来像是一个很酷的挑战。以下是你可以为你的研究生成的一些指标：</p> 
+<ul><li>特定主播每天收到多少条聊天消息。</li><li>用户每天发送多少条消息。</li><li>基于消息推断主播或用户在线的最可能的时间段。</li><li>每小时消息峰值等等。</li></ul> 
+<p>但你可能会问：“如果Twitch已经提供了分析面板，为什么我还要创建这个呢？”答案是：毫无用处的概念验证（PoCs），它们会教会你一些新东西！你以前创建过分析仪表板吗？使用过真正快速的数据库吗？思考过新的建模方式吗？如果没有，让我教你我对这个主题的了解！</p> 
+<hr> 
+<p><strong>做出明智的决策</strong></p> 
+<p>当你开始一个新项目时，你应该知道代码的每一部分和你用来实现项目的工具都将直接影响项目的未来。同时，你选择的数据库也直接影响整个应用程序的性能。现在我们将检查与数据库的快速性和一致性相关的一些属性。</p> 
+<p><strong>ACID缩写</strong></p> 
+<p>如果你对数据建模感兴趣，你可能已经听说过ACID。如果没有，ACID是原子性（Atomicity）、一致性（Consistency）、隔离性（Isolation）和持久性（Durability）的缩写。这些缩写的每个部分构成了关系数据库中的事务。事务是一个单一的操作，告诉你的数据库如果ACID中的任何一个概念失败，你的查询将不会成功。让我们更深入地探讨一下：</p> 
+<ul><li><strong>原子性：</strong> 事务中的每个部分都是唯一的，如果其中任何一个部分失败，它将失败并回滚到该数据的原始状态。</li><li><strong>一致性：</strong> 只有在符合特定模型的正确数据形式下，才能接受你的数据，这基于表建模、触发器、约束等。</li><li><strong>隔离性：</strong> 所有事务都是独立的，并不会干扰正在运行的事务。</li><li><strong>持久性：</strong> 如果事务完成，数据将持久保存，即使系统在此之后发生故障。</li></ul> 
+<p>正如你所见，ACID为所有数据提供了一个有趣的安全保障，但这需要进行一些权衡：维护成本高，因为对于每个事务，你将会锁定（隔离）你的数据。它需要许多节点。如果你的目标是通过更高的吞吐量加快速度，ACID将阻碍你的计划，因为所有这些操作都需要成功。你甚至不能考虑灵活的模式，即“文档”，因为这将违反一致性属性。那么怎么办呢？我们只是用JSON或TXT作为我们的数据库吗？嗯，这并不是件坏事，但让我们用非关系数据库（即NoSQL）来实现。</p> 
+<p><strong>BASE缩写</strong></p> 
+<p>当我们转向NoSQL数据库时，可能最重要的事情就是要知道：有不同的范式，每个范式都擅长特定的领域。但在大多数NoSQL数据库范式之间存在一个共同点，即BASE属性。这个缩写代表：基本可用（Basically Available）、软状态（Soft State）和最终一致性（Eventually Consistency）。现在事情变得有趣了，因为这些属性允许你在数据上进行“较少的验证”，因为你从开发人员的角度保证了数据的完整性。但在谈论这个之前，让我们来了解一下它们的意义：</p> 
+<ul><li><strong>基本可用：</strong> 你可以随时读取/写入数据库中的数据，但这并不意味着这些数据是最新的。</li><li><strong>软状态：</strong> 你可以根据需要灵活地调整模式，这成为开发人员的任务，而不是数据库管理员的任务。</li><li><strong>最终一致性：</strong> 所有的数据将在多个数据中心之间同步，直到达到所需的一致性级别。</li></ul> 
+<p>看起来，BASE属性给我们提供了一个数据库，可以接收任何类型的数据，并尊重数据建模。它始终可用于查询，并且对于高数据插入来说是一个不错的选择。但也有权衡的方面：如果你需要强一致性的数据，可能不是最佳选择。复杂性较高，因为数据库建模被委托给了开发人员。如果你需要在集群中同步节点，数据冲突可能会是一个问题。现在我们对数据库可能具有的一些属性有了更多了解，所以现在是根据我们的项目来做决策的时候了。</p> 
+<p><strong>做出明智的决策</strong></p> 
+<p>ACID vs BASE？谁赢了？这取决于项目的类型！通常情况下，你可以在一个项目中使用多个数据库，所以这不是一个问题。但如果你只能选择一个，要明智地选择。明确一下：当你需要具备数据一致性、事务处理，而性能不是关键考虑因素时，应选择ACID。当你对IOPS有更高的需求并且对数据建模有把握时，应选择BASE。对于我们的项目，我们将从Twitch.tv接收大量的消息。我们需要快速存储和处理所有这些消息。因此，当然我们要放弃ACID的“安全保护”，转而采用BASE的“明智处理”xD考虑到这一点，我决定使用CQL和ScyllaDB，因为它可以处理我们每秒接收数百万条消息的想法，并且同时具备一致性和ACID的支持。如果Discord使用ScyllaDB来存储消息，为什么我们不能在Twitch上使用呢？</p> 
+<hr> 
+<p><strong>将我们的想法建模成查询</strong></p> 
+<p><img src="https://images2.imgbox.com/b5/5b/HgQs9rzu_o.png" alt="">当你使用ScyllaDB时，你的主要关注点应该是你想要运行哪个查询。考虑到这一点，我们需要：</p> 
+<ul><li>存储消息并在必要时进行读取。</li><li>经常从流列表中进行存储和读取。</li><li>统计特定流中聊天用户发送的所有消息。</li></ul> 
+<p>因此，我们的数据建模应该如下所示：<img src="https://images2.imgbox.com/eb/9b/fsnWik2E_o.png" alt="">没什么大不了的，这应该很简单。我们需要尽可能快的吞吐量，复杂的查询不能让我们获得这样的性能。以下是我们可以使用从此模型中检索的数据运行的一些查询：</p> 
+<p><strong>每个用户的消息数量（前5名）</strong></p> 
+<pre><code>SELECT
+​    chatter_id,
+    chatter_username,
+    count(*) AS msg_count
+FROM
+    dev_sentinel.messages
+GROUP BY
+    chatter_id,
+    chatter_username
+ORDER BY
+    msg_count DESC
+LIMIT 5
+</code></pre> 
+<p><strong>每个流媒体主播的唯一用户数量</strong></p> 
+<pre><code>SELECT
+    streamer_id,
+    COUNT(DISTINCT chatter_id) AS unique_chatters
+FROM
+    dev_sentinel.messages
+GROUP BY
+    streamer_id
+ORDER BY
+    unique_chatters DESC
+</code></pre> 
+<p><strong>给定用户的最早和最近的消息</strong></p> 
+<pre><code>SELECT
+    min(sent_at) AS earliest_msg,
+    max(sent_at) AS latest_msg
+FROM
+    dev_sentinel.messages
+WHERE
+    chatter_username = 'danielhe4rt'
+</code></pre> 
+<hr> 
+<p><strong>Twitch作为我们的载荷！</strong></p> 
+<p>好的，现在我们已经对数据库的概念进行了建模，现在我们需要“真实世界”的载荷。我不知道你是否喜欢那些只是为了展示一个毫无意义的巨大数字而模拟所有数据的教程…我个人不喜欢，这也是为什么我想带给你一些真实的内容供你探索。在Twitch的直播平台上，他们有一堆可以与主播聊天互动的API。最著名的是称为’TMI’（Twitch消息接口）的客户端，它可以直接连接到任何你想要的Twitch主播聊天室。这里有一个客户端列表供你参考：</p> 
+<ul><li>tmi.js - 适用于NodeJS的接口</li><li>tmi.php - 适用于PHP的接口（可以轻松集成到Laravel中）</li><li>pytmi - 适用于Python的接口</li><li>twitch-irc-rs - 适用于Rust的接口</li></ul> 
+<p>无论如何，所有这些客户端的思路都是相同的：你需要选择一个频道并连接到它。代码如下所示：</p> 
+<pre><code>$client = new Client(new ClientOptions([
+    'connection' =&gt; [
+        'secure' =&gt; true,
+        'reconnect' =&gt; true,
+        'rejoin' =&gt; true,
+    ],
+    'channels' =&gt; ['danielhe4rt']
+]));
+​
+$client-&gt;on(MessageEvent::class, function (MessageEvent $e) {
+    print "{$e-&gt;tags['display-name']}: {$e-&gt;message}";
+});
+​
+$client-&gt;connect();
+</code></pre> 
+<p>每个Twitch负载都有一个名为"tags"的数组，它带有与该特定消息相关的JSON数据：</p> 
+<pre><code>{
+    "badge-info": {
+        "subscriber": "58"
+    },
+    "badges": {
+        "broadcaster": "1",
+        "subscriber": "3036",
+        "partner": "1"
+    },
+    "client-nonce": "3e00905ed814fb4d846e8b9ba6a9c1da",
+    "color": "#8A2BE2",
+    "display-name": "danielhe4rt",
+    "emotes": null,
+    "first-msg": false,
+    "flags": null,
+    "id": "b40513ae-efed-472b-9863-db34cf0baa98",
+    "mod": false,
+    "returning-chatter": false,
+    "room-id": "227168488",
+    "subscriber": true,
+    "tmi-sent-ts": "1686770892358",
+    "turbo": false,
+    "user-id": "227168488",
+    "user-type": null,
+    "emotes-raw": null,
+    "badge-info-raw": "subscriber/58",
+    "badges-raw": "broadcaster/1,subscriber/3036,partner/1",
+    "username": "danielhe4rt",
+    "message-type": "chat"
+}
+</code></pre> 
+<p>在这个负载中，我们只需要以下信息：</p> 
+<ul><li>room-id：与特定广播频道相关的标识符。</li><li>user-id：与发送消息的用户相关的标识符。</li><li>tmi-sent-at：消息的时间戳。</li></ul> 
+<p>在消息接口中，您还将收到一条包含消息的字符串。这是一个简单的项目，但是，试着从中抽象出更多的想法并让我知道！我很乐意帮助您创建更大的项目！</p> 
+<hr> 
+<p><strong>让它发挥作用！</strong></p> 
+<p>正如我在本文开头所说，我在这个项目中的目标是构建一个高度可扩展的应用程序，使用一个非常酷的数据库来处理我们的需求，即每秒接收大量的负载。<img src="https://images2.imgbox.com/8c/8c/YYqXr7je_o.png" alt="">因此，我们连接了 Twitch.tv 上约 20,000 个最受欢迎的聊天室，并获得了平均每秒 1,700 至 2,000 条消息。这意味着我们每小时平均收到 6 百万条消息。您有没有编写过处理如此高数据摄取的代码？在应用程序接收并将所有这些数据发布到 ScyllaDB 的同时，这里是一个 T3-Micro 集群（AWS 上最便宜的实例）的统计信息。<img src="https://images2.imgbox.com/90/29/cUnc0wev_o.png" alt="">它以毫秒级的 P99 延迟处理每秒 1,000 个请求，就像轻而易举一样。而对于每秒 1,000 个请求，这台轻量级机器的负载仅为 8%，因此如果您愿意，您可以做得更快。大部分情况下，这取决于有多少流媒体主播连接到您的机器人，以及观众每秒发送多少条消息。</p> 
+<hr> 
+<p><strong>最后的考虑</strong></p> 
+<p>这个项目让我深刻认识到选择适合特定任务的正确工具是多么重要。在这种情况下，数据库必须是您在考虑更高规模时会使用的工具。请记住，在一个项目中使用多个数据库是完全可以的。每个数据库都可以解决开发环境中的一般或特定问题。如果有时间，请始终进行适当的研究和尽可能多的工具的 PoC（概念验证）！<img src="https://images2.imgbox.com/4c/43/R3bcO6Wn_o.png" alt=""></p> 
+<p>更多技术干货请关注公号“<strong>云原生数据库</strong>”</p> 
+<p><strong>squids.cn</strong>，目前可体验<strong>全网zui低价云数据库RDS，免费的数据库迁移工具DBMotion、备份工具、SQL开发工具等</strong></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/6f55cde9d47acf8f9c6d40c8d2e0d7d2/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">v-bind和v-model的区别</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/fe4569b1d4c470edfd88c89077259ffd/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">解决git merge的冲突问题</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Redis高可用 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Redis高可用" />
+<meta property="og:description" content="主从复制 读写分离，主库和从库都可以进行读操作；主库进行写操作，然后将数据同步给从库。
+主从库第一次数据同步（全量复制） 建立连接，协商同步。为全量复制做准备，从库和主库建立起连接，并告诉主库即将进行同步，主库回复确认之后，主从库之间开始数据同步。 从库给主库发送psync命令，表示要进行数据同步，命令中包括主库的runID和复制进度offset两个参数，主库根据命令以及参数启动复制。 runID：每个Redis实例启动时都会自动生成的一个随机ID，用来唯一标识这个实例，第一次复制时，从库不知道主库的runID，所以设为一个?。offset：复制进度，-1表示第一次复制 主库收到psync命令之后，在第一次数据同步的时候会用FULLRESYNC响应带上主库的runID和主库目前的复制进度offset返回给从库，从库收到响应后会记录下这两个参数。 主库同步数据给从库。FULLRESYNC响应表示第一次复制采用的全量复制，主库会把所有的数据同步给从库。 主库执行bgsave命令，生成RDB文件，将文件发送给从库从库接收到RDB文件后，会将所有数据清空（防止从库中存在其他数据与主库不一致），然后再加载接收到的RDB文件 主库发送新的写命令给从库。主库在执行bgsave的时候还可以正常接收请求，这些数据不会记录到生成的RDB文件中，为了保证主从库的一致性，主库中会有一个专门的replication buffer，用来记录RDB文件生成后的所有写操作，当主库完成RDB文件发送后，就将此时的replication buffer中的修改操作发给从库，从库再执行一遍这些操作。 主从级联模式 传统的主从模式中，主库要负责生成RDB文件以及传输RDB文件，这两个操作都是比较耗时的操作，如果从库过多，可能会造成主库的主线程阻塞，所以就有了主-从-从模式。
+通过主-从-从模式，可以将主库生成RDB和传输RDB的压力，以级联的方式分散到从库上。也就是有的从库是从主库的从库中获取同步数据。
+增量复制 一旦主从库完成了全量复制，两者之间就会一直维护一个网络连接，主库会通过这个连接将后续陆续收到的命令操作再同步给从库，这个过程也称为基于长连接的命令传播，可以避免频繁建立连接的开销
+Redis2.8开始，如果主从之间网络断连，主从库之间会采用增量复制的方式继续同步，也就是只需要同步网络断连期间主库收到的命令。
+Redis通过环形缓冲区repl_backlog_buffer来实现增量复制的功能
+在主服务器进行命令传播的时候，不但将写命令发送给从服务器，同时会将写命令写入到repl_backlog_buffer环形缓冲区，该缓冲区就会保存着主服务器最近传播的写命令。
+网络断开后，当从服务器重新连接到主服务器时，会发送psync命令，会带有slave_repl_offset参数，主服务器收到之后会对比slave_repl_offset和master_repl_offset之间的差距
+如果判断出数据还在环形缓冲区内，则进行增量复制，即将数据复制到replication buffer中发送给从服务器如果数据不在环形缓冲区内，就进行全量复制 出现阶段
+缓冲区满了之后
+replication buffer
+全量复制和增量复制阶段都会出现，主节点会给每个从节点都分配一个
+会导致连接断开，删除缓存，从节点重新连接，重新开始全量复制
+repl backlog buffer
+增量复制阶段出现，一个主节点只分配一个
+环形缓冲区，直接覆盖旧数据
+如何判断节点是否存活 Redis通过ping-pong机制来判断节点是否存活，如果有一半的节点ping一个节点的时候没有pong返回，就认为该节点挂了，会断开与这个节点的连接。
+对于主节点来说，每隔10秒对从节点发起ping命令，判断从节点的存活性和连接状态，可以通过repl-ping-slave-period控制发送频率。
+对于从节点来说，每隔1秒发送replconf ack{offset}命令，给主节点上报自身当前的复制偏移量
+实时检测主从节点网络状态上报自身复制偏移量，检查复制数据是否丢失，如果从节点数据丢失，再从主节点的复制缓冲区拉取丢失的数据 过期key 主节点删除了一个key或者通过淘汰算法淘汰了一个key后，主节点会模拟一条del命令发送给从节点，从节点收到命令后就删除该key
+主从不一致 尽量保证主从节点间的网络连接状况良好，避免主从节点在不同的机房通过外部程序来监控主从节点之间的复制进度 可以通过Redis的INFO replication命令查看主节点接收写命令的进度以及从节点接收写命令的进度，通过计算两者的差值来监控复制进度如果某个节点的进度差值大于阈值，可以让客户端不再从该节点读取数据 主从切换 主从复制模型在主节点挂了的情况下，从节点无法自动升级为主节点。这个过程需要人工处理，在此期间Redis无法对外提供写操作
+主从切换异步复制导致数据丢失 当客户端写入数据到主节点后，主节点还没来得及同步到从节点就发生了断电，那么主节点内存中的数据就会丢失。
+Redis有一个min-slaves-max-lag参数，表示一旦所有从节点数据复制和同步的延迟都超过了这个值后，主节点会拒绝任何请求，这样就控制了数据丢失的大小，只会丢失这个参数配置时间内的数据，减少了损失客户端发现Redis写入失败之后，可以采取降级措施，比如写到本地缓存或者写入消息队列 集群脑裂 由于网络问题，集群节点之间失去联系。主从数据不同步，重新平衡选举，产生两个主节点。等网络恢复，旧的主节点会降级为从节点，再与新的主节点进行同步复制，此时由于会进行全量同步，会清空自己的缓冲区，这样前面客户端写入的数据就会丢失。
+解决方案：
+当主节点发现从节点下线的数量太多或者网络延迟太大的时候，主节点会禁止写入操作，直接把错误返回给客户端
+min-slaves-to-write x：主节点至少x个从节点，从节点小于这个数的时候，主节点会禁止写入操作min-slaves-max-lag x：主从复制和同步延迟不能超过x秒，如果超过，主节点会禁止写入操作 哨兵机制 哨兵其实就是一个运行在特殊模式下的Redis进程，主从库实例运行的同时，哨兵也在运行。
+哨兵职责 哨兵主要有以下三个任务：
+监控选主通知 监控 哨兵进程在运行的时候，会周期性地给所有主从库发送ping命令，检测它们是否仍然在线运行。
+如果从库没有在规定时间内响应哨兵的ping命令，哨兵就会把它标记为下线状态如果主库没有在规定时间内响应哨兵的ping命令，哨兵就会判定主库下线，然后开始自动切换主库的流程如果经过换主操作后旧的主节点重新上线，将其会设置为从节点 主观下线 哨兵进程会使用ping命令来检测自身和主从库的连接情况，用来判断实例的状态。
+如果哨兵发现主从库对于ping命令的响应超时了，就会将该节点标记为主观下线" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/dcdffaaa803e9d8c1d539345fd8abd92/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-19T20:26:36+08:00" />
+<meta property="article:modified_time" content="2023-12-19T20:26:36+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Redis高可用</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h3 id="jZVGg">主从复制</h3> 
+<p id="u1a39f978">读写分离，主库和从库都可以进行读操作；主库进行写操作，然后将数据同步给从库。</p> 
+<h4 id="QmYtW">主从库第一次数据同步（全量复制）</h4> 
+<ol><li id="uc7f77331"><strong>建立连接，协商同步。</strong>为全量复制做准备，从库和主库建立起连接，并告诉主库即将进行同步，主库回复确认之后，主从库之间开始数据同步。</li></ol> 
+<ol><li> 
+  <ol><li id="u634f8646">从库给主库发送<code>psync</code>命令，表示要进行数据同步，命令中包括<strong>主库的runID</strong>和<strong>复制进度offset</strong>两个参数，主库根据命令以及参数启动复制。</li></ol></li></ol> 
+<ol><li> 
+  <ol><li> 
+    <ol><li id="uac0f6388">runID：每个Redis实例启动时都会自动生成的一个随机ID，用来唯一标识这个实例，第一次复制时，从库不知道主库的runID，所以设为一个?。</li><li id="ue8d3e4a4">offset：复制进度，-1表示第一次复制</li></ol></li></ol></li></ol> 
+<ol><li> 
+  <ol><li id="u6e141d49">主库收到<code>psync</code>命令之后，在第一次数据同步的时候会用<code>FULLRESYNC</code>响应带上<strong>主库的runID</strong>和<strong>主库目前的复制进度offset</strong>返回给从库，从库收到响应后会记录下这两个参数。</li></ol></li></ol> 
+<ol><li id="u11fce1de"><strong>主库同步数据给从库</strong>。<code>FULLRESYNC</code>响应表示第一次复制采用的全量复制，主库会把所有的数据同步给从库。</li></ol> 
+<ol><li> 
+  <ol><li id="ud3b929e5">主库执行<code>bgsave</code>命令，生成RDB文件，将文件发送给从库</li><li id="u3b01a7a7">从库接收到RDB文件后，会将所有数据清空（防止从库中存在其他数据与主库不一致），然后再加载接收到的RDB文件</li></ol></li></ol> 
+<ol><li id="uf13092f4"><strong>主库发送新的写命令给从库</strong>。主库在执行<code>bgsave</code>的时候还可以正常接收请求，这些数据不会记录到生成的RDB文件中，为了保证主从库的一致性，主库中会有一个专门的<code>replication buffer</code>，用来记录RDB文件生成后的所有写操作，当主库完成RDB文件发送后，就将此时的<code>replication buffer</code>中的修改操作发给从库，从库再执行一遍这些操作。</li></ol> 
+<h4 id="KkQQk">主从级联模式</h4> 
+<p id="u8c58654a">传统的主从模式中，主库要负责<strong>生成RDB文件</strong>以及<strong>传输RDB文件</strong>，这两个操作都是比较耗时的操作，如果从库过多，可能会造成主库的主线程阻塞，所以就有了<strong>主-从-从</strong>模式。</p> 
+<p id="u2d2a901b">通过主-从-从模式，可以将主库生成RDB和传输RDB的压力，以级联的方式分散到从库上。也就是有的从库是从主库的从库中获取同步数据。</p> 
+<h4 id="UU0wS">增量复制</h4> 
+<p id="ued9d0c0a">一旦主从库完成了全量复制，两者之间就会一直维护一个网络连接，主库会通过这个连接将后续陆续收到的命令操作再同步给从库，这个过程也称为<strong>基于长连接的命令传播</strong>，可以避免频繁建立连接的开销</p> 
+<p id="ucd2b5f00">Redis2.8开始，如果主从之间网络断连，主从库之间会采用<strong>增量复制</strong>的方式继续同步，也就是只需要同步网络断连期间主库收到的命令。</p> 
+<p id="u49d504bc">Redis通过环形缓冲区<code>repl_backlog_buffer</code>来实现增量复制的功能</p> 
+<p id="udaee064b">在主服务器进行命令传播的时候，不但将写命令发送给从服务器，同时会将写命令写入到<code>repl_backlog_buffer</code>环形缓冲区，该缓冲区就会保存着主服务器最近传播的写命令。</p> 
+<p id="u17fe9b97">网络断开后，当从服务器重新连接到主服务器时，会发送<code>psync</code>命令，会带有<code>slave_repl_offset</code>参数，主服务器收到之后会对比<code>slave_repl_offset</code>和<code>master_repl_offset</code>之间的差距</p> 
+<ul><li id="ubde71497">如果判断出数据还在环形缓冲区内，则进行增量复制，即将数据复制到<code>replication buffer</code>中发送给从服务器</li><li id="u58858e57">如果数据不在环形缓冲区内，就进行全量复制</li></ul> 
+<table id="qsaQG"><tbody><tr><td></td><td> <p id="u2a1f2bb8">出现阶段</p> </td><td> <p id="ufbb8867c">缓冲区满了之后</p> </td></tr><tr><td> <p id="ud80cc740">replication buffer</p> </td><td> <p id="ufe22aa4c">全量复制和增量复制阶段都会出现，主节点会给每个从节点都分配一个</p> </td><td> <p id="ub1c05e1c">会导致连接断开，删除缓存，从节点重新连接，重新开始全量复制</p> </td></tr><tr><td> <p id="u7956a51a">repl backlog buffer</p> </td><td> <p id="u72c77911">增量复制阶段出现，一个主节点只分配一个</p> </td><td> <p id="u9b42ef44">环形缓冲区，直接覆盖旧数据</p> </td></tr></tbody></table> 
+<h4 id="mAzWo">如何判断节点是否存活</h4> 
+<p id="u35388030">Redis通过<code>ping-pong</code>机制来判断节点是否存活，如果有一半的节点ping一个节点的时候没有pong返回，就认为该节点挂了，会断开与这个节点的连接。</p> 
+<p id="ub7517f27">对于主节点来说，每隔10秒对从节点发起ping命令，判断从节点的存活性和连接状态，可以通过<code>repl-ping-slave-period</code>控制发送频率。</p> 
+<p id="u142f0e36">对于从节点来说，每隔1秒发送<code>replconf ack{offset}</code>命令，给主节点上报自身当前的复制偏移量</p> 
+<ul><li id="uf6645fe4">实时检测主从节点网络状态</li><li id="u78fc1a58">上报自身复制偏移量，检查复制数据是否丢失，如果从节点数据丢失，再从主节点的复制缓冲区拉取丢失的数据</li></ul> 
+<h4 id="KSdFn">过期key</h4> 
+<p id="ua0727f30">主节点删除了一个key或者通过淘汰算法淘汰了一个key后，主节点会模拟一条del命令发送给从节点，从节点收到命令后就删除该key</p> 
+<h4 id="al1eP">主从不一致</h4> 
+<ul><li id="u65b3a891">尽量保证主从节点间的网络连接状况良好，避免主从节点在不同的机房</li><li id="u8cbcd2f7">通过外部程序来监控主从节点之间的复制进度</li></ul> 
+<ul><li> 
+  <ul><li id="ua902a5a0">可以通过Redis的<code>INFO replication</code>命令查看主节点接收写命令的进度以及从节点接收写命令的进度，通过计算两者的差值来监控复制进度</li><li id="ufdd09e50">如果某个节点的进度差值大于阈值，可以让客户端不再从该节点读取数据</li></ul></li></ul> 
+<h4 id="yil8W">主从切换</h4> 
+<p id="uf4e5fd8b">主从复制模型在主节点挂了的情况下，从节点无法自动升级为主节点。这个过程需要人工处理，在此期间Redis无法对外提供写操作</p> 
+<h5 id="fnMUD">主从切换异步复制导致数据丢失</h5> 
+<p id="u327fd04f">当客户端写入数据到主节点后，主节点还没来得及同步到从节点就发生了断电，那么主节点内存中的数据就会丢失。</p> 
+<ul><li id="u486f6d21">Redis有一个<code>min-slaves-max-lag</code>参数，表示一旦所有从节点数据复制和同步的延迟都超过了这个值后，主节点会拒绝任何请求，这样就控制了数据丢失的大小，只会丢失这个参数配置时间内的数据，减少了损失</li><li id="u8ea3dd1a">客户端发现Redis写入失败之后，可以采取降级措施，比如写到本地缓存或者写入消息队列</li></ul> 
+<h5 id="dVKKm">集群脑裂</h5> 
+<p id="u58893962">由于网络问题，集群节点之间失去联系。主从数据不同步，重新平衡选举，产生两个主节点。等网络恢复，旧的主节点会降级为从节点，再与新的主节点进行同步复制，此时由于会进行全量同步，会清空自己的缓冲区，这样前面客户端写入的数据就会丢失。</p> 
+<p id="u92235f4e">解决方案：</p> 
+<p id="uc02a7a40">当主节点发现<strong>从节点下线的数量太多</strong>或者<strong>网络延迟太大</strong>的时候，主节点会禁止写入操作，直接把错误返回给客户端</p> 
+<ul><li id="ud90bfb41"><code>min-slaves-to-write x</code>：主节点<strong>至少x个从节点</strong>，从节点小于这个数的时候，主节点会禁止写入操作</li><li id="u112cb9a4"><code>min-slaves-max-lag x</code>：主从复制和同步延迟不能超过x秒，如果超过，主节点会禁止写入操作</li></ul> 
+<h3 id="zl5In">哨兵机制</h3> 
+<p id="u641abf13">哨兵其实就是一个运行在特殊模式下的Redis进程，主从库实例运行的同时，哨兵也在运行。</p> 
+<h4 id="qKK3B">哨兵职责</h4> 
+<p id="u2bcaacd2">哨兵主要有以下三个任务：</p> 
+<ol><li id="uf192453a"><strong>监控</strong></li><li id="u58379044"><strong>选主</strong></li><li id="u7d479141"><strong>通知</strong></li></ol> 
+<h5 id="jOmJv">监控</h5> 
+<p id="u53dcd9c7">哨兵进程在运行的时候，会周期性地给所有<strong>主从库</strong>发送ping命令，检测它们是否仍然在线运行。</p> 
+<ul><li id="u2091a197">如果<strong>从库</strong>没有在规定时间内响应哨兵的ping命令，哨兵就会把它标记为<strong>下线状态</strong></li><li id="uf7a2783b">如果<strong>主库</strong>没有在规定时间内响应哨兵的ping命令，哨兵就会判定主库下线，然后开始<strong>自动切换主库</strong>的流程</li><li id="ua758474b">如果经过换主操作后旧的主节点重新上线，将其会设置为从节点</li></ul> 
+<h6 id="SreTJ">主观下线</h6> 
+<p id="uc8084a47">哨兵进程会使用ping命令来检测自身和主从库的连接情况，用来判断实例的状态。</p> 
+<p id="u4d5fc0ca">如果哨兵发现主从库对于ping命令的响应超时了，就会将该节点标记为<strong>主观下线</strong></p> 
+<ul><li id="u3b4a1c04">如果是从库被标记为主观下线，那么就直接下线就好，从库下线不会影响到整个集群的对外服务</li><li id="ue6ced91a">如果是主库被标记为主观下线，考虑到主库下线的话就需要进行<strong>重新选主</strong>，重新选主后还要重新进行<strong>数据同步</strong>，所以为了防止主库被哨兵误判下线，所以进入<strong>哨兵集群</strong>，多个哨兵一起判断，防止因为某个哨兵的网络问题导致误判</li></ul> 
+<h6 id="R9HJb">客观下线</h6> 
+<p id="u3e7dff78">对于主库而言，一个哨兵判断其主观下线并不够，需要大多数的哨兵实例都认为主库已经主观下线了之后，才能判断主库已经<strong>客观下线</strong>了，此时才会触发哨兵的选主机制</p> 
+<p id="uaec8bb1e">客观下线的主要标准就是<strong>少数服从多数</strong>，如果有N个哨兵，一般当有<code>N/2+1</code>个哨兵认为主库主观下线之后，该主库才被标记为<strong>客观下线</strong></p> 
+<h5 id="TbaC5">选主</h5> 
+<p id="u18335e60">主库挂了之后，哨兵需要从多个从库里，按照<strong>一定的规则</strong>选择一个从库实例，把它作为新的主库</p> 
+<p id="u70dd2652">哨兵在所用从库中先进行<strong>筛选</strong>，把不符合条件的从库去掉，再按照一定的规则进行<strong>打分</strong>，将得分最高的从库选为新的主库。</p> 
+<p id="u8d2347dd"></p> 
+<p class="img-center"><img alt="" height="1027" id="u583bcf2d" src="https://images2.imgbox.com/9a/32/184e3q2t_o.png" width="879"></p> 
+<h6 id="ZJA8h">筛选</h6> 
+<p id="u57c071a7">在选主的时候，除了要检测从库当前的在线状态，还需要判断它<strong>之前的网络连接状态</strong>，如果这个从库之前就经常断连，那么就认为这个从库的网络状况存在问题，不适合成为主库。</p> 
+<p id="u0f6e7cb5">可以通过配置项<code>down-after-milliseconds</code>来判定主从库的最大连接时间，如果在配置时间内，主从库没有连接上，则认为断连，如果超过了10次，则认为从库的网络状况不好，不适合成为主库。</p> 
+<h6 id="TzMmF">打分</h6> 
+<p id="uc20c2a3d">通过三个规则，分别是<strong>从库优先级</strong>、<strong>从库复制进度</strong>、<strong>从库ID号</strong>进行三轮打分操作，只要在某一轮中的从库得分最高，则将其选为主库</p> 
+<ul><li id="u03ff1d51">优先级最高的从库得分高，可以通过<code>slave-priority</code>来设置从库的优先级，如果有一个从库的优先级高，则将其选为主库，如果都是一样的，则进行下一轮打分</li><li id="u9d16d8ea">与旧主库的复制同步最接近的得分高，通过主库的<code>master_repl_offset</code>和从库的<code>slave_repl_offset</code>来计算主从库之间的同步差值，差值最小的成为主库，否则进行第三轮打分</li><li id="u5251709d">id小的得分高</li></ul> 
+<h5 id="ErfYF">通知</h5> 
+<p id="ud70d038e">哨兵选出了新的主库之后，会把新的主库的连接信息发送给其他从库，让它们执行<code>replicaof</code>命令，和新主库建立连接并进行数据复制。</p> 
+<p id="ub1aa9148">同时，哨兵会把新主库的连接信息通知客户端，让它们把请求操作发到新的主库上。</p> 
+<h4 id="qfsnh">哨兵集群</h4> 
+<p id="ua59dbb21">配置哨兵的命令</p> 
+<pre id="fBmtM"><code>sentinel monitor &lt;master-name&gt; &lt;ip&gt; &lt;redis-port&gt; &lt;quorum&gt; </code></pre> 
+<p id="u9b8ed12f">配置哨兵的时候只需要指定<strong>主库名称</strong>、<strong>主库ip</strong>、<strong>主库端口</strong>以及<strong>哨兵集群中多数哨兵同意主库下线的最小数量</strong></p> 
+<h5 id="TabSH">哨兵发现哨兵</h5> 
+<p id="u892b9768">哨兵实例之间相互发现是基于Redis的<strong>pub/sub机制</strong>，也就是发布/订阅机制。</p> 
+<p id="ud6bc38ee">哨兵只要和主库建立起来了连接，就可以将自己的信息（IP和端口）发布在主库上，同时可以从主库上订阅消息，获取到其他哨兵的信息，这样所有的哨兵就彼此知道IP和端口了。</p> 
+<p id="u3f7d5a22">Redis的pub/sub机制通过<strong>频道</strong>来区分不同的消息。频道可以理解为消息的类别，只有同一类的消息才能在同一个频道里，只有订阅了相同频道的时候，才能够相互交换信息</p> 
+<p id="ubd86ac7f">在Redis的主从集群中主库上会有一个<code>__sentinal__:hello</code>的频道，不同的哨兵通过这个频道实现相互通信。</p> 
+<h5 id="HnImH">哨兵发现从库</h5> 
+<p id="u7a04c5c6">哨兵通过向主库发送<code>INFO</code>命令来获取到从库的列表，然后基于这个列表与从库建立连接关系。</p> 
+<h5 id="wLS1D">哨兵与客户端通信</h5> 
+<p id="u9a2eff42">哨兵从本质上说也是一个Redis实例，只是不对外提供服务，所以哨兵本身也有pub/sub机制，客户端可以通过订阅哨兵不同的频道来获取主库的情况。</p> 
+<p id="u4e4b715d"></p> 
+<p class="img-center"><img alt="" height="758" id="u6ff917d1" src="https://images2.imgbox.com/89/0d/ZrjwuZIh_o.png" width="1200"></p> 
+<p id="ud1e71e1a">客户端读取到哨兵的配置文件之后，可以获得哨兵的地址和端口，然后和哨兵建立起来网络连接，通过订阅哨兵提供的频道来获取主库的信息</p> 
+<h4 id="IezsI">主从切换的哨兵</h4> 
+<p id="ub3cf398b">哨兵集群通过一个<strong>投票仲裁</strong>的方式来决定由哪一个哨兵最终来执行换主的操作。</p> 
+<ol><li id="ubc01e42f">任何一个哨兵实例在认为主库主观下线之后，就会给其他的哨兵实例发送<code>is_master_down_by_addr</code>命令</li><li id="u3d595027">收到<code>is_master_down_by_addr</code>命令的其他哨兵就会根据自己与主库的连接情况回复Y（赞成）或者N（反对）</li><li id="ua2fcbd0a">当一个哨兵收到了仲裁所需的赞成票（quorum配置决定的最小赞成票数）之后，就会将主库标记为客观下线</li><li id="uf62e42bd">此时哨兵就可以发起<strong>Leader选举</strong>，也就是决定哪个哨兵来进行换主的操作，哨兵会发出命令表示自己想要成为Leader（可能会有多个哨兵发起），其他哨兵会进行投票选举，成为Leader的哨兵需要满足两个条件</li></ol> 
+<ol><li> 
+  <ol><li id="u9909a400">拿到半数以上的赞成票</li><li id="u241f94a9">拿到的票数需要大于等于quorum配置的值</li></ol></li></ol> 
+<ol><li id="ua888556f">接下来被选举出来的Leader哨兵就会进行选主操作，如果没有选出Leader，则在等待一段时间（哨兵的故障转移时间的2倍）之后再次进行选举</li></ol> 
+<p id="uc4b2ca92">在Leader选举中，只有标记主库为<strong>主观下线</strong>的哨兵才能成为候选人，候选人在Leader选举的时候会先给自己投一个赞成票，随后会发送命令给其他的哨兵，投票哨兵会给先收到的命令投赞成票，一轮投票中一个哨兵只有1票，所以后来的命令就只能投反对票了。</p> 
+<h3 id="xdwRE">集群模式</h3> 
+<p id="u88e0be6c">分片集群，启动多个Redis实例组成一个集群，按照一定的规则将收到的数据划分成多份，每一份用一个实例来保存。</p> 
+<h4 id="eePen">数据切片与实例</h4> 
+<p id="u36b2ef12">Redis Cluster采用<strong>哈希槽（Hash Slot）</strong>的方式来处理数据和实例之间的映射关系</p> 
+<p id="uffe43690">在Redis Cluster中，一个分片集群一共有16384个哈希槽，哈希槽类似与数据分区，每个键值对都会根据它的key被映射到一个哈希槽里。</p> 
+<ol><li id="u32db2217">首先根据键值对的key，通过<code>CRC-16</code>算法生成一个16位的值</li><li id="u5909dd3f">将这个值对16384取模，得到一个0-16383之间的数字，正好对应其中一个哈希槽</li></ol> 
+<p id="ue7a10f12">CRC（循环冗余校验）16算法是一种常用的错误检测算法，广泛应用于通信和数据存储系统中。CRC算法的核心思想是通过将数据视为一个大的多项式，然后除以另一个固定的多项式（称为生成多项式）来生成校验和。CRC-16指的是生成16位（即2字节）长度的校验和。</p> 
+<h5 id="paITn">自动分配哈希槽</h5> 
+<p id="u05649358">在部署Redis Cluster的时候，可以通过<code>cluster create</code>命令创建集群，此时Redis会自动将16384个哈希槽平均分配到所有实例上，比如如果有N个实例，那么每个实例上就会分配16384/N个哈希槽</p> 
+<h5 id="XkOt5">手动分配哈希槽</h5> 
+<p id="u8e016817">当我们通过<code>cluster meet</code>手动创建集群的时候，可以通过<code>cluster addslot</code>命令手动给实例分配哈希槽。<strong>一个集群必须分配够16384个哈希槽，负责集群无法工作。</strong></p> 
+<h4 id="nteZG">客户端定位数据</h4> 
+<ul><li id="u8246356a">Redis实例会把自己的哈希槽信息传递给其他实例，完成哈希槽信息的扩散，当实例之间的连接建立起来之后，每个实例也就有了所有的哈希槽分配的情况</li><li id="udabf376d">客户端与实例建立连接之后，实例就会将所有的哈希槽分配情况返回给客户端，客户端缓存了这个信息之后，客户端也就可以通过key来计算出数据在哪个实例上了</li></ul> 
+<h5 id="XcV9f">重定向机制</h5> 
+<p id="u676a8744">当集群中有新的实例增加、有实例被删除或者为了负载均衡时，Redis会对哈希槽进行重新分配，为了解决重新分配后的哈希槽信息与客户端一开始接收的不一致，Redis Cluster提供了重定向机制。</p> 
+<p id="uf85ae9f5">所谓<strong>重定向机制</strong>，就是客户端给一个实例发送读写操作的时候，如果这个实例上没有相应的数据，这个实例会给客户端返回一个带有新的实例地址的<code>MOVED</code>命令，客户端需要再给新的实例发送操作命令，同时更新缓存的哈希槽的情况。</p> 
+<p id="u93c5b593">在Redis进行哈希槽重新分配的时候，有可能请求的数据槽正在进行迁移，但是<strong>没有迁移完成</strong>，比如说slot 1中有key1和key2，key1已经迁移到了slot 2，此时客户端来slot 1请求key1，这个时候实例会返回<code>ASK</code>命令给客户端，里面还是会带有slot 2的地址，让客户端再请求一次slot 2，与<code>MOVED</code>命令不同点在于，客户端接收到<code>ASK</code>命令之后不会去更新自己的缓存，后续还是会先来slot 1请求</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/bc67b4aa30c85ea07aeff7878d33e853/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">深入探索Zookeeper的ZAB协议：分布式系统的核心解析</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2620aa0a23c6a652a199566fcbad52cf/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">【异常解决】MySQL数据库：Lock wait timeout exceeded； try restarting transaction问题解析及解决方案</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

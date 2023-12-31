@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>揭秘：腾讯会议背后的视频编码“神器” - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="揭秘：腾讯会议背后的视频编码“神器”" />
+<meta property="og:description" content="导语 | 作为一款实时音视频通信产品，腾讯会议里面有海量的音视频数据需要进行实时传输，比如我们的摄像头画面，屏幕分享的数据等。这些数据量非常庞大，通常需要经过编码压缩再进行传输，那么腾讯会议里有哪些视频编码方面的”神器”呢？本文将一一为大家揭晓。文章作者：张清，腾讯多媒体实验室高级研究员。
+一、时域SVC
+在视频编码中，有三种帧类型：
+I帧：只能进行帧内预测，可以独立解码；
+P帧：单假设参考帧，也就是通常说的前向预测帧，只能使用它之前的帧进行预测；
+B帧：双假设参考帧, 一般为双向预测帧。
+由于B帧会带来不可避免的延迟，因此在实时通信中通常只使用I帧和P帧这两种帧类型。
+I帧只使用了本帧的信息进行预测，也就是说I帧的解码不依赖于其他帧，因此可以独立解码，但I帧的编码效率偏低，数据量较大。
+P帧使用了帧间预测方法，可以参考之前的一些解码帧信息，能达到较高的压缩效率（帧大小比I帧小很多），但是解码时必须依赖于其他帧。
+在实际的应用场景中，为了提升压缩效率，往往会使用IPPP的帧结构，即I帧之后编码N个P帧。但当网络情况不好时（如抖动，丢包，限速等），这种帧结构就会造成长时间的卡顿。
+如下图所示，第0帧为I帧，后续7个帧均为P帧，且每个P帧只有一个参考帧（为其前一帧）。当网络发生丢包时，第3帧丢失，由于第4帧参考第3帧进行压缩，因此不能正确解码，5~7帧则类似。
+这种情况下，即使丢包只造成个别帧的丢失，但由于接收端很多帧不能正确解码，会造成长时间的卡顿，只能通过申请I帧的机制进行恢复。
+IPPP帧结构参考关系
+为了解决这一问题，我们加入了时域SVC技术，对参考帧结构进行了调整。
+时域SVC帧结构参考关系
+我们可以将视频帧分为若干层，上图以3层为例：
+Layer0的帧只能参考同样为Layer0的帧，不能参考Layer1和Layer2的帧；
+Layer1的帧可以参考Layer0和Layer1的帧，不能参考Layer2的帧；
+Layer2的帧可以参考Layer0~2的帧。
+越低层级的帧被参考的可能性越大，因此重要性也越大。在网络发生丢包时，只要所丢的帧不是Layer0层，就不需要重新申请I帧，解码端就可以持续成功解码。如上图中第1帧丢失仅会影响2，3帧，其他帧不会受到影响。
+此外还可以结合网络层的策略，对低层级的帧多加一些保护（如FEC），降低其丢失的概率，能有效地解决卡死的问题。在参会的下行人数很多时，可能会有小部分下行网络较差，如果采用传统的IPPP结构，则当某个下行损伤时就需要不断的申请I帧来恢复，这样就会影响到其他接收端的视频体验；如果采用时域SVC的结构，在能够保证少数的下行网络存在问题时，其他的下行端不会受到影响。
+说了这么多，我们来看一下实际的效果吧！第一个视频示例是IPPP结构在网络损伤时的表现，卡顿感很明显；接下来是采用时域SVC的版本，帧率会有所影响但整体还算流畅。
+IPPP帧结构网络损伤效果
+时域SVC帧结构网络损伤效果
+二、ROI检测以及基于ROI的编码
+摄像头内容是腾讯会议中的一个主要视频场景。在此场景中，人眼往往比较关注人脸区域，对背景区域的关注度较低。因此，我们加入了人脸检测算法和基于感兴趣区域（Region of Interest, 简称ROI）的编码算法。
+这类算法的主要思路是：实时地检测出当前视频中的ROI区域，将其传入到编码器内部，编码器进行单帧的码率重分配。对ROI区域，增大其码率，能使该区域编码的更好，提升主观质量；对于非ROI区域，降低其码率，则总的码率不会超出目标码率。
+在ROI检测方面，因为腾讯会议是一个实时性要求很高的场景，对算法复杂度很敏感，我们使用一些传统的算法，结合编码器的一些预分析结果，确定最终的ROI-map，对于1080p的视频，单帧检测耗时在0.3ms以内，完全满足了实时性的要求。
+基于ROI的检测和码率调整算法的优点在于：在低码率的情况下，能极大地提升主观质量；在高码率的场景下，可以保持主观质量基本不变，码率节省20%~30%，以下是一些对比效果：
+低码率效果对比 (左)关闭ROI (右)开启ROI
+高码率效果对比 (左) 300kbps, 关闭ROI (右) 210kbps, 开启ROI
+三、屏幕内容编码技术
+屏幕分享/白板等屏幕类内容是腾讯会议中另一类视频场景。屏幕生成的视频与摄像头采集的视频存在很大的不同：屏幕视频通常没有噪声，色调离散，线条细腻，边缘锐利；相反的，摄像机拍摄的视频通常存在噪声，色调连续且丰富，纹理比较复杂。
+传统的H.264和H.265编码器采用的是基于块的混合编码框架，包含预测，变换，量化以及熵编码。其中变换模块主要的目的是将残差信号从空域变换到频域，使信号能量更集中，也方便基于不同的频率分量做不同的处理，减小编码所需的比特数。
+但是，对屏幕分享的内容，采用基于变换的编码方法，会损失其高频细节，导致用户观看的视频变得不清晰。
+基于上述原因，我们在H.265编码器中加入了一些有效的屏幕内容编码技术（Screen Content Coding，简称SCC），包括帧内块拷贝和调色板编码。
+我们在前面的介绍中也提到过，一般情况下I帧编码效率要比P帧差，主要原因是P帧可以利用时域上的信息进行预测，预测精确度往往很高，这样编码的信息量就变少了。
+如下图所示，第N帧与第N-1帧之间只有很少量的运动，所以用第N-1帧的信息来预测第N帧相对来说会很准确。
+帧间预测示例图
+所谓的帧内块拷贝，是指借鉴了帧间预测的方法，在I帧中引入基于运动矢量（Motion Vector, 简称MV）的预测，提升其预测精确度，极大地提升了I帧的压缩效率。
+该方法之所以在屏幕类场景效果显著，是由于屏幕序列相比于摄像头采集序列有很多重复性的图案，用这个方法效果更好。
+屏幕序列重复图案示例
+在屏幕内容中，像素点的选择通常集中在某一些色彩上，所以我们引入了调色板模式。该模式彻底抛弃了传统的变换编码的方法，直接依据像素点的“颜色值”生成调色板。
+对每个像素点，传输其在调色板中的“索引”（“index”）即可。该算法可以达到很高的编码效率提升，同时这种方法由于不使用变换，且大多数的点可以在颜色表中找到对应的项，主观质量也有明显的提升。
+四、YUV444编码
+在视频编码中，基本的数据格式为YUV，根据采样格式的不同可以分为YUV444, YUV422以及YUV420，这三种格式的区别见下图（O表示Y分量，X表示U/V分量）：
+YUV采样格式 (左)YUV444 (中)YUV422 (右)YUV420" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/01d7bfe7e30e40de8b096926e3763c06/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-11-18T18:35:00+08:00" />
+<meta property="article:modified_time" content="2020-11-18T18:35:00+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">揭秘：腾讯会议背后的视频编码“神器”</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p><img src="https://images2.imgbox.com/59/0d/5qCDzGt0_o.png"></p> 
+ <p>导语 | 作为一款实时音视频通信产品，腾讯会议里面有海量的音视频数据需要进行实时传输，比如我们的摄像头画面，屏幕分享的数据等。这些数据量非常庞大，通常需要经过编码压缩再进行传输，那么腾讯会议里有哪些视频编码方面的”神器”呢？本文将一一为大家揭晓。文章作者：张清，腾讯多媒体实验室高级研究员。</p> 
+ <h3><br></h3> 
+ <p><strong>一、时域SVC</strong><strong></strong></p> 
+ <p>在视频编码中，有三种帧类型：</p> 
+ <ul><li><p>I帧：只能进行帧内预测，可以独立解码；</p></li><li><p>P帧：单假设参考帧，也就是通常说的前向预测帧，只能使用它之前的帧进行预测；</p></li><li><p>B帧：双假设参考帧, 一般为双向预测帧。</p></li></ul> 
+ <p>由于B帧会带来不可避免的延迟，因此在实时通信中通常只使用I帧和P帧这两种帧类型。</p> 
+ <p>I帧只使用了本帧的信息进行预测，也就是说I帧的解码不依赖于其他帧，因此可以独立解码，但I帧的编码效率偏低，数据量较大。</p> 
+ <p>P帧使用了帧间预测方法，可以参考之前的一些解码帧信息，能达到较高的压缩效率（帧大小比I帧小很多），但是解码时必须依赖于其他帧。</p> 
+ <p>在实际的应用场景中，为了提升压缩效率，往往会使用IPPP的帧结构，即I帧之后编码N个P帧。但当网络情况不好时（如抖动，丢包，限速等），这种帧结构就会造成长时间的卡顿。</p> 
+ <p>如下图所示，第0帧为I帧，后续7个帧均为P帧，且每个P帧只有一个参考帧（为其前一帧）。当网络发生丢包时，第3帧丢失，由于第4帧参考第3帧进行压缩，因此不能正确解码，5~7帧则类似。</p> 
+ <p>这种情况下，即使丢包只造成个别帧的丢失，但由于接收端很多帧不能正确解码，会造成长时间的卡顿，只能通过申请I帧的机制进行恢复。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/77/ba/ZyQMezdG_o.png"></p> 
+ <p style="text-align: center"><em>IPPP帧结构参考关系</em></p> 
+ <p>为了解决这一问题，我们加入了时域SVC技术，对参考帧结构进行了调整。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/eb/eb/Xp1alDc1_o.png"></p> 
+ <p style="text-align: center"><em>时域SVC帧结构参考关系</em></p> 
+ <p>我们可以将视频帧分为若干层，上图以3层为例：</p> 
+ <ul><li><p>Layer0的帧只能参考同样为Layer0的帧，不能参考Layer1和Layer2的帧；</p></li><li><p>Layer1的帧可以参考Layer0和Layer1的帧，不能参考Layer2的帧；</p></li><li><p>Layer2的帧可以参考Layer0~2的帧。</p></li></ul> 
+ <p>越低层级的帧被参考的可能性越大，因此重要性也越大。在网络发生丢包时，只要所丢的帧不是Layer0层，就不需要重新申请I帧，解码端就可以持续成功解码。如上图中第1帧丢失仅会影响2，3帧，其他帧不会受到影响。</p> 
+ <p>此外还可以结合网络层的策略，对低层级的帧多加一些保护（如FEC），降低其丢失的概率，能有效地解决卡死的问题。在参会的下行人数很多时，可能会有小部分下行网络较差，如果采用传统的IPPP结构，则当某个下行损伤时就需要不断的申请I帧来恢复，这样就会影响到其他接收端的视频体验；如果采用时域SVC的结构，在能够保证少数的下行网络存在问题时，其他的下行端不会受到影响。</p> 
+ <p>说了这么多，我们来看一下实际的效果吧！第一个视频示例是IPPP结构在网络损伤时的表现，卡顿感很明显；接下来是采用时域SVC的版本，帧率会有所影响但整体还算流畅。</p> 
+ <p style="text-align: center"><em>IPPP帧结构网络损伤效果</em></p> 
+ <p style="text-align: center"><em>时域SVC帧结构网络损伤效果</em></p> 
+ <p><strong>二、ROI检测以及基于ROI的编码</strong><strong></strong></p> 
+ <p>摄像头内容是腾讯会议中的一个主要视频场景。在此场景中，人眼往往比较关注人脸区域，对背景区域的关注度较低。因此，我们加入了人脸检测算法和基于感兴趣区域（Region of Interest, 简称ROI）的编码算法。</p> 
+ <p>这类算法的主要思路是：实时地检测出当前视频中的ROI区域，将其传入到编码器内部，编码器进行单帧的码率重分配。对ROI区域，增大其码率，能使该区域编码的更好，提升主观质量；对于非ROI区域，降低其码率，则总的码率不会超出目标码率。</p> 
+ <p>在ROI检测方面，因为腾讯会议是一个实时性要求很高的场景，对算法复杂度很敏感，我们使用一些传统的算法，结合编码器的一些预分析结果，确定最终的ROI-map，对于1080p的视频，单帧检测耗时在0.3ms以内，完全满足了实时性的要求。</p> 
+ <p>基于ROI的检测和码率调整算法的优点在于：<strong>在低码率的情况下，能极大地提升主观质量；在高码率的场景下，可以保持主观质量基本不变，码率节省20%~30%</strong>，以下是一些对比效果：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/54/6e/50kxu22v_o.png"></p> 
+ <p style="text-align: center"><em>低码率效果对比 (左)关闭ROI  (右)开启ROI</em></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/dc/9e/GBBEpoXY_o.png"></p> 
+ <p style="text-align: center"><em>高码率效果对比 (左) 300kbps, 关闭ROI  (右) 210kbps, 开启ROI</em></p> 
+ <h3><br></h3> 
+ <p><strong>三、屏幕内容编码技术</strong><strong></strong></p> 
+ <p>屏幕分享/白板等屏幕类内容是腾讯会议中另一类视频场景。屏幕生成的视频与摄像头采集的视频存在很大的不同：屏幕视频通常没有噪声，色调离散，线条细腻，边缘锐利；相反的，摄像机拍摄的视频通常存在噪声，色调连续且丰富，纹理比较复杂。</p> 
+ <p>传统的H.264和H.265编码器采用的是基于块的混合编码框架，包含预测，变换，量化以及熵编码。其中变换模块主要的目的是将残差信号从空域变换到频域，使信号能量更集中，也方便基于不同的频率分量做不同的处理，减小编码所需的比特数。</p> 
+ <p>但是，<strong>对屏幕分享的内容，采用基于变换的编码方法，会损失其高频细节，导致用户观看的视频变得不清晰</strong>。</p> 
+ <p>基于上述原因，我们在H.265编码器中加入了一些有效的屏幕内容编码技术（Screen Content Coding，简称SCC），包括帧内块拷贝和调色板编码。</p> 
+ <p>我们在前面的介绍中也提到过，一般情况下I帧编码效率要比P帧差，主要原因是P帧可以利用时域上的信息进行预测，预测精确度往往很高，这样编码的信息量就变少了。</p> 
+ <p>如下图所示，第N帧与第N-1帧之间只有很少量的运动，所以用第N-1帧的信息来预测第N帧相对来说会很准确。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/75/a4/JbH8JxYK_o.png"></p> 
+ <p style="text-align: center"><em>帧间预测示例图</em></p> 
+ <p>所谓的帧内块拷贝，是指借鉴了帧间预测的方法，在I帧中引入基于运动矢量（Motion Vector, 简称MV）的预测，提升其预测精确度，极大地提升了I帧的压缩效率。</p> 
+ <p>该方法之所以在屏幕类场景效果显著，是由于屏幕序列相比于摄像头采集序列有很多重复性的图案，用这个方法效果更好。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/6d/81/qtrB0yd1_o.png"></p> 
+ <p style="text-align: center"><em>屏幕序列重复图案示例</em></p> 
+ <p>在屏幕内容中，像素点的选择通常集中在某一些色彩上，所以我们引入了<strong>调色板模式</strong>。该模式彻底抛弃了传统的变换编码的方法，直接依据像素点的“颜色值”生成调色板。</p> 
+ <p>对每个像素点，传输其在调色板中的“索引”（“index”）即可。该算法可以达到很高的编码效率提升，同时这种方法由于不使用变换，且大多数的点可以在颜色表中找到对应的项，主观质量也有明显的提升。</p> 
+ <h3><br></h3> 
+ <p><strong>四、YUV444编码</strong><strong></strong></p> 
+ <p>在视频编码中，基本的数据格式为YUV，根据采样格式的不同可以分为YUV444, YUV422以及YUV420，这三种格式的区别见下图（O表示Y分量，X表示U/V分量）：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/06/28/HCrTa6ix_o.png"></p> 
+ <p style="text-align: center"><em>YUV采样格式 (左)YUV444  (中)YUV422  (右)YUV420</em></p> 
+ <p>YUV444采样格式中Y、U、V 三个分量的比例相同，每个像素的三个分量信息完整，都是一个字节。YUV422采样格式中Y 分量和 UV 分量则按照 2 : 1 的比例采样。如图所示，水平方向有4个像素点，那么就采样4个Y分量，2个UV 分量。</p> 
+ <p>YUV420采样格式中，每一行扫描时只扫描一种色度分量（U 或者 V）且该色度分量与Y分量按照 2 : 1 的方式采样。如图所示，为了直观的理解，我们认为4个Y分量对应1个UV分量，因此将X放在了四个O中间。</p> 
+ <p>一般来说，大多数的视频类应用都采样YUV420的格式进行编码，一方面这种格式数据量较少，另一方面色度分量的重要程度明显低于亮度分量，对色度降采样后人眼主观感受降低不明显。</p> 
+ <p>然而，在屏幕分享场景中，相比于摄像头采集序列，U/V分量信息更丰富，下采样会严重的丢失这部分信息，且在后续的后处理等环节无法补回，所以我们加入了YUV444编码的支持。</p> 
+ <p>大家可以看下下面这两张图，我们人为生成了一张U/V分量信息很丰富的图片，在发送端可以看到是有色彩的，但是经过YUV420采集编码传输后，到接收端看到的却是一幅灰度图像，失真非常严重。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/41/59/xmpch72n_o.png"></p> 
+ <p style="text-align: center"><em>测试图片</em></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/97/ec/kMab5Z48_o.png"></p> 
+ <p style="text-align: center"><em>YUV420传输效果(U/V分量严重失真)</em></p> 
+ <p>在屏幕分享场景下，有些时候可能会对色彩的保真度/还原度要求较高，如一些设计图像等，那么加入YUV444的支持就是为了在这些场景下达到不错的用户体验。下面是我们实际测试到的YUV420/YUV444编码下的对比图：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/fe/d1/yvbBY5jL_o.png"></p> 
+ <p style="text-align: center"><em>原图</em></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/3f/73/7PCWB3pi_o.png"></p> 
+ <p style="text-align: center"><em>YUV420编码图像</em></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/45/78/OtvczNCr_o.png"></p> 
+ <p style="text-align: center"><em>YUV444编码图像</em></p> 
+ <p><strong>五、业界领先的编码器</strong><strong></strong></p> 
+ <p>我们对H.264和H.265编码器进行了深度优化，一方面加入了很多快速算法，提升其编码速度；另一方面加入了一些新的编码工具集，提升其压缩效率。</p> 
+ <p>与业界最著名的x264开源编码器相比，我们的H.264编码器针对屏幕分享内容做了大量的优化，达到了40%以上压缩效率的提升，编码速度仅损失11%左右。</p> 
+ <p>我们的H.265编码器无论在屏幕分享场景还是摄像头场景，都远远优于开源的x265编码器。与x265相比，在屏幕分享场景下，压缩效率提升多达83.7%，速度提升210%；在摄像头场景下，压缩效率提升24.7%的同时速度可以提升140%左右。</p> 
+ <h3><br></h3> 
+ <p><strong>结语</strong><strong></strong></p> 
+ <p>本文较为详细的介绍了一些腾讯会议中的视频编码“神器”，为了不断地提升产品体验，我们会根据不同的场景持续优化我们的编码器，增加适合的编码技术，欢迎大家咨询体验！</p> 
+ <p style="text-align: center"><strong>/  文末福利  /</strong></p> 
+ <p>腾讯云十周年筑梦，感恩有你！扫描下方二维码，即可领取腾讯云定制红包封面一份，名额有限，先到先得哦<img src="https://images2.imgbox.com/57/da/MLj4V2jG_o.png"></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/b5/aa/7Gc2kDjQ_o.png"></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/9e/b4/HTwZRKdb_o.png"></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/8387c208fb92f1d45d81d7c8592e5411/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Landslide detection from an open satellite imagery 使用注意力增强卷积神经网络从开放的卫星图像和数字高程模型数据集检测滑坡</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/42534ac89ef608f68d25a21fbe99d3f9/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">postman  raw 可以请求数据，但是ajax拿不到数据问题排查</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

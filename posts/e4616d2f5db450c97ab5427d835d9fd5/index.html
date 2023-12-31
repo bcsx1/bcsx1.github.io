@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>FPGA 频率计实验 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="FPGA 频率计实验" />
+<meta property="og:description" content="参考：正点原子开拓者 FPGA 开发指南
+数字频率计是一种基本的测量仪器，被广泛应用于航天、电子、测控等领域。基于传统测频原理的频率计的测量精度将随被测信号频率的下降而降低，在使用中有较大的局限性，而等精度频率计不但具有较高的测量精度，而且在整个频率区域能保持恒定的测试精度。
+一、等精度频率计简介 频率测量在电子设计和测量领域中经常用到，因此对频率测量方法的研究在实际工程应用中具有重要意义。常用的频率测量方法有两种：周期测量法和频率测量法。
+周期测量法是先测量出被测信号的周期T，然后根据频率f = 1/T求出被测信号的频率。频率测量法是在时间t内对被测信号的脉冲数N进行计数，然后求出单位时间内的脉冲数，即为被测信号的频率。 但是上述两种方法都会产生±1个被测脉冲的误差，在实际应用中有一定的局限性。根据测量原理，很容易发现周期测量法适合于低频信号测量，频率测量法适合于高频信号测量(因为周期越大或者频率越高那么所测得的周期或者脉冲数N的相对误差就会越小)，但二者都不能兼顾高低频率同样精度的测量要求。
+等精度测量的一个最大特点是测量的实际门控时间不是一个固定值，而是一个与被测信号有关的值，刚好是被测信号的整数倍。在计数允许时间内，同时对基准时钟和被测信号进行计数，再通过数学公式推导得到被测信号的频率。由于门控信号是被测信号的整数倍，就消除了对被测信号产生的±l周期误差，但是会产生对基准时钟±1周期的误差。 等精度测量原理如下图所示：
+从以上叙述的等精度的测量原理可以很容易得出如下结论：首先，被测信号频率clk_fx的相对误差与被测信号的频率无关；其次，增大测量时间段“软件闸门”或提高“标频”clk_fs，可以减小相对误差，提高测量精度；最后，由于一般提供基准时钟clk_fs的石英晶振稳定性很高，所以基准时钟的相对误差很小，可忽略。假设基准时钟的频率为100MHz，只要实际闸门时间大于或等于1s，就可使测量的最大相对误差小于或等于10^(-8)，即精度达到1/100MHz。等精度测量的核心思想在于如何保证在实际测量门闸内被测信号为整数个周期，这就需要在设计中让实际测量门闸信号与被测信号建立一定的关系。基于这种思想，设计中以被测信号的上升沿作为开启门闸和关闭门闸的驱动信号，只有在被测信号的上升沿才将上图中预置的“软件闸门”的状态锁存，因此在“实际闸门”Tx内被测信号的个数就能保证整数个周期，这样就避免普通测量方法中被测信号的±1的误差，但会产生高频的基准时钟信号的±l周期误差，由于基准时钟频率远高于被测信号，因此它产生的±1周期误差对测量精度的影响十分有限，特别是在中低频测量的时候，相较于传统的频率测量和周期测量方法，可以大大提高测量精度。
+等精度测频的原理图如下图所示。图中，预置软件闸门信号GATE是由FPGA的定时模块产生，GATE的时间宽度对测频精度的影响较小，故可以在较大的范围内选择，GATE信号经被测时钟clk_fx同步化（图中的D触发器）到被测时钟域下。另外，为了方便处理，这里选择预置闸门信号的长度由参数GATE_TIME设置。图中的fs_cnt和fx_cnt是2个可控的32位高速计数器，fs_cnt_en和fx_cnt_en分别是其计数使能端，由同步化后的GATE信号控制，基准时钟信号clk_fs从时钟输入端clk_fs输入，待测信号clk_fx从时钟输入端clk_fx输入。测量时，生成的GATE信号，在被测时钟同步化后用来控制启动和关闭2个计数器，2个计数器分别对被测信号和基准时钟计数。若在一次实际闸门时间GATE_TIME中，计数器对被测信号的计数值为fx_cnt，对基准时钟的计数值为fs_cnt，而基准时钟的频率为CLK_FS，则被测信号的频率为clk_fx，则由公式：
+二、实验任务 板载50MHz的时钟通过分频产生某一频率的时钟信号，作为被测时钟，然后用Verilog HDL编写的等精度测量模块测量被测时钟，并通过数码管显示。
+三、程序设计 根据实验任务，我们可以大致规划出系统的控制流程：首先我们设计一个测试时钟模块用于生成被测的时钟，然后用等精度频率计模块测量被测时钟的频率，并将测得的时钟频率值送入数码管显示模块进行显示。由此画出系统的功能框图如下所示：
+由系统框图可知，FPGA部分包括四个模块：顶层模块（top_cymometer）、等精度频率计模块（cymometer）、时钟产生模块（clk_test）、以及数码管显示模块（seg_led）。各模块功能如下：
+顶层模块（top_cymometer）：顶层模块完成了对其它三个模块的例化，实现各模块之间的数据交互。时钟产生模块产生被测时钟输出，并从外部接入至等精度频率计模块，以进行频率测量，将测量的结果传输给数码管驱动模块进行显示。顶层模块的原理图如下图所示：
+等精度频率计模块（cymometer）：等精度频率计模块测量输入的被测时钟的频率。并将测得的频率结果输出。
+时钟产生模块（clk_test）：时钟产生模块产生被测的时钟。
+数码管显示模块（seg_led）：将等精度频率计测得的时钟频率值在数码管上显示出来。
+1、顶层模块的代码如下： module top_cymometer( //system clock input sys_clk , // 时钟信号 input sys_rst_n, // 复位信号 //cymometer interface input clk_fx , // 被测时钟 output clk_out , // 输出时钟 //user interface output [5:0] sel , // 数码管位选 output [7:0] seg_led // 数码管段选 ); //parameter define parameter CLK_FS = 26&#39;d50000000; // 基准时钟频率值 //wire define wire [19:0] data_fx; // 被测信号测量值 //***************************************************** //** main code //***************************************************** //例化等精度频率计模块 cymometer #(." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/e4616d2f5db450c97ab5427d835d9fd5/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-11-01T11:27:44+08:00" />
+<meta property="article:modified_time" content="2020-11-01T11:27:44+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">FPGA 频率计实验</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-tomorrow-night-eighties">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p><mark>参考</mark>：<strong>正点原子开拓者 FPGA 开发指南</strong></p> 
+<p>数字频率计是一种基本的测量仪器，被广泛应用于航天、电子、测控等领域。基于传统测频原理的频率计的测量精度将随被测信号频率的下降而降低，在使用中有较大的局限性，而等精度频率计不但具有较高的测量精度，而且在整个频率区域能保持恒定的测试精度。</p> 
+<h5><a id="_4"></a>一、等精度频率计简介</h5> 
+<p>频率测量在电子设计和测量领域中经常用到，因此对频率测量方法的研究在实际工程应用中具有重要意义。常用的频率测量方法有两种：<strong>周期测量法</strong>和<strong>频率测量法</strong>。</p> 
+<ul><li>周期测量法是先测量出被测信号的周期T，然后根据频率f = 1/T求出被测信号的频率。</li><li>频率测量法是在时间t内对被测信号的脉冲数N进行计数，然后求出单位时间内的脉冲数，即为被测信号的频率。</li></ul> 
+<p>但是上述两种方法都会产生±1个被测脉冲的误差，在实际应用中有一定的局限性。根据测量原理，很容易发现周期测量法适合于低频信号测量，频率测量法适合于高频信号测量(<strong>因为周期越大或者频率越高那么所测得的周期或者脉冲数N的相对误差就会越小</strong>)，但二者都不能兼顾高低频率同样精度的测量要求。</p> 
+<p><strong>等精度测量的一个最大特点是测量的实际门控时间不是一个固定值，而是一个与被测信号有关的值，刚好是被测信号的整数倍</strong>。在计数允许时间内，同时对基准时钟和被测信号进行计数，再通过数学公式推导得到被测信号的频率。<strong>由于门控信号是被测信号的整数倍，就消除了对被测信号产生的±l周期误差，但是会产生对基准时钟±1周期的误差。</strong> 等精度测量原理如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/90/81/kMJMesxa_o.png" alt="在这里插入图片描述"><br> 从以上叙述的等精度的测量原理可以很容易得出如下结论：<strong>首先，被测信号频率clk_fx的相对误差与被测信号的频率无关；其次，增大测量时间段“软件闸门”或提高“标频”clk_fs，可以减小相对误差，提高测量精度；最后，由于一般提供基准时钟clk_fs的石英晶振稳定性很高，所以基准时钟的相对误差很小，可忽略</strong>。假设基准时钟的频率为100MHz，只要实际闸门时间大于或等于1s，就可使测量的最大相对误差小于或等于10^(-8)，即精度达到1/100MHz。等精度测量的核心思想在于如何保证在实际测量门闸内被测信号为整数个周期，这就需要在设计中让实际测量门闸信号与被测信号建立一定的关系。基于这种思想，设计中以被测信号的上升沿作为开启门闸和关闭门闸的驱动信号，只有在被测信号的上升沿才将上图中预置的“软件闸门”的状态锁存，因此在“实际闸门”Tx内被测信号的个数就能保证整数个周期，这样就避免普通测量方法中被测信号的±1的误差，但会产生高频的基准时钟信号的±l周期误差，<strong>由于基准时钟频率远高于被测信号，因此它产生的±1周期误差对测量精度的影响十分有限，特别是在中低频测量的时候，相较于传统的频率测量和周期测量方法，可以大大提高测量精度。</strong></p> 
+<hr> 
+<p>等精度测频的原理图如下图所示。图中，预置软件闸门信号GATE是由FPGA的定时模块产生，GATE的时间宽度对测频精度的影响较小，故可以在较大的范围内选择，GATE信号经被测时钟clk_fx同步化（图中的D触发器）到被测时钟域下。另外，为了方便处理，这里选择预置闸门信号的长度由参数GATE_TIME设置。<strong>图中的fs_cnt和fx_cnt是2个可控的32位高速计数器，fs_cnt_en和fx_cnt_en分别是其计数使能端，由同步化后的GATE信号控制，基准时钟信号clk_fs从时钟输入端clk_fs输入，待测信号clk_fx从时钟输入端clk_fx输入</strong>。测量时，生成的GATE信号，在被测时钟同步化后用来控制启动和关闭2个计数器，2个计数器分别对被测信号和基准时钟计数。若在一次实际闸门时间GATE_TIME中，计数器对被测信号的计数值为fx_cnt，对基准时钟的计数值为fs_cnt，而基准时钟的频率为CLK_FS，则被测信号的频率为clk_fx，则由公式：</p> 
+<p><img src="https://images2.imgbox.com/a7/3a/zypRSNly_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/bc/4a/M9lgy6GR_o.png" alt="在这里插入图片描述"></p> 
+<h5><a id="_20"></a>二、实验任务</h5> 
+<p>板载50MHz的时钟通过分频产生某一频率的时钟信号，作为被测时钟，然后用Verilog HDL编写的等精度测量模块测量被测时钟，并通过数码管显示。</p> 
+<h5><a id="_22"></a>三、程序设计</h5> 
+<p>根据实验任务，我们可以大致规划出系统的控制流程：首先我们设计一个测试时钟模块用于生成被测的时钟，然后用等精度频率计模块测量被测时钟的频率，并将测得的时钟频率值送入数码管显示模块进行显示。由此画出系统的功能框图如下所示：</p> 
+<p><img src="https://images2.imgbox.com/93/09/WnIUPOEb_o.png" alt="在这里插入图片描述"><br> 由系统框图可知，FPGA部分包括四个模块：顶层模块（top_cymometer）、等精度频率计模块（cymometer）、时钟产生模块（clk_test）、以及数码管显示模块（seg_led）。各模块功能如下：</p> 
+<p>顶层模块（top_cymometer）：顶层模块完成了对其它三个模块的例化，实现各模块之间的数据交互。时钟产生模块产生被测时钟输出，并从外部接入至等精度频率计模块，以进行频率测量，将测量的结果传输给数码管驱动模块进行显示。顶层模块的原理图如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/48/6d/ZKFRZzGz_o.png" alt="在这里插入图片描述"></p> 
+<p>等精度频率计模块（cymometer）：等精度频率计模块测量输入的被测时钟的频率。并将测得的频率结果输出。</p> 
+<p>时钟产生模块（clk_test）：时钟产生模块产生被测的时钟。</p> 
+<p>数码管显示模块（seg_led）：将等精度频率计测得的时钟频率值在数码管上显示出来。</p> 
+<h6><a id="1_39"></a>1、顶层模块的代码如下：</h6> 
+<pre><code class="prism language-c">module <span class="token function">top_cymometer</span><span class="token punctuation">(</span>
+    <span class="token comment">//system clock</span>
+    input                  sys_clk  <span class="token punctuation">,</span>    <span class="token comment">// 时钟信号</span>
+    input                  sys_rst_n<span class="token punctuation">,</span>    <span class="token comment">// 复位信号</span>
+
+    <span class="token comment">//cymometer interface</span>
+    input                  clk_fx   <span class="token punctuation">,</span>    <span class="token comment">// 被测时钟</span>
+    output                 clk_out  <span class="token punctuation">,</span>    <span class="token comment">// 输出时钟</span>
+    <span class="token comment">//user interface</span>
+    output          <span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>  sel      <span class="token punctuation">,</span>    <span class="token comment">// 数码管位选</span>
+    output          <span class="token punctuation">[</span><span class="token number">7</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>  seg_led       <span class="token comment">// 数码管段选</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//parameter define</span>
+parameter    CLK_FS <span class="token operator">=</span> <span class="token number">26</span>'d50000000<span class="token punctuation">;</span>      <span class="token comment">// 基准时钟频率值</span>
+
+<span class="token comment">//wire define</span>
+wire    <span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>       data_fx<span class="token punctuation">;</span>            <span class="token comment">// 被测信号测量值</span>
+
+<span class="token comment">//*****************************************************</span>
+<span class="token comment">//**                    main code</span>
+<span class="token comment">//*****************************************************</span>
+
+<span class="token comment">//例化等精度频率计模块</span>
+cymometer #<span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token function">CLK_FS</span><span class="token punctuation">(</span>CLK_FS<span class="token punctuation">)</span>              <span class="token comment">// 基准时钟频率值</span>
+<span class="token punctuation">)</span> <span class="token function">u_cymometer</span><span class="token punctuation">(</span>
+    <span class="token comment">//system clock</span>
+    <span class="token punctuation">.</span>clk_fs      <span class="token punctuation">(</span>sys_clk  <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 基准时钟信号</span>
+    <span class="token punctuation">.</span>rst_n       <span class="token punctuation">(</span>sys_rst_n<span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 复位信号</span>
+    <span class="token comment">//cymometer interface</span>
+    <span class="token punctuation">.</span>clk_fx      <span class="token punctuation">(</span>clk_fx   <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 被测时钟信号</span>
+    <span class="token punctuation">.</span>data_fx     <span class="token punctuation">(</span>data_fx  <span class="token punctuation">)</span>             <span class="token comment">// 被测时钟频率输出</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    
+<span class="token comment">//例化测试时钟模块，产生测试时钟</span>
+clk_test #<span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token function">DIV_N</span><span class="token punctuation">(</span><span class="token number">7</span>'d100<span class="token punctuation">)</span>                <span class="token comment">// 分频系数</span>
+<span class="token punctuation">)</span> <span class="token function">u_clk_test</span><span class="token punctuation">(</span>
+    <span class="token comment">//源时钟</span>
+    <span class="token punctuation">.</span>clk_in      <span class="token punctuation">(</span>sys_clk  <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 输入时钟</span>
+    <span class="token punctuation">.</span>rst_n       <span class="token punctuation">(</span>sys_rst_n<span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 复位信号</span>
+    <span class="token comment">//分频后的时钟</span>
+    <span class="token punctuation">.</span>clk_out     <span class="token punctuation">(</span>clk_out  <span class="token punctuation">)</span>             <span class="token comment">// 测试时钟</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//例化数码管显示模块</span>
+seg_led <span class="token function">u_seg_led</span><span class="token punctuation">(</span>
+    <span class="token comment">//module clock</span>
+    <span class="token punctuation">.</span>clk         <span class="token punctuation">(</span>sys_clk  <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 数码管驱动模块的驱动时钟</span>
+    <span class="token punctuation">.</span>rst_n       <span class="token punctuation">(</span>sys_rst_n<span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 复位信号</span>
+    <span class="token comment">//seg_led interface</span>
+    <span class="token punctuation">.</span>sel         <span class="token punctuation">(</span>sel      <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 数码管位选</span>
+    <span class="token punctuation">.</span>seg_led     <span class="token punctuation">(</span>seg_led  <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 数码管段选</span>
+    <span class="token comment">//user interface</span>
+    <span class="token punctuation">.</span>data        <span class="token punctuation">(</span>data_fx  <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 被测频率值</span>
+    <span class="token punctuation">.</span>point       <span class="token punctuation">(</span><span class="token number">6</span>'d0     <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 数码管显示的点控制</span>
+    <span class="token punctuation">.</span>en          <span class="token punctuation">(</span><span class="token number">1</span>'b1     <span class="token punctuation">)</span><span class="token punctuation">,</span>            <span class="token comment">// 数码管驱动使能信号</span>
+    <span class="token punctuation">.</span>sign        <span class="token punctuation">(</span><span class="token number">1</span>'b0     <span class="token punctuation">)</span>             <span class="token comment">// 控制符号位显示</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+endmodule
+</code></pre> 
+<h6><a id="2_105"></a>2、时钟产生模块的代码如下：</h6> 
+<pre><code class="prism language-c">module clk_test #<span class="token punctuation">(</span>parameter DIV_N <span class="token operator">=</span> <span class="token number">7</span>'d100<span class="token punctuation">)</span>    <span class="token comment">//分频系数</span>
+    <span class="token punctuation">(</span>
+     <span class="token comment">//源时钟</span>
+     input        clk_in     <span class="token punctuation">,</span>                 <span class="token comment">// 输入时钟</span>
+     input        rst_n      <span class="token punctuation">,</span>                 <span class="token comment">// 复位信号</span>
+     <span class="token comment">//分频后的时钟</span>
+     output  reg  clk_out                      <span class="token comment">// 输出时钟</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//reg define</span>
+reg <span class="token punctuation">[</span><span class="token number">9</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span> cnt<span class="token punctuation">;</span>                                 <span class="token comment">// 时钟分频计数</span>
+
+<span class="token comment">//*****************************************************</span>
+<span class="token comment">//**                    main code</span>
+<span class="token comment">//*****************************************************</span>
+
+<span class="token comment">//时钟分频</span>
+always @<span class="token punctuation">(</span>posedge clk_in or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span>rst_n <span class="token operator">==</span> <span class="token number">1</span>'b0<span class="token punctuation">)</span> begin
+        cnt     <span class="token operator">&lt;=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+        clk_out <span class="token operator">&lt;=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> begin
+        <span class="token keyword">if</span><span class="token punctuation">(</span>cnt <span class="token operator">==</span> DIV_N<span class="token operator">/</span><span class="token number">2</span> <span class="token operator">-</span> <span class="token number">1</span>'b1<span class="token punctuation">)</span> begin
+            cnt     <span class="token operator">&lt;=</span> <span class="token number">10</span>'d0<span class="token punctuation">;</span>
+            clk_out <span class="token operator">&lt;=</span> <span class="token operator">~</span>clk_out<span class="token punctuation">;</span>
+        end
+        <span class="token keyword">else</span>
+            cnt <span class="token operator">&lt;=</span> cnt <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+    end
+end
+
+endmodule
+</code></pre> 
+<p>时钟产生模块通过分频产生被测时钟，这里是用偶数分频方法产生，修改代码第一行的DIV_N分频参数，可得到不同频率的时钟信号，时钟频率为clk_in/DIV_N 。由于该模块在顶层例化时clk_in为系统时钟50MHz，分频参数为100，产生的时钟频率为50000000/100 = 500000Hz。</p> 
+<h6><a id="3_144"></a>3、等精度频率计模块的代码如下：</h6> 
+<pre><code class="prism language-c">module cymometer
+   #<span class="token punctuation">(</span>parameter    CLK_FS <span class="token operator">=</span> <span class="token number">26</span>'d50_000_000<span class="token punctuation">)</span> <span class="token comment">// 基准时钟频率值</span>
+    <span class="token punctuation">(</span>   <span class="token comment">//system clock</span>
+        input                 clk_fs <span class="token punctuation">,</span>     <span class="token comment">// 基准时钟信号</span>
+        input                 rst_n  <span class="token punctuation">,</span>     <span class="token comment">// 复位信号</span>
+
+        <span class="token comment">//cymometer interface</span>
+        input                 clk_fx <span class="token punctuation">,</span>     <span class="token comment">// 被测时钟信号</span>
+        output   reg <span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   data_fx      <span class="token comment">// 被测时钟频率输出</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//parameter define</span>
+localparam   MAX       <span class="token operator">=</span>  <span class="token number">6</span>'d32<span class="token punctuation">;</span>           <span class="token comment">// 定义fs_cnt、fx_cnt的最大位宽</span>
+localparam   GATE_TIME <span class="token operator">=</span> <span class="token number">16</span>'d5_000<span class="token punctuation">;</span>        <span class="token comment">// 门控时间设置</span>
+
+<span class="token comment">//reg define</span>
+reg                gate        <span class="token punctuation">;</span>           <span class="token comment">// 门控信号</span>
+reg                gate_fs     <span class="token punctuation">;</span>           <span class="token comment">// 同步到基准时钟的门控信号</span>
+reg                gate_fs_r   <span class="token punctuation">;</span>           <span class="token comment">// 用于同步gate信号的寄存器</span>
+reg                gate_fs_d0  <span class="token punctuation">;</span>           <span class="token comment">// 用于采集基准时钟下gate下降沿</span>
+reg                gate_fs_d1  <span class="token punctuation">;</span>           <span class="token comment">// </span>
+reg                gate_fx_d0  <span class="token punctuation">;</span>           <span class="token comment">// 用于采集被测时钟下gate下降沿</span>
+reg                gate_fx_d1  <span class="token punctuation">;</span>           <span class="token comment">// </span>
+reg    <span class="token punctuation">[</span>   <span class="token number">15</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   gate_cnt    <span class="token punctuation">;</span>           <span class="token comment">// 门控计数</span>
+reg    <span class="token punctuation">[</span>MAX<span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   fs_cnt      <span class="token punctuation">;</span>           <span class="token comment">// 门控时间内基准时钟的计数值</span>
+reg    <span class="token punctuation">[</span>MAX<span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   fs_cnt_temp <span class="token punctuation">;</span>           <span class="token comment">// fs_cnt 临时值</span>
+reg    <span class="token punctuation">[</span>MAX<span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   fx_cnt      <span class="token punctuation">;</span>           <span class="token comment">// 门控时间内被测时钟的计数值</span>
+reg    <span class="token punctuation">[</span>MAX<span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   fx_cnt_temp <span class="token punctuation">;</span>           <span class="token comment">// fx_cnt 临时值</span>
+
+<span class="token comment">//wire define</span>
+wire               neg_gate_fs<span class="token punctuation">;</span>            <span class="token comment">// 基准时钟下门控信号下降沿</span>
+wire               neg_gate_fx<span class="token punctuation">;</span>            <span class="token comment">// 被测时钟下门控信号下降沿</span>
+
+<span class="token comment">//*****************************************************</span>
+<span class="token comment">//**                    main code</span>
+<span class="token comment">//*****************************************************</span>
+
+<span class="token comment">//边沿检测，捕获信号下降沿</span>
+assign neg_gate_fs <span class="token operator">=</span> gate_fs_d1 <span class="token operator">&amp;</span> <span class="token punctuation">(</span><span class="token operator">~</span>gate_fs_d0<span class="token punctuation">)</span><span class="token punctuation">;</span>
+assign neg_gate_fx <span class="token operator">=</span> gate_fx_d1 <span class="token operator">&amp;</span> <span class="token punctuation">(</span><span class="token operator">~</span>gate_fx_d0<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//门控信号计数器，使用被测时钟计数</span>
+always @<span class="token punctuation">(</span>posedge clk_fx or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span>
+        gate_cnt <span class="token operator">&lt;=</span> <span class="token number">16</span>'d0<span class="token punctuation">;</span> 
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate_cnt <span class="token operator">==</span> GATE_TIME <span class="token operator">+</span> <span class="token number">5</span>'d20<span class="token punctuation">)</span>
+        gate_cnt <span class="token operator">&lt;=</span> <span class="token number">16</span>'d0<span class="token punctuation">;</span>
+    <span class="token keyword">else</span>
+        gate_cnt <span class="token operator">&lt;=</span> gate_cnt <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+end
+
+<span class="token comment">//门控信号，拉高时间为GATE_TIME个实测时钟周期</span>
+always @<span class="token punctuation">(</span>posedge clk_fx or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span>
+        gate <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate_cnt <span class="token operator">&lt;</span> <span class="token number">4</span>'d10<span class="token punctuation">)</span>
+        gate <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>     
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate_cnt <span class="token operator">&lt;</span> GATE_TIME <span class="token operator">+</span> <span class="token number">4</span>'d10<span class="token punctuation">)</span>
+        gate <span class="token operator">&lt;=</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate_cnt <span class="token operator">&lt;=</span> GATE_TIME <span class="token operator">+</span> <span class="token number">5</span>'d20<span class="token punctuation">)</span>
+        gate <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> 
+        gate <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+end
+
+<span class="token comment">//将门控信号同步到基准时钟下</span>
+always @<span class="token punctuation">(</span>posedge clk_fs or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        gate_fs_r <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+        gate_fs   <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> begin
+        gate_fs_r <span class="token operator">&lt;=</span> gate<span class="token punctuation">;</span>
+        gate_fs   <span class="token operator">&lt;=</span> gate_fs_r<span class="token punctuation">;</span>
+    end
+end
+
+<span class="token comment">//打拍采门控信号的下降沿（被测时钟下）</span>
+always @<span class="token punctuation">(</span>posedge clk_fx or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        gate_fx_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+        gate_fx_d1 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> begin
+        gate_fx_d0 <span class="token operator">&lt;=</span> gate<span class="token punctuation">;</span>
+        gate_fx_d1 <span class="token operator">&lt;=</span> gate_fx_d0<span class="token punctuation">;</span>
+    end
+end
+
+<span class="token comment">//打拍采门控信号的下降沿（基准时钟下）</span>
+always @<span class="token punctuation">(</span>posedge clk_fs or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        gate_fs_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+        gate_fs_d1 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> begin
+        gate_fs_d0 <span class="token operator">&lt;=</span> gate_fs<span class="token punctuation">;</span>
+        gate_fs_d1 <span class="token operator">&lt;=</span> gate_fs_d0<span class="token punctuation">;</span>
+    end
+end
+
+<span class="token comment">//门控时间内对被测时钟计数</span>
+always @<span class="token punctuation">(</span>posedge clk_fx or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        fx_cnt_temp <span class="token operator">&lt;=</span> <span class="token number">32</span>'d0<span class="token punctuation">;</span>
+        fx_cnt <span class="token operator">&lt;=</span> <span class="token number">32</span>'d0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate<span class="token punctuation">)</span>
+        fx_cnt_temp <span class="token operator">&lt;=</span> fx_cnt_temp <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>neg_gate_fx<span class="token punctuation">)</span> begin
+        fx_cnt_temp <span class="token operator">&lt;=</span> <span class="token number">32</span>'d0<span class="token punctuation">;</span>
+        fx_cnt   <span class="token operator">&lt;=</span> fx_cnt_temp<span class="token punctuation">;</span>
+    end
+end
+
+<span class="token comment">//门控时间内对基准时钟计数</span>
+always @<span class="token punctuation">(</span>posedge clk_fs or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        fs_cnt_temp <span class="token operator">&lt;=</span> <span class="token number">32</span>'d0<span class="token punctuation">;</span>
+        fs_cnt <span class="token operator">&lt;=</span> <span class="token number">32</span>'d0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate_fs<span class="token punctuation">)</span>
+        fs_cnt_temp <span class="token operator">&lt;=</span> fs_cnt_temp <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>neg_gate_fs<span class="token punctuation">)</span> begin
+        fs_cnt_temp <span class="token operator">&lt;=</span> <span class="token number">32</span>'d0<span class="token punctuation">;</span>
+        fs_cnt <span class="token operator">&lt;=</span> fs_cnt_temp<span class="token punctuation">;</span>
+    end
+end
+
+<span class="token comment">//计算被测信号频率</span>
+always @<span class="token punctuation">(</span>posedge clk_fs or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        data_fx <span class="token operator">&lt;=</span> <span class="token number">20</span>'d0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>gate_fs <span class="token operator">==</span> <span class="token number">1</span>'b0<span class="token punctuation">)</span>
+        data_fx <span class="token operator">&lt;=</span> <span class="token punctuation">(</span>CLK_FS <span class="token operator">/</span> fs_cnt<span class="token punctuation">)</span> <span class="token operator">*</span> fx_cnt <span class="token punctuation">;</span>
+end
+
+endmodule 
+</code></pre> 
+<p>在前面的等精度频率计简介中，我们知道在等精度测量中需要一个闸门信号（门控信号），并且该闸门信号需要同步化到被测时钟域下。这里我们为了方便处理，用被测时钟控制闸门信号的产生，这样就避免了同步化处理，当然了，完全可以用基准时钟控制闸门信号的产生，不过这时产生的闸门信号我们需要同步化到被测时钟域下，这样做的目的是为了不让被测时钟计数产生±1周期的误差。门控时间由参数GATE_TIME设置，此处设为5000，需要说明的是该值越大测得的被测时钟频率值越精确，但测量时间也会相应的变慢一些。<strong>另外因为闸门信号是由被测时钟产生的，当测量频率较高的信号或者说信号频率大于10KHz（此值跟门控时间有关）时是不会有什么问题的，但当测量低频信号像Hz级这种，如果门控时间设置的大的话，测量时间就会非常长，此时可修改门控时间的值，为被测时钟频率的5~10倍即可</strong>，对于几十KHz及以上的时钟信号，门控时间的大小对测量速度的影响较小，频率越高影响越小，但对测量精度影响较大，因而在测量频率较高的信号时，建议增大门控时间。</p> 
+<h6><a id="4_289"></a>4、数码管显示模块的代码如下：</h6> 
+<pre><code class="prism language-c">module <span class="token function">seg_led</span><span class="token punctuation">(</span>
+    <span class="token comment">//module clock</span>
+    input                   clk    <span class="token punctuation">,</span>        <span class="token comment">// 时钟信号</span>
+    input                   rst_n  <span class="token punctuation">,</span>        <span class="token comment">// 复位信号</span>
+
+    <span class="token comment">//seg_led interface</span>
+    output   reg  <span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>     sel    <span class="token punctuation">,</span>        <span class="token comment">// 动态显示被选中的数码管</span>
+    output   reg  <span class="token punctuation">[</span><span class="token number">7</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>     seg_led<span class="token punctuation">,</span>        <span class="token comment">// 一个数码管中亮的灯,包含小数点</span>
+
+    <span class="token comment">//user interface</span>
+    input         <span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>    data   <span class="token punctuation">,</span>        <span class="token comment">// 6个数码管要显示的数值</span>
+    input         <span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>     point  <span class="token punctuation">,</span>        <span class="token comment">// 小数点具体显示的位置,从高到低,高电平有效</span>
+    input                   en     <span class="token punctuation">,</span>        <span class="token comment">// 数码管使能信号</span>
+    input                   sign            <span class="token comment">// 符号位（高电平显示"-"号）</span>
+<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">//parameter define</span>
+localparam  MAX_NUM    <span class="token operator">=</span> <span class="token number">13</span>'d5000  <span class="token punctuation">;</span>        <span class="token comment">// 1ms计数值</span>
+localparam  CLK_DIVIDE <span class="token operator">=</span>  <span class="token number">4</span>'d10    <span class="token punctuation">;</span>        <span class="token comment">// 时钟分频</span>
+
+<span class="token comment">//reg define</span>
+reg    <span class="token punctuation">[</span><span class="token number">12</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>             cnt0     <span class="token punctuation">;</span>        <span class="token comment">// 1ms计数</span>
+reg                       flag     <span class="token punctuation">;</span>        <span class="token comment">// 1ms计满标志信号</span>
+reg    <span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              cnt      <span class="token punctuation">;</span>        <span class="token comment">// 切换显示数码管用</span>
+reg    <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              num1     <span class="token punctuation">;</span>        <span class="token comment">// 送给要显示的数码管，要亮的灯</span>
+reg                       point1   <span class="token punctuation">;</span>        <span class="token comment">// 要显示的小数点</span>
+reg    <span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>             num      <span class="token punctuation">;</span>        <span class="token comment">// 24位bcd码用寄存器</span>
+reg    <span class="token punctuation">[</span> <span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>             clk_cnt  <span class="token punctuation">;</span>        <span class="token comment">// 时钟计数</span>
+reg                       dri_clk  <span class="token punctuation">;</span>        <span class="token comment">// 驱动数码管操作的驱动时钟</span>
+
+<span class="token comment">//wire define</span>
+wire   <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              data0    <span class="token punctuation">;</span>        <span class="token comment">// 十万位数</span>
+wire   <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              data1    <span class="token punctuation">;</span>        <span class="token comment">// 万位数</span>
+wire   <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              data2    <span class="token punctuation">;</span>        <span class="token comment">// 千位数</span>
+wire   <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              data3    <span class="token punctuation">;</span>        <span class="token comment">// 百位数</span>
+wire   <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              data4    <span class="token punctuation">;</span>        <span class="token comment">// 十位数</span>
+wire   <span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>              data5    <span class="token punctuation">;</span>        <span class="token comment">// 个位数</span>
+
+<span class="token comment">//*****************************************************</span>
+<span class="token comment">//**                    main code</span>
+<span class="token comment">//*****************************************************</span>
+
+assign  data5 <span class="token operator">=</span> data <span class="token operator">/</span> <span class="token number">17</span>'d100000<span class="token punctuation">;</span>           <span class="token comment">// 十万位数</span>
+assign  data4 <span class="token operator">=</span> data <span class="token operator">/</span> <span class="token number">14</span><span class="token string">'d10000 % 4'</span>d10<span class="token punctuation">;</span>    <span class="token comment">// 万位数</span>
+assign  data3 <span class="token operator">=</span> data <span class="token operator">/</span> <span class="token number">10</span><span class="token string">'d1000 % 4'</span>d10 <span class="token punctuation">;</span>    <span class="token comment">// 千位数</span>
+assign  data2 <span class="token operator">=</span> data <span class="token operator">/</span>  <span class="token number">7</span><span class="token string">'d100 % 4'</span>d10  <span class="token punctuation">;</span>    <span class="token comment">// 百位数</span>
+assign  data1 <span class="token operator">=</span> data <span class="token operator">/</span>  <span class="token number">4</span><span class="token string">'d10 % 4'</span>d10   <span class="token punctuation">;</span>    <span class="token comment">// 十位数</span>
+assign  data0 <span class="token operator">=</span> data <span class="token operator">%</span>  <span class="token number">4</span>'d10<span class="token punctuation">;</span>               <span class="token comment">// 个位数</span>
+
+<span class="token comment">//生成数码管的驱动时钟用于驱动数码管的操作</span>
+always @<span class="token punctuation">(</span>posedge clk or negedge rst_n<span class="token punctuation">)</span> begin
+   <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+       dri_clk <span class="token operator">&lt;=</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+       clk_cnt <span class="token operator">&lt;=</span> <span class="token number">4</span>'d0<span class="token punctuation">;</span>
+   end
+   <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>clk_cnt <span class="token operator">==</span> CLK_DIVIDE<span class="token operator">/</span><span class="token number">2</span> <span class="token operator">-</span> <span class="token number">1</span>'d1<span class="token punctuation">)</span> begin
+       clk_cnt <span class="token operator">&lt;=</span> <span class="token number">4</span>'d0<span class="token punctuation">;</span>
+       dri_clk <span class="token operator">&lt;=</span> <span class="token operator">~</span>dri_clk<span class="token punctuation">;</span>
+   end
+   <span class="token keyword">else</span>
+       clk_cnt <span class="token operator">&lt;=</span> clk_cnt <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+end
+
+<span class="token comment">//将20位2进制数转换为8421bcd码</span>
+always @ <span class="token punctuation">(</span>posedge dri_clk or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span>
+        num <span class="token operator">&lt;=</span> <span class="token number">24</span>'b0<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> begin
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>data5 <span class="token operator">||</span> point<span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">]</span><span class="token punctuation">)</span> begin
+            num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">20</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> data5<span class="token punctuation">;</span>
+            num<span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">16</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> data4<span class="token punctuation">;</span>
+            num<span class="token punctuation">[</span><span class="token number">15</span><span class="token punctuation">:</span><span class="token number">12</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> data3<span class="token punctuation">;</span>
+            num<span class="token punctuation">[</span><span class="token number">11</span><span class="token punctuation">:</span><span class="token number">8</span><span class="token punctuation">]</span>  <span class="token operator">&lt;=</span> data2<span class="token punctuation">;</span>
+            num<span class="token punctuation">[</span> <span class="token number">7</span><span class="token punctuation">:</span><span class="token number">4</span><span class="token punctuation">]</span>  <span class="token operator">&lt;=</span> data1<span class="token punctuation">;</span>
+            num<span class="token punctuation">[</span> <span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>  <span class="token operator">&lt;=</span> data0<span class="token punctuation">;</span>
+        end
+        <span class="token keyword">else</span> begin
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>data4 <span class="token operator">||</span> point<span class="token punctuation">[</span><span class="token number">4</span><span class="token punctuation">]</span><span class="token punctuation">)</span> begin
+                num<span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span>   <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span>data4<span class="token punctuation">,</span>data3<span class="token punctuation">,</span>data2<span class="token punctuation">,</span>data1<span class="token punctuation">,</span>data0<span class="token punctuation">}</span><span class="token punctuation">;</span>
+                <span class="token keyword">if</span><span class="token punctuation">(</span>sign<span class="token punctuation">)</span>
+                    num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">20</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d11<span class="token punctuation">;</span>
+                <span class="token keyword">else</span>
+                    num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">20</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d10<span class="token punctuation">;</span>
+            end
+            <span class="token keyword">else</span> begin
+                <span class="token keyword">if</span> <span class="token punctuation">(</span>data3 <span class="token operator">||</span> point<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span><span class="token punctuation">)</span> begin
+                    num<span class="token punctuation">[</span><span class="token number">15</span><span class="token punctuation">:</span> <span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span>data3<span class="token punctuation">,</span>data2<span class="token punctuation">,</span>data1<span class="token punctuation">,</span>data0<span class="token punctuation">}</span><span class="token punctuation">;</span>
+                    num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">20</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d10<span class="token punctuation">;</span>
+                    <span class="token keyword">if</span><span class="token punctuation">(</span>sign<span class="token punctuation">)</span>
+                        num<span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">16</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d11<span class="token punctuation">;</span>
+                    <span class="token keyword">else</span>
+                        num<span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">16</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d10<span class="token punctuation">;</span>
+                end
+                <span class="token keyword">else</span> begin
+                    <span class="token keyword">if</span> <span class="token punctuation">(</span>data2 <span class="token operator">||</span> point<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">)</span> begin
+                        num<span class="token punctuation">[</span><span class="token number">11</span><span class="token punctuation">:</span> <span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span>data2<span class="token punctuation">,</span>data1<span class="token punctuation">,</span>data0<span class="token punctuation">}</span><span class="token punctuation">;</span>
+                        num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">16</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span><span class="token number">2</span><span class="token punctuation">{<!-- --></span><span class="token number">4</span>'d10<span class="token punctuation">}</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+                        <span class="token keyword">if</span><span class="token punctuation">(</span>sign<span class="token punctuation">)</span>
+                            num<span class="token punctuation">[</span><span class="token number">15</span><span class="token punctuation">:</span><span class="token number">12</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d11<span class="token punctuation">;</span>
+                        <span class="token keyword">else</span>
+                            num<span class="token punctuation">[</span><span class="token number">15</span><span class="token punctuation">:</span><span class="token number">12</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token number">4</span>'d10<span class="token punctuation">;</span>
+                    end
+                    <span class="token keyword">else</span> begin
+                        <span class="token keyword">if</span> <span class="token punctuation">(</span>data1 <span class="token operator">||</span> point<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">)</span> begin
+                            num<span class="token punctuation">[</span> <span class="token number">7</span><span class="token punctuation">:</span> <span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span>data1<span class="token punctuation">,</span>data0<span class="token punctuation">}</span><span class="token punctuation">;</span>
+                            num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">12</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span><span class="token number">3</span><span class="token punctuation">{<!-- --></span><span class="token number">4</span>'d10<span class="token punctuation">}</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+                            <span class="token keyword">if</span><span class="token punctuation">(</span>sign<span class="token punctuation">)</span>
+                                num<span class="token punctuation">[</span><span class="token number">11</span><span class="token punctuation">:</span><span class="token number">8</span><span class="token punctuation">]</span>  <span class="token operator">&lt;=</span> <span class="token number">4</span>'d11<span class="token punctuation">;</span>
+                            <span class="token keyword">else</span>
+                                num<span class="token punctuation">[</span><span class="token number">11</span><span class="token punctuation">:</span><span class="token number">8</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span>  <span class="token number">4</span>'d10<span class="token punctuation">;</span>
+                        end
+                        <span class="token keyword">else</span> begin
+                            num<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> data0<span class="token punctuation">;</span>
+                            <span class="token keyword">if</span><span class="token punctuation">(</span>sign<span class="token punctuation">)</span>
+                                num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">4</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">{<!-- --></span><span class="token number">4</span><span class="token punctuation">{<!-- --></span><span class="token number">4</span><span class="token string">'d10}},4'</span>d11<span class="token punctuation">}</span><span class="token punctuation">;</span>
+                            <span class="token keyword">else</span>
+                                num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">4</span><span class="token punctuation">]</span> <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span><span class="token number">5</span><span class="token punctuation">{<!-- --></span><span class="token number">4</span>'d10<span class="token punctuation">}</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+<span class="token comment">//计数1ms</span>
+always @ <span class="token punctuation">(</span>posedge dri_clk or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>rst_n <span class="token operator">==</span> <span class="token number">1</span>'b0<span class="token punctuation">)</span> begin
+        flag <span class="token operator">&lt;=</span>  <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+        cnt0 <span class="token operator">&lt;=</span> <span class="token number">13</span>'b0<span class="token punctuation">;</span>
+     end
+    <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>cnt0 <span class="token operator">&lt;</span> MAX_NUM <span class="token operator">-</span> <span class="token number">1</span>'b1<span class="token punctuation">)</span> begin
+        flag <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+        cnt0 <span class="token operator">&lt;=</span> cnt0 <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+     end
+    <span class="token keyword">else</span> begin
+        flag <span class="token operator">&lt;=</span>  <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+        cnt0 <span class="token operator">&lt;=</span> <span class="token number">13</span>'b0<span class="token punctuation">;</span>
+     end
+end
+
+<span class="token comment">//计数器，用来计数6个状态（因为有6个灯）</span>
+always @ <span class="token punctuation">(</span>posedge dri_clk or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>rst_n <span class="token operator">==</span> <span class="token number">1</span>'b0<span class="token punctuation">)</span>
+        cnt <span class="token operator">&lt;=</span> <span class="token number">3</span>'b0<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>flag<span class="token punctuation">)</span> begin
+        <span class="token keyword">if</span><span class="token punctuation">(</span>cnt <span class="token operator">&lt;</span> <span class="token number">3</span>'d5<span class="token punctuation">)</span>
+            cnt <span class="token operator">&lt;=</span> cnt <span class="token operator">+</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+        <span class="token keyword">else</span>
+            cnt <span class="token operator">&lt;=</span> <span class="token number">3</span>'b0<span class="token punctuation">;</span>
+    end
+end
+<span class="token comment">//6个数码管轮流显示，完成刷新（ 从右到左）</span>
+always @ <span class="token punctuation">(</span>posedge dri_clk or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+        sel  <span class="token operator">&lt;=</span> <span class="token number">6</span>'b000000<span class="token punctuation">;</span>
+        num1 <span class="token operator">&lt;=</span> <span class="token number">4</span>'b0<span class="token punctuation">;</span>
+    end
+    <span class="token keyword">else</span> begin
+        <span class="token keyword">if</span><span class="token punctuation">(</span>en<span class="token punctuation">)</span> begin
+            <span class="token keyword">case</span> <span class="token punctuation">(</span>cnt<span class="token punctuation">)</span>
+                <span class="token number">3</span>'d0 <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b111110<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> num<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">:</span><span class="token number">0</span><span class="token punctuation">]</span> <span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token operator">~</span>point<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span> <span class="token punctuation">;</span>
+                end
+                <span class="token number">3</span>'d1 <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b111101<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> num<span class="token punctuation">[</span><span class="token number">7</span><span class="token punctuation">:</span><span class="token number">4</span><span class="token punctuation">]</span> <span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token operator">~</span>point<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span> <span class="token punctuation">;</span>
+                end
+                <span class="token number">3</span>'d2 <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b111011<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> num<span class="token punctuation">[</span><span class="token number">11</span><span class="token punctuation">:</span><span class="token number">8</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token operator">~</span>point<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span> <span class="token punctuation">;</span>
+                end
+                <span class="token number">3</span>'d3 <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b110111<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> num<span class="token punctuation">[</span><span class="token number">15</span><span class="token punctuation">:</span><span class="token number">12</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token operator">~</span>point<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span>  <span class="token punctuation">;</span>
+                end
+                <span class="token number">3</span>'d4 <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b101111<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> num<span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">:</span><span class="token number">16</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token operator">~</span>point<span class="token punctuation">[</span><span class="token number">4</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                end
+                <span class="token number">3</span>'d5 <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b011111<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> num<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">:</span><span class="token number">20</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token operator">~</span>point<span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+                end
+                <span class="token keyword">default</span> <span class="token punctuation">:</span>begin
+                    sel    <span class="token operator">&lt;=</span> <span class="token number">6</span>'b000000<span class="token punctuation">;</span>
+                    num1   <span class="token operator">&lt;=</span> <span class="token number">4</span>'b0<span class="token punctuation">;</span>
+                    point1 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+                end
+            endcase
+        end
+        <span class="token keyword">else</span>
+            sel <span class="token operator">&lt;=</span> <span class="token number">6</span>'b111111<span class="token punctuation">;</span>
+    end
+end
+
+<span class="token comment">//数码管显示数据</span>
+always @ <span class="token punctuation">(</span>posedge dri_clk or negedge rst_n<span class="token punctuation">)</span> begin
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span>
+        seg_led <span class="token operator">&lt;=</span> <span class="token number">7</span>'h40<span class="token punctuation">;</span>
+    <span class="token keyword">else</span> begin
+        <span class="token keyword">case</span> <span class="token punctuation">(</span>num1<span class="token punctuation">)</span>
+            <span class="token number">4</span><span class="token string">'d0 : seg_led &lt;= {point1,7'</span>b1000000<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d1 : seg_led &lt;= {point1,7'</span>b1111001<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d2 : seg_led &lt;= {point1,7'</span>b0100100<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d3 : seg_led &lt;= {point1,7'</span>b0110000<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d4 : seg_led &lt;= {point1,7'</span>b0011001<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d5 : seg_led &lt;= {point1,7'</span>b0010010<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d6 : seg_led &lt;= {point1,7'</span>b0000010<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d7 : seg_led &lt;= {point1,7'</span>b1111000<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d8 : seg_led &lt;= {point1,7'</span>b0000000<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d9 : seg_led &lt;= {point1,7'</span>b0010000<span class="token punctuation">}</span><span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d10: seg_led &lt;= 8'</span>b11111111<span class="token punctuation">;</span>
+            <span class="token number">4</span><span class="token string">'d11: seg_led &lt;= 8'</span>b10111111<span class="token punctuation">;</span>
+            <span class="token keyword">default</span> <span class="token punctuation">:</span> seg_led <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span>point1<span class="token punctuation">,</span><span class="token number">7</span>'b1000000<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        endcase
+    end
+end
+
+endmodule
+</code></pre> 
+<p><img src="https://images2.imgbox.com/e3/0c/9pj0W2qx_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/fa/9d/DHpxubOs_o.png" alt="在这里插入图片描述"></p> 
+<p>由上式可以看出，测量频率的相对误差与被测信号频率的大小无关，仅与闸门时间和基准时钟频率有关，即实现了整个测试频段的等精度测量。闸门时间越长，基准时钟频率越高，测频的相对误差就越小。基准时钟频率可由稳定度好、精度高的高频率晶体振荡器产生，在保证测量精度不变的前提下，提高基准时钟频率，可使闸门时间缩短，即提高测试速度。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/eb3c7ba526904ffc860643af98171245/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">知识图谱嵌入经典方法（Trans系列、KG2E）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e9bc27c4841507c7e832583052af04f1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">python循环语句-详解Python中的循环语句的用法</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

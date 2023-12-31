@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>分享哈啰出行小程序架构演进之路 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="分享哈啰出行小程序架构演进之路" />
+<meta property="og:description" content="今天跟大家分享一下哈啰出行支付宝小程序的架构演进之路。
+内容主要分四个部分。一是对支付宝小程序的简单介绍和我们的项目背景，二是我们遇到的问题和解决问题的思考，三是我们为了解决这些问题引出的哈啰小程序新架构，四是对未来的展望。
+一、小程序介绍及背景
+接触过支付宝小程序的同学可能不是太多，不过不要慌，你完全可以把支付宝小程序当成微信小程序，它们有非常相似的架构。都有一个大而全的IDE，如图，左中侧是一个类似 VS Code 的编辑器，右侧是小程序模拟器，顶部是配置和操作区域。通过这个IDE，开发者可以完成开发过程中的闭环操作。
+小程序是一种特殊的网页应用，有一个至关重要的全局配置，用以声明小程序包含哪些页面、配置全局默认标题和样式等。配置页面时要直接声明页面文件的目录，不支持别名等功能。
+二、问题和思考
+在理想情况或较为简单的业务场景下，开发、发布流程比较简单。在快速迭代、敏捷开发和git flow开发规范的情况下，开发者需要为一个版本创建一个 release 分支，从 release 分支切出一个功能对应的 feature 分支进行开发，开发完成后合并代码，并使用 release 分支代码发布体验码进行测试，测试完成后使用此体验码进行发布。
+但是这种纸上谈兵的模式是完全无法支撑哈啰出行小程序这种中大型规模小程序的开发的。实际情况是这样的：
+哈啰出行小程序有十几个业务线同时在开发，对应十几个需求、几十位开发、几十个 feature 分支。复杂度到达一定量级后小程序的开发发布流程会成为灾难。比如人多后很容易同时在修改同一个文件或者分支间提交同步不及时从而引发 git 冲突问题，git 冲突问题是无法自动化解决的，非常依赖开发者对冲突代码的理解，大型的冲突很难得到妥善解决。没有什么git操作是比处理冲突更让人心情糟糕的，如果有，那就是……这边先卖个关子，后面我们会提到。再比如一个需求开发完成后，开发者需要生成体验码给测试同学测试，但是小程序的体验码是同一时间只能存在一个的，新的体验码会让旧体验码失效，而且体验码的发布是没有集中机制的，任何开发者都有权限通过上述 IDE 的操作区发布体验码。这些原因会造成体验码的使用不便，你不知道这个体验码有没有失效、是谁发布的、对应哪个分支的代码、有没有你要测试的功能、最新的体验码在哪。由此我们引出了两个问题，「代码分支冲突」和「发布流程失控」。
+再来关注下我们的业务演变，这两个图分别是2018年v4版本和2019年v5版本的首页截图。
+可以比较明显地看出，首页的业务tab从只有两个快速增加到超过五个。而实际上从2018年到现在的时间里，哈啰出行的业务规模快速膨胀，业务线数从2个到11个，开发者数从2个到20多个。对于一个野蛮生长的项目来说，突然承接这么多业务需求和功能，自然而然会出现业务代码耦合的问题。需求和功能增加意味着页面和组件的增加，也就是代码量的增加，这对体积敏感的小程序来说也是不小的负面影响。不仅不利于线上的用户体验，还会增加开发调试阶段开发者构建速度，拖慢构建效率。
+这样我们又获得三个问题，「业务代码耦合」、「小程序体积过大」和「编译时间过长」。
+回顾一下所有的问题，我们将其分为两类。「代码分支冲突」、「业务代码耦合」、「编译时间过长」属于代码及项目组织问题；「发布流程失控」和「小程序体积过大」属于发布流程松散的问题。两类问题有各自的解决方式。
+对于代码及项目组织问题，我们的解决思路是分仓库。哈啰出行支付宝小程序的最大特点就是参与的业务线特别多，复杂度也是由此产生的。因为我们决定把每个业务线的代码拆到单独的仓库里。业务无关的代码，比如小程序入口、框架及登录和定位这种通用能力，还是保留在原来的基础仓库。自此形成了基础仓库为平台底座，业务仓库为可插拔模块的组织架构。
+每个业务线被归到独立仓库后，就可以充分利用gitlab仓库的管理能力，从原先的只在唯一一个仓库进行所有业务线的分支管理，分解成在业务线的小仓库里自行进行同业务的分支管理，从而拆解分离了业务域，降低了分支管理的复杂度。同时业务线之间的代码权限也被仓库隔离开，实现了代码安全和数据安全。
+现在代码是拆开了，但是运行时还是需要拼成一个完整的小程序的。那么要怎么做集成呢？我们主要考虑了两个方案。一是git submodule/git subtree，这个方案经过调研后很快被否决了，submodule 和 subtree 是相似的管理子仓库的方案，但是它们指令复杂，学习成本太高，操作失败没有友好的提示，不适合我们这种人员变动比较频繁的大型团队。前面提到没有什么git操作比处理冲突更让人心情糟糕，如果有那就是 submodule/subtree 了。第二种方案是 lerna，lerna 是近年来在开源社区比较流行的一个多包管理工具，知名的 babel、react 都在使用 lerna 管理仓库。但它还是不合适，lerna 注重多 package（npm概念上的包）架构的管理，而我们只是子仓库，而非多个 package。而且 lerna 提供的功能合指令优先，定制化比较困难，无法实现我们想要的一些功能，所以最终也没有选用 lerna。
+最终我们决定自研构建工具来实现代码集成。有了自己的构建工具相当于增加了一层抽象层，增加了项目的自由度。有句话说得好，没有什么问题是不能通过增加一个抽象层解决的，如果有，就再增加一层。通过构建工具这层抽象层，我们实现了除了基础和核心的仓库代码集成之外的很多功能和特性。其中比较重要的功能叫做增量构建。含义是能动态指定需要构建的业务线。我们的业务线比较多，而一个业务线的同学通常只在本业务线内进行开发，我们小程序体积比较大，构建预览起来比较慢，而且不支持也更新，每次保存代码后都需要重新构建一次，开发过程较为痛苦。而增量构建能实现仅构建平台仓库和一个业务线的代码，从而减小小程序体积，加快构建预览速度，提升开发体验。
+在介绍增量构建原理前，我们先简单理解一下分型的概念。分型是一个数学上的概念，表示宏观、介观或微观尺度上，物理结构的相似性。在小程序的项目配置和目录结构上，也存在着抽象意义上分型概念的存在，即小程序配置中声明分包与页面的嵌套结构与文件系统中业务仓库与页面代码位置的嵌套结构是一致的。如果能同时动态控制两个结构就能实现动态控制小程序的内容，这也就是增量构建的原理。
+我们来身临其境体会下增量构建是怎么使用的。开发者使用构建工具的命令行功能通过参数的形式指定要构建的对象，命令行工具拼装参数传递给构建工具核心，构建工具根据参数有选择地仅将构建目标的代码移动到产物文件夹，并生成相应分型结构的小程序配置，最后开发者使用小程序ide打开产物文件夹。
+构建工具也带来一些小插曲。在开发中难免会有组件跨仓库互相调用的情况，若依赖的组件没有被构建进来小程序是无法运行的。对此我们在构建时分析依赖的组件所在的仓库是否在本次构建列表中，如果没有则只能移除对此组件的依赖。此外对于页面跨仓库跳转时，我们对跳转 api 加了一层 hook，运行时判断目标页面是否被构建进来，如果没有则重定向到兜底的404页面。
+构建工具真的有用吗？我使用了MacBook Pro16 GB 2133 MHz LPDDR3 1.4 GHz 四核Intel Core i5的测试机器进行了基准测试。全量构建的产物体积是33." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5959b483b1e53a26a0a0f7d3ab8a35ea/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-07-02T14:53:24+08:00" />
+<meta property="article:modified_time" content="2021-07-02T14:53:24+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">分享哈啰出行小程序架构演进之路</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>今天跟大家分享一下哈啰出行支付宝小<a href="http://mp.weixin.qq.com/s?__biz=MjM5MTA1MjAxMQ==&amp;mid=200123908&amp;idx=1&amp;sn=34eefa17a54fcfe4129baeee2ca184a8&amp;scene=21&amp;subscene=126#wechat_redirect" rel="nofollow">程序</a>的<a href="http://mp.weixin.qq.com/s?__biz=MjM5MTA1MjAxMQ==&amp;mid=200231804&amp;idx=1&amp;sn=46059836dfc22e2408fee8ac522152fe&amp;scene=21&amp;subscene=126#wechat_redirect" rel="nofollow">架构</a>演进之路。</p> 
+<p>内容主要分四个部分。一是对支付宝小程序的简单介绍和我们的项目背景，二是我们遇到的问题和解决问题的思考，三是我们为了解决这些问题引出的哈啰小程序新架构，四是对未来的展望。</p> 
+<p>一、小程序介绍及背景</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/bc/f5/wmTjzXhz_o.png"></p> 
+<p>接触过支付宝小程序的同学可能不是太多，不过不要慌，你完全可以把支付宝小程序当成微信小程序，它们有非常相似的架构。都有一个大而全的IDE，如图，左中侧是一个类似 VS Code 的编辑器，右侧是小程序模拟器，顶部是配置和操作区域。通过这个IDE，开发者可以完成开发过程中的闭环操作。</p> 
+<p>小程序是一种特殊的网页应用，有一个至关重要的全局配置，用以声明小程序包含哪些页面、配置全局默认标题和样式等。配置页面时要直接声明页面文件的目录，不支持别名等功能。</p> 
+<p>二、问题和思考</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/17/c0/oGdIbmsq_o.png"></p> 
+<p>在理想情况或较为简单的业务场景下，开发、发布流程比较简单。在快速迭代、敏捷开发和git flow开发规范的情况下，开发者需要为一个版本创建一个 release 分支，从 release 分支切出一个功能对应的 feature 分支进行开发，开发完成后合并<a href="http://mp.weixin.qq.com/s?__biz=MjM5MTA1MjAxMQ==&amp;mid=200075923&amp;idx=1&amp;sn=f284645216c117a323f6beb288e4c444&amp;scene=21&amp;subscene=126#wechat_redirect" rel="nofollow">代码</a>，并使用 release 分支代码发布<a href="http://mp.weixin.qq.com/s?__biz=MjM5MTA1MjAxMQ==&amp;mid=200035502&amp;idx=1&amp;sn=8d4183f93cef06d394202b5bebee6c77&amp;scene=21&amp;subscene=126#wechat_redirect" rel="nofollow">体验</a>码进行测试，测试完成后使用此体验码进行发布。</p> 
+<p>但是这种纸上谈兵的模式是完全无法支撑哈啰出行小程序这种中大型规模小程序的开发的。实际情况是这样的：</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/6f/17/Ys6vca4l_o.png"></p> 
+<p>哈啰出行小程序有十几个业务线同时在开发，对应十几个需求、几十位开发、几十个 feature 分支。复杂度到达一定量级后小程序的开发发布流程会成为灾难。比如人多后很容易同时在修改同一个文件或者分支间提交同步不及时从而引发 git 冲突问题，git 冲突问题是无法自动化解决的，非常依赖开发者对冲突代码的理解，大型的冲突很难得到妥善解决。没有什么git操作是比处理冲突更让人心情糟糕的，如果有，那就是……这边先卖个关子，后面我们会提到。再比如一个需求开发完成后，开发者需要生成体验码给测试同学测试，但是小程序的体验码是同一时间只能存在一个的，新的体验码会让旧体验码失效，而且体验码的发布是没有集中机制的，任何开发者都有权限通过上述 IDE 的操作区发布体验码。这些原因会造成体验码的使用不便，你不知道这个体验码有没有失效、是谁发布的、对应哪个分支的代码、有没有你要测试的功能、最新的体验码在哪。由此我们引出了两个问题，「代码分支冲突」和「发布流程失控」。</p> 
+<p>再来关注下我们的业务演变，这两个图分别是2018年v4版本和2019年v5版本的首页截图。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/6f/e8/8z3hmQSJ_o.png">   <img alt="图片" src="https://images2.imgbox.com/f1/7d/JkOZDsDz_o.png"></p> 
+<p>可以比较明显地看出，首页的业务tab从只有两个快速增加到超过五个。而实际上从2018年到现在的时间里，哈啰出行的业务规模快速膨胀，业务线数从2个到11个，开发者数从2个到20多个。对于一个野蛮生长的项目来说，突然承接这么多业务需求和功能，自然而然会出现业务代码耦合的问题。需求和功能增加意味着页面和组件的增加，也就是代码量的增加，这对体积敏感的小程序来说也是不小的负面影响。不仅不利于线上的用户体验，还会增加开发调试阶段开发者构建速度，拖慢构建效率。</p> 
+<p>这样我们又获得三个问题，「业务代码耦合」、「小程序体积过大」和「编译时间过长」。</p> 
+<p>回顾一下所有的问题，我们将其分为两类。「代码分支冲突」、「业务代码耦合」、「编译时间过长」属于代码及项目组织问题；「发布流程失控」和「小程序体积过大」属于发布流程松散的问题。两类问题有各自的解决方式。</p> 
+<p>对于代码及项目组织问题，我们的解决思路是分仓库。哈啰出行支付宝小程序的最大特点就是参与的业务线特别多，复杂度也是由此产生的。因为我们决定把每个业务线的代码拆到单独的仓库里。业务无关的代码，比如小程序入口、框架及登录和定位这种通用能力，还是保留在原来的基础仓库。自此形成了基础仓库为平台底座，业务仓库为可插拔模块的组织架构。</p> 
+<p>每个业务线被归到独立仓库后，就可以充分利用gitlab仓库的管理能力，从原先的只在唯一一个仓库进行所有业务线的分支管理，分解成在业务线的小仓库里自行进行同业务的分支管理，从而拆解分离了业务域，降低了分支管理的复杂度。同时业务线之间的代码权限也被仓库隔离开，实现了代码安全和数据安全。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/aa/21/QkVmLHEq_o.png"></p> 
+<p>现在代码是拆开了，但是运行时还是需要拼成一个完整的小程序的。那么要怎么做集成呢？我们主要考虑了两个方案。一是git submodule/git subtree，这个方案经过调研后很快被否决了，submodule 和 subtree 是相似的管理子仓库的方案，但是它们指令复杂，学习成本太高，操作失败没有友好的提示，不适合我们这种人员变动比较频繁的大型团队。前面提到没有什么git操作比处理冲突更让人心情糟糕，如果有那就是 submodule/subtree 了。第二种方案是 lerna，lerna 是近年来在开源社区比较流行的一个多包管理工具，知名的 babel、react 都在使用 lerna 管理仓库。但它还是不合适，lerna 注重多 package（npm概念上的包）架构的管理，而我们只是子仓库，而非多个 package。而且 lerna 提供的功能合指令优先，定制化比较困难，无法实现我们想要的一些功能，所以最终也没有选用 lerna。</p> 
+<p>最终我们决定自研构建工具来实现代码集成。有了自己的构建工具相当于增加了一层抽象层，增加了项目的自由度。有句话说得好，没有什么问题是不能通过增加一个抽象层解决的，如果有，就再增加一层。通过构建工具这层抽象层，我们实现了除了基础和核心的仓库代码集成之外的很多功能和特性。其中比较重要的功能叫做增量构建。含义是能动态指定需要构建的业务线。我们的业务线比较多，而一个业务线的同学通常只在本业务线内进行开发，我们小程序体积比较大，构建预览起来比较慢，而且不支持也更新，每次保存代码后都需要重新构建一次，开发过程较为痛苦。而增量构建能实现仅构建平台仓库和一个业务线的代码，从而减小小程序体积，加快构建预览速度，提升开发体验。</p> 
+<p>在介绍增量构建原理前，我们先简单理解一下分型的概念。分型是一个数学上的概念，表示宏观、介观或微观尺度上，物理结构的相似性。在小程序的项目配置和目录结构上，也存在着抽象意义上分型概念的存在，即小程序配置中声明分包与页面的嵌套结构与文件系统中业务仓库与页面代码位置的嵌套结构是一致的。如果能同时动态控制两个结构就能实现动态控制小程序的内容，这也就是增量构建的原理。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/27/3c/BKGME5UM_o.png"></p> 
+<p>我们来身临其境体会下增量构建是怎么使用的。开发者使用构建工具的命令行功能通过参数的形式指定要构建的对象，命令行工具拼装参数传递给构建工具核心，构建工具根据参数有选择地仅将构建目标的代码移动到产物文件夹，并生成相应分型结构的小程序配置，最后开发者使用小程序ide打开产物文件夹。</p> 
+<p>构建工具也带来一些小插曲。在开发中难免会有组件跨仓库互相调用的情况，若依赖的组件没有被构建进来小程序是无法运行的。对此我们在构建时分析依赖的组件所在的仓库是否在本次构建列表中，如果没有则只能移除对此组件的依赖。此外对于页面跨仓库跳转时，我们对跳转 api 加了一层 hook，运行时判断目标页面是否被构建进来，如果没有则重定向到兜底的404页面。</p> 
+<p>构建工具真的有用吗？我使用了MacBook Pro16 GB 2133 MHz LPDDR3 1.4 GHz 四核Intel Core i5的测试机器进行了基准测试。全量构建的产物体积是33.1MB，构建时间花费了108.606秒；相比之下最小构建的产物体积为6.72 MB，构建时间仅为22.652秒。从这组数据中，我们可以轻松得出结论，一是小程序构建时间与代码体积成正比，而是增量构建真的在节省我们开发的生命。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/96/9d/gPhXZ69l_o.png"></p> 
+<p>分易合难。代码分开了意味着无法直接通过引入依赖的机制进行通信，但开发中实现无法避免这种需求。考虑一种经典的情况，这是我们小程序首页的宫格，如何实现在点击宫格时既能实现业务逻辑又能解耦呢？最基础最直接的方法就是用 if else，判断点击的是哪个业务线的宫格，引入对应业务线的处理函数并调用。但是我们知道在分仓库的情况下是无法引入的，所以这种方案行不通。第二种方案是使用事件机制去点击时分发，业务线各自进行事件监听并处理。这个基于事件的方案思路方向是对的，但是也行不通。因为首页属于平台仓库，还没进到业务线，所以无法执行业务线进行事件监听的代码。为了能成功且提前进行事件监听，我们还是在构建工具这一层抽象层引入了一个特性——一套用于跨仓库通信用的事件机制。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/da/09/b1vpE16B_o.png"></p> 
+<p>我们约定了一个位于各仓库根目录下的特殊事件文件，在里面书写事件回调。构建时通过构建工具里的事件处理模块将特殊文件进行代码分析和特殊处理后以文件生成和代码生成的方式将事件监听函数转移至构建后的小程序响应位置，并添加好事件监听。从而实现了没有进入到子包也能执行业务线的事件监听。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/63/1b/x4HUx7je_o.png"></p> 
+<p>这是上面提到的使用特殊事件文件监听首页宫格点击的样例，理论上这个文件存在于业务线仓库的根目录。观察里面的字段，‘pages/index/index’代表对这个页面进行事件监听，’gridClick’即约定的宫格点击事件名，业务线可以在函数体内实现自定义的跳转逻辑。从而达到了逻辑实现和代码结构的解耦。</p> 
+<p>我们再来回顾下问题。代码及项目组织问题的三个问题中，分仓库解决了「代码分支冲突」的问题；新事件系统解决了「业务代码耦合」的问题，增量构建解决了开发时「编译时间过长」的问题。初次之外我们还使用构建工具支持了less和ts支持等提升开发体验的功能。那剩下的属于发布松散的两个问题怎么办呢，我们建立了一个集权的发布平台。</p> 
+<p><img alt="图片" src="https://images2.imgbox.com/3b/91/2OAKOkeO_o.png"></p> 
+<p>发布系统主要从权限、版本、体验码和体积四个方面约束规范发布流程。权限是指开发者和体验者的增删，一般情况下只有小程序的管理员才有权限在支付宝后台管理。平时对人员权限变更的需求又比较频繁，所以经常要麻烦管理员去操作。并且添加是根据支付宝账号进行的，无法将支付宝账号与具体某个同事对应起来。因此我们把这功能移植到我们新的发布平台，能够相对自由、清晰地管理人员权限。版本方面，为了强化版本意识，清晰地展示并控制发布流程，我们在发布平台实现了一个发布版本专题页，表示现在处于哪个版本号、发布分支是哪个、发布负责人是谁、当前处于哪个发布阶段，从而降低了沟通成本。体验码的控制上，我们对体验码的发布进行收口，支持了使用发布系统在线发布体验码，并引入了钉钉bot的推送能力，将生成的体验码连同一些基本的元信息和备注信息自动推送到体验码群里，而开发者通过ide发布的版本不会被设为体验码。从而实现了体验码发布和使用的有序化。体积方面，我们都知道，前段项目的体积永远是越小越好，小程序也有体积红线。但是小程序是在提审时才告诉你体积是否满足要求，而提审时发布的最终一环，这时又需要重走发布流程，比较麻烦。随意发布系统实现了小程序体积检测机制，通过 git commit 触发使用 webpack-bundle-analyzer 进行体积检测和细致的可视化分析，从而能够在开发流程中就能发现体积隐患，提高发布效率。</p> 
+<p>再回顾一下问题。发布流程松散范畴内的两个问题「发布流程失控」和「小程序体积过大」通过发布系统也解决了。</p> 
+<p>三、哈啰出行支付宝小程序新架构</p> 
+<p>这样我们聊完了第三部分，得出了我们哈啰出行支付宝小程序的新架构。即构建工具加发布系统，一套覆盖开发、测试、发布所有流程的互相配合的工具。</p> 
+<p>最后的展望部分，架构也需要架构演进。我们这一套架构诞生时面向的对象仅仅是我们自己的哈啰出行小程序项目，功能方面也在不断地新增和完善。考虑到通用性，我们也希望在未来可以抹平这套架构项目上的特殊性，能让别的支付宝小程序项目也能用上这套架构。甚至将目光放远大些，让不同平台的小程序，如微信小程序、QQ小程序、360小程序、头条小程序也能使用上这套架构。以此来回馈社区。</p> 
+<p>四、展望</p> 
+<p>最后的展望部分，架构也需要架构演进。我们这一套架构诞生时面向的对象仅仅是我们自己的哈啰出行小程序项目，功能方面也在不断地新增和完善。考虑到通用性，我们也希望在未来可以抹平这套架构项目上的特殊性，能让别的支付宝小程序项目也能用上这套架构。甚至将目光放远大些，让不同平台的小程序，如微信小程序、QQ小程序、360小程序、头条小程序也能使用上这套架构。以此来回馈社区。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/d601040241960ebe43093fdef8d735bf/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">手机html端悬浮球,大屏手机绝配！一款轻巧强大的悬浮球App</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/27d49ad133f58fca32343ee0e67421e3/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Axi memory mapped to PCI Express、uart和gpio IP核在vivado中的应用</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

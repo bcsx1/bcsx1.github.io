@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>DPDK实践一：技术介绍 &#43; 编译运行 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="DPDK实践一：技术介绍 &#43; 编译运行" />
+<meta property="og:description" content="一、Intel® DPDK技术引入 网路的核心是报文的转发过程，linux网路是通过内核协议栈进行转发的，报文控制平面和数据转发平面没有分离，不适合处理大规模网络数据包，因为linux分为内核区和用户区，报文先进入内核区然后拷贝到用户区，供给上层应用程序处理。并且为了全面的支持用户空间的各个功能，协议栈中嵌入了大量用于对接的接口。如果能让应用程序直接接管网络数据包处理、内存管理以及CPU调度，那么性能可以得到一个质的提升。
+如今的处理器都是多核，而且内存也越来越大，可以提高多核和大内存的扩展性，减少CPU多核之间任务的切换，内存cache miss，因为内存的访问速度永远也赶不上cache和cpu的频率，为了能让性能平行扩展，最好是少访问。
+要提高网路报文转发，从如下几个方面着手：
+1.控制层留给Linux做，其它数据层全部由应用程序来处理。
+2.减少系统调度、系统调用、系统中断，上下文切换等
+3.摒弃Linux内核协议栈，将数据包传输到用户空间定制协议栈
+4.使用多核编程技术替代多线程，将OS绑在指定核上运行
+5.针对SMP系统，使CPU尽量使用所在NUMA系统节点的内存，减少内存刷写
+6.使用大页面，减少访问
+7.采用无锁技术解竞争
+Intel® DPDK全称Intel Data Plane Development Kit，是intel提供的数据平面开发工具集，主要应用x86通用平台，为用户空间高效的数据包处理提供库函数和驱动的支持。它不同于Linux系统以通用性设计为目的，而是专注于网络应用中数据包的高性能处理。
+需要强调的是，DPDK应用程序是运行在用户空间上利用自身提供的数据平面库来收发数据包，绕过了Linux内核协议栈对数据包处理过程。Linux内核将DPDK应用程序看作是一个普通的用户态进程，包括它的编译、连接和加载方式和普通程序没有什么两样。DPDK程序启动后只能有一个主线程，然后创建一些子线程并绑定到指定CPU核心上运行。
+二、DPDK架构 EAL（Environment Abstraction Layer）即环境抽象层，为应用提供了一个通用接口，隐藏了与底层库与设备打交道的相关细节。EAL实现了DPDK运行的初始化工作，基于大页表的内存分配，多核亲缘性设置，原子和锁操作，并将PCI设备地址映射到用户空间，方便应用程序访问。
+Buffer Manager API通过预先从EAL上分配固定大小的多个内存对象，避免了在运行过程中动态进行内存分配和回收来提高效率，常常用作数据包buffer来使用。
+Queue Manager API以高效的方式实现了无锁的FIFO环形队列，适合与一个生产者多个消费者、一个消费者多个生产者模型来避免等待，并且支持批量无锁的操作。
+Flow Classification API通过Intel SSE基于多元组实现了高效的hash算法，以便快速的将数据包进行分类处理。该API一般用于路由查找过程中的最长前缀匹配中，安全产品中根据Flow五元组来标记不同用户的场景也可以使用。
+PMD则实现了Intel 1GbE、10GbE和40GbE网卡下基于轮询收发包的工作模式，大大加速网卡收发包性能。
+DPDK的优势：
+DPDK拦截中断，不触发后续中断流程，并绕过协议栈，通过UIO技术将网卡收到的报文拷贝到应用层处理，报文不再经过内核协议栈。减少了中断，DPDK的包全部在用户控件使用内存池管理，内核控件与用户空间的内存交互不用进行拷贝，只做控制权转移，减少报文拷贝过程，提高报文的转发效率。
+DPDK核心技术如下：
+（1）通过UIO技术将报文拷贝到应用空间处理
+（2）通过大页内存，降低cache miss ，提高命中率，进而cpu访问速度
+（3）通过CPU亲和性，绑定网卡和线程到固定的core，减少cpu任务切换
+（4）通过无锁队列，减少资源竞争
+接下来深入学习总结一下dpdk所用到的技术，加深理解。
+三、DPDK关键技术 1、hugepage： 使用大页缓存支持来提高内存访问效率。
+为实现物理地址到虚拟地址的转换，Linux一般通过查找TLB来进行快速映射，如果在查找TLB没有命中，就会触发一次缺页中断，将访问内存来重新刷新TLB页表。Linux下默认页大小为4K，当用户程序占用4M的内存时，就需要1K的页表项，如果使用2M的页面，那么只需要2条页表项，这样有两个好处：
+第一是使用hugepage的内存所需的页表项比较少，对于需要大量内存的进程来说节省了很多开销，像oracle之类的大型数据库优化都使用了大页面配置；
+第二是TLB冲突概率降低，TLB是cpu中单独的一块高速cache，一般只能容纳100条页表项，采用hugepage可以大大降低TLB miss的开销。
+DPDK目前支持了2M和1G两种方式的hugepage。通过修改默认/etc/grub.conf中hugepage配置为:
+default_hugepagesz=1G hugepagesz=1G hugepages=32 isolcpus=0-22 1 然后通过
+mount –t hugetlbfs nodev /mnt/huge 1 就将hugepage文件系统hugetlbfs挂在/mnt/huge目录下，然后用户进程就可以使用mmap映射hugepage目标文件来使用大页面了。测试表明应用使用大页表比使用4K的页表性能提高10%~15%
+2、UIO,PMD，用户态轮询驱动，可以减小上下文切换开销，方便实现虚拟机和主机零拷贝zero copy。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/0a0354f3a290a1d0880bfd30d15349eb/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-12-04T18:06:11+08:00" />
+<meta property="article:modified_time" content="2020-12-04T18:06:11+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">DPDK实践一：技术介绍 &#43; 编译运行</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h3>一、Intel® DPDK技术引入</h3> 
+<p>网路的核心是报文的转发过程，linux网路是通过内核协议栈进行转发的，报文控制平面和数据转发平面没有分离，不适合处理大规模网络数据包，因为linux分为内核区和用户区，报文先进入内核区然后拷贝到用户区，供给上层应用程序处理。并且为了全面的支持用户空间的各个功能，协议栈中嵌入了大量用于对接的接口。如果能让应用程序直接接管网络数据包处理、内存管理以及CPU调度，那么性能可以得到一个质的提升。</p> 
+<p>如今的处理器都是多核，而且内存也越来越大，可以提高多核和大内存的扩展性，减少CPU多核之间任务的切换，内存cache miss，因为内存的访问速度永远也赶不上cache和cpu的频率，为了能让性能平行扩展，最好是少访问。</p> 
+<p>要提高网路报文转发，从如下几个方面着手：</p> 
+<p>1.控制层留给Linux做，其它数据层全部由应用程序来处理。<br> 　　2.减少系统调度、系统调用、系统中断，上下文切换等<br> 　　3.摒弃Linux内核协议栈，将数据包传输到用户空间定制协议栈<br> 　　4.使用多核编程技术替代多线程，将OS绑在指定核上运行<br> 　　5.针对SMP系统，使CPU尽量使用所在NUMA系统节点的内存，减少内存刷写<br> 　　6.使用大页面，减少访问<br> 　　7.采用无锁技术解竞争</p> 
+<p>Intel® DPDK全称Intel Data Plane Development Kit，是intel提供的数据平面开发工具集，主要应用x86通用平台，为用户空间高效的数据包处理提供库函数和驱动的支持。它不同于Linux系统以通用性设计为目的，而是专注于网络应用中数据包的高性能处理。</p> 
+<p>需要强调的是，DPDK应用程序是运行在用户空间上利用自身提供的数据平面库来收发数据包，绕过了Linux内核协议栈对数据包处理过程。Linux内核将DPDK应用程序看作是一个普通的用户态进程，包括它的编译、连接和加载方式和普通程序没有什么两样。DPDK程序启动后只能有一个主线程，然后创建一些子线程并绑定到指定CPU核心上运行。</p> 
+<h3><a name="t1"></a><a id="DPDK_21"></a>二、DPDK架构</h3> 
+<p><img alt="这里写图片描述" src="https://images2.imgbox.com/06/b7/LSXGcSFK_o.png"></p> 
+<ul><li> <p>EAL（Environment Abstraction Layer）即环境抽象层，为应用提供了一个通用接口，隐藏了与底层库与设备打交道的相关细节。EAL实现了DPDK运行的初始化工作，基于大页表的内存分配，多核亲缘性设置，原子和锁操作，并将PCI设备地址映射到用户空间，方便应用程序访问。</p> </li><li> <p>Buffer Manager API通过预先从EAL上分配固定大小的多个内存对象，避免了在运行过程中动态进行内存分配和回收来提高效率，常常用作数据包buffer来使用。</p> </li><li> <p>Queue Manager API以高效的方式实现了无锁的FIFO环形队列，适合与一个生产者多个消费者、一个消费者多个生产者模型来避免等待，并且支持批量无锁的操作。</p> </li><li> <p>Flow Classification API通过Intel SSE基于多元组实现了高效的hash算法，以便快速的将数据包进行分类处理。该API一般用于路由查找过程中的最长前缀匹配中，安全产品中根据Flow五元组来标记不同用户的场景也可以使用。</p> </li><li> <p>PMD则实现了Intel 1GbE、10GbE和40GbE网卡下基于轮询收发包的工作模式，大大加速网卡收发包性能。</p> </li></ul> 
+<p><strong>DPDK的优势：</strong></p> 
+<p><img alt="这里写图片描述" src="https://images2.imgbox.com/cc/20/QbSjOcon_o.png"></p> 
+<p>DPDK拦截中断，不触发后续中断流程，并绕过协议栈，通过UIO技术将网卡收到的报文拷贝到应用层处理，报文不再经过内核协议栈。减少了中断，DPDK的包全部在用户控件使用内存池管理，内核控件与用户空间的内存交互不用进行拷贝，只做控制权转移，减少报文拷贝过程，提高报文的转发效率。</p> 
+<p>DPDK核心技术如下：</p> 
+<p>（1）通过UIO技术将报文拷贝到应用空间处理</p> 
+<p>（2）通过大页内存，降低cache miss ，提高命中率，进而cpu访问速度</p> 
+<p>（3）通过CPU亲和性，绑定网卡和线程到固定的core，减少cpu任务切换</p> 
+<p>（4）通过无锁队列，减少资源竞争</p> 
+<p>接下来深入学习总结一下dpdk所用到的技术，加深理解。</p> 
+<h3><a name="t2"></a><a id="DPDK_55"></a>三、DPDK关键技术</h3> 
+<p><strong>1、hugepage： 使用大页缓存支持来提高内存访问效率。</strong></p> 
+<p>为实现物理地址到虚拟地址的转换，Linux一般通过查找TLB来进行快速映射，如果在查找TLB没有命中，就会触发一次缺页中断，将访问内存来重新刷新TLB页表。Linux下默认页大小为4K，当用户程序占用4M的内存时，就需要1K的页表项，如果使用2M的页面，那么只需要2条页表项，这样有两个好处：</p> 
+<p>第一是使用hugepage的内存所需的页表项比较少，对于需要大量内存的进程来说节省了很多开销，像oracle之类的大型数据库优化都使用了大页面配置；</p> 
+<p>第二是TLB冲突概率降低，TLB是cpu中单独的一块高速cache，一般只能容纳100条页表项，采用hugepage可以大大降低TLB miss的开销。</p> 
+<p>DPDK目前支持了2M和1G两种方式的hugepage。通过修改默认/etc/grub.conf中hugepage配置为:</p> 
+<pre><code>default_hugepagesz=1G hugepagesz=1G hugepages=32 isolcpus=0-22
+</code></pre> 
+<ul><li>1</li></ul> 
+<p>然后通过</p> 
+<pre><code>mount –t hugetlbfs nodev /mnt/huge
+</code></pre> 
+<ul><li>1</li></ul> 
+<p>就将hugepage文件系统hugetlbfs挂在/mnt/huge目录下，然后用户进程就可以使用mmap映射hugepage目标文件来使用大页面了。测试表明应用使用大页表比使用4K的页表性能提高10%~15%</p> 
+<p><strong>2、UIO,PMD，用户态轮询驱动，可以减小上下文切换开销，方便实现虚拟机和主机零拷贝zero copy。</strong></p> 
+<p>当前Linux操作系统都是通过中断方式通知CPU来收发数据包，我们假定网卡每收到10个数据包触发一次软中断，一个CPU核心每秒最多处理2w次中断，那么当一个核每秒收到20w个包时就占用了100%，此刻它无法做其它任何操作。</p> 
+<p>DPDK针对Intel网卡实现了基于轮询方式的PMD（Poll Mode Drivers）驱动，该驱动由API、用户空间运行的驱动程序构成，该驱动使用无中断方式直接操作网卡的接收和发送队列（除了链路状态通知仍必须采用中断方式以外）。目前PMD驱动支持Intel的大部分1G、10G和40G的网卡。</p> 
+<p>PMD驱动从网卡上接收到数据包后，会直接通过DMA方式传输到预分配的内存中，同时更新无锁环形队列中的数据包指针，不断轮询的应用程序很快就能感知收到数据包，并在预分配的内存地址上直接处理数据包，这个过程非常简洁。</p> 
+<p>如果要是让Linux来处理收包过程，首先网卡通过中断方式通知协议栈对数据包进行处理，协议栈先会对数据包进行合法性进行必要的校验，然后判断数据包目标是否本机的socket，满足条件则会将数据包拷贝一份向上递交给用户socket来处理，不仅处理路径冗长，还需要从内核到应用层的一次拷贝过程。</p> 
+<p>dpdk利用uio支持，提供应用空间下PMD驱动程序的支持，也就是说网卡驱动是运行在用户空间的，减下了报文在用户空间和应用空间的多次拷贝。</p> 
+<p><strong>3、 利用LINUX亲和性支持，把控制面线程及各个数据面线程绑定到不同的CPU核，节省了 线程在各个CPU核来回调度。</strong></p> 
+<p>多线程的初衷是提高整体应用程序的性能，但是如果不加注意，就会将多线程的创建和销毁开销，锁竞争，访存冲突，cache失效，上下文切换等诸多消耗性能的因素引入进来。</p> 
+<p>为了进一步提高性能，就必须仔细考虑线程在CPU不同核上的分布情况，这也就是常说的多核编程。多核编程和多线程有很大的不同：多线程是指每个CPU上可以运行多个线程，涉及到线程调度、锁机制以及上下文的切换；而多核则是每个CPU核一个线程，核心之间访问数据无需上锁。为了最大限度减少线程调度的资源消耗，需要将Linux绑定在特定的核上，释放其余核心来专供应用程序使用。</p> 
+<p>同时还需要考虑CPU特性和系统是否支持NUMA架构，如果支持的话，不同插槽上CPU的进程要避免访问远端内存，尽量访问本端内存。</p> 
+<p><strong>4、 提供内存池和无锁环形缓存管理，加快内存访问效率。多个收发包集中到一个cache line，在内存池中实现，无需反复申请和释放。</strong></p> 
+<p>模块分解如下：<br><img alt="这里写图片描述" src="https://images2.imgbox.com/aa/7a/oUSFARMc_o.png"></p> 
+<p>模块分解：</p> 
+<p><img alt="这里写图片描述" src="https://images2.imgbox.com/b0/1e/NBiPi1YO_o.png"></p> 
+<p><img alt="这里写图片描述" src="https://images2.imgbox.com/fe/60/I7jvqvPc_o.png"></p> 
+<p>在最底部的内核态DPDK有几个模块：</p> 
+<ul><li>KNI：提供给用户一个使用Linux内核态的协议栈以及传统的Linux网络工具（如ethtool、ifconfig）；</li><li>IGB_UIO（igb_uio.ko和kni.ko.IGB_UIO）:借助UIO技术，在初始化工程中将网卡硬件寄存器映射到用户态</li></ul> 
+<p>核心组件：</p> 
+<p>1、 环境抽象层（EAL）：为DPDK其它组件和应用程序提供一个屏蔽具体平台特性的统一接口，EAL提供的功能主要有：DPDK加载和启动；支持多核或多线程执行类型；CPU核亲和性处理；原子操作和锁操作接口；时钟参考；PCI总线访问接口；跟踪和调试接口；CPU特性采集接口；中断和告警接口等。</p> 
+<p>2、 堆内存管理组件（MALLOC）：堆内存管理组件为应用程序提供从大页内存分配堆内存的接口。当需要分配大量内存小块时（如用于存储列表中每个表项指针的内存），使用这些接口可以减少TLB缺页。</p> 
+<p>3、 网络报文缓存块管理组件（Mbuf）：提供应用程序创建和释放用于存储报文信息的缓存块的接口，这些MBUF存储在一内存池中。提供两种类型的MBUF，一种用于存储一般信息，一种用于存储报文数据。</p> 
+<p>4、 内存池管理组件（Mempool）：为应用程序和其它组件提供分配内存池的接口，内存池是一个由固定大小的多个内存块组成的内存容器，可用于存储相同对像实体，如报文缓存块等。内存池由内存池的名称（一个字符串）来唯一标识，它由一个环缓中区和一组核本地缓存队列组成，每个核从自已的缓存队列分配内存块，当本地缓存队列减少到一定程度时，从内存环缓冲区中申请内存块来补充本地队列。</p> 
+<p>5、 环缓冲区管理组件（RING）：环缓冲区管理组件为应用程序和其它组件提供一个无锁的多生产者多消费者FIFO队列API。</p> 
+<p>6、 定时器组件（Timer）：提供一些异步周期执行的接口（也可以只执行一次），可以指定某个函数在规定的时间异步的执行，就像LIBC中的timer定时器，但是这里的定时器需要应用程序在主循环中周期调用rte_timer_manage来使定时器得到执行，使用起来没有那么方便。定时器组件的时间参考来自EAL层提供的时间接口。</p> 
+<p>除了以上六个核心组件外，DPDK还提供以下功能：<br> 1、 以太网轮询模式驱动（PMD）架构：把以太网驱动从内核移到应用层，采用同步轮询机制而不是内核态的异步中断机制来提高报文的接收和发送效率。<br> 2、 报文转发算法支持：Hash 库和LPM库为报文转发算法提供支持。<br> 3、 网络协议定义和相关宏定义：基于FreeBSD IP协议栈的相关定义如：TCP、UDP、SCTP等协议头定义。<br> 4、 报文QOS调度库：支持随机早检测、流量整形、严格优先级和加权随机循环优先级调度等相关QOS功能。<br> 5、 内核网络接口库（KNI）：提供一种DPDK应用程序与内核协议栈的通信的方法，类似普通LINUX的TUN/TAP接口，但比TUN/TAP接口效率高。每个物理网口可以虚拟出多个KNI接口。</p> 
+<h3><a name="t3"></a><a id="_146"></a>四、组件代码</h3> 
+<p><img alt="这里写图片描述" src="https://images2.imgbox.com/aa/1e/Z2wRG8lw_o.png"></p> 
+<p>RTE：Run-Time Environment</p> 
+<p>EAL：Environment Abstraction Layer</p> 
+<p>PMD： Poll-Mode Driver</p> 
+<p><strong>Memory Manager (librte_malloc，内存管理器)</strong></p> 
+<p>Librte_malloc 库提供一组API，用于从hugepages创建的memzones中分配内存而不是在堆中分配。这有助于改善Linux用户空间环境下典型的从堆中大量分配4KB页面而容易引起TLB不命中。</p> 
+<p><strong>Memory Pool Manager (librte_mempool，内存池管理器)</strong></p> 
+<p>内存池管理器负责分配的内存中的pool对象。一个pool由名称标识，并使用一个ring来存储空闲对象。它提供了其他一些可选的服务，例如每个core的对象缓存和对齐方式帮助器，以确保将填充的对象在所有内存通道上均匀分布。</p> 
+<p><strong>Ring Manager (librte_ring，环形队列管理器)</strong></p> 
+<p>在一个有限大小的表中，ring结构提供了一个无锁的多生产者多消费者的FIFO API。相较于无锁队列，它有一些的优势 ；更容易实现，适应于大容量操作和速度更快。一个ring用在内存池管理器(librte_mempool)，也可用作cores和（或）在一个逻辑core之上的连接在一起的执行块的通用沟通机制。</p> 
+<p><strong>Network Packet Buffer Management (librte_mbuf，网络报文缓冲管理)</strong></p> 
+<p>mbuf 库提供了创建和销毁缓冲区，英特尔 ® DPDK 应用程序可能用来存储消息缓冲。创建消息缓冲区在启动时间和存储在 mempool，并使用英特尔 ® DPDK mempool 库。</p> 
+<p>此库提供一组 API，用于分配或释放 mbufs，操纵控制消息缓冲区(ctrlmbuf) ——普通的消息缓冲区，还操作数据包缓冲区 (pktmbuf) ­——用来进行网络数据包。</p> 
+<p><strong>Timer Manager (librte_timer，定时器管理)</strong></p> 
+<p>timer库向英特尔 ® DPDK 执行单位提供定时器服务，保证以异步方式执行函数的能力。它可以是定期调用，或只是一次性调用。它使用环境抽象层 （EAL) 提供的到的 HPET 接口来获取精确时间的引用，并根据需求在每个核心启动。</p> 
+<p>代码目录：<br><img alt="这里写图片描述" src="https://images2.imgbox.com/3e/5c/Y8EFBmEQ_o.png"></p> 
+<p><img alt="这里写图片描述" src="https://images2.imgbox.com/a9/2f/tCltprr2_o.png"></p> 
+<h3><a name="t4"></a><a id="_183"></a>五、运行环境搭建</h3> 
+<p>在root权限下：</p> 
+<p>1）配置大页内存</p> 
+<pre><code>echo 128 &gt; /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 
+mkdir /mnt/huge 
+mount -t hugetlbfs nodev /mnt/huge  
+cat /proc/meminfo | grep Huge
+</code></pre> 
+<p>2）编译dpdk+helloworld</p> 
+<p>dpdk源码下载：http://www.dpdk.org/browse/dpdk/refs/tags?h=releases</p> 
+<p>进入dpdk主目录，输以下命令进行编译</p> 
+<pre><code>1,设置环境变量：
+export RTE_SDK=/home/dpdk-20.08
+export RTE_TARGET=x86_64-native-linuxapp-gcc
+export KERNELDIR=/lib/modules/3.10.0-862.14.1.6_97.x86_64/build/
+
+ps：可以通过env命令查看已设置的环境变量
+
+2,设置编译生成动态库so和igb_uio：
+vim config/common_base
+CONFIG_RTE_BUILD_SHARED_LIB=y
+CONFIG_RTE_EAL_IGB_UIO=y
+
+3,编译
+make config T=x86_64-native-linuxapp-gcc
+make install T=x86_64-native-linuxapp-gcc RTE_KERNELDIR=/lib/modules/3.10.0-862.14.1.6_97.x86_64/build/ -j 8 'TOOLCHAIN_CFLAGS=-msse4.2 -g -Wall -Werror -fstack-protector-strong -fPIC' 'EXTRA_LDFLAGS=-z relro -z now -z noexecstack' MAKE_PAUSE=n
+
+编译成功后可以在 x86_64-native-linuxapp-gcc/lib/ 目录下看到对应的so， 拷贝到/lib64目录下
+cp x86_64-native-linuxapp-gcc/lib/lib* /lib64/
+</code></pre> 
+<p>在DPDK的examples路径下面有许多示例应用，可以在examples路径下面运行make，将这些应用全都编译好，然后执行，从helloword开始：</p> 
+<pre><code># cd examples
+# make
+# ./helloworld/x86_64-native-linuxapp-gcc/helloworld -c 0xf -n 2
+EAL: Detected 56 lcore(s)
+EAL: Detected 2 NUMA nodes
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: Selected IOVA mode 'VA'
+EAL: Probing VFIO support...
+EAL: VFIO support initialized
+EAL: No legacy callbacks, legacy socket not created
+hello from core 1
+hello from core 0
+hello from core 3
+hello from core 2
+
+</code></pre> 
+<p>该程序自动检测逻辑核，0核为主逻辑核，默认运行结果如上述打印。<br> 执行该程序时默认加的参数，具体含义如下：</p> 
+<pre><code>EAL common options:
+  -c COREMASK         Hexadecimal bitmask of cores to run on
+  -l CORELIST         List of cores to run on
+                      The argument format is &lt;c1&gt;[-c2][,c3[-c4],...]
+                      where c1, c2, etc are core indexes between 0 and 128
+  --lcores COREMAP    Map lcore set to physical cpu set
+                      The argument format is
+                            '&lt;lcores[@cpus]&gt;[&lt;,lcores[@cpus]&gt;...]'
+                      lcores and cpus list are grouped by '(' and ')'
+                      Within the group, '-' is used for range separator,
+                      ',' is used for single number separator.
+                      '( )' can be omitted for single element group,
+                      '@' can be omitted if cpus and lcores have the same value
+  -s SERVICE COREMASK Hexadecimal bitmask of cores to be used as service cores
+  --master-lcore ID   Core ID that is used as master
+  --mbuf-pool-ops-name Pool ops name for mbuf to use
+  -n CHANNELS         Number of memory channels
+  -m MB               Memory to allocate (see also --socket-mem)
+  -r RANKS            Force number of memory ranks (don't detect)
+  -b, --pci-blacklist Add a PCI device in black list.
+                      Prevent EAL from using this PCI device. The argument
+                      format is &lt;domain:bus:devid.func&gt;.
+  -w, --pci-whitelist Add a PCI device in white list.
+                      Only use the specified PCI devices. The argument format
+                      is &lt;[domain:]bus:devid.func&gt;. This option can be present
+                      several times (once per device).
+                      [NOTE: PCI whitelist cannot be used with -b option]
+  --vdev              Add a virtual device.
+                      The argument format is &lt;driver&gt;&lt;id&gt;[,key=val,...]
+                      (ex: --vdev=net_pcap0,iface=eth2).
+  --iova-mode   Set IOVA mode. 'pa' for IOVA_PA
+                      'va' for IOVA_VA
+  -d LIB.so|DIR       Add a driver or driver directory
+                      (can be used multiple times)
+  --vmware-tsc-map    Use VMware TSC map instead of native RDTSC
+  --proc-type         Type of this process (primary|secondary|auto)
+  --syslog            Set syslog facility
+  --log-level=&lt;int&gt;   Set global log level
+  --log-level=&lt;type-match&gt;:&lt;int&gt;
+                      Set specific log level
+  --trace=&lt;regex-match&gt;
+                      Enable trace based on regular expression trace name.
+                      By default, the trace is disabled.
+                      User must specify this option to enable trace.
+  --trace-dir=&lt;directory path&gt;
+                      Specify trace directory for trace output.
+                      By default, trace output will created at
+                      $HOME directory and parameter must be
+                      specified once only.
+  --trace-bufsz=&lt;int&gt;
+                      Specify maximum size of allocated memory
+                      for trace output for each thread. Valid
+                      unit can be either 'B|K|M' for 'Bytes',
+                      'KBytes' and 'MBytes' respectively.
+                      Default is 1MB and parameter must be
+                      specified once only.
+  --trace-mode=&lt;o[verwrite] | d[iscard]&gt;
+                      Specify the mode of update of trace
+                      output file. Either update on a file can
+                      be wrapped or discarded when file size
+                      reaches its maximum limit.
+                      Default mode is 'overwrite' and parameter
+                      must be specified once only.
+  -v                  Display version information on startup
+  -h, --help          This help
+  --in-memory   Operate entirely in memory. This will
+                      disable secondary process support
+  --base-virtaddr     Base virtual address
+  --telemetry   Enable telemetry support (on by default)
+  --no-telemetry   Disable telemetry support
+
+EAL options for DEBUG use only:
+  --huge-unlink       Unlink hugepage files after init
+  --no-huge           Use malloc instead of hugetlbfs
+  --no-pci            Disable PCI
+  --no-hpet           Disable HPET
+  --no-shconf         No shared config (mmap'd files)
+
+EAL Linux options:
+  --socket-mem        Memory to allocate on sockets (comma separated values)
+  --socket-limit      Limit memory allocation on sockets (comma separated values)
+  --huge-dir          Directory where hugetlbfs is mounted
+  --file-prefix       Prefix for hugepage filenames
+  --create-uio-dev    Create /dev/uioX (usually done by hotplug)
+  --vfio-intr         Interrupt mode for VFIO (legacy|msi|msix)
+  --vfio-vf-token     VF token (UUID) shared between SR-IOV PF and VFs
+  --legacy-mem        Legacy memory mode (no dynamic allocation, contiguous segments)
+  --single-file-segments Put all hugepage memory in single files
+  --match-allocations Free hugepages exactly as allocated
+
+</code></pre> 
+<p>3）转发实践</p> 
+<pre><code>1,安装igb_uio驱动
+modprobe uio
+rmmod igb_uio.ko
+insmod x86_64-native-linuxapp-gcc/kmod/igb_uio.ko
+
+2，绑定网卡
+先看一下当前网卡的状态：
+./usertools/dpdk-devbind.py --status
+
+再进行绑定：
+./usertools/dpdk-devbind.py -b igb_uio 0000:02:06.0 
+./usertools/dpdk-devbind.py -b igb_uio 0000:02:06.1 
+
+ps：如果网卡有接口名，如eth1, eth2, 也可以在-b igb_uio后面使用接口名， 而不使用pci地址
+
+</code></pre> 
+<p>DPDK搭建环境完成后，网卡绑定到相应IGB_UIO驱动接口上，所有的网络数据包都会到DPDK，例如examples/l2fwd程序，网卡接收网络数据包，再从另一个网卡转发出去。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/d0b0a198af41e9f29525c2e55f0e8bdf/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">matlab二元一次方程求解_方程的计算机处理913_Matlab</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/0aeb1bc2b95f06409b57951735f37838/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">1176：谁考了第k名</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

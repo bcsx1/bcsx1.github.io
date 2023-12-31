@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Iceberg 在基于 Flink 的流式数据入库场景中的应用 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Iceberg 在基于 Flink 的流式数据入库场景中的应用" />
+<meta property="og:description" content="本文以流式数据入库的场景为基础，介绍引入 Iceberg 作为落地格式和嵌入 Flink sink 的收益，并分析了当前可实现的框架及要点。
+应用场景
+流式数据入库，是大数据和数据湖的典型应用场景。上游的流式数据，如日志，或增量修改，通过数据总线，经过必要的处理后，汇聚并存储于数据湖，供下游的应用（如报表或者商业智能分析）使用。
+上述的应用场景通常有如下的痛点，需要整个流程不断的优化：
+支持流式数据写入，并保证端到端的不重不丢（即 exactly-once）；
+尽量减少中间环节，能支持更实时（甚至是 T&#43;0）的读取或导出，给下游提供更实时更准确的基础数据；
+支持 ACID，避免脏读等错误发生；
+支持修改已落地的数据，虽然大数据和数据湖长于处理静态的或者缓慢变化的数据，即读多写少的场景，但方便的修改功能可以提升用户体验，避免用户因为极少的修改，手动更换整个数据文件，甚至是重新导出；
+支持修改表结构，如增加或者变更列；而且变更不要引起数据的重新组织。
+引入 Iceberg 作为 Flink sink
+为了解决上述痛点，我们引入了 Iceberg 作为数据落地的格式。Iceberg 支持 ACID 事务、修改和删除、独立于计算引擎、支持表结构和分区方式动态变更等特性，很好的满足我们的需求。
+同时，为了支持流式数据的写入，我们引入 Flink 作为流式处理框架，并将 Iceberg 作为 Flink sink。 下文主要介绍 Flink Iceberg sink 的实现框架和要点。但在这之前，需要先介绍一些实现中用到的 Flink 基本概念。
+Flink 基本概念
+从 Flink 的角度如何理解&#34;流&#34;和&#34;批&#34;
+Flink 使用 DataFrame API 来统一的处理流和批数据。
+Stream, Transformation 和 Operator
+一个 Flink 程序由 stream 和 transformation 组成：
+Stream: Transformation 之间的中间结果数据；
+Transformation：对（一个或多个）输入 stream 进行操作，输出（一个或多个）结果 stream。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/ad1a022980e41f0e3f99e4050c12cfc8/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-04-14T15:31:49+08:00" />
+<meta property="article:modified_time" content="2020-04-14T15:31:49+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Iceberg 在基于 Flink 的流式数据入库场景中的应用</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p style="text-align: left">本文以流式数据入库的场景为基础，介绍引入 Iceberg 作为落地格式和嵌入 Flink sink 的收益，并分析了当前可实现的框架及要点。</p> 
+ <h2></h2> 
+ <p><strong>应用场景</strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: left">流式数据入库，是大数据和数据湖的典型应用场景。上游的流式数据，如日志，或增量修改，通过数据总线，经过必要的处理后，汇聚并存储于数据湖，供下游的应用（如报表或者商业智能分析）使用。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/be/15/AyCItCmN_o.png"></p> 
+ <p style="text-align: left">上述的应用场景通常有如下的痛点，需要整个流程不断的优化：</p> 
+ <ul><li><p style="text-align: left"><strong>支持流式数据写入</strong>，并保证端到端的不重不丢（即 exactly-once）；</p></li><li><p style="text-align: left"><strong>尽量减少中间环节</strong>，能支持更实时（甚至是 T+0）的读取或导出，给下游提供更实时更准确的基础数据；</p></li><li><p style="text-align: left"><strong>支持 ACID</strong>，避免脏读等错误发生；</p></li><li><p style="text-align: left"><strong>支持修改已落地的数据</strong>，虽然大数据和数据湖长于处理静态的或者缓慢变化的数据，即读多写少的场景，但方便的修改功能可以提升用户体验，避免用户因为极少的修改，手动更换整个数据文件，甚至是重新导出；</p></li><li><p style="text-align: left"><strong>支持修改表结构</strong>，如增加或者变更列；而且变更不要引起数据的重新组织。</p></li></ul> 
+ <p><strong>引入 Iceberg 作为 Flink sink</strong></p> 
+ <p style="text-align: left">为了解决上述痛点，我们引入了 Iceberg 作为数据落地的格式。Iceberg 支持 ACID 事务、修改和删除、独立于计算引擎、支持表结构和分区方式动态变更等特性，很好的满足我们的需求。</p> 
+ <p style="text-align: left">同时，为了支持流式数据的写入，我们引入 Flink 作为流式处理框架，并将 Iceberg 作为 Flink sink。 </p> 
+ <p style="text-align: left">下文主要介绍 Flink Iceberg sink 的实现框架和要点。但在这之前，需要先介绍一些实现中用到的 Flink 基本概念。</p> 
+ <p><strong>Flink 基本概念</strong></p> 
+ <h4><br></h4> 
+ <p>   </p> 
+ <p><strong>从 Flink 的角度如何理解"流"和"批"</strong><strong></strong></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/65/96/TEDhIwIf_o.png"></p> 
+ <p style="text-align: left">Flink 使用 DataFrame API 来统一的处理流和批数据。<br></p> 
+ <h3><br></h3> 
+ <p>   </p> 
+ <p><strong>Stream, Transformation 和 Operator</strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: left">一个 Flink 程序由 stream 和 transformation 组成：</p> 
+ <ul><li><p style="text-align: left">Stream: Transformation 之间的中间结果数据；</p></li><li><p style="text-align: left">Transformation：对（一个或多个）输入 stream 进行操作，输出（一个或多个）结果 stream。</p></li></ul> 
+ <p style="text-align: left">当 Flink 程序执行时，其被映射成 Streaming Dataflow，由如下的部分组成：</p> 
+ <ul><li><p style="text-align: left">Source (operator)：接收外部输入给 Flink；</p></li><li><p style="text-align: left">Transformation (operator)：中间对 stream 做的任何操作；</p></li><li><p style="text-align: left">Sink (operator)：Flink 输出给外部。</p></li></ul> 
+ <p style="text-align: left">下图为 Flink 官网的示例，展示了一个以 Kafka 作为输入 Source，经过中间两个 transformation，最终通过 sink 输出到 Flink 之外的过程。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/9d/1f/DkQlR9Le_o.png"></p> 
+ <p>   </p> 
+ <p><strong>State, Checkpoint and Snapshot</strong><strong></strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: left">Flink 依靠 checkpoint 和基于 snapshot 的恢复机制，保证程序 state 的一致性，实现容错。</p> 
+ <p style="text-align: left">Checkpoint 是对分布式的数据流，以及所有 operator 的 state，打 snapshot 的过程。</p> 
+ <strong>■ State</strong> 
+ <h4><br></h4> 
+ <p style="text-align: left">一个 operator 的 state，即它包含的所有用于恢复当前状态的信息，可分为两类：</p> 
+ <ul><li><p style="text-align: left">系统 state：如 operator 中对数据的缓存。</p></li><li><p style="text-align: left">用户自定义 state：和用户逻辑相关，可以利用 Flink 提供的 managed state，如 ValueState、ListState，来存储。</p></li></ul> 
+ <p style="text-align: left">State 的存储位置，可以分为：</p> 
+ <ul><li><p style="text-align: left">Local：内存，或者本地磁盘</p></li><li><p style="text-align: left">State backend：远端的持久化存储，如 HDFS。</p></li></ul> 
+ <p style="text-align: left">如下图所示：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/a7/b6/v6wwjyaK_o.png"></p> 
+ <p>■ <strong>Checkpoint</strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: left">Flink 做 checkpoint 的过程如下：</p> 
+ <ol><li><p style="text-align: left">Checkpoint coordinator 首先发送 barrier 给 source。</p></li><li><p style="text-align: left">Source 做 snapshot，完成后向 coordinator 确认。</p></li><li><p style="text-align: left">Source 向下游发送 barrier。</p></li><li><p style="text-align: left">下游 operator 收到所有上游的 barrier 后，做 snapshot，完成后向 coordinator 确认。</p></li><li><p style="text-align: left">继续往下游发送 barrier，直到 sink。</p></li><li><p style="text-align: left">Sink 通知 coordinator 自己完成 checkpoint。</p></li><li><p style="text-align: left">Coordinator 确认本周期 snapshot 做完。</p></li></ol> 
+ <p style="text-align: left">如下图所示：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/c7/df/3n8oGZpa_o.png"></p> 
+ <strong>■ Barrier</strong> 
+ <p style="text-align: left">Barrier 是 Flink 做分布式 snapshot 的重要概念。它作为一个系统标记，被插入到数据流中，随真实数据一起，按照数据流的方向，从上游向下游传递。</p> 
+ <p style="text-align: left">由于每个 barrier 唯一对应 checkpoint id，所以数据流中的 record 实际被 barrier 分组，如下图所示，barrier n 和 barrier n-1 之间的 record，属于 checkpoint n。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/44/4a/aIjEpJwY_o.png"></p> 
+ <p style="text-align: left">Barrier 的作用是在分布式的数据流中，将 operator 的多个输入流按照 checkpoint对齐（align），如下图所示：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/c6/c7/UM4YV9ww_o.png"></p> 
+ <p><strong>Flink Iceberg sink</strong><strong></strong></p> 
+ <p style="text-align: left">了解了上述 Flink 的基本概念，这些概念又是如何被应用和映射到 Flink Iceberg sink 当中的呢？<br></p> 
+ <p>   </p> 
+ <p><strong>总体框架</strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/e3/f0/RmSLldN7_o.png"></p> 
+ <p style="text-align: left">如图，Flink Iceberg sink 有两个主要模块和两个辅助模块组成：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/d4/5e/XGj736Wi_o.png"></p> 
+ <p>   </p> 
+ <p><strong>实现要点</strong></p> 
+ <strong>■ Writer</strong> 
+ <h4><br></h4> 
+ <ol><li><p style="text-align: left">在当前的实现中，Java 的 Map&lt;String, Object&gt; 作为每条记录，输入给 writer。内部逻辑先将其转化为作为中间格式的 Avro IndexedRecord，而后通过 Iceberg 里的 Parquet 相关 API，累积的写入 DataFile。</p></li><li><p style="text-align: left">使用 Avro 作为中间格式是一个临时方案，为简化适配，并最大限度的利用现有逻辑。但长期来看，使用中间格式会影响处理效率，社区也在试图通过 ISSUE-870 来去掉 Avro，进而使用 Iceberg 内建的数据类型作为输入，同时也需要加入一个到 Flink 内建数据类型的转换器。</p></li><li><p style="text-align: left">在做 checkpoint 的过程中，发送 writer 自己的 barrier 到下游的 committer 之前，关闭单个 Parquet 文件，构建 DataFile，并发送 DataFile 的信息给下游。</p><p style="text-align: left">  </p></li></ol> 
+ <p><strong>■ Committer</strong></p> 
+ <h4><br></h4> 
+ <ol><li><p style="text-align: left">全局唯一的 Committer 在收到上游所有 writer 的 barrier 以后，将收到的 DataFile 的信息填入 manifest file，并使用 ListState 把 manifest file 作为用户自定义的 state，保存于 snapshot 中。</p></li><li><p style="text-align: left">当 checkpoint 完成以后，通过 merge append 将 manifest file 提交给 Iceberg。Iceberg 内部通过后续的一系列操作完成 commit。最终让新加入的数据对其他的读任务可见。</p></li></ol> 
+ <p><strong>试用 Flink Iceberg sink</strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: left">社区上 https://github.com/apache/incubator-iceberg/pull/856 提供了可以试用的原型代码。下载该 patch 放入 master 分支，编译并构建即可。如下的程序展示了如何将该 sink 嵌入到 Flink 数据流中：</p> 
+ <pre class="has"><code class="language-javascript">// Configurate catalog
+org.apache.hadoop.conf.Configuration hadoopConf =
+    new org.apache.hadoop.conf.Configuration();
+hadoopConf.set(
+    org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTOREURIS.varname,
+    META_STORE_URIS);
+hadoopConf.set(
+    org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTOREWAREHOUSE.varname,
+    META_STORE_WAREHOUSE);
+ 
+Catalog icebergCatalog = new HiveCatalog(hadoopConf);
+ 
+// Create Iceberg table
+Schema schema = new Schema(
+   ...
+);
+PartitionSpec partitionSpec = builderFor(schema)...
+TableIdentifier tableIdentifier =
+    TableIdentifier.of(DATABASE_NAME, TABLE_NAME);
+// If needed, check the existence of table by loadTable() and drop it
+// before creating it
+icebergCatalog.createTable(tableIdentifier, schema, partitionSpec);
+ 
+// Obtain an execution environment
+StreamExecutionEnvironment env = 
+    StreamExecutionEnvironment.getExecutionEnvironment();
+ 
+// Enable checkpointing
+env.enableCheckpointing(...);
+  
+// Add Source
+DataStream&lt;Map&lt;String, Object&gt;&gt; dataStream =
+    env.addSource(source, typeInformation);
+ 
+// Configure Ieberg sink
+Configuration conf = new Configuration();
+conf.setString(
+    org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTOREWAREHOUSE.varname,
+    META_STORE_URIS);
+conf.setString(IcebergConnectorConstant.DATABASE, DATABASE_NAME);
+conf.setString(IcebergConnectorConstant.TABLE, TABLE_NAME);
+ 
+// Append Iceberg sink to data stream
+IcebergSinkAppender&lt;Map&lt;String, Object&gt;&gt; appender =
+   new IcebergSinkAppender&lt;Map&lt;String, Object&gt;&gt;(conf, "test")
+       .withSerializer(MapAvroSerializer.getInstance())
+       .withWriterParallelism(1);
+appender.append(dataStream);
+ 
+// Trigger the execution
+env.execute("Sink Test");
+</code></pre> 
+ <p><strong>后续规划</strong></p> 
+ <h4><br></h4> 
+ <p style="text-align: left">Flink Iceberg sink 有很多需要完善的地方，例如：上文中提到的去掉 Avro 作为中间格式；以及在各种失败的情况下是否仍能保证端到端的 exactly-once；按固定时长做 checkpoint，在高低峰时生成不同大小的 DataFile，是否对后续读不友好等。这些问题都在我们的后续规划中，也会全数贡献给社区。</p> 
+ <strong>参考资料：</strong> 
+ <h4><br></h4> 
+ <p style="text-align: left">[1] Iceberg 官网：<br>https://iceberg.apache.org/</p> 
+ <p style="text-align: left">[2] Flink 1.10文 档：<br>https://ci.apache.org/projects/flink/flink-docs-release-1.10/</p> 
+ <p style="text-align: left">[3] Neflix 提供的 Flink Iceberg connector 原型：<br>https://github.com/Netflix-Skunkworks/nfflink-connector-iceberg</p> 
+ <p style="text-align: left">[4] Flink Iceberg sink 设计文档：<br>https://docs.google.com/document/d/19M-sP6FlTVm7BV7MM4Om1n_MVo1xCy7GyDl_9ZAjVNQ/edit?usp=sharing</p> 
+ <p style="text-align: left">[5] Flink 容错机制(checkpoint) ：<br>https://www.cnblogs.com/starzy/p/11439988.html</p> 
+ <p style="text-align: center"><strong>▼  更多 Flink 应用实践  <strong>▼</strong></strong></p> 
+ <ul><li><h3><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b8211ca4c0b079c0effc02363fcb4546eaa637af8ceffa349e4f1b48318023f729c2b04ad&amp;idx=1&amp;mid=2247486547&amp;scene=21&amp;sn=8d4d05091c6f68f3370584bcc5c9e72c#wechat_redirect" rel="nofollow">趣头条 | 趣头条基于 Flink+ClickHouse 构建实时数据分析平</a>台</h3></li><li><h3><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b8211ca4c0b079c0effc02363fcb4546eaa637af8ceffa349e4f1b48318023f729c2b04ad&amp;idx=1&amp;mid=2247486547&amp;scene=21&amp;sn=8d4d05091c6f68f3370584bcc5c9e72c#wechat_redirect" rel="nofollow"></a><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b86b6ca4c0fa0076ed507b89cb593d4fb2f40e908d129ca0cc3abae84f1de3344fb257f58&amp;idx=1&amp;mid=2247485684&amp;scene=21&amp;sn=61be9ee7ca60afffb2460b743bc6294b#wechat_redirect" rel="nofollow">奇安信 ｜基于 Flink 构建 CEP 引擎的挑战和实践</a></h3></li><li><h3><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b861fca4c0f09448faf184a8904d9673874c4386c819265b50a59d1b56211dfabf9e929e2&amp;idx=1&amp;mid=2247485533&amp;scene=21&amp;sn=233e1dc8c5aef383f1593f509e206626#wechat_redirect" rel="nofollow">携程 ｜监控指标10K+！</a><a target="_blank" href="https://blog.csdn.net/weixin_44904816/article/details/103775996" rel="noopener noreferrer">携程实时智能检测平台实践</a></h3></li><li><p style="text-align: left"><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b8277ca4c0b61606827ecb3c49aa9fbd1c96910f4dac874d7eaa73408e6fc0d8067833477&amp;idx=1&amp;mid=2247486517&amp;scene=21&amp;sn=c8453622a126d14568f2a6c308a51f62#wechat_redirect" rel="nofollow">Netflix | Netflix：如何打造开放协作的实时 ETL 平台？<br></a></p></li><li><p style="text-align: left"><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b899eca4c0088622f41d9a4a3183fbcb8b2f10cad82e34e64ddb1a0b453cad73f37bdd9a1&amp;idx=1&amp;mid=2247485404&amp;scene=21&amp;sn=fc958616d6e3f3f3001f3e02bb784278#wechat_redirect" rel="nofollow">Lyft ｜Lyft 基于 Flink 的大规模准实时数据分析平台</a></p></li></ul> 
+ <hr> 
+ <p style="text-align: center"><strong># 社区活动推荐 #</strong><br></p> 
+ <p style="text-align: left">普惠全球开发者，这一次，格外与众不同！首个 Apache 顶级项目在线会议 Flink Forward 全球直播中文精华版来啦，聚焦 Alibaba、Google、AWS、Uber、Netflix、新浪微博等海内外一线厂商，经典 Flink 应用场景，最新功能、未来规划一览无余。点击下方图片可了解更多大会详情：</p> 
+ <p style="text-align: center"><a href="http://mp.weixin.qq.com/s?__biz=MzU3Mzg4OTMyNQ%3D%3D&amp;chksm=fd3b82c9ca4c0bdf2f59416839791a42a6a5cfc786fbbf156428610aac7e5e5a6e7390407825&amp;idx=1&amp;mid=2247486603&amp;scene=21&amp;sn=919176f3a88cfe9388a5379c188d5a8e#wechat_redirect" rel="nofollow"><img src="https://images2.imgbox.com/b6/c9/MR666KIs_o.png"></a></p> 
+ <p style="text-align: center">关注 Flink 中文社区，获取更多技术干货<br></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/80/fc/lQ5w4ef1_o.png"></p> 
+ <p style="text-align: right">你也「<strong>在看</strong>」吗？????</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/a7e94712675ec2aa9f431d33114be486/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">StringBuffer、StringBuilder 判断是否为空</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/9775e12c6417c5babe3e6ff851bd0d7d/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">标题PHP use、namespace和自动加载的关系</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Spark性能调优 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Spark性能调优" />
+<meta property="og:description" content="文章目录 一、概述二、资源参数调优1 参数调优① num-executors② executor-memory③ executor-core④ driver-memory⑤ Spark.default.parallelism⑥ Spark.storage.memoryFraction⑦ Spark.Shuffle.memoryFraction 三 代码重构调优1 优化RDD① 避免创建重复的RDD② 尽可能复用一个RDD③ 对多次使用的RDD进行持久化如何选择一种最合适的持久化策略? 2 优化算子① 尽量避免使用Shuffle算子② 使用高性能算子 3 广播大变量4 优化数据① 使用 Kryo 优化序列化性能② 优化数据结构 结尾： 一、概述 嗨，各位小伙伴大家好，我是爱小可爱的IT白，最近应朋友所邀，一直让写一篇关于Spark调优方面的文章，这两天工作之余，忙里偷闲，写了这篇调优文章，跟大家一起共享；在大数据领域，肯定有很多小伙伴跟笔者一样为了让生产中数据执行速度更快、性能更高而去使用Spark，当我们用Spark程序实现功能开发并使程序正常稳定运行起来的时候，一定是非常有成就感的；但是随着数据量的增加以及需求的完善，我们就开始关注我们这个程序能否做到在运行起来的时候让数据查询更快、让页面响应更快、尽可能的节省空间占用率；而前面提到这些&#34;美好的设想&#34;其实是由很多方面决定的，由很多部分组成，并不是仅仅通过调节几个参数就可以大幅度提升作业性能的。我们需要结合实际应用场景对Spark作业进行综合分析并进行调整，才能获得更好的性能。而这些就需要我们这些大数据开发者重构代码或者调整各种配置参数或者从数据倾斜方面进行优化，之前的文章中有提到过数据倾斜方面的优化，本文就不对数据倾斜一一赘述了，下面将由我从参数调优和代码重构两个方面为各位小伙伴进行相关Spark作业优化的讲解。
+二、资源参数调优 在我们进行代码重构之前，我们首先考虑到的应该是可以通过调节哪些参数，从而达到通过优化资源使用率提升Spark作业执行性能的目的，当我们把各个参数调到相对最优，这时候再进行代码重构，等于将Spark程序执行效率实现从老牛拉破车→绿皮火车→子弹头高铁的速度跨越。
+在实际生产中，我们使用Spark时候有三种方式来设置资源参数，按照优先级排序依是：
+（1）代码中显示调用 set()方法设置；
+（2）通过 Spark-submit 传递参数；
+（3）配置文件。
+当以上三种方法均没有设置参数值时，Spark将使用系统默认值，下面我将对主要参数的配置为各位进行简单阐述：
+1 参数调优 ① num-executors 该参数用于设计Spark作业总的Executor进程的个数。YARN集群管理器会尽可能根据num-executor设置在工作节点上启动 Executor。Spark默认只会启动很少的进程，如果我们不及时对此参数进行调整，这时并行度不够，任务执行速度十分缓慢。一般为每个Spark作业设置 50~100个Executor，设置 Executor太多大部分队列无法给予充分的资源；设置 Executor太少无法充分利用集群性能。
+② executor-memory 该参数用于设置每个Executor 进程的内存，Executor内存的大小，很多程度上直接决定了 Spark 作业的性能，而且跟很常见的 Java中的虚拟机内存溢出异常(oom)也有关系。所以建议每个Executor进程的内存设置4G～8G较为合适，但是这也只是一个参考值，具体设置还需要根据队列中任务的多少以及最大内存资源来设置，根据经验，内存最好不要超过资源队列的最大内存的1/3～1/2。
+③ executor-core 该参数用于设置每个Executor进程的 CPU core 数量。因为每个CPU core同一时间只能执行一个 task 线程，所以executor-core 的个数决定了 Executor 进程的并发线程能力。该参数设置为 2-4 比较合适。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/cfdf49b2e2e4d06827c252915fb09d16/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-08-24T10:31:10+08:00" />
+<meta property="article:modified_time" content="2022-08-24T10:31:10+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Spark性能调优</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><a href="#_1" rel="nofollow">一、概述</a></li><li><a href="#_3" rel="nofollow">二、资源参数调优</a></li><li><ul><li><a href="#1__10" rel="nofollow">1 参数调优</a></li><li><ul><li><a href="#_numexecutors_11" rel="nofollow">① num-executors</a></li><li><a href="#_executormemory_13" rel="nofollow">② executor-memory</a></li><li><a href="#_executorcore_15" rel="nofollow">③ executor-core</a></li><li><a href="#_drivermemory_45" rel="nofollow">④ driver-memory</a></li><li><a href="#_Sparkdefaultparallelism_47" rel="nofollow">⑤ Spark.default.parallelism</a></li><li><a href="#_SparkstoragememoryFraction_49" rel="nofollow">⑥ Spark.storage.memoryFraction</a></li><li><a href="#_SparkShufflememoryFraction_51" rel="nofollow">⑦ Spark.Shuffle.memoryFraction</a></li></ul> 
+  </li></ul> 
+  </li><li><a href="#__53" rel="nofollow">三 代码重构调优</a></li><li><ul><li><a href="#1_RDD_54" rel="nofollow">1 优化RDD</a></li><li><ul><li><a href="#_RDD_55" rel="nofollow">① 避免创建重复的RDD</a></li><li><a href="#_RDD_60" rel="nofollow">② 尽可能复用一个RDD</a></li><li><a href="#_RDD_62" rel="nofollow">③ 对多次使用的RDD进行持久化</a></li><li><a href="#_68" rel="nofollow">如何选择一种最合适的持久化策略?</a></li></ul> 
+   </li><li><a href="#2__128" rel="nofollow">2 优化算子</a></li><li><ul><li><a href="#_Shuffle_129" rel="nofollow">① 尽量避免使用Shuffle算子</a></li><li><a href="#__133" rel="nofollow">② 使用高性能算子</a></li></ul> 
+   </li><li><a href="#3__339" rel="nofollow">3 广播大变量</a></li><li><a href="#4__374" rel="nofollow">4 优化数据</a></li><li><ul><li><a href="#__Kryo__375" rel="nofollow">① 使用 Kryo 优化序列化性能</a></li><li><a href="#__386" rel="nofollow">② 优化数据结构</a></li></ul> 
+  </li></ul> 
+  </li><li><a href="#_392" rel="nofollow">结尾：</a></li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_1"></a>一、概述</h2> 
+<p>嗨，各位小伙伴大家好，我是爱小可爱的IT白，最近应朋友所邀，一直让写一篇关于Spark调优方面的文章，这两天工作之余，忙里偷闲，写了这篇调优文章，跟大家一起共享；在大数据领域，肯定有很多小伙伴跟笔者一样为了让生产中数据执行速度更快、性能更高而去使用Spark，当我们用Spark程序实现功能开发并使程序正常稳定运行起来的时候，一定是非常有成就感的；但是随着数据量的增加以及需求的完善，我们就开始关注我们这个程序能否做到在运行起来的时候让数据查询更快、让页面响应更快、尽可能的节省空间占用率；而前面提到这些"美好的设想"其实是由很多方面决定的，由很多部分组成，并不是仅仅通过调节几个参数就可以大幅度提升作业性能的。我们需要结合实际应用场景对Spark作业进行综合分析并进行调整，才能获得更好的性能。而这些就需要我们这些大数据开发者重构代码或者调整各种配置参数或者从数据倾斜方面进行优化，之前的文章中有提到过数据倾斜方面的优化，本文就不对数据倾斜一一赘述了，下面将由我从<strong>参数调优和代码重构</strong>两个方面为各位小伙伴进行相关Spark作业优化的讲解。</p> 
+<h2><a id="_3"></a>二、资源参数调优</h2> 
+<p>在我们进行代码重构之前，我们首先考虑到的应该是可以通过调节哪些参数，从而达到通过优化资源使用率提升Spark作业执行性能的目的，当我们把各个参数调到相对最优，这时候再进行代码重构，等于将Spark程序执行效率实现从<strong>老牛拉破车→绿皮火车→子弹头高铁</strong>的速度跨越。<br> 在实际生产中，我们使用Spark时候有三种方式来设置资源参数，按照优先级排序依是：<br> <strong>（1）代码中显示调用 set()方法设置；<br> （2）通过 Spark-submit 传递参数；<br> （3）配置文件。</strong><br> 当以上三种方法均没有设置参数值时，Spark将使用系统默认值，下面我将对主要参数的配置为各位进行简单阐述：</p> 
+<h3><a id="1__10"></a>1 参数调优</h3> 
+<h4><a id="_numexecutors_11"></a>① num-executors</h4> 
+<p>该参数用于设计Spark作业总的Executor进程的个数。YARN集群管理器会尽可能根据num-executor设置在工作节点上启动 Executor。Spark默认只会启动很少的进程，如果我们不及时对此参数进行调整，这时并行度不够，任务执行速度十分缓慢。一般为每个Spark作业设置 <strong>50~100个Executor</strong>，设置 Executor太多大部分队列无法给予充分的资源；设置 Executor太少无法充分利用集群性能。</p> 
+<h4><a id="_executormemory_13"></a>② executor-memory</h4> 
+<p>该参数用于设置每个Executor 进程的内存，Executor内存的大小，很多程度上直接决定了 Spark 作业的性能，而且跟很常见的 Java中的虚拟机内存溢出异常(oom)也有关系。<strong>所以建议每个Executor进程的内存设置4G～8G较为合适</strong>，但是这也只是一个参考值，具体设置还需要根据队列中任务的多少以及最大内存资源来设置，根据经验，<strong>内存最好不要超过资源队列的最大内存的1/3～1/2。</strong></p> 
+<h4><a id="_executorcore_15"></a>③ executor-core</h4> 
+<p>该参数用于设置每个Executor进程的 CPU core 数量。因为每个CPU core同一时间只能执行一个 task 线程，所以executor-core 的个数决定了 Executor 进程的并发线程能力。<strong>该参数设置为 2-4 比较合适。</strong><br> 下面以我们生产中为例：为各位小伙伴具体讲解关于<strong>① num-executors、② executor-memory、③ executor-core的调优：</strong></p> 
+<pre><code class="prism language-scala">配置：
+<span class="token number">3</span>台 <span class="token number">48</span>核 <span class="token number">64</span>GB
+具体调参如下：
+考虑Linux运行及程序、Hadoop、Yarn等守护进程等，约占<span class="token number">5</span><span class="token operator">%</span><span class="token operator">-</span><span class="token number">10</span><span class="token operator">%</span>，每台预留<span class="token number">3</span>核心以及<span class="token number">4</span>G内存。
+
+为每个执行器分配<span class="token number">3</span>个核心
+<span class="token operator">--</span>executor<span class="token operator">-</span>cores <span class="token operator">=</span> <span class="token number">3</span>
+ 
+每个节点除去预留核心，剩下： <span class="token number">48</span><span class="token operator">-</span><span class="token number">3</span> <span class="token operator">=</span> <span class="token number">45</span>
+群集中核心的可用总数： <span class="token number">45</span> x <span class="token number">3</span> <span class="token operator">=</span> <span class="token number">135</span>
+ 
+–<span class="token operator">-</span>num<span class="token operator">-</span>executors <span class="token operator">=</span> 群集中核心的可用总数<span class="token operator">/</span>每个executors分配<span class="token number">3</span>核心数
+                <span class="token operator">=</span> <span class="token number">135</span><span class="token operator">/</span><span class="token number">3</span> 
+                <span class="token operator">=</span> <span class="token number">45</span>
+每个节点的executors数目： <span class="token number">45</span><span class="token operator">/</span><span class="token number">3</span> <span class="token operator">=</span> <span class="token number">15</span>
+
+群集中每个节点的可使用的总内存数： <span class="token number">64</span>GB <span class="token operator">-</span> <span class="token number">4</span>GB <span class="token operator">=</span> <span class="token number">60</span>GB
+ 
+<span class="token operator">--</span>executor<span class="token operator">-</span>memory <span class="token operator">=</span> 每个executor的内存<span class="token operator">=</span> <span class="token number">60</span>GB <span class="token operator">/</span> <span class="token number">15</span> 
+                  <span class="token operator">=</span> <span class="token number">4</span>GB
+ 
+预留的 off heap overhead <span class="token operator">=</span> <span class="token number">4</span>GB <span class="token operator">*</span> Max<span class="token punctuation">(</span><span class="token number">384</span>MB<span class="token punctuation">,</span> <span class="token number">7</span><span class="token operator">%</span> of <span class="token number">4</span>GB<span class="token punctuation">)</span>
+<span class="token operator">--</span>executor<span class="token operator">-</span>memory <span class="token operator">=</span> <span class="token number">4</span> <span class="token operator">-</span> <span class="token number">384</span>M 
+                  ≈ <span class="token number">4</span>GB
+PS<span class="token operator">:</span>经参数调优以及测试之后，此为最佳num<span class="token operator">-</span>executors、executor<span class="token operator">-</span>memory、executor<span class="token operator">-</span>core数目设置
+</code></pre> 
+<h4><a id="_drivermemory_45"></a>④ driver-memory</h4> 
+<p>该参数用于设置Driver进程的内存。这个参数通常不设置，<strong>driver运行内存默认值512MB，一般设置1G~4G</strong>；但是要注意的一点是，使用collect算子时，一定要保证 Driver 内存足够大，否则会出现内存溢出的错误。</p> 
+<h4><a id="_Sparkdefaultparallelism_47"></a>⑤ Spark.default.parallelism</h4> 
+<p>该参数用于设置每个Stage默认的task数量。该参数使用默认值时，Spark会根据底层HDFS的block数量设置task数量，通常一个block对应一个task，这样task的数量通常是偏少的。由于task是真正执行Spark作业的线程，如果task数量太少，那么Executor中将面临有足够资源却没有task执行的窘境，针对Executor所做的优化也将前功尽弃。所以设置原则为<strong>num-executors&amp;executor-cors的2-3倍</strong>较为合适。如果executor的总cpu core数量为144个，那么设置500个task是可以的，此时可以充分的利用Spark集群的资源。</p> 
+<h4><a id="_SparkstoragememoryFraction_49"></a>⑥ Spark.storage.memoryFraction</h4> 
+<p>该参数针对<strong>Spark1.6之前</strong>，用于设置RDD持久化数据在Executor内存中能占的比例，默认是<strong>0.6</strong>。也就是说，默认Executor 60%的内存，可以用来保存持久化的 RDD 数据。当Spark作业中有较多RDD需要进行持久化操作时，可以将该参数值调高；当Spark作业中有较少RDD需要进行持久化操作时，可以将该参数值调低。</p> 
+<h4><a id="_SparkShufflememoryFraction_51"></a>⑦ Spark.Shuffle.memoryFraction</h4> 
+<p>该参数用于设置Shuffle过程中一个task拉取到上个Stage的task的输出后，进行聚合操作时能够使用的Executor内存的比例，默认是<strong>0.2</strong>。也就是说，Executor默认只有20%的内存用来进行该操作。shuffle操作在进行聚合时，如果发现使用的内存超出了这个20%的限制，那么多余的数据就会溢写到磁盘文件中去，此时就会极大地降低性能。建议：如果Spark作业中的RDD持久化操作较少，shuffle操作较多时，建议降低持久化操作的内存占比，提高shuffle操作的内存占比比例，避免shuffle过程中数据过多时内存不够用，必须溢写到磁盘上，降低了性能。此外，如果发现作业由于频繁的gc导致运行缓慢，意味着task执行用户代码的内存不够用，那么同样建议调低这个参数的值。</p> 
+<h2><a id="__53"></a>三 代码重构调优</h2> 
+<h3><a id="1_RDD_54"></a>1 优化RDD</h3> 
+<h4><a id="_RDD_55"></a>① 避免创建重复的RDD</h4> 
+<p>通常来说，一个Spark作业就是对某个数据源创建RDD，然后对这个RDD进行转化和行为操作。通过转化操作，得到下一个RDD；通过行为操作，得到处理结果。在开发过程中需要注意，对于同一份数据，只应该创建一个 RDD，不能创建多个RDD代表同一份数据。使用多个RDD代表同一份数据源时常常会增加作业的性能开销，这些开销包括：<br> <strong>(1)创建新 RDD 的开销；<br> (2)从外部系统中加载数据到RDD中的开销；<br> (3)重复计算的开销。</strong></p> 
+<h4><a id="_RDD_60"></a>② 尽可能复用一个RDD</h4> 
+<p>在对不同的数据执行算子操作时应该尽量复用一个 RDD。例如，当 RDD A的数据格式是key-value类型的，RDD B的数据格式是value类型的，但是这两个RDD的value数据完全相同；那么，RDD A包含了RDD B中的所有信息，理论上来说RDD B可以被替代，而实际开发中也应该尽量减少多个RDD数据有重复或者包含的情况，这样可以尽可能减少RDD的数量从而减少算子执行的次数。</p> 
+<h4><a id="_RDD_62"></a>③ 对多次使用的RDD进行持久化</h4> 
+<p>RDD的持有化有几种不同的级别，分别是：<strong>MEMORY_ONLY、MEMORY_AND_DISK、MEMORY_ONLY_SER、MEMORY_AND_DISK_SER、DISK_ONLY、MEMORY_ONLY_2</strong> 等，这几种持久化级别使用的优先级排序如下：<br> (1)<strong>MEMORY_ONLY</strong>性能最高，直接将RDD存储在内存中，省去了序列化及反序列化、从磁盘读取的时间，但是对于内存的容量有较高的要求；<br> (2)MEMORY_ONLY_SER会将数据序列化后保存在内存中，通过序列化压缩了RDD的大小，但是相较于MEMORY_ONLY多出了序列化及反序列化的时间；<br> (3)MEMORY_AND_DISK_SER优先将RDD缓存在内存中，内存缓存不下时才会存在磁盘中;<br> (4)DISK_ONLY和后缀为_2的级别通常不建议使用，完全基于磁盘文件的读写会导致性能的极具降低；后缀为2的级别会将所有数据都复制一份副本到其他节点上，数据复制及网络传输会导致较大的性能开销。</p> 
+<h4><a id="_68"></a>如何选择一种最合适的持久化策略?</h4> 
+<p>如果纯内存的级别都无法使用，那么建议使用<strong>MEMORY_AND_DISK_SER</strong>策略，而不是MEMORY_AND_DISK策略。因为既然到了这一步，就说明RDD的数据量很大，内存无法完全放下。序列化后的数据比较少，可以节省内存和磁盘的空间开销。同时该策略会优先尽量尝试将数据缓存在内存中，内存缓存不下才会写入磁盘。<br> 通常不建议使用DISK_ONLY和后缀为2的级别：因为完全基于磁盘文件进行数据的读写 ，会导致性能急剧降低，有时还不如重新计算一次所有RDD。后缀为2的级别，必须将所有数据都复制一份副本，并发送到其他节点上，数据复制以及网络传输会导致较大的性能开销，除非是要求作业的高可用性，否则不建议使用。</p> 
+<pre><code class="prism language-scala"><span class="token keyword">object</span> Demo1Cache <span class="token punctuation">{<!-- --></span>
+  <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Unit</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">val</span> spark<span class="token operator">:</span> SparkSession <span class="token operator">=</span> SparkSession
+      <span class="token punctuation">.</span>builder<span class="token punctuation">(</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>master<span class="token punctuation">(</span><span class="token string">"local"</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>appName<span class="token punctuation">(</span><span class="token string">"cache"</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>config<span class="token punctuation">(</span><span class="token string">"spark.sql.shuffle.partitions"</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>getOrCreate<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> sc<span class="token operator">:</span> SparkContext <span class="token operator">=</span> spark<span class="token punctuation">.</span>sparkContext
+    <span class="token keyword">val</span> studentsRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> sc<span class="token punctuation">.</span>textFile<span class="token punctuation">(</span><span class="token string">"data/students.txt"</span><span class="token punctuation">)</span>
+    <span class="token comment">/**
+     * 当对同一个rdd进行多次使用的时候可以将rdd缓存起来
+     *
+     */</span>
+    <span class="token comment">//缓存级别是MEMORY_ONLY</span>
+    <span class="token comment">//studentsRDD.cache()</span>
+    <span class="token comment">//内存放不下放磁盘，同时会对数据做序列化，将一个分区的数据序列化从一个字节数组</span>
+    studentsRDD<span class="token punctuation">.</span>persist<span class="token punctuation">(</span>StorageLevel<span class="token punctuation">.</span>MEMORY_AND_DISK_SER<span class="token punctuation">)</span>
+    <span class="token comment">/**
+     * rdd: rdd.cache
+     * df : df.cache
+     * sql: cache table student,  uncache table studnet
+     */</span>
+    <span class="token comment">/**
+     * 统计班级的的人数
+     *
+     */</span>
+    studentsRDD
+      <span class="token punctuation">.</span>map<span class="token punctuation">(</span>stu <span class="token keyword">=&gt;</span> <span class="token punctuation">(</span>stu<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>reduceByKey<span class="token punctuation">(</span>_ <span class="token operator">+</span> _<span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>map <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> <span class="token punctuation">(</span>clazz<span class="token operator">:</span> <span class="token builtin">String</span><span class="token punctuation">,</span> num<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">)</span> <span class="token keyword">=&gt;</span>
+          <span class="token string-interpolation"><span class="token id function">s</span><span class="token string">"</span><span class="token interpolation"><span class="token punctuation">$</span><span class="token expression">clazz</span></span><span class="token string">\t</span><span class="token interpolation"><span class="token punctuation">$</span><span class="token expression">num</span></span><span class="token string">"</span></span>
+      <span class="token punctuation">}</span>
+      <span class="token punctuation">.</span>saveAsTextFile<span class="token punctuation">(</span><span class="token string">"data/cache/clazz_num"</span><span class="token punctuation">)</span>
+    <span class="token comment">/**
+     * 统计性别的人数
+     *
+     */</span>
+    studentsRDD
+      <span class="token punctuation">.</span>map<span class="token punctuation">(</span>stu <span class="token keyword">=&gt;</span> <span class="token punctuation">(</span>stu<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>reduceByKey<span class="token punctuation">(</span>_ <span class="token operator">+</span> _<span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>map <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> <span class="token punctuation">(</span>gender<span class="token operator">:</span> <span class="token builtin">String</span><span class="token punctuation">,</span> num<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">)</span> <span class="token keyword">=&gt;</span>
+          <span class="token string-interpolation"><span class="token id function">s</span><span class="token string">"</span><span class="token interpolation"><span class="token punctuation">$</span><span class="token expression">gender</span></span><span class="token string">\t</span><span class="token interpolation"><span class="token punctuation">$</span><span class="token expression">num</span></span><span class="token string">"</span></span>
+      <span class="token punctuation">}</span>
+      <span class="token punctuation">.</span>saveAsTextFile<span class="token punctuation">(</span><span class="token string">"data/cache/gender_num"</span><span class="token punctuation">)</span>
+    <span class="token comment">/**
+     * 清空缓存
+     */</span>
+    studentsRDD<span class="token punctuation">.</span>unpersist<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="2__128"></a>2 优化算子</h3> 
+<h4><a id="_Shuffle_129"></a>① 尽量避免使用Shuffle算子</h4> 
+<p>Spark作业最消耗性能的部分就是Shuffle过程，应尽量避免使用Shuffle算子。Shuffle过程就是将分布在集群中多个节点上的同一个 key，拉取到同一个节点上，进行聚合或者join操作，在操作过程中可能会因为一个节点上处理的key过多导致数据溢出到磁盘。由此可见，Shuffle过程可能会发生大量的磁盘文件读写的 IO 操作，以及数据的网络传输操作，Shuffle过程如下图 所示。<br> <img src="https://images2.imgbox.com/95/5e/VVQGxUl1_o.png" alt="在这里插入图片描述"><br> Shuffle类算子有：<strong>distinct、groupByKey、reduceByKey、aggregateByKey、join、cogroup、repartition等</strong>，编写Spark作业程序时，应该尽量使用map类算子替代Shuffle 算子。</p> 
+<h4><a id="__133"></a>② 使用高性能算子</h4> 
+<p><strong>1 使用reduceByKey/aggregateByKey替代groupByKey</strong><br> <strong>2 使用mapPartitions替代普通map Transformation算子</strong><br> <strong>3 使用foreachPartitions替代foreach Action算子<br> 4 使用filter之后进行coalesce操作<br> 5 repartition:coalesce(numPartitions，true)增多分区使用这个<br> 6 coalesce(numPartitions，false)减少分区，没有shuffle只是合并partition</strong></p> 
+<pre><code class="prism language-scala"><span class="token number">1</span> 使用reduceByKey<span class="token operator">/</span>aggregateByKey替代groupByKey
+实例如下：
+<span class="token keyword">object</span> Demo2AggregateByKey<span class="token punctuation">{<!-- --></span>
+  <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Unit</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">val</span> spark<span class="token operator">:</span> SparkSession <span class="token operator">=</span> SparkSession
+      <span class="token punctuation">.</span>builder<span class="token punctuation">(</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>master<span class="token punctuation">(</span><span class="token string">"local"</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>appName<span class="token punctuation">(</span><span class="token string">"Demo2AggregateByKey"</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>config<span class="token punctuation">(</span><span class="token string">"spark.sql.shuffle.partitions"</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>getOrCreate<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> sc<span class="token operator">:</span> SparkContext <span class="token operator">=</span> spark<span class="token punctuation">.</span>sparkContext
+    <span class="token keyword">val</span> studentsRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> sc<span class="token punctuation">.</span>textFile<span class="token punctuation">(</span><span class="token string">"data/students.txt"</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> clazzKvDS<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token punctuation">(</span><span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">Int</span><span class="token punctuation">)</span><span class="token punctuation">]</span> <span class="token operator">=</span> studentsRDD<span class="token punctuation">.</span>map<span class="token punctuation">(</span>stu <span class="token keyword">=&gt;</span> <span class="token punctuation">(</span>stu<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">4</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token comment">/**
+     * aggregateByKey: 需要两个函数，一个是map端预聚合的函数，一个reduce端汇总的函数
+     * reduceByKey map端和reduce端聚合函数是一样，
+     * 如果map端和reduce端要写不一样的聚合函数可以使用aggregateByKey
+     */</span>
+    <span class="token keyword">val</span> countRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token punctuation">(</span><span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">Int</span><span class="token punctuation">)</span><span class="token punctuation">]</span> <span class="token operator">=</span> clazzKvDS<span class="token punctuation">.</span>aggregateByKey<span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">(</span>
+      <span class="token punctuation">(</span>u<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">,</span> i<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">)</span> <span class="token keyword">=&gt;</span> u <span class="token operator">+</span> i<span class="token punctuation">,</span><span class="token comment">//在map端做聚合函数</span>
+      <span class="token punctuation">(</span>u1<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">,</span> u2<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">)</span> <span class="token keyword">=&gt;</span> u1 <span class="token operator">+</span> u2<span class="token comment">//在reduce端做聚合的函数</span>
+    <span class="token punctuation">)</span>
+    countRDD<span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token number">2</span> 使用mapPartitions替代普通map Transformation算子
+实例如下：
+<span class="token keyword">object</span> Demo3MapPartition <span class="token punctuation">{<!-- --></span>
+  <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Unit</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">val</span> spark<span class="token operator">:</span> SparkSession <span class="token operator">=</span> SparkSession
+      <span class="token punctuation">.</span>builder<span class="token punctuation">(</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>master<span class="token punctuation">(</span><span class="token string">"local"</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>appName<span class="token punctuation">(</span><span class="token string">"cache"</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>config<span class="token punctuation">(</span><span class="token string">"spark.sql.shuffle.partitions"</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>getOrCreate<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> sc<span class="token operator">:</span> SparkContext <span class="token operator">=</span> spark<span class="token punctuation">.</span>sparkContext
+    <span class="token keyword">val</span> dataRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> sc<span class="token punctuation">.</span>textFile<span class="token punctuation">(</span><span class="token string">"data/students.txt"</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> kvRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token punctuation">(</span><span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">String</span><span class="token punctuation">)</span><span class="token punctuation">]</span> <span class="token operator">=</span> dataRDD<span class="token punctuation">.</span>mapPartitions<span class="token punctuation">(</span>iter <span class="token keyword">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+      iter<span class="token punctuation">.</span>map<span class="token punctuation">(</span>line <span class="token keyword">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//如果只是简单的拆分数据，使用map和mappartition没有区别</span>
+        <span class="token keyword">val</span> split<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> line<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">"\t"</span><span class="token punctuation">)</span>
+        <span class="token punctuation">(</span>split<span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+      <span class="token punctuation">}</span><span class="token punctuation">)</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> resultRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token punctuation">(</span><span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">Long</span><span class="token punctuation">,</span> <span class="token builtin">String</span><span class="token punctuation">)</span><span class="token punctuation">]</span> <span class="token operator">=</span> kvRDD<span class="token punctuation">.</span>mapPartitions<span class="token punctuation">(</span>iter <span class="token keyword">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+      <span class="token comment">/**
+       *
+       * 可以将一些初始化的代码放在mapPartitions中，减少占用的内存空间
+       */</span>
+      <span class="token comment">//将时间字段转换成时间戳</span>
+      <span class="token comment">//在这里创建的对象，是一个分区创建一个</span>
+      <span class="token keyword">val</span> format <span class="token operator">=</span> <span class="token keyword">new</span> SimpleDateFormat<span class="token punctuation">(</span><span class="token string">"yyyy/MM/dd"</span><span class="token punctuation">)</span>
+      iter<span class="token punctuation">.</span>map <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> <span class="token punctuation">(</span>id<span class="token operator">:</span> <span class="token builtin">String</span><span class="token punctuation">,</span> sdate<span class="token operator">:</span> <span class="token builtin">String</span><span class="token punctuation">,</span> p<span class="token operator">:</span> <span class="token builtin">String</span><span class="token punctuation">)</span> <span class="token keyword">=&gt;</span>
+          <span class="token keyword">val</span> dateObj<span class="token operator">:</span> Date <span class="token operator">=</span> format<span class="token punctuation">.</span>parse<span class="token punctuation">(</span>sdate<span class="token punctuation">)</span>
+          <span class="token keyword">val</span> ts<span class="token operator">:</span> <span class="token builtin">Long</span> <span class="token operator">=</span> dateObj<span class="token punctuation">.</span>getTime
+          <span class="token punctuation">(</span>id<span class="token punctuation">,</span> ts<span class="token punctuation">,</span> p<span class="token punctuation">)</span>
+      <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span>
+    resultRDD<span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token number">3</span> 使用foreachPartitions替代foreach Action算子
+实例如下：
+<span class="token keyword">object</span> Demo4ForeachPartition <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Unit</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+      <span class="token keyword">val</span> spark<span class="token operator">:</span> SparkSession <span class="token operator">=</span> SparkSession<span class="token punctuation">.</span>builder<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token punctuation">.</span>master<span class="token punctuation">(</span><span class="token string">"local"</span><span class="token punctuation">)</span>
+        <span class="token punctuation">.</span>appName<span class="token punctuation">(</span><span class="token string">"foreach"</span><span class="token punctuation">)</span>
+        <span class="token punctuation">.</span>getOrCreate<span class="token punctuation">(</span><span class="token punctuation">)</span>
+      <span class="token keyword">val</span> rdd1<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> spark
+        <span class="token punctuation">.</span>sparkContext
+        <span class="token punctuation">.</span>textFile<span class="token punctuation">(</span><span class="token string">"data/student.txt"</span><span class="token punctuation">,</span> <span class="token number">4</span><span class="token punctuation">)</span>
+      println<span class="token punctuation">(</span>rdd1<span class="token punctuation">.</span>getNumPartitions<span class="token punctuation">)</span>
+      <span class="token comment">/*
+        * foreachPartition: 遍历一个分区的数据
+        * 如果需要将数据保存到外部数据库，使用foreachPartition代替foreach
+        * foreachPartition 每一个分区只会创建一个连接
+        */</span>
+      rdd1<span class="token punctuation">.</span>foreachPartition<span class="token punctuation">(</span>iter <span class="token keyword">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//这里的代码每一个分区只会执行一次</span>
+        <span class="token comment">//每一个分区只会建立一个连接</span>
+        Class<span class="token punctuation">.</span>forName<span class="token punctuation">(</span><span class="token string">"com.mysql.jdbc.Driver"</span><span class="token punctuation">)</span>
+        <span class="token keyword">val</span> con<span class="token operator">:</span> Connection <span class="token operator">=</span> DriverManager<span class="token punctuation">.</span>getConnection<span class="token punctuation">(</span><span class="token string">"jdbc:mysql://localhost:3306/student?useUnicode=true&amp;characterEncoding=utf-8"</span><span class="token punctuation">,</span> <span class="token string">"root"</span><span class="token punctuation">,</span> <span class="token string">"123456"</span><span class="token punctuation">)</span>
+        println<span class="token punctuation">(</span><span class="token string">"连接建立成功"</span><span class="token punctuation">)</span>
+        <span class="token comment">//遍历一个分区的数据</span>
+        iter<span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>line <span class="token keyword">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+          <span class="token keyword">val</span> stat<span class="token operator">:</span> PreparedStatement <span class="token operator">=</span> con<span class="token punctuation">.</span>prepareStatement<span class="token punctuation">(</span><span class="token string">"insert into student(id,name,age,gender,clazz) values(?,?,?,?,?)"</span><span class="token punctuation">)</span>
+          <span class="token keyword">val</span> split<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> line<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span>
+          stat<span class="token punctuation">.</span>setString<span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+          stat<span class="token punctuation">.</span>setString<span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+          stat<span class="token punctuation">.</span>setInt<span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">.</span>toInt<span class="token punctuation">)</span>
+          stat<span class="token punctuation">.</span>setString<span class="token punctuation">(</span><span class="token number">4</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+          stat<span class="token punctuation">.</span>setString<span class="token punctuation">(</span><span class="token number">5</span><span class="token punctuation">,</span> split<span class="token punctuation">(</span><span class="token number">4</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+          <span class="token comment">//插入数据</span>
+          stat<span class="token punctuation">.</span>executeUpdate<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token punctuation">}</span><span class="token punctuation">)</span>
+        <span class="token comment">//关闭连接</span>
+        con<span class="token punctuation">.</span>close<span class="token punctuation">(</span><span class="token punctuation">)</span>
+      <span class="token punctuation">}</span><span class="token punctuation">)</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token number">4</span> 使用filter之后进行coalesce操作
+<span class="token number">5</span> repartition<span class="token operator">:</span>coalesce<span class="token punctuation">(</span>numPartitions，<span class="token boolean">true</span><span class="token punctuation">)</span>增多分区使用这个
+<span class="token number">6</span> coalesce<span class="token punctuation">(</span>numPartitions，<span class="token boolean">false</span><span class="token punctuation">)</span>减少分区，没有shuffle只是合并partition
+<span class="token number">4</span> <span class="token number">5</span> <span class="token number">6</span>实例如下：
+<span class="token keyword">object</span> Demo5FilterCoalesceRepartition <span class="token punctuation">{<!-- --></span>
+  <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Unit</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">val</span> sparkConf <span class="token operator">=</span> <span class="token keyword">new</span> SparkConf<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setMaster<span class="token punctuation">(</span><span class="token string">"local[*]"</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setAppName<span class="token punctuation">(</span><span class="token string">"Operator"</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> sc <span class="token operator">=</span> <span class="token keyword">new</span> SparkContext<span class="token punctuation">(</span>sparkConf<span class="token punctuation">)</span>
+    <span class="token keyword">val</span> rdd <span class="token operator">=</span> sc<span class="token punctuation">.</span>makeRDD<span class="token punctuation">(</span>List<span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">,</span> <span class="token number">3</span><span class="token punctuation">,</span> <span class="token number">4</span><span class="token punctuation">,</span> <span class="token number">5</span><span class="token punctuation">,</span> <span class="token number">6</span><span class="token punctuation">,</span><span class="token number">7</span><span class="token punctuation">,</span><span class="token number">8</span><span class="token punctuation">,</span><span class="token number">9</span><span class="token punctuation">,</span><span class="token number">10</span><span class="token punctuation">,</span><span class="token number">11</span><span class="token punctuation">,</span><span class="token number">12</span><span class="token punctuation">)</span><span class="token punctuation">,</span><span class="token number">3</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> result <span class="token operator">=</span> rdd<span class="token punctuation">.</span>filter<span class="token punctuation">(</span>
+      item <span class="token keyword">=&gt;</span> item <span class="token operator">%</span> <span class="token number">2</span> <span class="token operator">==</span> <span class="token number">0</span>
+    <span class="token punctuation">)</span>
+    result<span class="token punctuation">.</span>collect<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+    print<span class="token punctuation">(</span><span class="token string">"-------------------以上为filter结果，以下为先filter后coalesce结果----------------------------------"</span><span class="token punctuation">)</span>
+    <span class="token comment">// 缩减分区：coalesce，如果想要数据均衡，可以采用shuffle</span>
+    <span class="token keyword">val</span> coalesce_result <span class="token operator">=</span> result<span class="token punctuation">.</span>coalesce<span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">,</span><span class="token boolean">true</span><span class="token punctuation">)</span>
+    coalesce_result<span class="token punctuation">.</span>collect<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+    print<span class="token punctuation">(</span><span class="token string">"--------------------以上为先filter后coalesce结果，以下为先filter后repartition结果-------------------"</span><span class="token punctuation">)</span>
+    <span class="token comment">// 扩大分区：repartition, 底层代码调用的就是coalesce，而且肯定采用shuffle</span>
+    <span class="token keyword">val</span> repartition_result <span class="token operator">=</span> result<span class="token punctuation">.</span>repartition<span class="token punctuation">(</span><span class="token number">6</span><span class="token punctuation">)</span>
+    repartition_result<span class="token punctuation">.</span>collect<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+    print<span class="token punctuation">(</span><span class="token string">"--------------------以上为先filter后repartition结果，以下为coalesce(numPartitions，false)减少分区结果"</span><span class="token punctuation">)</span>
+    <span class="token comment">// coalesce(numPartitions，false) 减少分区，没有shuffle只是合并partition</span>
+    <span class="token keyword">val</span> coalesce_falseresult <span class="token operator">=</span> result<span class="token punctuation">.</span>coalesce<span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">,</span><span class="token boolean">false</span><span class="token punctuation">)</span>
+    coalesce_falseresult<span class="token punctuation">.</span>collect<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+    sc<span class="token punctuation">.</span>stop<span class="token punctuation">(</span><span class="token punctuation">)</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token number">7</span> 使用repartitionAndSortWithinPartitions替代repartition与sort类操作代码
+实例如下：
+<span class="token comment">//创建key类，key组合键为grade，score</span>
+<span class="token keyword">case</span> <span class="token keyword">class</span> StudentKey<span class="token punctuation">(</span>grade<span class="token operator">:</span><span class="token builtin">String</span><span class="token punctuation">,</span>score<span class="token operator">:</span><span class="token builtin">Int</span><span class="token punctuation">)</span>
+<span class="token keyword">object</span> StudentKey <span class="token punctuation">{<!-- --></span>
+  <span class="token keyword">implicit</span> <span class="token keyword">def</span> orderingByGradeStudentScore<span class="token punctuation">[</span>A <span class="token operator">&lt;</span><span class="token operator">:</span> StudentKey<span class="token punctuation">]</span> <span class="token operator">:</span> Ordering<span class="token punctuation">[</span>A<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    Ordering<span class="token punctuation">.</span>by<span class="token punctuation">(</span>fk <span class="token keyword">=&gt;</span> <span class="token punctuation">(</span>fk<span class="token punctuation">.</span>grade<span class="token punctuation">,</span> fk<span class="token punctuation">.</span>score <span class="token operator">*</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+<span class="token keyword">object</span> Demo6Student<span class="token punctuation">{<!-- --></span>
+  <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//定义hdfs文件索引值</span>
+    <span class="token keyword">val</span> grade_idx<span class="token operator">:</span><span class="token builtin">Int</span><span class="token operator">=</span><span class="token number">0</span>
+    <span class="token keyword">val</span> student_idx<span class="token operator">:</span><span class="token builtin">Int</span><span class="token operator">=</span><span class="token number">1</span>
+    <span class="token keyword">val</span> course_idx<span class="token operator">:</span><span class="token builtin">Int</span><span class="token operator">=</span><span class="token number">2</span>
+    <span class="token keyword">val</span> score_idx<span class="token operator">:</span><span class="token builtin">Int</span><span class="token operator">=</span><span class="token number">3</span>
+    <span class="token comment">//定义转化函数，不能转化为Int类型的，给默认值0</span>
+    <span class="token keyword">def</span> safeInt<span class="token punctuation">(</span>s<span class="token operator">:</span> <span class="token builtin">String</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Int</span> <span class="token operator">=</span> <span class="token keyword">try</span> <span class="token punctuation">{<!-- --></span> s<span class="token punctuation">.</span>toInt <span class="token punctuation">}</span> <span class="token keyword">catch</span> <span class="token punctuation">{<!-- --></span> <span class="token keyword">case</span> _<span class="token operator">:</span> Throwable  <span class="token keyword">=&gt;</span> <span class="token number">0</span> <span class="token punctuation">}</span>
+    <span class="token comment">//定义提取key的函数</span>
+    <span class="token keyword">def</span> createKey<span class="token punctuation">(</span>data<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span>StudentKey<span class="token operator">=</span><span class="token punctuation">{<!-- --></span>
+      StudentKey<span class="token punctuation">(</span>data<span class="token punctuation">(</span>grade_idx<span class="token punctuation">)</span><span class="token punctuation">,</span>safeInt<span class="token punctuation">(</span>data<span class="token punctuation">(</span>score_idx<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//定义提取value的函数</span>
+    <span class="token keyword">def</span> listData<span class="token punctuation">(</span>data<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span>List<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token operator">=</span><span class="token punctuation">{<!-- --></span>
+      List<span class="token punctuation">(</span>data<span class="token punctuation">(</span>grade_idx<span class="token punctuation">)</span><span class="token punctuation">,</span>data<span class="token punctuation">(</span>student_idx<span class="token punctuation">)</span><span class="token punctuation">,</span>data<span class="token punctuation">(</span>course_idx<span class="token punctuation">)</span><span class="token punctuation">,</span>data<span class="token punctuation">(</span>score_idx<span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">def</span> createKeyValueTuple<span class="token punctuation">(</span>data<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">:</span><span class="token punctuation">(</span>StudentKey<span class="token punctuation">,</span>List<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+      <span class="token punctuation">(</span>createKey<span class="token punctuation">(</span>data<span class="token punctuation">)</span><span class="token punctuation">,</span>listData<span class="token punctuation">(</span>data<span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//创建分区类</span>
+    <span class="token keyword">import</span> <span class="token namespace">org<span class="token punctuation">.</span>apache<span class="token punctuation">.</span>spark<span class="token punctuation">.</span></span>Partitioner
+    <span class="token keyword">class</span> StudentPartitioner<span class="token punctuation">(</span>partitions<span class="token operator">:</span> <span class="token builtin">Int</span><span class="token punctuation">)</span> <span class="token keyword">extends</span> Partitioner <span class="token punctuation">{<!-- --></span>
+      require<span class="token punctuation">(</span>partitions <span class="token operator">&gt;=</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token string-interpolation"><span class="token id function">s</span><span class="token string">"Number of partitions (</span><span class="token interpolation"><span class="token punctuation">$</span><span class="token expression">partitions</span></span><span class="token string">) cannot be negative."</span></span><span class="token punctuation">)</span>
+      <span class="token keyword">override</span> <span class="token keyword">def</span> numPartitions<span class="token operator">:</span> <span class="token builtin">Int</span> <span class="token operator">=</span> partitions
+      <span class="token keyword">override</span> <span class="token keyword">def</span> getPartition<span class="token punctuation">(</span>key<span class="token operator">:</span> <span class="token builtin">Any</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Int</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">val</span> k <span class="token operator">=</span> key<span class="token punctuation">.</span>asInstanceOf<span class="token punctuation">[</span>StudentKey<span class="token punctuation">]</span>
+        k<span class="token punctuation">.</span>grade<span class="token punctuation">.</span>hashCode<span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">%</span> numPartitions
+      <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//设置master为local，用来进行本地调试</span>
+    <span class="token keyword">val</span> conf <span class="token operator">=</span> <span class="token keyword">new</span> SparkConf<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setAppName<span class="token punctuation">(</span><span class="token string">"Student_partition_sort"</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setMaster<span class="token punctuation">(</span><span class="token string">"local"</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> sc <span class="token operator">=</span> <span class="token keyword">new</span> SparkContext<span class="token punctuation">(</span>conf<span class="token punctuation">)</span>
+    <span class="token comment">//随机数据</span>
+    <span class="token keyword">val</span> student_array <span class="token operator">=</span>Array<span class="token punctuation">(</span>
+      <span class="token string">"c001,n003,chinese,49"</span><span class="token punctuation">,</span>
+      <span class="token string">"c002,n004,english,79"</span><span class="token punctuation">,</span>
+      <span class="token string">"c002,n004,chinese,13"</span><span class="token punctuation">,</span>
+      <span class="token string">"c001,n001,english,88"</span><span class="token punctuation">,</span>
+      <span class="token string">"c001,n002,chinese,10"</span><span class="token punctuation">,</span>
+      <span class="token string">"c002,n006,chinese,29"</span><span class="token punctuation">,</span>
+      <span class="token string">"c001,n001,chinese,54"</span><span class="token punctuation">,</span>
+      <span class="token string">"c001,n002,english,32"</span><span class="token punctuation">,</span>
+      <span class="token string">"c001,n003,english,43"</span><span class="token punctuation">,</span>
+      <span class="token string">"c002,n005,english,80"</span><span class="token punctuation">,</span>
+      <span class="token string">"c002,n005,chinese,48"</span><span class="token punctuation">,</span>
+      <span class="token string">"c002,n006,english,69"</span>
+    <span class="token punctuation">)</span>
+    <span class="token comment">//将学生信息并行化为rdd</span>
+    <span class="token keyword">val</span> student_rdd <span class="token operator">=</span> sc<span class="token punctuation">.</span>parallelize<span class="token punctuation">(</span>student_array<span class="token punctuation">)</span>
+    <span class="token comment">//生成key-value格式的rdd</span>
+    <span class="token keyword">val</span> student_rdd2 <span class="token operator">=</span> student_rdd<span class="token punctuation">.</span>map<span class="token punctuation">(</span>line <span class="token keyword">=&gt;</span> line<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">.</span>map<span class="token punctuation">(</span>createKeyValueTuple<span class="token punctuation">)</span>
+    <span class="token comment">//根据StudentKey中的grade进行分区，并根据score降序排列</span>
+    <span class="token keyword">val</span> student_rdd3 <span class="token operator">=</span> student_rdd2<span class="token punctuation">.</span>repartitionAndSortWithinPartitions<span class="token punctuation">(</span><span class="token keyword">new</span> StudentPartitioner<span class="token punctuation">(</span><span class="token number">10</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token comment">//打印数据</span>
+    student_rdd3<span class="token punctuation">.</span>collect<span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="3__339"></a>3 广播大变量</h3> 
+<p><strong>PS:一般大于1G的不能被广播</strong><br> 开发过程中，会遇到需要在算子函数中使用外部变量的场景(尤其是大变量，比如100M以上的大集合)，那么此时就应该使用Spark的广播(Broadcast)功能来提升性能； 函数中使用到外部变量时，默认情况下，Spark会将该变量复制多个副本，通过网络传输到task中，此时每个task都有一个变量副本。如果变量本身比较大的话(比如100M，甚至1G)，那么大量的变量副本在网络中传输的性能开销，以及在各个节点的Executor中占用过多内存导致的频繁GC(垃圾回收)，都会极大地影响性能； 如果使用的外部变量比较大，建议使用Spark的广播功能，对该变量进行广播。广播后的变量，会保证每个Executor的内存中，只驻留一份变量副本，而Executor中的 task执行时共享该Executor中的那份变量副本。这样的话，可以大大减少变量副本的数量，从而减少网络传输的性能开销，并减少对Executor内存的占用开销，降低 GC的频率； 广播大变量发送方式:Executor一开始并没有广播变量，而是task运行需要用到广播变量，会找executor的blockManager要，bloackManager需要找Driver里面的 blockManagerMaster要。</p> 
+<pre><code class="prism language-scala"><span class="token keyword">object</span> Demo7Mapjoin <span class="token punctuation">{<!-- --></span>
+  <span class="token comment">/**
+    * map join将小表广播，大表使用map算子
+    * 1、小表不能太大,不能超过2G
+    * 2、如果driver内存不足，需要手动设置;如果广播变量大小超过了driver内存大小，会出现oom
+    */</span>
+  <span class="token keyword">def</span> main<span class="token punctuation">(</span>args<span class="token operator">:</span> Array<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token operator">:</span> <span class="token builtin">Unit</span> <span class="token operator">=</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">val</span> conf<span class="token operator">:</span> SparkConf <span class="token operator">=</span> <span class="token keyword">new</span> SparkConf<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setMaster<span class="token punctuation">(</span><span class="token string">"local"</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setAppName<span class="token punctuation">(</span><span class="token string">"app"</span><span class="token punctuation">)</span>
+    <span class="token keyword">val</span> sc<span class="token operator">:</span> SparkContext <span class="token operator">=</span> <span class="token keyword">new</span> SparkContext<span class="token punctuation">(</span>conf<span class="token punctuation">)</span>
+    <span class="token comment">//RDD 不能广播</span>
+    <span class="token keyword">val</span> studentRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> sc<span class="token punctuation">.</span>textFile<span class="token punctuation">(</span><span class="token string">"data/students.txt"</span><span class="token punctuation">)</span>
+    <span class="token comment">//将数据拉去到driver端，变成一个map集合</span>
+    <span class="token keyword">val</span> stuMap<span class="token operator">:</span> Map<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> studentRDD
+      <span class="token punctuation">.</span>collect<span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">//将rdd的数据拉取Driver端变成一个数组</span>
+      <span class="token punctuation">.</span>map<span class="token punctuation">(</span>s <span class="token keyword">=&gt;</span> <span class="token punctuation">(</span>s<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">,</span> s<span class="token punctuation">)</span><span class="token punctuation">)</span>
+      <span class="token punctuation">.</span>toMap
+    <span class="token comment">//广播map集合</span>
+    <span class="token keyword">val</span> broStu<span class="token operator">:</span> Broadcast<span class="token punctuation">[</span>Map<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">,</span> <span class="token builtin">String</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">=</span> sc<span class="token punctuation">.</span>broadcast<span class="token punctuation">(</span>stuMap<span class="token punctuation">)</span>
+    <span class="token keyword">val</span> scoreRDD<span class="token operator">:</span> RDD<span class="token punctuation">[</span><span class="token builtin">String</span><span class="token punctuation">]</span> <span class="token operator">=</span> sc<span class="token punctuation">.</span>textFile<span class="token punctuation">(</span><span class="token string">"data/students.txt"</span><span class="token punctuation">)</span>
+    <span class="token comment">//循环大表，通过key获取小表信息</span>
+    scoreRDD<span class="token punctuation">.</span>map<span class="token punctuation">(</span>s <span class="token keyword">=&gt;</span> <span class="token punctuation">{<!-- --></span>
+      <span class="token keyword">val</span> sId<span class="token operator">:</span> <span class="token builtin">String</span> <span class="token operator">=</span> s<span class="token punctuation">.</span>split<span class="token punctuation">(</span><span class="token string">","</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span>
+      <span class="token comment">//重广播变量里面获取数据</span>
+      <span class="token keyword">val</span> stuInfo<span class="token operator">:</span> <span class="token builtin">String</span> <span class="token operator">=</span> broStu<span class="token punctuation">.</span>value<span class="token punctuation">.</span>getOrElse<span class="token punctuation">(</span>sId<span class="token punctuation">,</span> <span class="token string">""</span><span class="token punctuation">)</span>
+      stuInfo <span class="token operator">+</span> <span class="token string">","</span> <span class="token operator">+</span> s
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">.</span>foreach<span class="token punctuation">(</span>println<span class="token punctuation">)</span>
+    <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token boolean">true</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="4__374"></a>4 优化数据</h3> 
+<h4><a id="__Kryo__375"></a>① 使用 Kryo 优化序列化性能</h4> 
+<p>Spark支持使用Kryo序列化机制。这种序列化机制，比默认的Java序列化机制速度要快，序列化后的数据更小，大概是Java序列化机制的1/10。所以Kryo序列化优化以后，可以让网络传输的数据变少，在集群中耗费的内存资源大大减少。而Spark之所以默认没有使用 Kryo 作为序列化类库，是因为Kryo要求最好要注册所有需要进行序列化的自定义类型，因此对于开发者来说，这种方式比较麻烦。 以下是使用 Kryo 的代码示例，我们只要设置序列化类，再注册要序列化的自定义类型即可（比如算子函数中使用到的外部变量类型、作为 RDD 泛型类型的自定义类型等）：</p> 
+<pre><code class="prism language-scala">第一步，创建SparkConf对象。
+<span class="token keyword">val</span> conf <span class="token operator">=</span> <span class="token keyword">new</span> SparkConf<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setMaster<span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span><span class="token punctuation">.</span>setAppName<span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span>
+第二步，在SparkConf中设置序列化器为KryoSerializer。
+conf<span class="token punctuation">.</span>set<span class="token punctuation">(</span><span class="token string">"spark.serializer"</span><span class="token punctuation">,</span> <span class="token string">"org.apache.spark.serializer.KryoSerializer"</span><span class="token punctuation">)</span> 
+第三步，注册你使用的需要通过Kryo序列化的一些自定义类，SparkConf<span class="token punctuation">.</span>registerKryoClasses<span class="token punctuation">(</span><span class="token punctuation">)</span>。 
+项目中的使用： 
+conf<span class="token punctuation">.</span>registerKryoClasses<span class="token punctuation">(</span><span class="token keyword">new</span> Class<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">{<!-- --></span>CategorySortKey<span class="token punctuation">.</span><span class="token keyword">class</span><span class="token punctuation">}</span><span class="token punctuation">)</span>
+</code></pre> 
+<h4><a id="__386"></a>② 优化数据结构</h4> 
+<p>在Java中有三种类型比较耗费内存：<br> (1)对象；每个Java对象都有对象头、引用等额外的信息，因此比较占用内存空间。<br> (2)字符串；每个字符串内部都有一个字符数组以及长度等额外信息。<br> (3)集合类型；比如HashMap、LinkedList等，因为集合类型内部通常会使用一些内部类来封装集合元素，比如Map.Entry<br> 因此Spark编码时应尽量不要使用以上三种数据结构，<strong>尽量使用字符串代替对象，使用原始类型（比如 Int、Long）替代字符串，使用数组替代集合类型</strong>，这样尽可能地减少内存占用，降低垃圾回收的频率提高性能。</p> 
+<h2><a id="_392"></a>结尾：</h2> 
+<p>说一千道一万，在实际生产的复杂需求中，需要进行优化的时候，绝对不是以上的任何一种方案就可以了。你需要根据你的需求场景来决定，有可能是一种最合适的方案，也有可能是多种以上方案的整合体。将其运用于实战当中，招术融会贯通用起来。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/879d92a671dbd54f916e4f50fa41c594/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">udev的rules编写</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/9fe94f4152c41f4cc6724f953c53a111/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">windows做软件界面</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

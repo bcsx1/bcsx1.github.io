@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>k8s资源限制 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="k8s资源限制" />
+<meta property="og:description" content="文章目录 容器资源需求和限制Pod服务质量类别LimitRangeResourceQuota 在Kubernetes中可以从容器、Pod和名称空间级别来实现资源限制
+容器资源需求和限制 在Pod内的容器上可以对cpu和内存资源定义需求和限制，主要通过pod.spec.containers.resources.requests和pod.spec.containers.resources.limits两个字段实现：
+pod.spec.containers.resources.requests：用来定义容器资源需求，表明系统需要预留给该容器使用的资源的最小可用值pod.spec.containers.resources.limits：用来定义资源限制，指定了该容器可以申请使用的资源的最大值，资源限制需要大于等于资源需求 资源需求会影响Pod调度结果，如果一个节点的可用资源小于一个Pod内所有容器的资源需求的和，那么这个Pod不会被调度到这个节点上。资源限制并不影响Pod的调度结果，即一个节点上所有Pod对象资源限制数量之和可以大于节点拥有的资源量，即支持资源过载使用。不过，一旦内存资源耗尽，几乎必然的会有容器因OOMKilled而终止
+配置容器的cpu和内存限制可以参考官方文档：https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-memory-resource/和https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-cpu-resource/
+下面是一个示例：
+kind: Deployment metadata: name: pod-with-requests-limits spec: replicas: 1 selector: matchLabels: app: stress-ng template: metadata: labels: app: stress-ng spec: containers: - name: stress-ng image: lorel/docker-stress-ng imagePullPolicy: IfNotPresent args: [&#34;--vm&#34;, &#34;3&#34;, &#34;--vm-bytes&#34;, &#34;256M&#34;] resources: requests:	#设置容器的资源需求 cpu: 500m	#最少需要0.5个cpu，1cpu=1000m memory: 256Mi	#最少需要256MB内存 limits:	#设置容器的资源限制 cpu: 1	#最多可以使用1个cpu memory: 512Mi	#最多可以有使用512MB内存 查看Pod的资源利用率，cpu和内存的使用量是不会超过limits限制的
+如果Pod内容器的资源需求之和超过节点的可用资源，Pod是无法被调度成功的，例如将容器的内存需求修改为100G，再进行创建，Pod会调度失败：
+kubectl describe可以看到Pod调度失败
+对于压缩性资源CPU来说，若未定义容器的资源需求量，在资源紧缺的情况下，该Pod占用的CPU资源可能会被压缩至极低的水平，甚至导致Pod无法运行。对于非压缩性资源内存来说，在资源紧缺的情况下可能会导致相关业务容器被杀死。所以，对于运行关键业务的Pod，建议一定要使用requests指定资源需求，或者为Pod定义高优先级避免这种情况。
+另外，k8s仅确保Pod可以获得它请求的cpu时间额度，它能否获得额外的cpu时间额度，则取决与其它正在运行作业的cpu资源占用情况。例如对于总数1000m的cpu资源来说，容器A请求使用200m，容器b请求使用500m，在不超出它们最大限额的情况下，剩余的的300m会在双方都需要时以2:5(200m:500m)的比例进行分配。
+Pod服务质量类别 容器的limits可以大于requests，这表节点资源可以被Pod过载使用，那么在内存资源紧张时，应该以什么顺序终结哪些Pod就成为一个问题。k8s借助Pod的服务质量类别和Pod优先级完成判定。k8s根据Pod内容器的requests和limits属性将Pod分为BestEffort、Burstable和Guaranteed三个服务质量类别：
+Guaranteed：为Pod中的所有容器设置了cpu和内存的requests和limits属性，且requests和limits属性的值相等。这类Pod具有最高级别服务质量Burstable：至少为一个容器设置了cpu和内存的requests或limits属性，但不满足Guaranteed类别的要求，这类Pod具有中等级别服务质量BestEffort：没有为任何一个容器设置requests和limits属性，这类Pod具有最低的服务质量 一旦内存资源紧张，BestEffort类别的Pod首先被终止，因为系统不为其提供任何级别的资源保证，但相应的这类Pod可以尽量占用更多的资源。如果此时已经没有BestEffort类别的Pod，接下来会接着终止Burstable类别的Pod。Guaranteed类别的Pod拥有最高优先级，它们不会被杀死，除非其内存资源超过限制，或者没有更低服务质量类别的Pod。
+每个运行状态的Pod都有其OOM评分，评分越高越优先被杀死。OOM评分主要根据两个维度进行计算：从服务质量类别继承的默认分值和容器的可用内存资源比例。同等类别的Pod对象的默认分值相同，Guaranteed类别Pod的默认分值为-998，BestEffort类别Pod的默认分值为1000，Burstable类别未定义默认分值，其OOM分值会通过相应的算法计算得出。
+因此，同等级别的Pod资源，在内存资源紧缺别终止时，与自身的requests属性相比，内存占用比例最大的Pod会优先被杀死。例如：同属于Burstable类别，PodA内存使用比例为%95，PodB内存占用比例为%80，此时PodA会被终止" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/b5fff6250444487e26e0d88ec4c4ea79/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-10-07T18:13:05+08:00" />
+<meta property="article:modified_time" content="2022-10-07T18:13:05+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">k8s资源限制</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><ul><li><ul><li><a href="#_4" rel="nofollow">容器资源需求和限制</a></li><li><a href="#Pod_58" rel="nofollow">Pod服务质量类别</a></li><li><a href="#LimitRange_73" rel="nofollow">LimitRange</a></li><li><a href="#ResourceQuota_194" rel="nofollow">ResourceQuota</a></li></ul> 
+  </li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<p>在Kubernetes中可以从容器、Pod和名称空间级别来实现资源限制</p> 
+<h4><a id="_4"></a>容器资源需求和限制</h4> 
+<p>在Pod内的容器上可以对cpu和内存资源定义需求和限制，主要通过pod.spec.containers.resources.requests和pod.spec.containers.resources.limits两个字段实现：</p> 
+<ul><li>pod.spec.containers.resources.requests：用来定义容器资源需求，表明系统需要预留给该容器使用的资源的最小可用值</li><li>pod.spec.containers.resources.limits：用来定义资源限制，指定了该容器可以申请使用的资源的最大值，资源限制需要大于等于资源需求</li></ul> 
+<p>资源需求会影响Pod调度结果，如果一个节点的可用资源小于一个Pod内所有容器的资源需求的和，那么这个Pod不会被调度到这个节点上。资源限制并不影响Pod的调度结果，即一个节点上所有Pod对象资源限制数量之和可以大于节点拥有的资源量，即支持资源过载使用。不过，一旦内存资源耗尽，几乎必然的会有容器因OOMKilled而终止</p> 
+<p>配置容器的cpu和内存限制可以参考官方文档：<a href="https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-memory-resource/" rel="nofollow">https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-memory-resource/</a>和<a href="https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-cpu-resource/" rel="nofollow">https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-cpu-resource/</a></p> 
+<p>下面是一个示例：</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> pod<span class="token punctuation">-</span>with<span class="token punctuation">-</span>requests<span class="token punctuation">-</span>limits
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">1</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span> stress<span class="token punctuation">-</span>ng
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> stress<span class="token punctuation">-</span>ng
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> stress<span class="token punctuation">-</span>ng
+        <span class="token key atrule">image</span><span class="token punctuation">:</span> lorel/docker<span class="token punctuation">-</span>stress<span class="token punctuation">-</span>ng
+        <span class="token key atrule">imagePullPolicy</span><span class="token punctuation">:</span> IfNotPresent
+        <span class="token key atrule">args</span><span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token string">"--vm"</span><span class="token punctuation">,</span> <span class="token string">"3"</span><span class="token punctuation">,</span> <span class="token string">"--vm-bytes"</span><span class="token punctuation">,</span> <span class="token string">"256M"</span><span class="token punctuation">]</span>
+        <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+          <span class="token key atrule">requests</span><span class="token punctuation">:</span>		<span class="token comment">#设置容器的资源需求</span>
+            <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 500m	<span class="token comment">#最少需要0.5个cpu，1cpu=1000m</span>
+            <span class="token key atrule">memory</span><span class="token punctuation">:</span> 256Mi	<span class="token comment">#最少需要256MB内存</span>
+          <span class="token key atrule">limits</span><span class="token punctuation">:</span>	<span class="token comment">#设置容器的资源限制</span>
+            <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">1</span>	<span class="token comment">#最多可以使用1个cpu</span>
+            <span class="token key atrule">memory</span><span class="token punctuation">:</span> 512Mi	<span class="token comment">#最多可以有使用512MB内存</span>
+
+</code></pre> 
+<p>查看Pod的资源利用率，cpu和内存的使用量是不会超过limits限制的<br> <img src="https://images2.imgbox.com/ca/5a/9sn5Egtd_o.png" alt="在这里插入图片描述"><br> 如果Pod内容器的资源需求之和超过节点的可用资源，Pod是无法被调度成功的，例如将容器的内存需求修改为100G，再进行创建，Pod会调度失败：<br> <img src="https://images2.imgbox.com/7b/dc/mTZs3D9I_o.png" alt="在这里插入图片描述"><br> kubectl describe可以看到Pod调度失败<br> <img src="https://images2.imgbox.com/4a/d8/Tez8pNsZ_o.png" alt="在这里插入图片描述"></p> 
+<p>对于压缩性资源CPU来说，若未定义容器的资源需求量，在资源紧缺的情况下，该Pod占用的CPU资源可能会被压缩至极低的水平，甚至导致Pod无法运行。对于非压缩性资源内存来说，在资源紧缺的情况下可能会导致相关业务容器被杀死。所以，对于运行关键业务的Pod，建议一定要使用requests指定资源需求，或者为Pod定义高优先级避免这种情况。</p> 
+<p>另外，k8s仅确保Pod可以获得它请求的cpu时间额度，它能否获得额外的cpu时间额度，则取决与其它正在运行作业的cpu资源占用情况。例如对于总数1000m的cpu资源来说，容器A请求使用200m，容器b请求使用500m，在不超出它们最大限额的情况下，剩余的的300m会在双方都需要时以2:5(200m:500m)的比例进行分配。</p> 
+<h4><a id="Pod_58"></a>Pod服务质量类别</h4> 
+<p>容器的limits可以大于requests，这表节点资源可以被Pod过载使用，那么在内存资源紧张时，应该以什么顺序终结哪些Pod就成为一个问题。k8s借助Pod的服务质量类别和Pod优先级完成判定。k8s根据Pod内容器的requests和limits属性将Pod分为BestEffort、Burstable和Guaranteed三个服务质量类别：</p> 
+<ul><li>Guaranteed：为Pod中的所有容器设置了cpu和内存的requests和limits属性，且requests和limits属性的值相等。这类Pod具有最高级别服务质量</li><li>Burstable：至少为一个容器设置了cpu和内存的requests或limits属性，但不满足Guaranteed类别的要求，这类Pod具有中等级别服务质量</li><li>BestEffort：没有为任何一个容器设置requests和limits属性，这类Pod具有最低的服务质量</li></ul> 
+<p>一旦内存资源紧张，BestEffort类别的Pod首先被终止，因为系统不为其提供任何级别的资源保证，但相应的这类Pod可以尽量占用更多的资源。如果此时已经没有BestEffort类别的Pod，接下来会接着终止Burstable类别的Pod。Guaranteed类别的Pod拥有最高优先级，它们不会被杀死，除非其内存资源超过限制，或者没有更低服务质量类别的Pod。</p> 
+<p>每个运行状态的Pod都有其OOM评分，评分越高越优先被杀死。OOM评分主要根据两个维度进行计算：从服务质量类别继承的默认分值和容器的可用内存资源比例。同等类别的Pod对象的默认分值相同，Guaranteed类别Pod的默认分值为-998，BestEffort类别Pod的默认分值为1000，Burstable类别未定义默认分值，其OOM分值会通过相应的算法计算得出。</p> 
+<p>因此，同等级别的Pod资源，在内存资源紧缺别终止时，与自身的requests属性相比，内存占用比例最大的Pod会优先被杀死。例如：同属于Burstable类别，PodA内存使用比例为%95，PodB内存占用比例为%80，此时PodA会被终止</p> 
+<h4><a id="LimitRange_73"></a>LimitRange</h4> 
+<p>LimitRange官方文档：<a href="https://kubernetes.io/zh-cn/docs/concepts/policy/limit-range/" rel="nofollow">https://kubernetes.io/zh-cn/docs/concepts/policy/limit-range/</a></p> 
+<p>虽然可以在Pod内的容器上定义cpu和内存的需求和限制，但这不是强制性要求，那些未定义明确需求的Pod有可能会占用节点上的所有资源。这个时候可以使用LimitRange资源在名称空间中限制每个容器的最小和最大资源用量，以及为那些没有设置资源需求和资源限制属性的容器设置默认的资源需求和限制。</p> 
+<p>LimitRange支持在Pod级别和容器级别分别设置cpu和内存的可用范围。一旦在名称空间上启用了LimitRange，该名称空间中Pod或容器的requests和limits属性值必须在LimitRange定义的可用的范围之内，否则请求会被拒绝。而未显式指定requests和limits属性的容器，将会从LimitRange资源上自动继承相应的默认设置。这都是LimitRange准入控制器的功能。</p> 
+<p>另外，LimitRange也支持对PVC的存储空间进行限制，它用于限制创建PVC时请求的存储空间不能超过指定范围。同样的，未指定requests和limits属性值的PVC也会从LimitRange继承默认值</p> 
+<p>需要注意，LimitRange是名称空间级别资源，需要在每个名称空间都定义；定义的限制仅对LimitRange创建后的Pod和PVC创建请求生效，对之前已存在的资源无效。</p> 
+<p>下面是一个示例：</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> LimitRange
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>demo
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> default	<span class="token comment">#针对default名称空间生效</span>
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">limits</span><span class="token punctuation">:</span>	<span class="token comment">#定义限制</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">type</span><span class="token punctuation">:</span> Container		<span class="token comment">#针对容器的限制</span>
+    <span class="token key atrule">min</span><span class="token punctuation">:</span>	<span class="token comment">#单个容器最小可用的资源，容器的requests属性值要&gt;=这里的设置</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 100m		<span class="token comment">#cpu最少申请100m</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 128Mi	<span class="token comment">#内存最少申请128Mi</span>
+    <span class="token key atrule">max</span><span class="token punctuation">:</span>	<span class="token comment">#单个容器最大可用的资源，容器的limits属性值要&lt;=这里的设置</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">2</span>	<span class="token comment">#cpu最多使用2核</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 2Gi	<span class="token comment">#内存最多使用2G</span>
+    <span class="token key atrule">default</span><span class="token punctuation">:</span>	<span class="token comment">#容器limits属性的默认值设置，在容器未设置limits属性时生效</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 500m		<span class="token comment">#默认单容器cpu限制使用500m</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 512Mi		<span class="token comment">#默认单容器内存限制使用512Mi</span>
+    <span class="token key atrule">defaultRequest</span><span class="token punctuation">:</span>		<span class="token comment">#容器requests属性的默认值设置，在容器未设置requests属性时生效</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 200m		<span class="token comment">#默认单容器cpu申请200m</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 256Mi		<span class="token comment">#默认单容器内存申请256Mi</span>
+    <span class="token key atrule">maxLimitRequestRatio</span><span class="token punctuation">:</span>	<span class="token comment">#容器limits和requests属性的最大比值</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">4</span>	<span class="token comment">#limits.cpu/requests.cpu不能超过4倍</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> <span class="token number">4</span>		<span class="token comment">#limits.memory/requests.memory不能超过4倍</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">type</span><span class="token punctuation">:</span> Pod		<span class="token comment">#针对Pod的限制，</span>
+    <span class="token key atrule">max</span><span class="token punctuation">:</span>		<span class="token comment">#单Pod内所有容器最大可用资源限制</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">4</span>		<span class="token comment">#单Pod内所有容器最多可用4个cpu</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 4Gi	<span class="token comment">#Pod内所有容器最多可用4G</span>
+    <span class="token key atrule">min</span><span class="token punctuation">:</span>		<span class="token comment">#单Pod内所有容器最小可用资源限制</span>
+      <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 200m		<span class="token comment">#单Pod内所有容器最少需要申请200m cpu</span>
+      <span class="token key atrule">memory</span><span class="token punctuation">:</span> 256Mi		<span class="token comment">#单Pod内所有容器最少需要申请256Mi内存</span>
+  <span class="token punctuation">-</span> <span class="token key atrule">type</span><span class="token punctuation">:</span> PersistentVolumeClaim		<span class="token comment">#针对PVC资源存储空间的限制</span>
+    <span class="token key atrule">min</span><span class="token punctuation">:</span>	
+      <span class="token key atrule">storage</span><span class="token punctuation">:</span> 1Gi		<span class="token comment">#单个PVC最少申请1Gi空间</span>
+    <span class="token key atrule">max</span><span class="token punctuation">:</span>
+      <span class="token key atrule">storage</span><span class="token punctuation">:</span> 10Gi		<span class="token comment">#单个PVC最多申请10Gi空间</span>
+    <span class="token key atrule">default</span><span class="token punctuation">:</span>	<span class="token comment">#PVC的默认limits属性值，PVC未设置limits属性时生效</span>
+      <span class="token key atrule">storage</span><span class="token punctuation">:</span> 5Gi
+    <span class="token key atrule">defaultRequest</span><span class="token punctuation">:</span>		<span class="token comment">#PVC的默认requests属性值，PVC未设置requests属性时生效</span>
+      <span class="token key atrule">storage</span><span class="token punctuation">:</span> 2Gi
+    <span class="token key atrule">maxLimitRequestRatio</span><span class="token punctuation">:</span>	<span class="token comment">#PVC资源的limits属性和requests属性的最大比值</span>
+      <span class="token key atrule">storage</span><span class="token punctuation">:</span> <span class="token number">5</span>		<span class="token comment">#PVC子资源limits.storage/requests.storage最多为5倍</span>
+</code></pre> 
+<p>注意：Pod级别不支持设置默认值，一般情况下只设置最大限制，不设置最小限制，这里只是一个示例。</p> 
+<p>查看LimitRange资源：<br> <img src="https://images2.imgbox.com/56/b5/pZbdzuBq_o.png" alt="在这里插入图片描述"></p> 
+<p>创建不符合limitrange-demo限制的Pod，看是否可以创建成功，验证LimitRange资源的限制是否生效。部署文件如下，其中容器的limits.cpu/requests.cpu超过4倍，不符合LimitRange的要求。</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">2</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">image</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">imagePullPolicy</span><span class="token punctuation">:</span> IfNotPresent
+        <span class="token key atrule">resources</span><span class="token punctuation">:</span>		
+          <span class="token key atrule">requests</span><span class="token punctuation">:</span>		
+            <span class="token key atrule">cpu</span><span class="token punctuation">:</span> 200m
+            <span class="token key atrule">memory</span><span class="token punctuation">:</span> 256Mi
+          <span class="token key atrule">limits</span><span class="token punctuation">:</span>
+            <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">1</span>
+            <span class="token key atrule">memory</span><span class="token punctuation">:</span> 512Mi
+</code></pre> 
+<p>创建之后，查询没有Pod被创建出来，如下图：<br> <img src="https://images2.imgbox.com/80/22/ewgHW79k_o.png" alt="在这里插入图片描述"><br> 然后通过kubectl get deploy/limitrange-test-deploy -o yaml的输出可以看到Pod违反了资源限制，所以创建失败<br> <img src="https://images2.imgbox.com/1f/cf/xWabPW00_o.png" alt="在这里插入图片描述"></p> 
+<p>再创建一些未设置资源需求和限制的容器，验证LimitRange资源是否会为容器设置默认的资源需求和限制。部署文件如下：</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy1
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">2</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy1
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> limitrange<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy1
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">image</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">imagePullPolicy</span><span class="token punctuation">:</span> IfNotPresent
+</code></pre> 
+<p>创建之后，通过kubectl describe的输出可以看到容器被添加了limits和requests属性值，和LimitRange资源设定的默认值一致。<br> <img src="https://images2.imgbox.com/96/ca/j9SUx3S1_o.png" alt="在这里插入图片描述"></p> 
+<h4><a id="ResourceQuota_194"></a>ResourceQuota</h4> 
+<p>ResourceQuota官方文档：<a href="https://kubernetes.io/zh-cn/docs/concepts/policy/resource-quotas/" rel="nofollow">https://kubernetes.io/zh-cn/docs/concepts/policy/resource-quotas/</a><br> ResourceQuota资源能够在名称空间级别定义资源的配额，它支持以资源类型来限制可在名称空间中创建的相关资源对象的数量，以及这些资源对象消耗的计算资源总量。ResourceQuota的功能由同名的ResourceQuota准入控制器实现。</p> 
+<p>ResourceQuota支持针对计算资源配额、存储资源配额和资源对象数量配额。</p> 
+<p><strong>计算资源配额</strong>，ResourceQuota可以限制名称空间中所有非终止状态的所有Pod对象的计算资源需求和计算资源限制的总量。可以使用下面这些字段进行定义：</p> 
+<ul><li>limits.cpu：CPU 资源的限制总量不能超过该值。</li><li>limits.memory：内存资源的限制总量不能超过该值。</li><li>requests.cpu或cpu：CPU资源请求总量不能超过该值。</li><li>requests.memory或memory： 内存请求总量不能超过该值。</li><li>hugepages-&lt;size&gt; 指定页面大小的大页内存请求总数不能超过此值</li></ul> 
+<p>另外也可以对扩展资源进行限制，比如GPU，对于扩展资源而言，目前仅允许使用前缀为 requests. 的配额项：</p> 
+<ul><li>requests.nvidia.com/gpu：设置可以请求使用的GPU数量</li></ul> 
+<p><strong>存储资源配额</strong>，ResourceQuota资源支持为名称空间中的所有PVC资源设置存储空间需求和存储空间限制的总量，它支持从名称空间中的全部PVC、隶属与特定存储类的PVC和基于临时存储的PVC进行限制。可以使用下面这些字段进行定义：</p> 
+<ul><li>requests.storage：所有PVC请求存储空间的总量</li><li>persistentvolumeclaims：可以创建的PVC数量限制</li><li>&lt;storage-class-name&gt;.storageclass.storage.k8s.io/requests.storage：隶属于指定存储类的所有PVC请求存储空间的总量</li><li>&lt;storage-class-name&gt;.storageclass.storage.k8s.io/persistentvolumeclaims：可以创建的隶属于指定存储类的PVC的数量限制</li></ul> 
+<p><strong>对象数量配额</strong>，ResourceQuota支持对名称空间中可创建的资源对象的数量进行限制，通过以下字段实现</p> 
+<ul><li>count/&lt;resource&gt;.&lt;group&gt;：用于非核心API群组的资源，例如deployments、jobs、cronjobs等</li><li>count/&lt;resource&gt;：用于核心组的资源，例如pods、services、persistentvolumes等</li></ul> 
+<p>一些资源可以省略前面的count前缀，如下所示：<br> <img src="https://images2.imgbox.com/57/78/iqzX4Clh_o.png" alt="在这里插入图片描述"></p> 
+<p>下面是一个示例：</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> ResourceQuota
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> resource<span class="token punctuation">-</span>quota<span class="token punctuation">-</span>demo
+  <span class="token key atrule">namespace</span><span class="token punctuation">:</span> default
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">hard</span><span class="token punctuation">:</span>
+    <span class="token key atrule">requests.cpu</span><span class="token punctuation">:</span> <span class="token number">2</span>
+    <span class="token key atrule">requests.memory</span><span class="token punctuation">:</span> 4Gi
+    <span class="token key atrule">limits.cpu</span><span class="token punctuation">:</span> <span class="token number">4</span>
+    <span class="token key atrule">limits.memory</span><span class="token punctuation">:</span> 8Gi
+    <span class="token key atrule">persistentvolumeclaims</span><span class="token punctuation">:</span> <span class="token number">10</span>
+    <span class="token key atrule">requests.storage</span><span class="token punctuation">:</span> 100Gi
+    <span class="token key atrule">managed-nfs-storage.storageclass.storage.k8s.io/persistentvolumeclaims</span><span class="token punctuation">:</span> <span class="token number">5</span>	<span class="token comment">#限制在managed-nfs-storage这个存储类上最多创建5个pvc</span>
+    <span class="token key atrule">managed-nfs-storage.storageclass.storage.k8s.io/requests.storage</span><span class="token punctuation">:</span> 30Gi
+    <span class="token key atrule">pods</span><span class="token punctuation">:</span> <span class="token number">5</span>
+    <span class="token key atrule">services</span><span class="token punctuation">:</span> <span class="token number">5</span>
+    <span class="token key atrule">count/deployments.apps</span><span class="token punctuation">:</span> <span class="token number">3</span>
+    <span class="token key atrule">count/statefulsets.apps</span><span class="token punctuation">:</span> <span class="token number">3</span>
+    <span class="token key atrule">count/roles.rbac.authorization.k8s.io</span><span class="token punctuation">:</span> <span class="token number">10</span>
+</code></pre> 
+<p>创建后，查看ResourceQuota资源详情：<br> <img src="https://images2.imgbox.com/a4/e8/Vb1kuPJA_o.png" alt="在这里插入图片描述"></p> 
+<p>创建一个具有6副本的deployment，验证ResourceQuotai资源对象对于pod数量配额是否生效：</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> resourcequota<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">6</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span>  resourcequota<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> resourcequota<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">image</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">imagePullPolicy</span><span class="token punctuation">:</span> IfNotPresent
+</code></pre> 
+<p>创建之后查看只创建了5个Pod，deployment的当前副本数为5<br> <img src="https://images2.imgbox.com/44/3d/uLYHjV9y_o.png" alt="在这里插入图片描述"><br> 然后通过kubecetl get deploy/resourcequota-test-deploy -o yaml命令查看status字段，提示Pod数量超出限制，请求被拒绝<br> <img src="https://images2.imgbox.com/11/83/vapqpdgO_o.png" alt="在这里插入图片描述"></p> 
+<p>再创建两个Pod，它们的requests.cpu之和超过2，验证ResourceQuota资源对象对于cpu和内存的配额是否生效</p> 
+<pre><code class="prism language-yaml"><span class="token key atrule">apiVersion</span><span class="token punctuation">:</span> apps/v1
+<span class="token key atrule">kind</span><span class="token punctuation">:</span> Deployment
+<span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+  <span class="token key atrule">name</span><span class="token punctuation">:</span> resourcequota<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy1
+<span class="token key atrule">spec</span><span class="token punctuation">:</span>
+  <span class="token key atrule">replicas</span><span class="token punctuation">:</span> <span class="token number">2</span>
+  <span class="token key atrule">selector</span><span class="token punctuation">:</span>
+    <span class="token key atrule">matchLabels</span><span class="token punctuation">:</span>
+      <span class="token key atrule">app</span><span class="token punctuation">:</span>  resourcequota<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy1
+  <span class="token key atrule">template</span><span class="token punctuation">:</span>
+    <span class="token key atrule">metadata</span><span class="token punctuation">:</span>
+      <span class="token key atrule">labels</span><span class="token punctuation">:</span>
+        <span class="token key atrule">app</span><span class="token punctuation">:</span> resourcequota<span class="token punctuation">-</span>test<span class="token punctuation">-</span>deploy1
+    <span class="token key atrule">spec</span><span class="token punctuation">:</span>
+      <span class="token key atrule">containers</span><span class="token punctuation">:</span>
+      <span class="token punctuation">-</span> <span class="token key atrule">name</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">image</span><span class="token punctuation">:</span> nginx
+        <span class="token key atrule">imagePullPolicy</span><span class="token punctuation">:</span> IfNotPresent
+        <span class="token key atrule">resources</span><span class="token punctuation">:</span>
+          <span class="token key atrule">requests</span><span class="token punctuation">:</span>
+            <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">1.5</span>
+            <span class="token key atrule">memory</span><span class="token punctuation">:</span> 1Gi
+          <span class="token key atrule">limits</span><span class="token punctuation">:</span>
+            <span class="token key atrule">cpu</span><span class="token punctuation">:</span> <span class="token number">1.5</span>
+            <span class="token key atrule">memory</span><span class="token punctuation">:</span> 1Gi
+</code></pre> 
+<p>创建之后查看只创建了一个Pod，另一个Pod未创建<br> <img src="https://images2.imgbox.com/88/f0/8iqtZqjz_o.png" alt="在这里插入图片描述"><br> 同样查看deployment的status字段，可以看到requests.cpu超出配额，所以另一个Pod创建失败<br> <img src="https://images2.imgbox.com/ac/78/KgvYwzoh_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>最后需要注意</strong>，和LimitRange不同，ResourceQuota资源对象创建之前已存在的资源对象也会在被ResourceQuota资源对象计入配额统计范围，即之前已存在的资源对象也会占用配额。</p> 
+<p>关于ResourceQutoa的更多使用方式，比如配额作用域、基于优先级设置配额等可以参考官方文档：<a href="https://kubernetes.io/zh-cn/docs/concepts/policy/resource-quotas/" rel="nofollow">https://kubernetes.io/zh-cn/docs/concepts/policy/resource-quotas/</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/07e2ee25dddaa6121285427138f5f1da/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Vue字典配置_全局字典数据获取、快速转义</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/a7dd293520616f133b5ae76b5018081a/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Ubuntu开机默认进入命令行模式/用户图形界面</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

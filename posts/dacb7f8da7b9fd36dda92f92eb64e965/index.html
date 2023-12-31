@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>以写Hbase表的方式更新Phoenix索引 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="以写Hbase表的方式更新Phoenix索引" />
+<meta property="og:description" content="第一步 查询出Phoenix表所有的索引以及索引对应的字段。
+Phoenix元数据表：system.catalog
+Phoenix在执行查询语句：
+select TABLE_NAME as INDEX_NAME,COLUMN_NAME
+from system.catalog
+where DATA_TABLE_NAME=&#39;${hbaseTable}&#39;
+and INDEX_TYPE is null and COLUMN_NAME!=&#39;:ROW&#39;
+order by TABLE_NAME,ORDINAL_POSITION
+此处：hbaseTable与Phoenix表名一致，是相互对应的。
+将查询结果进行处理，得到如下数据，以index_name为key，以index字段为value：
+indexFeildMap =
+Map(AC_INDEX01 -&gt; List(sale_id, dt),
+AC_INDEX02 -&gt; List(object_id, dt),
+AC_INDEX05 -&gt; List(loan_id, dt))
+第二步 查询出hive源表中，所有的索引字段、rowkey字段，组成DataFrame临时表，此临时表提供给查询生成每个索引对应的hbase表。
+所有索引字段和rowkey的查询语句如下：
+Select md5(concat(type,loan_id,item_id,date)) as md5Id
+,sale_id
+,loan_id
+,&#39;20220801&#39; as dt
+,object_id
+from temp.acc_20220801
+第三步 遍历如下indexFeildMap，将md5Id（即rowkey，还可以做加盐处理）与各个索引字段，结合在一起，即为“索引对应的hbase表”的rowkey，插入进去，则Phoenix索引更新完毕。
+注意：注意：注意：源hbase表的rowkey与索引字段，结合时，不能直接用&#34;\\x00”字符串。
+经观察，索引的主键是原表的字段组合而成的，索引表会把所有索引字段&#43;rowkey拼接起来写进Hbase ,做索引的主键为索引表的RowKey。并且组合的时候还要加上\x00这样的字符串。
+经观察，索引hbase表，只有rowkey、0:_0两个有效字段，且字段0:_0,值为“x”。
+但是直接使用&#34;\\x00”字符串，生产新rowkey时，会出错。
+如上图，直接以拼接字符串的形式往里插就可以，但是发现hbase会对\做二进制转译，‘\’会被转译为\x5c。
+如上问题怎么解决了？
+解决的方案就是：
+在插入数据的时候直接以byte[] 的形式往hbase表插。
+本例中，先用var rowkeyBtBf: Array[Byte]封装索引的主键，再转成string类型，便于DataFrame临时表做查询。
+例如：
+AC_INDEX01索引对应的子查询single_sql ==== :" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/dacb7f8da7b9fd36dda92f92eb64e965/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-09-07T14:28:34+08:00" />
+<meta property="article:modified_time" content="2022-09-07T14:28:34+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">以写Hbase表的方式更新Phoenix索引</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h3 style="margin-left:0;text-align:justify;">第一步</h3> 
+<p style="margin-left:.0001pt;text-align:justify;">查询出Phoenix表所有的索引以及索引对应的字段。</p> 
+<p style="margin-left:.0001pt;text-align:justify;">Phoenix元数据表：system.catalog</p> 
+<p style="margin-left:.0001pt;text-align:justify;">Phoenix在执行查询语句：</p> 
+<p style="margin-left:.0001pt;text-align:justify;">select TABLE_NAME as INDEX_NAME,COLUMN_NAME</p> 
+<p style="margin-left:.0001pt;text-align:justify;"> from system.catalog</p> 
+<p style="margin-left:.0001pt;text-align:justify;"> where DATA_TABLE_NAME='${hbaseTable}'</p> 
+<p style="margin-left:.0001pt;text-align:justify;"> and INDEX_TYPE is null and COLUMN_NAME!=':ROW'</p> 
+<p style="margin-left:.0001pt;text-align:justify;"> order by TABLE_NAME,ORDINAL_POSITION</p> 
+<p style="margin-left:.0001pt;text-align:justify;">此处：hbaseTable与Phoenix表名一致，是相互对应的。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">将查询结果进行处理，得到如下数据，以index_name为key，以index字段为value：</p> 
+<p style="margin-left:.0001pt;text-align:justify;">indexFeildMap =</p> 
+<p style="margin-left:.0001pt;text-align:justify;">Map(AC_INDEX01 -&gt; List(sale_id, dt),</p> 
+<p style="margin-left:.0001pt;text-align:justify;">AC_INDEX02 -&gt; List(object_id, dt),</p> 
+<p style="margin-left:.0001pt;text-align:justify;">AC_INDEX05 -&gt; List(loan_id, dt))</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<h3 style="margin-left:0;text-align:justify;">第二步</h3> 
+<p style="margin-left:.0001pt;text-align:justify;">查询出hive源表中，所有的索引字段、rowkey字段，组成DataFrame临时表，此临时表提供给查询生成每个索引对应的hbase表。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">所有索引字段和rowkey的查询语句如下：</p> 
+<p style="margin-left:.0001pt;text-align:justify;">Select md5(concat(type,loan_id,item_id,date)) as md5Id</p> 
+<p style="margin-left:.0001pt;text-align:justify;">,sale_id</p> 
+<p style="margin-left:.0001pt;text-align:justify;">,loan_id</p> 
+<p style="margin-left:.0001pt;text-align:justify;">,'20220801' as dt</p> 
+<p style="margin-left:.0001pt;text-align:justify;">,object_id</p> 
+<p style="margin-left:.0001pt;text-align:justify;">  from temp.acc_20220801</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<h3 style="margin-left:0;text-align:justify;">第三步</h3> 
+<p style="margin-left:.0001pt;text-align:justify;">遍历如下indexFeildMap，将md5Id（即rowkey，还可以做加盐处理）与各个索引字段，结合在一起，即为“索引对应的hbase表”的rowkey，插入进去，则Phoenix索引更新完毕。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><span style="background-color:#ffff00;">注意：注意：注意</span></strong>：源hbase表的rowkey与索引字段，结合时，不能直接用"\\x00”字符串。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"><img alt="" height="270" src="https://images2.imgbox.com/df/6d/dPhGayTj_o.png" width="865"></p> 
+<p>经观察，索引的主键是原表的字段组合而成的，索引表会把所有索引字段+rowkey拼接起来写进Hbase ,做索引的主键为索引表的RowKey。并且组合的时候还要加上\x00这样的字符串。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">经观察，索引hbase表，只有rowkey、0:_0两个有效字段，且字段0:_0,值为“x”。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">但是直接使用"\\x00”字符串，生产新rowkey时，会出错。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"><img alt="" height="190" src="https://images2.imgbox.com/05/6f/XdEzUYX4_o.png" width="865"></p> 
+<p>如上图，直接以拼接字符串的形式往里插就可以，但是发现hbase会对\做二进制转译，‘\’会被转译为\x5c。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">如上问题怎么解决了？</p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong>解决的方案就是：</strong></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong>    </strong><strong>在插入数据的时候直接以byte[] 的形式往hbase表插。</strong></p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">本例中，先用var rowkeyBtBf: Array[Byte]封装索引的主键，再转成string类型，便于DataFrame临时表做查询。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">例如：</p> 
+<p style="margin-left:.0001pt;text-align:justify;">AC_INDEX01索引对应的子查询single_sql ==== :</p> 
+<p style="margin-left:.0001pt;text-align:justify;">select md5Id,sale_id,dt</p> 
+<p style="margin-left:.0001pt;text-align:justify;">from cache_all_index_field</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><span style="background-color:#ffff00;">本例用scala代码</span></strong></p> 
+<p style="margin-left:.0001pt;text-align:justify;">val <strong>single_df</strong> = spark.sql(single_sql)</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">伪码indexFieldList = List(sale_order_id, dt)</p> 
+<pre><code class="language-Scala">//df转rdd
+val singleIndexFieldList = List("md5Id") ++ indexFieldList
+
+val single_index_field_rdd: RDD[Map[String, String]] = single_df.map(row =&gt; {
+
+    val fields_map = row.getValuesMap[String](singleIndexFieldList)
+
+    fields_map
+
+}).rdd</code></pre> 
+<p style="margin-left:.0001pt;text-align:justify;">因索引字段，是灵活变动的，组成map，再用字段名称去取值。当前map中有md5Id,sale_order_id,dt字段对应的值。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">本例：</p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong>索引表主键 = sale_order_id +“\\x00” +dt +“\\x00”+加盐操作（md5Id）</strong></p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><span style="background-color:#ffff00;">注意：注意：注意：字段顺序很重要</span></strong>，索引字段在前（多个索引字段也有顺序，顺序从Phoenix system.catalog表ORDINAL_POSITION字段可以查看到），源hbase表rowkey在后。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">转换符</p> 
+<p style="margin-left:.0001pt;text-align:justify;">val transformChar: Byte = 0.toByte</p> 
+<p style="margin-left:.0001pt;text-align:justify;">val transfromChars: Array[Byte] = Array[Byte](transformChar)</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">ArrayUtils类</p> 
+<p style="margin-left:.0001pt;text-align:justify;">import org.apache.commons.lang.ArrayUtils</p> 
+<pre><code class="language-Scala">val single_index_rdd: RDD[Row] = single_index_field_rdd.map(single_map =&gt; {
+
+//生成一个空的Array[Byte]，用来装rowkey
+var rowkeyBtBf: Array[Byte] = Array.empty[Byte]
+for (f &lt;- indexFieldList) {
+    rowkeyBtBf = ArrayUtils.addAll(rowkeyBtBf, single_map.getOrElse(f, "").getBytes()) //索引字段的内容
+    rowkeyBtBf = ArrayUtils.addAll(rowkeyBtBf, transfromChars) //加字段隔间转换符
+}
+
+val idStr = single_map("md5Id")
+val rowkey = getRowkey(idStr, hbaseTable, saltNum) //rowkey加盐处理
+rowkeyBtBf = ArrayUtils.addAll(rowkeyBtBf, rowkey.getBytes()) //最后一个不需要再加转换符
+
+rowkeyBtBf
+
+}).map(newrowkey =&gt; Row(new String(newrowkey), "x"))
+//rdd再转df，Row对象包含两个字段，一个 索引字段+\x00+hbase_rowkey，另一个字段的值为x
+
+//单个索引对应的df
+val indexNameDF: DataFrame = spark.createDataFrame(single_index_rdd, getSchema()) //当前schema只有hbaseRowkey _0两个字段
+
+indexNameDF.createOrReplaceTempView(s"cache_${indexName}")</code></pre> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">val getSql =</p> 
+<p style="margin-left:.0001pt;text-align:justify;">    s"""</p> 
+<p style="margin-left:.0001pt;text-align:justify;">       |select hbaseRowkey ,_0</p> 
+<p style="margin-left:.0001pt;text-align:justify;">       |  from cache_${indexName}</p> 
+<p style="margin-left:.0001pt;text-align:justify;">       |""".stripMargin</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong>val IndexFamilyByte: Array[Byte] = "0".getBytes() //列族</strong></p> 
+<p style="margin-left:.0001pt;text-align:justify;">再加上“0”列族，即可保存到hbase索引表中。</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">完成</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;">方法2，见如下blog</p> 
+<p style="margin-left:.0001pt;text-align:justify;">https://blog.csdn.net/qq_35207086/article/details/121141086</p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/89e7d41cc7d03fa0af3e88887dbec734/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">[025量化交易] python跌了就买涨了就卖策略</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/cd3cdce05846e936ea1cd8995bb2200b/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">【Tools】i1Profiler3.5安装教程详解</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>linux uevent 机制中的udev 和mdev - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="linux uevent 机制中的udev 和mdev" />
+<meta property="og:description" content="一、Uevent机制 1.前提摘要
+（1）Sysfs文件系统 内核设备模型主要的模块和用户之间能看到的相关部分就是sysfs文件系统了。内核在启动的时候会注册sysfs文件系统，并且在启动系统的初期。通过mount命令挂载sysfs文件系统到/sys挂载点。
+Mount -t sysfs sysfs /sys
+那么sysfs文件系统的作用是什么呢。概括的说有三点：
+1）、建立系统中总线、驱动、设备三者之间的桥梁
+2）、像用户空间展示内核中各种设备的拓扑图
+3）、提供给用户空间对设备获取信息和操作的接口，部分取代ioctl功能。
+2）Kobject：Sysfs文件系统中最基本的结构就是kobject，kobject可以代表一个设备，一条总线等。在sys目录下直观的以一个目录表示出来。
+（3）Uevent机制
+上面的分析其实只是对Linux设备模型做了一些基础性的了解。也就是一个穿针引线的作用，如果要细致了解，需要仔细阅读代码。有了上面对于sysfs的基础。接下来我们来比较详细的了解一下uevent机制。
+什么是uevent机制。这个得从热插拔设备开始说起。最简单的一个例子就是U盘了。当我们在计算机上插上一个U盘的时候，系统的USB hub会检测到U盘设备接入，并且完成设备枚举过程(从设备上读出相应的设备信息)，并在内核中创建相应的设备结构体。但是，usb设备千奇百态，内核不可能预先将所有usb设备驱动都增加到内存中来。也就是当插入U盘设备的时候，内核中不一定存在对应这个设备的usb驱动。这个时候USB驱动也许以模块的形式保存在硬盘上。载入驱动必然只能从用户态来进行，那这时候应该怎么办呢？
+看到这里的时候，有人一定会想，人工敲入命令载入驱动，呵呵。这必然是一种方法，但是是一种很古老的方法。Linux对类似的情况设计了一种uevent的机制。当有新的设备加入的时候，将设备的信息发送消息到用户态。而用户态有一个udev的进程监听这个信息。当收到信息后做一定的解析，根据解析到的结果和用户程序的配置做一些处理，也包括加载驱动程序。
+2.具体介绍（Linux设备模型(3)_Uevent）
+Uevent是Kobject的一部分，用于在Kobject状态发生改变时，例如增加、移除等，通知用户空间程序。
+用户空间程序收到这样的事件后，会做相应的处理。
+该机制通常是用来支持热拔插设备的，例如U盘插入后，USB相关的驱动软件会动态创建用于表示该U盘的device结构（相应的也包括其中的kobject），并告知用户空间程序，为该U盘动态的创建/dev/目录下的设备节点，
+更进一步，可以通知其它的应用程序，将该U盘设备mount到系统中，从而动态的支持该设备。
+Uevent在kernel中的位置
+由此可知，Uevent的机制是比较简单的，设备模型中任何设备有事件需要上报时，会触发Uevent提供的接口。Uevent模块准备好上报事件的格式后。
+可以通过两个途径把事件上报到用户空间：一种是通过kmod模块，直接调用用户空间的可执行文件；
+另一种是通过netlink通信机制，将事件从内核空间传递给用户空间。
+注1：有关kmod和netlink，会在其它文章中描述，因此本文就不再详细说明了。
+Uevent的内部逻辑解析
+Uevent的代码比较简单，主要涉及kobject.h和kobject_uevent.c两个文件，如下：
+include/linux/kobject.hlib/kobject_uevent.c 前面有提到过，在利用Kmod向用户空间上报event事件时，会直接执行用户空间的可执行文件。而在Linux系统，可执行文件的执行，依赖于环境变量，因此kobj_uevent_env用于组织此次事件上报时的环境变量。
+说明：怎么指定处理uevent的用户空间程序(简称uevent helper)？
+上面介绍kobject_uevent_env的内部动作时，有提到，Uevent模块通过Kmod上报Uevent时，会通过call_usermodehelper函数，调用用户空间的可执行文件（或者脚本，简称uevent helper ）处理该event。而该uevent helper的路径保存在uevent_helper数组中。
+可以在编译内核时，通过CONFIG_UEVENT_HELPER_PATH配置项，静态指定uevent helper。但这种方式会为每个event fork一个进程，随着内核支持的设备数量的增多，这种方式在系统启动时将会是致命的（可以导致内存溢出等）。因此只有在早期的内核版本中会使用这种方式，现在内核不再推荐使用该方式。因此内核编译时，需要把该配置项留空。
+在系统启动后，大部分的设备已经ready，可以根据需要，重新指定一个uevent helper，以便检测系统运行过程中的热拔插事件。这可以通过把helper的路径写入到&#34;/sys/kernel/uevent_helper”文件中实现。实际上，内核通过sysfs文件系统的形式，将uevent_helper数组开放到用户空间，供用户空间程序修改访问，具体可参考&#34;./kernel/ksysfs.c”中相应的代码，这里不再详细描述。
+3.实例分析（Uevent 上报event事件给上层的详细讲解_sunweizhong1024的专栏-CSDN博客_add_uevent_var）headphone_event 上报事件的分析
+本文章讲解插入headphone的时候，向上层上报event函数的整个过程
+#ifdef CONFIG_I_LOVE_PBJ30
+void headphone_event(int state)
+{
+switch_set_state(&amp;wired_switch_dev, state);
+}
+EXPORT_SYMBOL_GPL(headphone_event);
+#endif
+headphone_event 函数会调用switch_set_state函数进行上报事件
+接下来会调用kobject_uevent_env函数进行上报事件。
+最终调用add_uevent_var（）将用户空间需要的参数添加到环境变量中去，如
+retval = add_uevent_var(env,&#34;ACTION=%s&#34;, action_string);
+if (retval)" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/be9e56205cee6bc31a123e5b2ecc144a/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-01-04T22:41:23+08:00" />
+<meta property="article:modified_time" content="2022-01-04T22:41:23+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">linux uevent 机制中的udev 和mdev</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>一、Uevent机制</h2> 
+<p>1.前提摘要</p> 
+<p>（1）Sysfs文件系统 </p> 
+<p>        内核设备模型主要的模块和用户之间能看到的相关部分就是sysfs文件系统了。内核在启动的时候会注册sysfs文件系统，并且在启动系统的初期。通过mount命令挂载sysfs文件系统到/sys挂载点。</p> 
+<p>       Mount -t sysfs sysfs /sys</p> 
+<p></p> 
+<p>           那么sysfs文件系统的作用是什么呢。概括的说有三点：</p> 
+<p>                    1）、建立系统中总线、驱动、设备三者之间的桥梁</p> 
+<p>                    2）、像用户空间展示内核中各种设备的拓扑图</p> 
+<p>                    3）、提供给用户空间对设备获取信息和操作的接口，部分取代ioctl功能。</p> 
+<p></p> 
+<p>2）Kobject：Sysfs文件系统中最基本的结构就是kobject，kobject可以代表一个设备，一条总线等。在sys目录下直观的以一个目录表示出来。</p> 
+<p></p> 
+<p>（3）Uevent机制</p> 
+<p>     上面的分析其实只是对<a href="http://lib.csdn.net/base/linux" rel="nofollow" title="Linux">Linux</a>设备模型做了一些基础性的了解。也就是一个穿针引线的作用，如果要细致了解，需要仔细阅读代码。有了上面对于sysfs的基础。接下来我们来比较详细的了解一下uevent机制。</p> 
+<p>         什么是uevent机制。这个得从热插拔设备开始说起。最简单的一个例子就是U盘了。当我们在计算机上插上一个U盘的时候，系统的USB hub会检测到U盘设备接入，并且完成设备枚举过程(从设备上读出相应的设备信息)，并在内核中创建相应的设备结构体。但是，usb设备千奇百态，内核不可能预先将所有usb设备驱动都增加到内存中来。也就是当插入U盘设备的时候，内核中不一定存在对应这个设备的usb驱动。这个时候USB驱动也许以模块的形式保存在硬盘上。载入驱动必然只能从用户态来进行，那这时候应该怎么办呢？</p> 
+<p>          看到这里的时候，有人一定会想，人工敲入命令载入驱动，呵呵。这必然是一种方法，但是是一种很古老的方法。Linux对类似的情况设计了一种uevent的机制。当有新的设备加入的时候，将设备的信息发送消息到用户态。而用户态有一个udev的进程监听这个信息。当收到信息后做一定的解析，根据解析到的结果和用户程序的配置做一些处理，也包括加载驱动程序。</p> 
+<p>2.具体介绍（<a href="http://www.wowotech.net/linux_kenrel/uevent.html" rel="nofollow" title="Linux设备模型(3)_Uevent">Linux设备模型(3)_Uevent</a>）</p> 
+<p>          Uevent是Kobject的一部分，用于在Kobject状态发生改变时，例如增加、移除等，通知用户空间程序。</p> 
+<p>用户空间程序收到这样的事件后，会做相应的处理。</p> 
+<p>          该机制通常是用来支持热拔插设备的，例如U盘插入后，USB相关的驱动软件会动态创建用于表示该U盘的device结构（相应的也包括其中的kobject），并告知用户空间程序，为该U盘动态的创建/dev/目录下的设备节点，</p> 
+<p>更进一步，可以通知其它的应用程序，将该U盘设备mount到系统中，从而动态的支持该设备。</p> 
+<p>Uevent在kernel中的位置</p> 
+<p><img alt="" src="https://images2.imgbox.com/1f/ce/AHCIP32k_o.gif"></p> 
+<p> </p> 
+<p>由此可知，Uevent的机制是比较简单的，设备模型中任何设备有事件需要上报时，会触发Uevent提供的接口。Uevent模块准备好上报事件的格式后。</p> 
+<p>        可以通过两个途径把事件上报到用户空间：一种是通过kmod模块，直接调用用户空间的可执行文件；</p> 
+<p>另一种是通过netlink通信机制，将事件从内核空间传递给用户空间。</p> 
+<p>        注1：有关kmod和netlink，会在其它文章中描述，因此本文就不再详细说明了。</p> 
+<p>Uevent的内部逻辑解析</p> 
+<p>        Uevent的代码比较简单，主要涉及kobject.h和kobject_uevent.c两个文件，如下：</p> 
+<ul><li>include/linux/kobject.h</li><li>lib/kobject_uevent.c</li></ul> 
+<p>        前面有提到过，在利用Kmod向用户空间上报event事件时，会直接执行用户空间的可执行文件。而在Linux系统，可执行文件的执行，依赖于环境变量，因此kobj_uevent_env用于组织此次事件上报时的环境变量。</p> 
+<p></p> 
+<p>         说明：怎么指定处理uevent的用户空间程序(简称uevent helper)？<br><br>     上面介绍kobject_uevent_env的内部动作时，有提到，Uevent模块通过Kmod上报Uevent时，会通过call_usermodehelper函数，调用用户空间的可执行文件（或者脚本，简称uevent helper ）处理该event。而该uevent helper的路径保存在uevent_helper数组中。<br><br>        可以在编译内核时，通过CONFIG_UEVENT_HELPER_PATH配置项，静态指定uevent helper。但这种方式会为每个event fork一个进程，随着内核支持的设备数量的增多，这种方式在系统启动时将会是致命的（可以导致内存溢出等）。因此只有在早期的内核版本中会使用这种方式，现在内核不再推荐使用该方式。因此内核编译时，需要把该配置项留空。<br><br>       在系统启动后，大部分的设备已经ready，可以根据需要，重新指定一个uevent helper，以便检测系统运行过程中的热拔插事件。这可以通过把helper的路径写入到"/sys/kernel/uevent_helper”文件中实现。实际上，内核通过sysfs文件系统的形式，将uevent_helper数组开放到用户空间，供用户空间程序修改访问，具体可参考"./kernel/ksysfs.c”中相应的代码，这里不再详细描述。</p> 
+<p>3.实例分析（<a href="http://blog.csdn.net/sunweizhong1024/article/details/7928530" title="Uevent 上报event事件给上层的详细讲解_sunweizhong1024的专栏-CSDN博客_add_uevent_var">Uevent 上报event事件给上层的详细讲解_sunweizhong1024的专栏-CSDN博客_add_uevent_var</a>）<strong>headphone_event 上报事件的分析</strong></p> 
+<p>     本文章讲解插入headphone的时候，向上层上报event函数的整个过程</p> 
+<p><strong>#ifdef</strong> CONFIG_I_LOVE_PBJ30</p> 
+<p><strong>void</strong> headphone_event(<strong>int</strong> state)</p> 
+<p>{<!-- --></p> 
+<p>       switch_set_state(&amp;wired_switch_dev, state);</p> 
+<p>}</p> 
+<p>EXPORT_SYMBOL_GPL(headphone_event);</p> 
+<p><strong>#endif</strong></p> 
+<p><strong> </strong></p> 
+<p>headphone_event 函数会调用switch_set_state函数进行上报事件</p> 
+<p></p> 
+<p>接下来会调用kobject_uevent_env函数进行上报事件。</p> 
+<p></p> 
+<p>最终调用add_uevent_var（）将用户空间需要的参数添加到环境变量中去，如</p> 
+<p>retval = add_uevent_var(env,"ACTION=%s", action_string);</p> 
+<p>       <strong>if</strong> (retval)</p> 
+<p>              <strong>goto</strong> exit;</p> 
+<p>       retval = add_uevent_var(env,"DEVPATH=%s", devpath);</p> 
+<p>       <strong>if</strong> (retval)</p> 
+<p>              <strong>goto</strong> exit;</p> 
+<p>       retval = add_uevent_var(env,"SUBSYSTEM=%s", subsystem);</p> 
+<p>       <strong>if</strong> (retval)</p> 
+<p>              <strong>goto</strong> exit;</p> 
+<p></p> 
+<p>4.实例分析2</p> 
+<p>     Uevent 是内核通知<a href="http://lib.csdn.net/base/android" rel="nofollow" title="Android">Android</a>有状态变化的一种方法，比如USB线插入、拔出，电池电量变化等等。其本质是内核发送（可以通过socket）一个字符串，应用层（android）接收并解释该字符串，获取相应信息。</p> 
+<p></p> 
+<p><strong> (一)、</strong><strong>Kernel</strong><strong>侧：</strong>UEVENT的发起在Kernel端，主要是通过函数</p> 
+<p>             intkobject_uevent_env(struct kobject*kobj, enum kobject_action action,char*envp_ext[])</p> 
+<p>该函数的主要功能是根据参数组合一个字符串并发送。一个典型的字符串如下：<strong>change@</strong>/devices/platform/msm-battery/power_supply/usb纮<strong>ACTION</strong>=change纮<strong>DEVPATH</strong>=/devices/platform/msm-battery/power_supply/usb纮<strong>SUBSYSTEM</strong>=power_supply纮POWER_SUPPLY_NAME=usb纮POWER_SUPPLY_ONLINE=0纮<strong>SEQNUM</strong>=1486纮</p> 
+<p>上面这块来自网上，这段内容是否有问题，待考究。</p> 
+<p>下面看这个函数： int kobject_uevent_env(structkobject *kobj, enum kobject_action action,char *envp_ext[])</p> 
+<p>static const char *kobject_actions[] ={<!-- --></p> 
+<p>[KOBJ_ADD] = "add",</p> 
+<p>[KOBJ_REMOVE] = "remove",</p> 
+<p>[KOBJ_CHANGE] = "change",</p> 
+<p>[KOBJ_MOVE] = "move",</p> 
+<p>[KOBJ_ONLINE] = "online",</p> 
+<p>[KOBJ_OFFLINE] = "offline",</p> 
+<p>};</p> 
+<p>//以上为kobject标准的动作，调用时需要传入相应的enum值</p> 
+<p></p> 
+<p></p> 
+<p>///以下是获取subsystem信息</p> 
+<p>if (uevent_ops&amp;&amp;uevent_ops-&gt;name)</p> 
+<p>subsystem =uevent_ops-&gt;name(kset, kobj);</p> 
+<p>else</p> 
+<p>subsystem =kobject_name(&amp;kset-&gt;kobj);</p> 
+<p>if (!subsystem) {<!-- --></p> 
+<p>pr_debug("kobject: '%s' (%p):%s: unset subsystem caused the "</p> 
+<p>"event to drop!\n",kobject_name(kobj), kobj,</p> 
+<p>__func__);</p> 
+<p>return 0;</p> 
+<p>}</p> 
+<p></p> 
+<p></p> 
+<p>//下面准备要传递的信息数据</p> 
+<p>retval = add_uevent_var(env, "ACTION=%s",action_string);</p> 
+<p>if (retval)</p> 
+<p>goto exit;</p> 
+<p>retval = add_uevent_var(env, "DEVPATH=%s",devpath);</p> 
+<p>if (retval)</p> 
+<p>goto exit;</p> 
+<p>retval = add_uevent_var(env, "SUBSYSTEM=%s",subsystem);</p> 
+<p>if (retval)</p> 
+<p>goto exit;</p> 
+<p>//envp_ext[i]是传进来的参数，为该event时携带的一些自定义的信息</p> 
+<p>if (envp_ext) {<!-- --></p> 
+<p>for (i = 0; envp_ext[i]; i++){<!-- --></p> 
+<p>retval = add_uevent_var(env, "%s", envp_ext[i]);</p> 
+<p>if (retval)</p> 
+<p>goto exit;</p> 
+<p></p> 
+<p></p> 
+<p>//下面通过网络socket将数据发送出去</p> 
+<p>mutex_lock(&amp;uevent_sock_mutex);</p> 
+<p>list_for_each_entry(ue_sk,&amp;uevent_sock_list, list) {<!-- --></p> 
+<p>struct sock *uevent_sock =ue_sk-&gt;sk;</p> 
+<p>struct sk_buff*skb;</p> 
+<p>size_t len;</p> 
+<p></p> 
+<p>NETLINK_CB(skb).dst_group =1;//下面开始发送数据</p> 
+<p>retval =netlink_broadcast_filtered(uevent_sock, skb,</p> 
+<p>0, 1, GFP_KERNEL,</p> 
+<p>kobj_bcast_filter,</p> 
+<p>kobj);</p> 
+<p>}</p> 
+<p></p> 
+<p><a href="https://www.cnblogs.com/sky-heaven/p/6394267.html" title="Linux--内核Uevent事件机制 与 Input子系统【转】 - sky-heaven - 博客园">Linux--内核Uevent事件机制 与 Input子系统【转】 - sky-heaven - 博客园</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/a30b1d57446e03219df3d084ab91718e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">记一记redis命令，老是记不住</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f43e92c6f3f501de67512a586cbabcd4/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">List去重的三种种方法--C#</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

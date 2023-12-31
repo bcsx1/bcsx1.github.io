@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Linux应用程序崩溃定位 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Linux应用程序崩溃定位" />
+<meta property="og:description" content="背景 最近项目中用到了一个库，在程序崩溃时可以生成exception文件，记录程序崩溃时的调用信息，对于定位问题比较有价值，因此整理下这个库涉及到的知识点。相关测试代码已经放到github可以下载调试。
+基础知识 maps maps用来描述进程的虚拟地址空间是如何使用的。总共包括六列，每列及其含义如下：
+名字含义address本段在虚拟内存中的地址范围。perms本段的权限，r-读，w-写，x-执行， p-私有，s-共享。offset即本段映射地址在文件中的偏移。dev主设备号与次设备号：所映射的文件所属设备的设备号。inode文件索引节点号。pathname映射的文件名。
+对有名映射而言，是映射的文件名。
+对匿名映射来说，是此段内存在进程中的作用。
+[stack]表示本段内存作为栈来使用，[heap]作为堆来使用，其他情况则为无。 对于有名的内存区间而言，属性为r--p表示存放的是rodata;属性为rw-p存放的是bss和data;属性为r-xp表示存放的是text数据。没有文件名的内存区间则表示用mmap映射的匿名空间。
+以下为./example/maps_test.c编译成的可执行文件mapstest的运行结果：
+code addr = 0x55e1df08d6da A_global_addr = 0x55e1df28e034 B_global_init0_addr = 0x55e1df28e020 C_global_init_addr = 0x55e1df28e010 D_global_static_addr = 0x55e1df28e024 E_global_static_init0_addr = 0x55e1df28e028 F_global_static_init_addr = 0x55e1df28e014 G_global_const_addr = 0x55e1df08d998 a_addr = 0x7ffce299bb90 b_init0_addr = 0x7ffce299bb94 c_init_addr = 0x7ffce299bb98 d_static_addr = 0x55e1df28e02c e_static_init0_addr = 0x55e1df28e030 f_static_init_addr = 0x55e1df28e018 g_const_addr = 0x7ffce299bb9c h1_arr_addr = 0x7ffce299bbb2 h2_strconst_addr = 0x55e1df08d99c h2_point_addr = 0x7ffce299bba0 i_malloc_addr = 0x55e1dfd1d260 ps -ef| grep mapstest得到进程对应的pid号，maps文件如下：（路径为/proc/{pid}/maps）" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/0c61a3d54a801be1c9676b0cca84d280/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-09-13T14:36:25+08:00" />
+<meta property="article:modified_time" content="2022-09-13T14:36:25+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Linux应用程序崩溃定位</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="_1"></a>背景</h2> 
+<p>最近项目中用到了一个库，在程序崩溃时可以生成<code>exception</code>文件，记录程序崩溃时的调用信息，对于定位问题比较有价值，因此整理下这个库涉及到的知识点。相关测试代码已经放到<a href="https://github.com/yanxicheung/daydayup/tree/main/Debug/Linux"><code>github</code></a>可以下载调试。</p> 
+<h2><a id="_7"></a>基础知识</h2> 
+<h3><a id="maps_9"></a>maps</h3> 
+<p><code>maps</code>用来描述进程的虚拟地址空间是如何使用的。总共包括六列，每列及其含义如下：</p> 
+<table><thead><tr><th>名字</th><th>含义</th></tr></thead><tbody><tr><td>address</td><td>本段在虚拟内存中的地址范围。</td></tr><tr><td>perms</td><td>本段的权限，r-读，w-写，x-执行， p-私有，s-共享。</td></tr><tr><td>offset</td><td>即本段映射地址在文件中的偏移。</td></tr><tr><td>dev</td><td>主设备号与次设备号：所映射的文件所属设备的设备号。</td></tr><tr><td>inode</td><td>文件索引节点号。</td></tr><tr><td>pathname</td><td>映射的文件名。<br>对有名映射而言，是映射的文件名。<br>对匿名映射来说，是此段内存在进程中的作用。<br>[stack]表示本段内存作为栈来使用，[heap]作为堆来使用，其他情况则为无。</td></tr></tbody></table> 
+<p>对于有名的内存区间而言，属性为<code>r--p</code>表示存放的是<code>rodata</code>;属性为<code>rw-p</code>存放的是<code>bss</code>和<code>data</code>;属性为<code>r-xp</code>表示存放的是<code>text</code>数据。没有文件名的内存区间则表示用<code>mmap</code>映射的匿名空间。</p> 
+<p>以下为<code>./example/maps_test.c</code>编译成的可执行文件<code>mapstest</code>的运行结果：</p> 
+<pre><code class="prism language-shell">code addr <span class="token operator">=</span> 0x55e1df08d6da
+A_global_addr <span class="token operator">=</span> 0x55e1df28e034
+B_global_init0_addr <span class="token operator">=</span> 0x55e1df28e020
+C_global_init_addr <span class="token operator">=</span> 0x55e1df28e010
+D_global_static_addr <span class="token operator">=</span> 0x55e1df28e024
+E_global_static_init0_addr <span class="token operator">=</span> 0x55e1df28e028
+F_global_static_init_addr <span class="token operator">=</span> 0x55e1df28e014
+G_global_const_addr <span class="token operator">=</span> 0x55e1df08d998
+
+a_addr <span class="token operator">=</span> 0x7ffce299bb90
+b_init0_addr <span class="token operator">=</span> 0x7ffce299bb94
+c_init_addr <span class="token operator">=</span> 0x7ffce299bb98
+d_static_addr <span class="token operator">=</span> 0x55e1df28e02c
+e_static_init0_addr <span class="token operator">=</span> 0x55e1df28e030
+f_static_init_addr <span class="token operator">=</span> 0x55e1df28e018
+g_const_addr <span class="token operator">=</span> 0x7ffce299bb9c
+
+h1_arr_addr <span class="token operator">=</span> 0x7ffce299bbb2
+h2_strconst_addr <span class="token operator">=</span> 0x55e1df08d99c
+h2_point_addr <span class="token operator">=</span> 0x7ffce299bba0
+i_malloc_addr <span class="token operator">=</span> 0x55e1dfd1d260
+</code></pre> 
+<p><code>ps -ef| grep mapstest</code>得到进程对应的<code>pid</code>号，maps文件如下：（路径为<code>/proc/{pid}/maps</code>）</p> 
+<pre><code class="prism language-shell">55e1df08d000-55e1df08e000 r-xp 00000000 08:01 <span class="token number">24786338</span>  /mapstest    <span class="token comment">#text</span>
+55e1df28d000-55e1df28e000 r--p 00000000 08:01 <span class="token number">24786338</span>  /mapstest    <span class="token comment">#rodata</span>
+55e1df28e000-55e1df28f000 rw-p 00001000 08:01 <span class="token number">24786338</span>  /mapstest    <span class="token comment">#bss data</span>
+55e1dfd1d000-55e1dfd3e000 rw-p 00000000 00:00 <span class="token number">0</span>         <span class="token punctuation">[</span>heap<span class="token punctuation">]</span>       <span class="token comment">#堆</span>
+7f64881e5000-7f64883cc000 r-xp 00000000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f64883cc000-7f64885cc000 ---p 001e7000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f64885cc000-7f64885d0000 r--p 001e7000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f64885d0000-7f64885d2000 rw-p 001eb000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f64885d2000-7f64885d6000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f64885d6000-7f64885fd000 r-xp 00000000 08:01 <span class="token number">10490421</span>  /lib/x86_64-linux-gnu/ld-2.27.so
+7f64887de000-7f64887e0000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f64887fd000-7f64887fe000 r--p 00027000 08:01 <span class="token number">10490421</span>  /lib/x86_64-linux-gnu/ld-2.27.so
+7f64887fe000-7f64887ff000 rw-p 00028000 08:01 <span class="token number">10490421</span>  /lib/x86_64-linux-gnu/ld-2.27.so
+7f64887ff000-7f6488800000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7ffce297d000-7ffce299e000 rw-p 00000000 00:00 <span class="token number">0</span>          <span class="token punctuation">[</span>stack<span class="token punctuation">]</span>    <span class="token comment">#栈</span>
+7ffce29ef000-7ffce29f2000 r--p 00000000 00:00 <span class="token number">0</span>          <span class="token punctuation">[</span>vvar<span class="token punctuation">]</span>
+7ffce29f2000-7ffce29f4000 r-xp 00000000 00:00 <span class="token number">0</span>          <span class="token punctuation">[</span>vdso<span class="token punctuation">]</span>
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 <span class="token number">0</span>  <span class="token punctuation">[</span>vsyscall<span class="token punctuation">]</span>
+</code></pre> 
+<p>对应地，我们可以找到每个变量在虚拟内存中的地址范围。其中<strong>动态链接库是程序运行时动态加载的而其加载地址也是每次可能不一样的</strong>。</p> 
+<h3><a id="signal_77"></a>signal</h3> 
+<p>​ <code>Linux</code>中的信号是一种消息处理机制, 它本质上是一个整数，不同的信号对应不同的值，由于信号的结构简单所以天生不能携带很大的信息量，但是信号在系统中的优先级是非常高的。</p> 
+<p>​ 在<code>Linux</code>中的很多常规操作中都会有相关的信号产生，先从我们最熟悉的场景说起：</p> 
+<p>​ <code>通过键盘操作产生了信号</code>：用户按下<code>Ctrl-C</code>，这个键盘输入产生一个硬件中断，使用这个快捷键会产生信号, 这个信号会杀死对应的某个进程。</p> 
+<p>​ <code>通过shell命令产生了信号</code>：通过<code>kill</code>命令终止某一个进程，<code>kill -9 进程PID</code>。<br> <code>通过函数调用产生了信号</code>：如果CPU当前正在执行这个进程的代码调用，比如函数 sleep()，进程收到相关的信号，被迫挂起。</p> 
+<p>​ <code>通过对硬件进行非法访问产生了信号</code>：正在运行的程序访问了非法内存，发生段错误，进程退出。</p> 
+<p>​ 信号也可以实现进程间通信，但是信号能传递的数据量很少，不能满足大部分需求，另外信号的优先级很高，并且它对应的处理动作是回调完成的，它会打乱程序原有的处理流程，影响到最终的处理结果。因此非常不建议使用信号进行进程间通信。</p> 
+<p>​ 通过 <code>kill -l</code> 命令可以查看系统定义的信号列表。</p> 
+<p>进程对信号的处理可以有以下三种措施：</p> 
+<ol><li> <p>忽略这个信号；</p> </li><li> <p>执行用户定义相应操作；</p> </li><li> <p>执行默认的操作；</p> </li></ol> 
+<p><code>SIGKILL</code>和<code>SIGTSTOP</code>是不可以被信号处理函数捕捉或者忽略。</p> 
+<p>常用接口：</p> 
+<table><thead><tr><th>函数名</th><th>备注</th></tr></thead><tbody><tr><td><code>signal</code></td><td>信号安装函数，但是有消息重入问题，不建议使用</td></tr><tr><td><code>sigaction</code></td><td>信号安装函数</td></tr><tr><td><code>kill</code></td><td>给指定进程发送信号</td></tr><tr><td><code>raise</code></td><td>给自己发送信号，和<code>kill(getpid( ),sig)</code>等价</td></tr><tr><td><code>alarm</code></td><td>设置定时器，定时器超时后，发送一个<code>SIGALRM</code>信号</td></tr></tbody></table> 
+<p><strong>例子：</strong></p> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;stdio.h&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;unistd.h&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;signal.h&gt;</span></span>
+<span class="token keyword">void</span> <span class="token function">catch_signal</span><span class="token punctuation">(</span><span class="token keyword">int</span> sig<span class="token punctuation">)</span>
+ <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">switch</span><span class="token punctuation">(</span>sig<span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">case</span> SIGINT<span class="token operator">:</span><span class="token function">printf</span><span class="token punctuation">(</span><span class="token string">"get SIGINT signal\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>    
+    <span class="token punctuation">}</span>
+
+<span class="token punctuation">}</span>
+
+<span class="token keyword">int</span> <span class="token function">main</span> <span class="token punctuation">(</span><span class="token keyword">int</span> argc<span class="token punctuation">,</span><span class="token keyword">char</span> <span class="token operator">*</span>argv<span class="token punctuation">[</span> <span class="token punctuation">]</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+    <span class="token function">signal</span><span class="token punctuation">(</span>SIGINT<span class="token punctuation">,</span>catch_signal<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">int</span> i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token keyword">while</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token function">sleep</span><span class="token punctuation">(</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">//执行完信号后sleep（）立即返回，不会一直休眠下去</span>
+        <span class="token function">printf</span><span class="token punctuation">(</span><span class="token string">"hello i = %d"</span><span class="token punctuation">,</span>i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;stdio.h&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;unistd.h&gt;</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;signal.h&gt;</span></span>
+<span class="token keyword">int</span> temp <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+<span class="token keyword">void</span> <span class="token function">handler_sigint</span><span class="token punctuation">(</span><span class="token keyword">int</span> signo<span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	<span class="token function">printf</span><span class="token punctuation">(</span><span class="token string">"recv SIGINT\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">sleep</span><span class="token punctuation">(</span><span class="token number">5</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	temp <span class="token operator">+=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+	<span class="token function">printf</span><span class="token punctuation">(</span><span class="token string">"the value of temp is:%d\n"</span><span class="token punctuation">,</span>temp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">printf</span><span class="token punctuation">(</span><span class="token string">"in handler_sigint, after sleep\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">struct</span> <span class="token class-name">sigaction</span> act<span class="token punctuation">;</span>
+	act<span class="token punctuation">.</span>sa_handler <span class="token operator">=</span> handler_sigint<span class="token punctuation">;</span>
+	act<span class="token punctuation">.</span>sa_flags <span class="token operator">=</span> SA_NOMASK<span class="token punctuation">;</span>
+	<span class="token function">sigaction</span><span class="token punctuation">(</span>SIGINT<span class="token punctuation">,</span> <span class="token operator">&amp;</span>act<span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">while</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="objdump_170"></a>objdump</h3> 
+<p><code>objdump -d</code>可以将目标文件、动态库、可执行文件反汇编，如下：</p> 
+<pre><code class="prism language-asm">00000000000006da &lt;swap&gt;:
+ 6da:	55                   	push   %rbp
+ 6db:	48 89 e5             	mov    %rsp,%rbp
+ 6de:	48 89 7d e8          	mov    %rdi,-0x18(%rbp)
+ 6e2:	48 89 75 e0          	mov    %rsi,-0x20(%rbp)
+ 6e6:	48 8b 45 e8          	mov    -0x18(%rbp),%rax
+ 6ea:	8b 00                	mov    (%rax),%eax
+ 6ec:	89 45 fc             	mov    %eax,-0x4(%rbp)
+ 6ef:	48 8b 45 e0          	mov    -0x20(%rbp),%rax
+ 6f3:	8b 10                	mov    (%rax),%edx
+ 6f5:	48 8b 45 e8          	mov    -0x18(%rbp),%rax
+ 6f9:	89 10                	mov    %edx,(%rax)
+ 6fb:	48 8b 45 e0          	mov    -0x20(%rbp),%rax
+ 6ff:	8b 55 fc             	mov    -0x4(%rbp),%edx
+ 702:	89 10                	mov    %edx,(%rax)
+ 704:	90                   	nop
+ 705:	5d                   	pop    %rbp
+ 706:	c3                   	retq   
+</code></pre> 
+<p><code>00000000000006da</code>是函数的地址，<code>&lt;swap&gt;</code>是函数名，整个汇编文件分为三列，分别是指令地址、指令机器码、指令机器码反汇编得到的指令。</p> 
+<h3><a id="strip_197"></a>strip</h3> 
+<p>实际项目中，许多组件编译后，都会使用<code>strip</code>命令减小目标文件的大小，处理后的文件依然可以正常运行，但是其中的符号信息（比如函数名）会失去。出问题后不利于定位。</p> 
+<p>解决方法是在编译（<code>gcc -c</code>）阶段加入<code>-rdynamic</code>选项，此方法会将函数名加入到<code>*.dyn</code>节中，<code>strip</code>对其无效。</p> 
+<h3><a id="backtrace_203"></a>backtrace</h3> 
+<p>在Linux上的C/C++编程环境下，我们可以通过如下三个函数来获取程序的调用栈信息。</p> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">&lt;execinfo.h&gt;</span></span>
+<span class="token comment">/* Store up to SIZE return address of the current program state in
+   ARRAY and return the exact number of values stored.  */</span>
+<span class="token keyword">int</span> <span class="token function">backtrace</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span><span class="token operator">*</span>array<span class="token punctuation">,</span> <span class="token keyword">int</span> size<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token comment">/* Return names of functions from the backtrace list in ARRAY in a newly
+   malloc()ed memory block.  */</span>
+<span class="token keyword">char</span> <span class="token operator">*</span><span class="token operator">*</span><span class="token function">backtrace_symbols</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span><span class="token keyword">const</span> <span class="token operator">*</span>array<span class="token punctuation">,</span> <span class="token keyword">int</span> size<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token comment">/* This function is similar to backtrace_symbols() but it writes the result
+   immediately to a file.  */</span>
+<span class="token keyword">void</span> <span class="token function">backtrace_symbols_fd</span><span class="token punctuation">(</span><span class="token keyword">void</span> <span class="token operator">*</span><span class="token keyword">const</span> <span class="token operator">*</span>array<span class="token punctuation">,</span> <span class="token keyword">int</span> size<span class="token punctuation">,</span> <span class="token keyword">int</span> fd<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>使用它们的时候有一下几点需要我们注意的地方：</p> 
+<ul><li><code>backtrace</code>的实现依赖于栈指针（<code>fp</code>寄存器），在<code>gcc</code>编译过程中任何非零的优化等级（<code>-On</code>参数）或加入了栈指针优化参数<code>-fomit-frame-pointer</code>后多将不能正确得到程序栈信息；</li><li><code>backtrace_symbols</code>的实现需要符号名称的支持，在<code>gcc</code>编译过程中需要加入<code>-rdynamic</code>参数；</li><li>内联函数没有栈帧，它在编译过程中被展开在调用的位置；</li><li>尾调用优化（<code>Tail-call Optimization</code>）将复用当前函数栈，而不再生成新的函数栈，这将导致栈信息不能正确被获取。</li></ul> 
+<h2><a id="_231"></a>崩溃定位</h2> 
+<p>在程序崩溃时，系统会发送信号，在注册的信号处理函数中，将进程的<code>maps</code>文件保存下来，同时记录此时的函数调用链，利用这些信息就可以进行故障定位。前提是需要添加编译选项<code>-g</code>（不加也没事，不过用<code>addr2line</code>获得崩溃代码的行号需要），链接选项<code>-rdynamic</code>（<strong>一定要加</strong>） 。</p> 
+<h3><a id="_235"></a>在可执行文件中崩溃</h3> 
+<p>在64位<code>Linux</code>上编译运行<code>example</code>下的<code>test</code>，程序崩溃：</p> 
+<pre><code class="prism language-shell">hello world
+segmentfault addr 0x55daa333903e
+<span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span><span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>maps <span class="token operator">&lt;&lt;&lt;</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span>
+55daa3338000-55daa333a000 r-xp 00000000 08:01 <span class="token number">24786361</span>  /example/test
+55daa3539000-55daa353a000 r--p 00001000 08:01 <span class="token number">24786361</span>  /example/test
+55daa353a000-55daa353b000 rw-p 00002000 08:01 <span class="token number">24786361</span>  /example/test
+55daa3e40000-55daa3e61000 rw-p 00000000 00:00 <span class="token number">0</span>         <span class="token punctuation">[</span>heap<span class="token punctuation">]</span>
+7f09107eb000-7f09109d2000 r-xp 00000000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f09109d2000-7f0910bd2000 ---p 001e7000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f0910bd2000-7f0910bd6000 r--p 001e7000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f0910bd6000-7f0910bd8000 rw-p 001eb000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f0910bd8000-7f0910bdc000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f0910bdc000-7f0910c03000 r-xp 00000000 08:01 <span class="token number">10490421</span>  /lib/x86_64-linux-gnu/ld-2.27.so
+7f0910de4000-7f0910de6000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f0910e03000-7f0910e04000 r--p 00027000 08:01 <span class="token number">10490421</span>  /lib/x86_64-linux-gnu/ld-2.27.so
+7f0910e04000-7f0910e05000 rw-p 00028000 08:01 <span class="token number">10490421</span>  /lib/x86_64-linux-gnu/ld-2.27.so
+7f0910e05000-7f0910e06000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7ffc3e767000-7ffc3e788000 rw-p 00000000 00:00 <span class="token number">0</span>         <span class="token punctuation">[</span>stack<span class="token punctuation">]</span>
+7ffc3e79e000-7ffc3e7a1000 r--p 00000000 00:00 <span class="token number">0</span>         <span class="token punctuation">[</span>vvar<span class="token punctuation">]</span>
+7ffc3e7a1000-7ffc3e7a3000 r-xp 00000000 00:00 <span class="token number">0</span>         <span class="token punctuation">[</span>vdso<span class="token punctuation">]</span>
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 <span class="token number">0</span> <span class="token punctuation">[</span>vsyscall<span class="token punctuation">]</span>
+
+<span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span><span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>catch signal <span class="token number">11</span> <span class="token operator">&lt;&lt;&lt;</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span>   <span class="token comment"># 信号11是段错误</span>
+Dump stack start<span class="token punctuation">..</span>.
+backtrace<span class="token punctuation">(</span><span class="token punctuation">)</span> returned <span class="token number">7</span> addresses
+  <span class="token punctuation">[</span>00<span class="token punctuation">]</span> ./test<span class="token punctuation">(</span>dump+0x2e<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x55daa3338d98<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>01<span class="token punctuation">]</span> ./test<span class="token punctuation">(</span>signal_handler+0xb8<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x55daa3338f2a<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>02<span class="token punctuation">]</span> /lib/x86_64-linux-gnu/libc.so.6<span class="token punctuation">(</span>+0x3ef20<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x7f0910829f20<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>03<span class="token punctuation">]</span> ./test<span class="token punctuation">(</span>segmentfault+0x3a<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x55daa3339078<span class="token punctuation">]</span>   <span class="token comment">#这里崩溃</span>
+  <span class="token punctuation">[</span>04<span class="token punctuation">]</span> ./test<span class="token punctuation">(</span>main+0x36<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x55daa3338f9c<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>05<span class="token punctuation">]</span> /lib/x86_64-linux-gnu/libc.so.6<span class="token punctuation">(</span>__libc_start_main+0xe7<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x7f091080cb97<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>06<span class="token punctuation">]</span> ./test<span class="token punctuation">(</span>_start+0x2a<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x55daa3338c8a<span class="token punctuation">]</span>
+Dump stack end<span class="token punctuation">..</span>.
+Segmentation fault <span class="token punctuation">(</span>core dumped<span class="token punctuation">)</span>
+</code></pre> 
+<p>由于64位系统运行的可执行文件的<a href="https://so.csdn.net/so/search?q=%E7%AC%A6%E5%8F%B7%E8%A1%A8&amp;spm=1001.2101.3001.7020">符号表</a>地址和实际运行时地址差异甚大。</p> 
+<p>崩溃地址<code>0x55daa3339078</code>是动态映射的虚拟地址，该虚拟地址是通过符号表地址+该代码段映射区间（maps里面有）的地址得来的。</p> 
+<p><code>0x55daa3339078</code>落在区间<code>55daa3338000-55daa333a000</code></p> 
+<p>得到真正的符号表地址<code>0x55daa3339078</code>-<code>0x55daa3338000</code>=<code>0x1078</code></p> 
+<pre><code>daniel@daniel:~/example$  addr2line -e test 1078
+～/example/calc.c:44
+</code></pre> 
+<p>32位系统显示的是实际地址，可以不用转换。</p> 
+<p>上面是获得符号表地址的一种方法，也可以使用<code>objdump -d test</code>将<code>test</code>反汇编找到<code>segmentfault</code>的地址:</p> 
+<pre><code class="prism language-shell">000000000000103e <span class="token operator">&lt;</span>segmentfault<span class="token operator">&gt;</span>:
+    103e:	<span class="token number">55</span>                   	push   %rbp
+    103f:	<span class="token number">48</span> <span class="token number">89</span> e5             	mov    %rsp,%rbp
+    <span class="token number">1042</span>:	<span class="token number">48</span> <span class="token number">83</span> ec <span class="token number">10</span>          	sub    <span class="token variable">$0x10</span>,%rsp
+    <span class="token number">1046</span>:	<span class="token number">48</span> 8d <span class="token number">35</span> f1 ff ff ff 	lea    -0xf<span class="token punctuation">(</span>%rip<span class="token punctuation">)</span>,%rsi   <span class="token comment"># 103e &lt;segmentfault&gt;</span>
+    104d:	<span class="token number">48</span> 8d 3d b1 01 00 00 	lea    0x1b1<span class="token punctuation">(</span>%rip<span class="token punctuation">)</span>,%rdi  <span class="token comment"># 1205 &lt;_IO_stdin_used+0xe5&gt;</span>
+    <span class="token number">1054</span>:	b8 00 00 00 00       	mov    <span class="token variable">$0x0</span>,%eax
+    <span class="token number">1059</span>:	e8 a2 fb ff ff       	callq  c00 <span class="token operator">&lt;</span>printf@plt<span class="token operator">&gt;</span>
+    105e:	c7 <span class="token number">45</span> f0 0a 00 00 00 	movl   <span class="token variable">$0xa</span>,-0x10<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+    <span class="token number">1065</span>:	c7 <span class="token number">45</span> f4 00 00 00 00 	movl   <span class="token variable">$0x0</span>,-0xc<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+    106c:	<span class="token number">48</span> c7 <span class="token number">45</span> f8 00 00 00 	movq   <span class="token variable">$0x0</span>,-0x8<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+    <span class="token number">1073</span>:	00 
+    <span class="token number">1074</span>:	<span class="token number">48</span> 8b <span class="token number">45</span> f8          	mov    -0x8<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%rax
+    <span class="token number">1078</span>:	c7 00 01 00 00 00    	movl   <span class="token variable">$0x1</span>,<span class="token punctuation">(</span>%rax<span class="token punctuation">)</span>
+    107e:	<span class="token number">48</span> 8b <span class="token number">45</span> f8          	mov    -0x8<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%rax
+    <span class="token number">1082</span>:	8b <span class="token number">10</span>                	mov    <span class="token punctuation">(</span>%rax<span class="token punctuation">)</span>,%edx
+    <span class="token number">1084</span>:	8b <span class="token number">45</span> f0             	mov    -0x10<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%eax
+    <span class="token number">1087</span>:	01 d0                	<span class="token function">add</span>    %edx,%eax
+    <span class="token number">1089</span>:	<span class="token number">89</span> <span class="token number">45</span> f4             	mov    %eax,-0xc<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+    108c:	8b <span class="token number">45</span> f4             	mov    -0xc<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%eax
+    108f:	c9                   	leaveq 
+    <span class="token number">1090</span>:	c3                   	retq   
+    <span class="token number">1091</span>:	<span class="token number">66</span> 2e 0f 1f <span class="token number">84</span> 00 00 	nopw   %cs:0x0<span class="token punctuation">(</span>%rax,%rax,1<span class="token punctuation">)</span>
+    <span class="token number">1098</span>:	00 00 00 
+    109b:	0f 1f <span class="token number">44</span> 00 00       	nopl   0x0<span class="token punctuation">(</span>%rax,%rax,1<span class="token punctuation">)</span>
+</code></pre> 
+<p>真正的符号表地址为<code>000000000000103e</code> + <code>0x3a</code> = <code>0x1078</code></p> 
+<h3><a id="_329"></a>在动态库中崩溃</h3> 
+<pre><code class="prism language-shell">hello world
+add<span class="token punctuation">(</span><span class="token number">1,2</span><span class="token punctuation">)</span><span class="token operator">=</span><span class="token number">3</span>
+segmentfault addr 0x7f7335fb483a
+
+<span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span><span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>maps <span class="token operator">&lt;&lt;&lt;</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span>
+5631f8167000-5631f8169000 r-xp 00000000 08:01 <span class="token number">24786364</span>     /example/test_dynamic
+5631f8368000-5631f8369000 r--p 00001000 08:01 <span class="token number">24786364</span>     /example/test_dynamic
+5631f8369000-5631f836a000 rw-p 00002000 08:01 <span class="token number">24786364</span>     /example/test_dynamic
+5631f8706000-5631f8727000 rw-p 00000000 00:00 <span class="token number">0</span>            <span class="token punctuation">[</span>heap<span class="token punctuation">]</span>
+7f7335bc3000-7f7335daa000 r-xp 00000000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f7335daa000-7f7335faa000 ---p 001e7000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f7335faa000-7f7335fae000 r--p 001e7000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f7335fae000-7f7335fb0000 rw-p 001eb000 08:01 <span class="token number">10490449</span>  /lib/x86_64-linux-gnu/libc-2.27.so
+7f7335fb0000-7f7335fb4000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f7335fb4000-7f7335fb5000 r-xp 00000000 08:01 <span class="token number">24786363</span>  /example/libcalc.so
+7f7335fb5000-7f73361b4000 ---p 00001000 08:01 <span class="token number">24786363</span>  /example/libcalc.so
+7f73361b4000-7f73361b5000 r--p 00000000 08:01 <span class="token number">24786363</span>  /example/libcalc.so
+7f73361b5000-7f73361b6000 rw-p 00001000 08:01 <span class="token number">24786363</span>   /example/libcalc.so
+7f73361b6000-7f73361dd000 r-xp 00000000 08:01 <span class="token number">10490421</span>   /lib/x86_64-linux-gnu/ld-2.27.so
+7f73363bb000-7f73363be000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f73363db000-7f73363dd000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7f73363dd000-7f73363de000 r--p 00027000 08:01 <span class="token number">10490421</span>   /lib/x86_64-linux-gnu/ld-2.27.so
+7f73363de000-7f73363df000 rw-p 00028000 08:01 <span class="token number">10490421</span>   /lib/x86_64-linux-gnu/ld-2.27.so
+7f73363df000-7f73363e0000 rw-p 00000000 00:00 <span class="token number">0</span> 
+7fffe6dfd000-7fffe6e1e000 rw-p 00000000 00:00 <span class="token number">0</span>                          <span class="token punctuation">[</span>stack<span class="token punctuation">]</span>
+7fffe6fd4000-7fffe6fd7000 r--p 00000000 00:00 <span class="token number">0</span>                          <span class="token punctuation">[</span>vvar<span class="token punctuation">]</span>
+7fffe6fd7000-7fffe6fd9000 r-xp 00000000 00:00 <span class="token number">0</span>                          <span class="token punctuation">[</span>vdso<span class="token punctuation">]</span>
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 <span class="token number">0</span>                  <span class="token punctuation">[</span>vsyscall<span class="token punctuation">]</span>
+
+<span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span><span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>catch signal <span class="token number">11</span> <span class="token operator">&lt;&lt;&lt;</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">==</span><span class="token operator">=</span>   <span class="token comment"># 信号11是段错误</span>
+Dump stack start<span class="token punctuation">..</span>.
+backtrace<span class="token punctuation">(</span><span class="token punctuation">)</span> returned <span class="token number">7</span> addresses
+  <span class="token punctuation">[</span>00<span class="token punctuation">]</span> ./test_dynamic<span class="token punctuation">(</span>dump+0x2e<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x5631f8167cc8<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>01<span class="token punctuation">]</span> ./test_dynamic<span class="token punctuation">(</span>signal_handler+0xb8<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x5631f8167e5a<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>02<span class="token punctuation">]</span> /lib/x86_64-linux-gnu/libc.so.6<span class="token punctuation">(</span>+0x3ef20<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x7f7335c01f20<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>03<span class="token punctuation">]</span> ./libcalc.so<span class="token punctuation">(</span>segmentfault+0x3d<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x7f7335fb4877<span class="token punctuation">]</span>   <span class="token comment">#在动态库里面崩溃</span>
+  <span class="token punctuation">[</span>04<span class="token punctuation">]</span> ./test_dynamic<span class="token punctuation">(</span>main+0x58<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x5631f8167eee<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>05<span class="token punctuation">]</span> /lib/x86_64-linux-gnu/libc.so.6<span class="token punctuation">(</span>__libc_start_main+0xe7<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x7f7335be4b97<span class="token punctuation">]</span>
+  <span class="token punctuation">[</span>06<span class="token punctuation">]</span> ./test_dynamic<span class="token punctuation">(</span>_start+0x2a<span class="token punctuation">)</span> <span class="token punctuation">[</span>0x5631f8167bba<span class="token punctuation">]</span>
+Dump stack end<span class="token punctuation">..</span>.
+Segmentation fault <span class="token punctuation">(</span>core dumped<span class="token punctuation">)</span>
+</code></pre> 
+<p>同样地获得符号表地址：<code>0x7f7335fb4877 - 0x7f7335fb4000 = 0x877</code></p> 
+<pre><code class="prism language-shell">daniel@daniel:~/example$ addr2line -e libcalc.so <span class="token number">877</span>
+/example/calc.c:44
+</code></pre> 
+<p><code>objdump -d libcalc.so</code>获得<code>segmentfault</code>符号地址<code>000000000000083a</code>，加上偏移<code>0x3d</code>得到 <code>0x877</code></p> 
+<pre><code class="prism language-shell">000000000000083a <span class="token operator">&lt;</span>segmentfault<span class="token operator">&gt;</span>:
+ 83a:	<span class="token number">55</span>                   	push   %rbp
+ 83b:	<span class="token number">48</span> <span class="token number">89</span> e5             	mov    %rsp,%rbp
+ 83e:	<span class="token number">48</span> <span class="token number">83</span> ec <span class="token number">10</span>          	sub    <span class="token variable">$0x10</span>,%rsp
+ <span class="token number">842</span>:	<span class="token number">48</span> 8b 05 9f 07 <span class="token number">20</span> 00 	mov    0x20079f<span class="token punctuation">(</span>%rip<span class="token punctuation">)</span>,%rax        <span class="token comment"># 200fe8 &lt;segmentfault@@Base+0x2007ae&gt;</span>
+ <span class="token number">849</span>:	<span class="token number">48</span> <span class="token number">89</span> c6             	mov    %rax,%rsi
+ 84c:	<span class="token number">48</span> 8d 3d <span class="token number">46</span> 00 00 00 	lea    0x46<span class="token punctuation">(</span>%rip<span class="token punctuation">)</span>,%rdi        <span class="token comment"># 899 &lt;_fini+0x9&gt;</span>
+ <span class="token number">853</span>:	b8 00 00 00 00       	mov    <span class="token variable">$0x0</span>,%eax
+ <span class="token number">858</span>:	e8 <span class="token number">43</span> fe ff ff       	callq  6a0 <span class="token operator">&lt;</span>printf@plt<span class="token operator">&gt;</span>
+ 85d:	c7 <span class="token number">45</span> f0 0a 00 00 00 	movl   <span class="token variable">$0xa</span>,-0x10<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+ <span class="token number">864</span>:	c7 <span class="token number">45</span> f4 00 00 00 00 	movl   <span class="token variable">$0x0</span>,-0xc<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+ 86b:	<span class="token number">48</span> c7 <span class="token number">45</span> f8 00 00 00 	movq   <span class="token variable">$0x0</span>,-0x8<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+ <span class="token number">872</span>:	00 
+ <span class="token number">873</span>:	<span class="token number">48</span> 8b <span class="token number">45</span> f8          	mov    -0x8<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%rax
+ <span class="token number">877</span>:	c7 00 01 00 00 00    	movl   <span class="token variable">$0x1</span>,<span class="token punctuation">(</span>%rax<span class="token punctuation">)</span>
+ 87d:	<span class="token number">48</span> 8b <span class="token number">45</span> f8          	mov    -0x8<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%rax
+ <span class="token number">881</span>:	8b <span class="token number">10</span>                	mov    <span class="token punctuation">(</span>%rax<span class="token punctuation">)</span>,%edx
+ <span class="token number">883</span>:	8b <span class="token number">45</span> f0             	mov    -0x10<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%eax
+ <span class="token number">886</span>:	01 d0                	<span class="token function">add</span>    %edx,%eax
+ <span class="token number">888</span>:	<span class="token number">89</span> <span class="token number">45</span> f4             	mov    %eax,-0xc<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>
+ 88b:	8b <span class="token number">45</span> f4             	mov    -0xc<span class="token punctuation">(</span>%rbp<span class="token punctuation">)</span>,%eax
+ 88e:	c9                   	leaveq 
+ 88f:	c3                   	retq   
+
+</code></pre> 
+<h2><a id="_413"></a>参考文献</h2> 
+<ol><li><a href="https://seisman.github.io/how-to-write-makefile/index.html" rel="nofollow">跟我一起写Makefile</a></li><li><a href="https://blog.csdn.net/wzd547191555/article/details/123562888">linux进程地址空间</a></li><li><a href="https://www.cnblogs.com/arnoldlu/p/10272466.html" rel="nofollow">/proc/{pid}/maps简要分析</a></li><li><a href="https://blog.csdn.net/secretii/article/details/118555867">Linux利用maps文件和反汇编定位崩溃地址</a></li><li><a href="https://blog.csdn.net/qq_34999565/article/details/112342905">Linux信号处理程序的一个应用定位故障</a></li><li><a href="https://blog.csdn.net/jxgz_leo/article/details/53458366">在Linux中如何利用backtrace信息解决问题</a></li><li><a href="https://blog.csdn.net/qq_45477402/article/details/124450645">objdump(Linux)反汇编命令使用指南</a></li><li><a href="https://blog.csdn.net/qq_39852676/article/details/122523274">addr2line 动态库</a></li><li><a href="https://blog.csdn.net/C_Creator/article/details/125172325">linux64位系统 addr2line使用</a></li><li><a href="https://blog.csdn.net/tjcwt2011/article/details/122068913">strip命令介绍</a></li></ol>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/aa2df951af0995fadad3c41236706931/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">games101学习笔记_shading1(着色)</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/11e998799a75fcc3665fdf5f834f8450/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">C&#43;&#43; mutable关键字</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>内核与用户空间的通信实现—netlink - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="内核与用户空间的通信实现—netlink" />
+<meta property="og:description" content="前言 netlink是一个内核空间与用户空间通信的机制，相对ioctl和procfs方式来说，netlink有很多优点：
+netlink使用简单，与UDO的socket编程类似，直接使用socket编程的API即可。只需要自定义一个新类型的 netlink 协议定义即可。netlink是一种异步通信机制，在内核与用户态应用之间传递的消息保存在socket缓存队列中，发送消息只是把消息保存在接收者的socket的接收队列，而不需要等待接收者收到消息。netlink 支持多播，内核模块或应用可以把消息多播给一个netlink组。内核可以使用 netlink 首先发起会话。 netlink通信的用户程序与平时使用的UDPsocket类似，只是多了几个结构体，在刚开始学习netlink时被那么多结构体间的关系搞的头脑爆炸，很重要的一点也是在学习UDPsocket时没有打好基础，就正如sendto、sendmsg的使用。
+只要一开始能搞清楚整个netlink通信的创建和交互过程就能很容易理解。关于netlink更全面的理解大家自行百度，本文单纯从编程角度入手，只是简单介绍一下基础的流程实现。
+netlink编程 应用程序 流程图 图1.sendto发送信息流程图
+图2.sendmsg发送信息流程图 socket() /* 函数原型就是socket编程中的socket()函数，就不介绍函数原型了，只介绍netlink相关。 * 创建netlink套接字 * SOCK_RAW表示原始的数据流 * NETLINK_TEST是自己定义的一个宏，用来标识协议号，也可以用定义在linux/netlink.h中内核预留的宏NETLINK_GENERIC，实际上就是定义一个内核还没占用的数字。 */ sock_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_TEST) bind() /* 函数原型就是socket编程中的bind()函数，就不介绍函数原型了，只介绍netlink相关。 * 用户程序进程绑定sockaddr_nl元素 * saddr是struct sockaddr_nl的一个结构体元素，是netlink专用的地址结构体。 */ bind(sock_fd, (struct sockaddr*)&amp;saddr, sizeof(saddr)) Struct sockaddr_ln为Netlink的地址，和我们通常socket编程中的sockaddr_in作用一样
+struct sockaddr_nl { sa_family_t nl_family; /*该字段总是为AF_NETLINK */ unsigned short nl_pad; /* 目前未用到，填充为0*/ __u32 nl_pid; /* PORT-ID 用来标识单播地址，是netlink通信标识，类似于ip地址，0表示内核*/ __u32 nl_groups; /* 多播使用，0表示不用多播 */ }; 创建struct nlmsghdr /* netlink通信的报文分为消息头和消息体。 * netlink与tcp、udp的通信区别就是netlink的报文需要自己定义头部信息。 * 而tcp、udp的socket直接发送消息内容，内核协议栈会根据源、目的地址（sockaddr_in）自己填充头部信息。 * netlink的消息头就是结构体nlmsghdr。 */ struct nlmsghdr { __u32 nlmsg_len; // 整个消息的长度，包括消息头 __u16 nlmsg_type; // 消息的类型，区别数据消息还是控制消息 __u16 nlmsg_flags; // 附加在消息上的额外说明 __u32 nlmsg_seq; // 消息序列号，防止消息丢失 __u32 nlmsg_pid; // 用来表示自己的进程标识。为netlink连接通道唯一数字标识符，用于避免内核发送给用户进程时发错对象，通常是用户进程的pid。 }; nlmsg_type： #define NLMSG_NOOP 0x1 //不执行任何动作，必须将该消息丢弃； #define NLMSG_ERROR 0x2 //消息发生错误; #define NLMSG_DONE 0x3 //标识分组消息的末尾； #define NLMSG_OVERRUN 0x4 //缓冲区溢出，表示某些消息已经丢失。 define NLMSG_MIN_TYPE 0x10 //预留 nlmsg_flags: #define NLM_F_REQUEST 1 // It is request message." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/3ef213448dd71236ae5d56be8ae98ce4/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-10-11T14:32:28+08:00" />
+<meta property="article:modified_time" content="2022-10-11T14:32:28+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">内核与用户空间的通信实现—netlink</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>前言</h2> 
+<p>        netlink是一个内核空间与用户空间通信的机制，相对ioctl和procfs方式来说，netlink有很多优点：</p> 
+<ul><li>netlink使用简单，与UDO的socket编程类似，直接使用socket编程的API即可。只需要自定义一个新类型的 netlink 协议定义即可。</li><li>netlink是一种异步通信机制，在内核与用户态应用之间传递的消息保存在socket缓存队列中，发送消息只是把消息保存在接收者的socket的接收队列，而不需要等待接收者收到消息。</li><li>netlink 支持多播，内核模块或应用可以把消息多播给一个netlink组。</li><li>内核可以使用 netlink 首先发起会话。</li></ul> 
+<p>        netlink通信的用户程序与平时使用的UDPsocket类似，只是多了几个结构体，在刚开始学习netlink时被那么多结构体间的关系搞的头脑爆炸，很重要的一点也是在学习UDPsocket时没有打好基础，就正如sendto、sendmsg的使用。</p> 
+<p>        只要一开始能搞清楚整个netlink通信的创建和交互过程就能很容易理解。关于netlink更全面的理解大家自行百度，本文单纯从编程角度入手，只是简单介绍一下基础的流程实现。</p> 
+<h2>netlink编程</h2> 
+<h3>应用程序</h3> 
+<h4>流程图</h4> 
+<p class="img-center"><img alt="" height="627" src="https://images2.imgbox.com/e1/91/an55ewBn_o.png" width="314"></p> 
+<p style="text-align:center;"> 图1.sendto发送信息流程图</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="710" src="https://images2.imgbox.com/d6/3c/znQNl06l_o.png" width="434"></p> 
+<p style="text-align:center;">图2.sendmsg发送信息流程图 </p> 
+<p></p> 
+<h4>socket()</h4> 
+<pre><code class="language-cpp">/* 函数原型就是socket编程中的socket()函数，就不介绍函数原型了，只介绍netlink相关。
+ * 创建netlink套接字
+ * SOCK_RAW表示原始的数据流
+ * NETLINK_TEST是自己定义的一个宏，用来标识协议号，也可以用定义在linux/netlink.h中内核预留的宏NETLINK_GENERIC，实际上就是定义一个内核还没占用的数字。
+ */
+sock_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_TEST)</code></pre> 
+<h4>bind()</h4> 
+<pre><code class="language-cpp">/* 函数原型就是socket编程中的bind()函数，就不介绍函数原型了，只介绍netlink相关。
+ * 用户程序进程绑定sockaddr_nl元素
+ * saddr是struct sockaddr_nl的一个结构体元素，是netlink专用的地址结构体。
+ */
+bind(sock_fd, (struct sockaddr*)&amp;saddr, sizeof(saddr))
+</code></pre> 
+<p>        Struct sockaddr_ln为Netlink的地址，和我们通常socket编程中的sockaddr_in作用一样<img alt="" height="184" src="https://images2.imgbox.com/60/2c/fi3Jx4CX_o.png" width="753"></p> 
+<pre><code class="language-cpp">struct sockaddr_nl
+{
+    sa_family_t nl_family; /*该字段总是为AF_NETLINK */
+    unsigned short nl_pad; /* 目前未用到，填充为0*/
+    __u32 nl_pid;          /* PORT-ID 用来标识单播地址，是netlink通信标识，类似于ip地址，0表示内核*/
+    __u32 nl_groups;       /* 多播使用，0表示不用多播 */
+};</code></pre> 
+<h4>创建struct nlmsghdr</h4> 
+<pre><code class="language-cpp">/* netlink通信的报文分为消息头和消息体。
+ * netlink与tcp、udp的通信区别就是netlink的报文需要自己定义头部信息。
+ * 而tcp、udp的socket直接发送消息内容，内核协议栈会根据源、目的地址（sockaddr_in）自己填充头部信息。 
+ * netlink的消息头就是结构体nlmsghdr。 
+ */
+struct nlmsghdr
+{
+    __u32        nlmsg_len;      // 整个消息的长度，包括消息头
+    __u16        nlmsg_type;     // 消息的类型，区别数据消息还是控制消息
+    __u16        nlmsg_flags;    // 附加在消息上的额外说明
+    __u32        nlmsg_seq;      // 消息序列号，防止消息丢失
+    __u32        nlmsg_pid;      // 用来表示自己的进程标识。为netlink连接通道唯一数字标识符，用于避免内核发送给用户进程时发错对象，通常是用户进程的pid。
+};
+
+nlmsg_type：
+#define NLMSG_NOOP      0x1      //不执行任何动作，必须将该消息丢弃；
+#define NLMSG_ERROR     0x2      //消息发生错误;
+#define NLMSG_DONE      0x3      //标识分组消息的末尾；
+#define NLMSG_OVERRUN   0x4      //缓冲区溢出，表示某些消息已经丢失。
+define NLMSG_MIN_TYPE   0x10     //预留
+        
+nlmsg_flags:
+#define NLM_F_REQUEST      1    // It is request message.
+#define NLM_F_MULTI        2    // Multipart message, terminated by NLMSG_DONE 
+#define NLM_F_ACK          4    // Reply with ack, with zero or error code
+#define NLM_F_ECHO         8    // Echo this request
+#define NLM_F_DUMP_INTR    16   // Dump was inconsistent due to sequence change
+ 
+// Modifiers to GET request
+#define NLM_F_ROOT      0x100   // specify tree    root
+#define NLM_F_MATCH     0x200   // return all matching
+#define NLM_F_ATOMIC    0x400   // atomic GET
+#define NLM_F_DUMP    (NLM_F_ROOT|NLM_F_MATCH)
+ 
+// Modifiers to NEW request 
+#define NLM_F_REPLACE   0x100   //Override existing
+#define NLM_F_EXCL      0x200   // Do not touch, if it exists
+#define NLM_F_CREATE    0x400   // Create, if it does not exist
+#define NLM_F_APPEND    0x800   // Add to end of list</code></pre> 
+<blockquote> 
+ <p>注意：struct nlmsghdr结构体中</p> 
+ <p>    __u32        nlmsg_pid;      // 用来表示自己的进程标识。</p> 
+ <p></p> 
+ <p>        内核通过获取这个值知道用户进程的标识，然后通过netlink_unicast的第三个参数pid发送出去。</p> 
+ <p>        需要注意的是内核设置消息头的结构体nlmsg_put第四个参数设置nlmsg_pid应为0，标识自己的pid为0级内核。</p> 
+</blockquote> 
+<p></p> 
+<p></p> 
+<p></p> 
+<p>        我们在创建netlink报文消息头nlsmhdr结构体时会一起申请消息体的结构。</p> 
+<pre><code class="language-cpp">struct nlmsghdr *nlh = NULL; //定义netlink消息头类型的指针
+nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD)); // 申请netlink报文空间：消息头+消息体。NLMSG_SPACE是系统头文件定义的宏，后面会介绍netlink通信常用的宏；MAX_PAYLOAD是用户自己定义的消息负载大小</code></pre> 
+<h4>netlink常用的系统定义的宏</h4> 
+<pre><code class="language-cpp">#define NLMSG_ALIGNTO   4U
+
+/* 宏NLMSG_ALIGN(len)用于得到不小于len且字节对齐的最小数值 */
+#define NLMSG_ALIGN(len) ( ((len)+NLMSG_ALIGNTO-1) &amp; ~(NLMSG_ALIGNTO-1) )
+
+/* Netlink 头部长度 */
+#define NLMSG_HDRLEN     ((int) NLMSG_ALIGN(sizeof(struct nlmsghdr)))
+
+/* 计算消息数据len的真实消息长度（消息体 +　消息头）*/
+#define NLMSG_LENGTH(len) ((len) + NLMSG_HDRLEN)
+
+/* 宏NLMSG_SPACE(len)返回不小于NLMSG_LENGTH(len)且字节对齐的最小数值 */
+#define NLMSG_SPACE(len) NLMSG_ALIGN(NLMSG_LENGTH(len))
+
+/* 宏NLMSG_DATA(nlh)用于取得消息的数据部分的首地址，设置和读取消息数据部分时需要使用该宏 */
+#define NLMSG_DATA(nlh)  ((void*)(((char*)nlh) + NLMSG_LENGTH(0)))
+
+/* 宏NLMSG_NEXT(nlh,len)用于得到下一个消息的首地址, 同时len 变为剩余消息的长度 */
+#define NLMSG_NEXT(nlh,len)  ((len) -= NLMSG_ALIGN((nlh)-&gt;nlmsg_len), \(struct nlmsghdr*)(((char*)(nlh)) + NLMSG_ALIGN((nlh)-&gt;nlmsg_len)))
+
+/* 判断消息是否 &gt;len */
+#define NLMSG_OK(nlh,len) ((len) &gt;= (int)sizeof(struct nlmsghdr) &amp;&amp; \(nlh)-&gt;nlmsg_len &gt;= sizeof(struct nlmsghdr) &amp;&amp; \(nlh)-&gt;nlmsg_len &lt;= (len))
+
+/* NLMSG_PAYLOAD(nlh,len) 用于返回payload的长度*/
+#define NLMSG_PAYLOAD(nlh,len) ((nlh)-&gt;nlmsg_len - NLMSG_SPACE((len)))</code></pre> 
+<h4>sendto、recvfrom</h4> 
+<pre><code class="language-cpp">/* sendto函数原型 */
+int sendto(int s, const void * msg, int len, unsigned int flags, const struct sockaddr * to, int tolen);
+
+/* netlink使用
+ * sock_fd ： socket函数创建的fd。
+ * nlh ： nlmsghdr结构体指针
+ * nlh-&gt;nlmsg_le ： netlink报文长度
+ * 0 ： flag
+ * daddr ： 目的地址
+ * sizeof(struct sockaddr_nl) ： daddr元素大小
+ */
+sendto(sock_fd, nlh, nlh-&gt;nlmsg_len, 0, (struct sockaddr *)&amp;daddr, sizeof(struct         sockaddr_nl));</code></pre> 
+<pre><code class="language-cpp">/* recvfrom函数原型 */
+int recvfrom(socket s,void *buf,int len,unsigned int flags, struct sockaddr *from,int *fromlen);
+
+/* netlink使用 */
+recvfrom(sock_fd, nlh, NLMSG_LENGTH(MAX_PAYLOAD), 0, NULL, NULL);</code></pre> 
+<h4>sendmsg、recvmsg</h4> 
+<p>        netlink用户程序发送和接收消息可以用sendto/sendmsg、recvfrom/recvmsg。使用sendto和recvfrom则如上所述。如果使用sendmsg和recvmsg就需要用到msghdr结构体和iovec结构体。sendmsg、recvmsg更为复杂功能更强。msghdr、nlmsghdr、iovec的关系如下图所示：</p> 
+<p><img alt="" height="589" src="https://images2.imgbox.com/25/a8/ABdjnxUy_o.png" width="853"></p> 
+<p>         下面我们来介绍一下msghdr与iovec结构体</p> 
+<pre><code class="language-cpp">struct iovec 
+{                    /* Scatter/gather array items */
+    void  *iov_base;              /* Starting address */
+    size_t iov_len;               /* Number of bytes to transfer */
+};
+/* iov_base: iov_base指向数据包缓冲区，即参数buff，iov_len是buff的长度。msghdr中允许一次传递多个buff，以数组的形式组织在 msg_iov中，msg_iovlen就记录数组的长度 （即有多少个buff）*/ 
+
+struct msghdr 
+{
+    void         *msg_name;        // 数据的目的地址，网络包指向sockaddr_in, netlink则指向sockaddr_nl; 
+    socklen_t     msg_namelen;    // msg_namelen: msg_name 所代表的地址长度
+    struct iovec *msg_iov;        // 指向的是缓冲区数组
+    size_t        msg_iovlen;     // 缓冲区数组长度 
+    void         *msg_control;    // 辅助数据，控制信息(发送任何的控制信息) 
+    size_t        msg_controllen; // 辅助信息长度 
+    int           msg_flags;      // 消息标识
+};
+
+/* iovec、msghdr结构体的使用 */
+memset(&amp;iov, 0, sizeof(iov));  
+iov.iov_base = (void *)nlh;  
+iov.iov_len = nlh-&gt;nlmsg_len; 
+memset(&amp;msg, 0, sizeof(msg));
+msg.msg_iov = &amp;iov;
+msg.msg_iovlen = 1;</code></pre> 
+<p>        sendmsg与recvmsg的使用</p> 
+<pre><code class="language-cpp">/* sendmsg函数原型 */
+ssize_t sendmsg(int sockfd, struct msghdr *msg, int flags);
+
+sendmsg(sock_fd, &amp;msg, 0); //sock_fd为socket创建的fd，msg为msghdr的指针
+
+/* recvmsg函数原型 */
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
+
+recvmsg(sock_fd, &amp;msg, 0);</code></pre> 
+<h4>用户程序代码-usr_netlink_demo.c</h4> 
+<p>使用sendto、recvfrom</p> 
+<pre><code class="language-cpp">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;asm/types.h&gt;
+#include &lt;linux/netlink.h&gt;
+#include &lt;linux/socket.h&gt;
+
+#define MAX_PAYLOAD 1024 /* netlink消息最大负载为1024B */
+#define NETLINK_TEST 30
+
+int main(int argc, char **argv)
+{
+	struct sockaddr_nl daddr;
+	struct sockaddr_nl saddr; //定义netlink用户空间地址体
+	struct nlmsghdr *nlh = NULL; //定义netlink消息头类型的指针
+	
+	int sock_fd = -1;
+	int len;
+	int ret;
+	char recv_buf[MAX_PAYLOAD] = {0};
+	char *umsg = "hello";
+
+	/* 创建netlink套接字，SOCK_RAW表示原始的数据流，NETLINK_TEST表示用户自定义协议 */
+	if (-1 == (sock_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_TEST)))
+	{
+		perror("can't create netlink socket!");
+		return -1;
+	}
+	memset(&amp;saddr, 0, sizeof(saddr));
+	saddr.nl_family = AF_NETLINK;
+	saddr.nl_pid = 100;
+	saddr.nl_groups = 0;
+	
+	memset(&amp;daddr, 0, sizeof(daddr));
+	daddr.nl_family = AF_NETLINK;
+	daddr.nl_pid = 0; // to kernel 
+	daddr.nl_groups = 0;
+	
+	if (-1 == bind(sock_fd, (struct sockaddr*)&amp;saddr, sizeof(saddr)))
+	{
+		perror("can't bind sockfd with sockaddr_nl!");
+		return -2;
+	}
+	
+	/* 
+		给结构体指针nlh分配地址
+		NLMSG_SPACE(MAX_PAYLOAD): 该宏用于返回不小于MAX_PAYLOAD且4字节对齐的最小长度值
+		一般用于向内存系统申请空间是指定所申请的内存字节数
+	*/
+	if (NULL == (nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD))))
+	{
+		perror("malloc mem failed!");
+		return -3;
+	}
+	memset(nlh, 0, sizeof(struct nlmsghdr));
+	nlh-&gt;nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
+	nlh-&gt;nlmsg_pid = 100;
+	nlh-&gt;nlmsg_type = 0;
+	nlh-&gt;nlmsg_flags = 0;
+	nlh-&gt;nlmsg_seq = 0;
+	
+	memcpy(NLMSG_DATA(nlh), umsg, strlen(umsg));
+	
+	ret = sendto(sock_fd, nlh, nlh-&gt;nlmsg_len, 0, (struct sockaddr *)&amp;daddr, sizeof(struct sockaddr_nl));
+	if(0 &gt;= ret)
+	{
+		perror("sendto error\n");
+		ret = -4;
+		goto CleanUp;
+	}
+
+	memset(nlh,0,NLMSG_SPACE(MAX_PAYLOAD));
+	
+	len = sizeof(struct sockaddr_nl);
+	ret = recvfrom(sock_fd, nlh, NLMSG_LENGTH(MAX_PAYLOAD), 0, NULL, NULL);
+	if(0 &gt;= ret)
+	{
+		perror("recvfrom kernel error\n");
+		ret = -5;
+		goto CleanUp;
+	}
+    printf("usr recv kernel:%s\n",NLMSG_DATA(nlh));
+    ret = 0;
+	
+CleanUp:
+	close(sock_fd);
+	free(nlh);
+	return ret;
+}
+</code></pre> 
+<p>使用sendmsg、recvmsg</p> 
+<pre><code class="language-cpp">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;asm/types.h&gt;
+#include &lt;linux/netlink.h&gt;
+#include &lt;linux/socket.h&gt;
+
+#define MAX_PAYLOAD 1024 /* netlink消息最大负载为1024B */
+#define NETLINK_TEST 30
+
+int main(int argc, char **argv)
+{
+	struct sockaddr_nl daddr;
+	struct sockaddr_nl saddr; //定义netlink用户空间地址体
+	struct nlmsghdr *nlh = NULL; //定义netlink消息头类型的指针
+	struct iovec iov; //定义一个向量元素，通常用于多元素的数组
+	struct msghdr msg; // 用于recvmsg、sendmsg发送和接受的数据存放；
+	
+	int sock_fd = -1;
+	int len;
+	int ret;
+	char recv_buf[MAX_PAYLOAD] = {0};
+	char *umsg = "hello";
+
+	/* 创建netlink套接字，SOCK_RAW表示原始的数据流，NETLINK_TEST表示用户自定义协议 */
+	if (-1 == (sock_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_TEST)))
+	{
+		perror("can't create netlink socket!");
+		return -1;
+	}
+	memset(&amp;saddr, 0, sizeof(saddr));
+	saddr.nl_family = AF_NETLINK;
+	saddr.nl_pid = 100;
+	saddr.nl_groups = 0;
+	
+	memset(&amp;daddr, 0, sizeof(daddr));
+	daddr.nl_family = AF_NETLINK;
+	daddr.nl_pid = 0; // to kernel 
+	daddr.nl_groups = 0;
+	
+	if (-1 == bind(sock_fd, (struct sockaddr*)&amp;saddr, sizeof(saddr)))
+	{
+		perror("can't bind sockfd with sockaddr_nl!");
+		return -2;
+	}
+	
+	/* 
+		给结构体指针nlh分配地址
+		NLMSG_SPACE(MAX_PAYLOAD): 该宏用于返回不小于MAX_PAYLOAD且4字节对齐的最小长度值
+		一般用于向内存系统申请空间是指定所申请的内存字节数
+	*/
+	if (NULL == (nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD))))
+	{
+		perror("malloc mem failed!");
+		return -3;
+	}
+	memset(nlh, 0, sizeof(struct nlmsghdr));
+	nlh-&gt;nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
+	nlh-&gt;nlmsg_pid = 100;
+	nlh-&gt;nlmsg_type = 0;
+	nlh-&gt;nlmsg_flags = 0;
+	nlh-&gt;nlmsg_seq = 0;
+	
+	memcpy(NLMSG_DATA(nlh), umsg, strlen(umsg));
+	
+	memset(&amp;iov, 0, sizeof(iov));
+	iov.iov_base = (void *)nlh;
+	iov.iov_len = nlh-&gt;nlmsg_len;
+	memset(&amp;msg, 0, sizeof(msg));
+    msg.msg_name = (void *)&amp;(daddr);
+    msg.msg_namelen = sizeof(daddr);   
+	msg.msg_iov = &amp;iov;
+	msg.msg_iovlen = 1;
+    ret = sendmsg(sock_fd, &amp;msg, 0);
+    if(0 &gt;= ret)
+	{
+		perror("sendto kernel error\n");
+		ret = -5;
+		goto CleanUp;
+	}
+    memset(nlh,0,NLMSG_SPACE(MAX_PAYLOAD));
+    recvmsg(sock_fd, &amp;msg, 0);
+    if(0 &gt;= ret)
+	{
+		perror("recvfrom kernel error\n");
+		ret = -6;
+		goto CleanUp;
+	}
+    printf("Received message: %s\n",(char *) NLMSG_DATA(nlh));
+    ret = 0;
+	
+CleanUp:
+	close(sock_fd);
+	free(nlh);
+	return ret;
+}
+</code></pre> 
+<h4>内核程序-kernel_netlink_demo.c</h4> 
+<pre><code class="language-cpp">#include &lt;linux/init.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/types.h&gt;
+#include &lt;linux/netlink.h&gt;
+#include &lt;net/sock.h&gt;
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/skbuff.h&gt;
+#include &lt;linux/ip.h&gt;
+#include &lt;linux/types.h&gt;
+#include &lt;linux/sched.h&gt;
+
+#define NETLINK_TEST 30
+#define MSG_LEN      125
+#define USER_PORT    100
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("lixuezahng");
+MODULE_DESCRIPTION("netlink example");
+
+
+struct sock *nl_sk = NULL;
+struct net init_net;
+
+static int netlink_send_msg(char *send_buf, size_t len, long pid)
+{
+	struct sk_buff *psk_buff_t;
+	struct nlmsghdr *pnlmsghdr_t;
+	
+	int ret;
+	
+	psk_buff_t = nlmsg_new(len, GFP_ATOMIC); //创建sk_buff空间
+	if(NULL == psk_buff_t)
+	{
+		printk("netlink alloc failure\n");
+		return -1;
+	}
+	
+	/* 设置netlink消息头 */
+	pnlmsghdr_t = nlmsg_put(psk_buff_t, 0, 0, pid, len, 0);
+	if(NULL == pnlmsghdr_t)
+	{
+		printk("nlmsg_put failure\n");
+		nlmsg_free(psk_buff_t);        //针对nlmsg_new申请空间的释放问题，若put失败需要手动释放，若put成功netlink_unicast发送后内核会自己处理
+		return -2;
+	}
+	
+	memcpy(NLMSG_DATA(pnlmsghdr_t), send_buf, len);
+	
+	/*
+		内核发送单播消息
+		extern int netlink_unicast(struct sock *ssk, struct sk_buff *skb, __u32 portid, int nonblock);
+		ssk: netlink socket 
+		skb: skb buff 指针 
+		portid：通信的端口号 
+		nonblock：表示该函数是否为非阻塞，如果为1，该函数将在没有接收缓存可利用时立即返回，而如果为 0，该函数在没有接收缓存可利用 定时睡眠
+		
+		内核发送多播消息
+		extern int netlink_broadcast(struct sock *ssk, struct sk_buff *skb, __u32 portid, __u32 group, gfp_t allocation);
+		ssk: 同上（对应 netlink_kernel_create 返回值）、 
+		skb: 内核 skb buff 
+		portid：端口id 
+		group: 是所有目标多播组对应掩码的"OR"操作的。 
+		allocation: 指定内核内存分配方式，通常 GFP_ATOMIC 用于中断上下文，而 GFP_KERNEL 用于其他场合。这个参数的存在是因为该 API 可能需要分配一个或多个缓冲区来对多播消息进行 clone。 
+	*/
+	ret = netlink_unicast(nl_sk, psk_buff_t, pid, MSG_DONTWAIT);
+	
+	return ret;
+}
+	
+static void netlink_rcv_msg(struct sk_buff *psk_buff_t)
+{
+	struct nlmsghdr *pnlmsghdr_t = NULL;
+	char *umsg = NULL;
+	char *kmsg = "hello users!!!";
+	
+	if(psk_buff_t-&gt;len &gt;= nlmsg_total_size(0))
+	{
+		pnlmsghdr_t = nlmsg_hdr(psk_buff_t);
+		umsg = NLMSG_DATA(pnlmsghdr_t);
+		if(umsg)
+		{
+			printk("kernel recv from user: %s\n", umsg);
+			netlink_send_msg(kmsg, strlen(kmsg), pnlmsghdr_t-&gt;nlmsg_pid);
+		}
+	}
+}
+
+struct netlink_kernel_cfg cfg = {
+		.input = netlink_rcv_msg, /* set recv callback */
+};
+
+
+static int __init nlmoudle_init(void)
+{
+	printk(KERN_ALERT "my netlink_kernel in\n");
+	
+	/*
+		static inline struct sock * netlink_kernel_create(struct net *net, int unit, struct netlink_kernel_cfg *cfg) 
+		net:指向所在的网络命名空间, 默认传入的是 &amp;init_net (不需要定义);  定义在 net_namespace.c(extern struct net init_net); 
+		unit:netlink协议类型
+		cfg：cfg 存放的是 netlink 内核配置参数
+		struct netlink_kernel_cfg { 
+			unsigned int    groups; 
+			unsigned int    flags; 
+			void        	(*input)(struct sk_buff *skb); // input 回调函数
+			struct mutex    *cb_mutex; 
+			void        (*bind)(int group); 
+			bool        (*compare)(struct net *net, struct sock *sk); 
+}; 
+	*/
+	nl_sk = (struct sock *)netlink_kernel_create(&amp;init_net, NETLINK_TEST, &amp;cfg);
+	return 0;
+}
+
+static void __exit nlmoudle_exit(void)
+{
+	printk(KERN_ALERT "my netlink_kernel out\n");
+	netlink_kernel_release(nl_sk);
+}
+
+module_init(nlmoudle_init);
+module_exit(nlmoudle_exit);
+</code></pre> 
+<h4>makefile</h4> 
+<pre><code class="language-bash">KERNEL_DIR := /XX/XX/linux-3.10 #指定内核的路径
+CURRENT_PATH := $(shell pwd)    #当前路径
+obj-m += kernel_netlink_demo.o    #编译kernel_ioctl_demo.c生成.ko文件
+ 
+build:netlink_module              #总目标
+ 
+netlink_module:
+	$(MAKE) -C $(KERNEL_DIR) ARCH=XXX CROSS_COMPILE=XXX M=$(CURRENT_PATH) modules
+    #-C [CPATH]表示make要跳转到CPATH路径执行make
+    #-M [MPATH]表示执行完CPATH路径下的make后再回到MPATH继续执行剩下的
+    #ARCH 指定处理器架构
+    #CROSS_COMPILE 指定交叉编译器
+ 
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(CURRENT_PATH) clean
+</code></pre> 
+<h4>sendmsg实例</h4> 
+<pre><code class="language-cpp">/*************************************************************************
+ * @description             : nl_send_msg 函数，通过netlink发送数据到内核
+ * @param -sock_fd          : sock描述符
+ * @param -dst_addr         : netlink目的地址
+ * @param -message          : 发送的数据
+ * @param -len              ：发送数据的长度
+ * @return                  : 失败返回 -1，成功返回0
+ *************************************************************************/
+
+
+static int nl_send_msg(int sock_fd, struct sockaddr_nl *dst_addr, char *message, int len)
+{
+	struct nlmsghdr *nlh = NULL;
+	struct iovec iov;
+	struct msghdr msg;
+
+	if( !len || !message)
+	{
+		printf("message is empty or len is zero\n");
+		return -1;
+	}
+	/* 1、构建nlh */
+	if(NULL == (nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(len))))
+	{
+		printf("nlh malloc failed\n");
+		return -1;
+	}
+
+	nlh-&gt;nlmsg_len 		= NLMSG_SPACE(len);
+	nlh-&gt;nlmsg_pid 		= getpid();
+	nlh-&gt;nlmsg_flags 	= 0;
+	memcpy(NLMSG_DATA(nlh), message, len);
+
+	/* 2、构建iov */
+
+	iov.iov_base = (void *)nlh;
+	iov.iov_len = nlh-&gt;nlmsg_len;
+
+	/* 3、构建msg */
+	memset(&amp;msg, 0, sizeof(struct msghdr));
+	msg.msg_name = (void *)dst_addr;
+	msg.msg_namelen = sizeof(struct sockaddr_nl);
+	msg.msg_iov = &amp;iov;
+	msg.msg_iovlen = 1;
+
+	/* 4、发送消息 */
+	if(0 &gt; sendmsg(sock_fd, &amp;msg, 0))
+	{
+		printf("sendmsg failed\n");
+		free(nlh);
+		return -1;
+	}
+
+	free(nlh);
+
+	return 0;
+}
+
+/*************************************************************************
+ * @description             : nl_recv_msg 函数，接收从内核发送的数据
+ * @param -sock_fd          : sock描述符
+ * @param -dst_addr         : netlink源地址
+ * @param -message          : 接收到的数据
+ * @param -len              ：接收到数据的长度
+ * @return                  : 失败返回 -1，成功返回0
+ *************************************************************************/
+
+static int nl_recv_msg(int sock_fd, struct sockaddr_nl *src_addr, char *message, int len)
+{
+	struct nlmsghdr *nlh = NULL;
+	struct iovec iov;
+	struct msghdr msg;
+
+	if( !len || !message)
+	{
+		printf("message is empty or len is zero\n");
+		return -1;
+	}
+
+	/* 1、构建nlh */
+	if(NULL == (nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(RESCVPLAYLOAD))))
+	{
+		printf("recv nlh malloc failed\n");
+		return -1;
+	}
+
+	/* 2、构建ivo */
+	iov.iov_base = (void *)nlh;
+	iov.iov_len = NLMSG_SPACE(RESCVPLAYLOAD);
+
+	/* 3、构建msg */
+	memset(src_addr, 0, sizeof(struct sockaddr_nl));
+	memset(&amp;msg, 0, sizeof(struct msghdr));
+	msg.msg_name = (void *)src_addr;
+	msg.msg_namelen = sizeof(struct sockaddr_nl);
+	msg.msg_iov = &amp;iov;
+	msg.msg_iovlen = 1;
+
+	/* 4、接受信息 */
+	if(0 &gt; recvmsg(sock_fd, &amp;msg, 0))
+	{
+		printf("recv_message failed\n");
+		free(nlh);
+		return -1;
+	}
+
+	memcpy(message, (unsigned char *)NLMSG_DATA(nlh), nlh-&gt;nlmsg_len - NLMSG_SPACE(0));
+
+	free(nlh);
+	return 0;
+}
+</code></pre> 
+<p></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3c7b4dc0395dd6254776b0f4ec7d9784/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Ubuntu安装SSH服务</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/d557bd1300d388fb44fe5005a56e77b3/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">编译原理 --- NFA（非确定有限自动机）和DFA（确定有限自动机）之间的转换以及DFA的化简</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

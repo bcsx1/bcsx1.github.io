@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>魔改nnU-Net夺冠！2021 BraTS 脑肿瘤分割竞赛第一名解决方案 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="魔改nnU-Net夺冠！2021 BraTS 脑肿瘤分割竞赛第一名解决方案" />
+<meta property="og:description" content="点击下方卡片，关注“CVer”公众号
+AI/CV重磅干货，第一时间送达
+转载自：集智书童 Extending nn-UNet for brain tumor segmentation
+论文：https://arxiv.org/abs/2112.04653
+代码（刚刚开源）：
+https://github.com/rixez/Brats21_KAIST_MRI_Lab
+本文描述了基于nn-UNet试验了几种改进，包括使用更大的网络、用GN替换BN以及在解码器中使用Axial Attention。与Baseline相比，量化指标略有改进。在unseen test data的最终排名中，nn-UNet赢得了第一名的好成绩。
+1改进策略 1.1 数据方面 BraTS2021包括了来自2000名患者的多参数MRI扫描结果，其中1251人的图像提供了分割标签给参与者来开发算法，其中219人在验证阶段被用于公共排行榜，其余530个案例用于私人排行榜和参与者的最终排名。
+MRI扫描有4种对比:
+原生T1加权图像
+对比后T1加权(T1GD)
+T2加权
+T2流体衰减反转恢复(T2-Flair)
+注释由1-4个评分员手工完成，最终得到有经验的神经放射学家的批准。这些标签包括gd增强肿瘤(ET)、瘤周水肿/侵袭组织(ED)和坏死肿瘤核心(NCR)区域。所有MRI扫描均通过同解剖模板配准、各向同性1mm3分辨率插值和颅骨剥离进行预处理。所有MRI扫描及相关标记的图像大小为240×240×155。
+图1 图1显示了这4种对比与分割的代表性切片。在输入网络之前，对提供的数据进行了进一步的处理。为了减少计算量，将volumes裁剪为non-zero voxels。由于MR图像的强度是定性的，因此根据其均值和标准差对voxels进行归一化。
+1.2 模型方面 1、Baseline nnU-Net nnU-Net核心是一个在128×128×128大小的Patch上运行的3D U-Net。该网络具有编码-解码器结构，并带有Skip Connection，将两条路径连接起来。
+该编码器由5个相同分辨率的卷积层组成，具有卷积下采样功能。该解码器遵循相同的结构，使用转置卷积上采样和卷积操作在同一级别上的编码器分支的串联Skip特征。每次卷积操作后，采用斜率为0.01的Leaky ReLU(lReLU)和批归一化处理。mpMRI volumes被连接并作为4通道输入。
+nnU-Net应用Region-Based训练，而不是预测3个相互排斥的肿瘤子区域，而不是预测3个互斥肿瘤分区,与提供的分割标签一样，该网络预测的是增强肿瘤的3个重叠区域如加强肿瘤(ET,original region),肿瘤核心或TC(ET&#43;necrotic tumor),和整个肿瘤或WT(ET&#43;NT&#43;ED)。
+网络的最后一层的softmax被sigmoid所取代，将每个voxels作为一个多类分类问题。
+由于公共和私人排行榜的计算指标是基于这些区域的，这种基于区域的训练可以提高表现。额外的sigmoid输出添加到每个分辨率除了2个最低的水平，应用深度监督和改善梯度传播到早期层。卷积滤波器的数量被初始化为32个，并且分辨率每降低一倍，最大可达320个。
+2、更大的网络和GN 第一个修改是，通过将编码器中的kernel数量加倍，同时在解码器中保持相同的kernel，非对称地增加了网络的大小。由于训练数据的数量是前一年的4倍，增加网络的容量将有助于它能够建模更大的数据种类。kernel的最大数量也增加到512个，改进后的网络结构如图2所示：
+图2 第二个修改是用GN代替所有BN。即使使用混合精度训练，3D卷积网络也需要大量的GPU内存，这限制了在训练中可以使用的Batch-Size。
+3、Axial attention解码器 最后添加的是在解码器中使用Axial attention。Self-Attention或Transformer是一个突破性的想法，允许学习一个输入序列的自适应注意力仅仅基于它自己。Self-Attention最初是在自然语言处理中，现在已经慢慢被计算机视觉研究所采用。当试图将Self-Attention应用于视觉问题时，主要的障碍之一是注意力机制的计算复杂度与输入的大小成二次方，这使得它不可能适合或训练网络在一个标准的工作站设置。当处理带有额外维度的3D数据时，这是一个更大的问题。
+Axial attention最近被提出作为将注意力应用于多维数据时的一种有效解决方案。通过将Self-Attention独立地应用于输入的每一个轴上，计算只与图像大小成线性比例，使注意力机制即使与3D数据整合成为可能。
+本文将Axial attention应用到网络的解码器上，将其运行在转置卷积上采样的输出上，然后将它们相加。
+图3 显示了Axial attention解码器块的示意图。即使有了更有效的注意力，作者发现这种方法也不可能应用于最高分辨率的特征(128×128×128)，因此只选择了4个较低分辨率的特征。注意力头的数量和每个头的尺寸随着分辨率的降低而增加一倍，分别从4和16(64×64×64分辨率)开始。
+1.3 训练策略 这里遵循nnU-Net训练方法。每个网络都接受了5倍交叉验证的训练。在训练过程中，动态地应用数据增强来提高泛化能力。数据增强包括随机旋转和缩放、弹性变形、附加亮度增强和伽玛缩放。
+优化的目标是binary entropy loss和Dice loss的总和，计算在最终的全分辨率输出以及在低分辨率的辅助输出。使用Batch Dice loss代替sample Dice loss，将整个批次作为一个样本来计算损失，而不是平均每个样本在小批中的Dice。批量Dice帮助稳定训练通过减少来自样本的错误，少量的注释样本。网络采用Nesterov动量为0." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/7b6a820b4faa4a6f0e4b050e6743a5e2/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-12-13T23:59:00+08:00" />
+<meta property="article:modified_time" content="2021-12-13T23:59:00+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">魔改nnU-Net夺冠！2021 BraTS 脑肿瘤分割竞赛第一名解决方案</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p style="text-align:center;">点击下方<strong>卡片</strong>，关注“<strong>CVer</strong>”公众号</p> 
+ <p style="text-align:center;">AI/CV重磅干货，第一时间送达</p> 
+ 转载自：集智书童 
+ <p style="text-align:left;">Extending nn-UNet for brain tumor segmentation</p> 
+ <p style="text-align:left;"><img src="https://images2.imgbox.com/2c/0f/O971JM1S_o.png" alt="44b79a8e8eb2046d391ab56d2b8f2c85.png">论文：https://arxiv.org/abs/2112.04653</p> 
+ <p style="text-align:left;">代码（刚刚开源）：</p> 
+ <p style="text-align:left;">https://github.com/rixez/Brats21_KAIST_MRI_Lab</p> 
+ <blockquote> 
+  <p>本文描述了基于nn-UNet试验了几种改进，包括使用更大的网络、用GN替换BN以及在解码器中使用Axial Attention。与Baseline相比，量化指标略有改进。在unseen test data的最终排名中，nn-UNet赢得了第一名的好成绩。</p> 
+ </blockquote> 
+ <h3>1改进策略</h3> 
+ <h4>1.1 数据方面</h4> 
+ <p>BraTS2021包括了来自2000名患者的多参数MRI扫描结果，其中1251人的图像提供了分割标签给参与者来开发算法，其中219人在验证阶段被用于公共排行榜，其余530个案例用于私人排行榜和参与者的最终排名。</p> 
+ <p>MRI扫描有4种对比:</p> 
+ <ul><li><p>原生T1加权图像</p></li><li><p>对比后T1加权(T1GD)</p></li><li><p>T2加权</p></li><li><p>T2流体衰减反转恢复(T2-Flair)</p></li></ul> 
+ <p>注释由1-4个评分员手工完成，最终得到有经验的神经放射学家的批准。这些标签包括gd增强肿瘤(ET)、瘤周水肿/侵袭组织(ED)和坏死肿瘤核心(NCR)区域。所有MRI扫描均通过同解剖模板配准、各向同性1mm3分辨率插值和颅骨剥离进行预处理。所有MRI扫描及相关标记的图像大小为240×240×155。</p> 
+ <img src="https://images2.imgbox.com/5a/07/2llA66E0_o.png" alt="a71934a53dbe422821ae8a33d75ce880.png"> 
+ <figcaption>
+   图1 
+ </figcaption> 
+ <p>图1显示了这4种对比与分割的代表性切片。在输入网络之前，对提供的数据进行了进一步的处理。为了减少计算量，将volumes裁剪为non-zero voxels。由于MR图像的强度是定性的，因此根据其均值和标准差对voxels进行归一化。</p> 
+ <h4>1.2 模型方面</h4> 
+ <h5>1、Baseline nnU-Net</h5> 
+ <p>nnU-Net核心是一个在128×128×128大小的Patch上运行的3D U-Net。该网络具有编码-解码器结构，并带有Skip Connection，将两条路径连接起来。</p> 
+ <p>该编码器由5个相同分辨率的卷积层组成，具有卷积下采样功能。该解码器遵循相同的结构，使用转置卷积上采样和卷积操作在同一级别上的编码器分支的串联Skip特征。每次卷积操作后，采用斜率为0.01的Leaky ReLU(lReLU)和批归一化处理。mpMRI volumes被连接并作为4通道输入。</p> 
+ <p>nnU-Net应用Region-Based训练，而不是预测3个相互排斥的肿瘤子区域，而不是预测3个互斥肿瘤分区,与提供的分割标签一样，该网络预测的是增强肿瘤的3个重叠区域如加强肿瘤(ET,original region),肿瘤核心或TC(ET+necrotic tumor),和整个肿瘤或WT(ET+NT+ED)。</p> 
+ <p>网络的最后一层的softmax被sigmoid所取代，将每个voxels作为一个多类分类问题。</p> 
+ <p>由于公共和私人排行榜的计算指标是基于这些区域的，这种基于区域的训练可以提高表现。额外的sigmoid输出添加到每个分辨率除了2个最低的水平，应用深度监督和改善梯度传播到早期层。卷积滤波器的数量被初始化为32个，并且分辨率每降低一倍，最大可达320个。</p> 
+ <h5>2、更大的网络和GN</h5> 
+ <p>第一个修改是，通过将编码器中的kernel数量加倍，同时在解码器中保持相同的kernel，非对称地增加了网络的大小。由于训练数据的数量是前一年的4倍，增加网络的容量将有助于它能够建模更大的数据种类。kernel的最大数量也增加到512个，改进后的网络结构如图2所示：</p> 
+ <img src="https://images2.imgbox.com/f3/1e/SAVFX4uQ_o.png" alt="21819688a5293d165f943128a736f664.png"> 
+ <figcaption>
+   图2 
+ </figcaption> 
+ <p>第二个修改是用GN代替所有BN。即使使用混合精度训练，3D卷积网络也需要大量的GPU内存，这限制了在训练中可以使用的Batch-Size。</p> 
+ <h5>3、Axial attention解码器</h5> 
+ <p>最后添加的是在解码器中使用Axial attention。Self-Attention或Transformer是一个突破性的想法，允许学习一个输入序列的自适应注意力仅仅基于它自己。Self-Attention最初是在自然语言处理中，现在已经慢慢被计算机视觉研究所采用。当试图将Self-Attention应用于视觉问题时，主要的障碍之一是注意力机制的计算复杂度与输入的大小成二次方，这使得它不可能适合或训练网络在一个标准的工作站设置。当处理带有额外维度的3D数据时，这是一个更大的问题。</p> 
+ <p>Axial attention最近被提出作为将注意力应用于多维数据时的一种有效解决方案。通过将Self-Attention独立地应用于输入的每一个轴上，计算只与图像大小成线性比例，使注意力机制即使与3D数据整合成为可能。</p> 
+ <p>本文将Axial attention应用到网络的解码器上，将其运行在转置卷积上采样的输出上，然后将它们相加。</p> 
+ <img src="https://images2.imgbox.com/df/b3/jE2iojVX_o.png" alt="687414b14e144a7cca1ed22667c28951.png"> 
+ <figcaption>
+   图3 
+ </figcaption> 
+ <p>显示了Axial attention解码器块的示意图。即使有了更有效的注意力，作者发现这种方法也不可能应用于最高分辨率的特征(128×128×128)，因此只选择了4个较低分辨率的特征。注意力头的数量和每个头的尺寸随着分辨率的降低而增加一倍，分别从4和16(64×64×64分辨率)开始。</p> 
+ <h4>1.3 训练策略</h4> 
+ <p>这里遵循nnU-Net训练方法。每个网络都接受了5倍交叉验证的训练。在训练过程中，动态地应用数据增强来提高泛化能力。数据增强包括随机旋转和缩放、弹性变形、附加亮度增强和伽玛缩放。</p> 
+ <p>优化的目标是binary entropy loss和Dice loss的总和，计算在最终的全分辨率输出以及在低分辨率的辅助输出。使用Batch Dice loss代替sample Dice loss，将整个批次作为一个样本来计算损失，而不是平均每个样本在小批中的Dice。批量Dice帮助稳定训练通过减少来自样本的错误，少量的注释样本。网络采用Nesterov动量为0.99的随机梯度下降法进行优化。初始学习率为0.01，并按照多项式计划衰减：</p> 
+ <img src="https://images2.imgbox.com/81/60/B2xDl4WG_o.png" alt="e2f8db0b18fec4a3763daf443f1d604d.png"> 
+ <p>每次训练运行持续1000个epoch，每个epoch包含250个小批量。当前折叠验证集上的Dice Score用于监视训练进度。所有实验都是在24GB VRAM的NVIDIA RTX 3090 GPU上使用Pytorch 1.9进行的。开发了以下模型:</p> 
+ <ul><li><p>BL：Baseline nnUNet</p></li><li><p>BL+L：Baseline with Large nnUNet</p></li><li><p>BL+GN：Baseline with Group Normalization</p></li><li><p>BL+AA：Baseline with axial attention, batch normalization</p></li><li><p>BL+L+GN：nnUNet with larger Unet, group normalization</p></li></ul> 
+ <h3>2比赛结果</h3> 
+ <img src="https://images2.imgbox.com/94/96/p1v1HzTM_o.png" alt="070e9f3dc222dcad0542960bf38bacd3.png"> 
+ <img src="https://images2.imgbox.com/6b/d7/03Hr4OlE_o.png" alt="0ac695ce432adbc4d638b3b3d71b0e2d.png"> 
+  
+ <p style="text-align:left;"><strong>上面论文代码</strong><strong>下载</strong></p> 
+ <p style="text-align:left;">后台回复：<strong>冠军方案，</strong>即可下载上述论文和代码</p> 
+ <p style="text-align:left;">后台回复：<strong>CVPR2021，</strong>即可下载CVPR 2021论文和代码开源的论文合集</p> 
+ <p style="text-align:left;">后台回复：<strong>ICCV2021，</strong>即可下载ICCV 2021论文和代码开源的论文合集</p> 
+ <p style="text-align:left;">后台回复：<strong>Transformer综述，</strong>即可下载最新的<strong>3篇</strong>Transformer综述PDF</p> 
+ <p style="text-align:center;"><strong>重磅！</strong><strong>医疗影像</strong><strong>交流</strong><strong>群成立</strong></p> 
+ <p style="text-align:left;">扫码添加CVer助手，<strong>可申请加入CVer-</strong><strong>医疗影像 </strong><strong>微信交流</strong><strong>群，</strong><strong><strong>方向已涵盖：</strong><strong>目标检测、图像分割、目标跟踪、人脸检测&amp;识别、OCR、姿态估计、超分辨率、SLAM、医疗影像、Re-ID、GAN、NAS、深度估计、自动驾驶、强化学习、车道线检测、模型剪枝&amp;压缩、去噪、去雾、去雨、风格迁移、遥感图像、行为识别、视频理解、图像融合、图像检索、论文投稿&amp;交流、Transformer、PyTorch和TensorFlow</strong><strong>等群。</strong></strong></p> 
+ <p style="text-align:left;"><strong>一定要备注：</strong><strong>研究方向+地点+学校/公司+昵称</strong><strong>（如</strong><strong>医疗影像+</strong><strong>上海+上交+卡卡）</strong>，根据格式备注，可更快被通过且邀请进群</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/e4/76/cNzzGOFX_o.png" alt="6b72e4a61c255358e9831d2b04d24f34.png"></p> 
+ <p style="text-align:center;">▲长按加小助手微信，进交流群</p> 
+ <p style="text-align:center;">▲点击上方卡片，关注CVer公众号</p> 
+ <p style="text-align:right;"><strong><strong><strong><strong><strong><strong><strong><strong>整理不易，请点赞和在看</strong></strong></strong></strong></strong></strong></strong></strong><strong><img width="30" src="https://images2.imgbox.com/6d/fc/Ev1puXXm_o.gif" alt="0f34124f9c0a51985b1f6983a3060d91.gif"></strong></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/e6bbe35a2a0d5039c72ecb4a30e034b6/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Centos安装NextCloud</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/7a5673d51d66fb43f4f6361dcf100655/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">webpack 最全的总结</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

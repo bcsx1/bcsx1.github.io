@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【正点原子FPGA连载】 第二十七章OV5640摄像头LCD显示 摘自【正点原子】DFZU2EG_4EV MPSoC之嵌入式Vitis开发指南 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【正点原子FPGA连载】 第二十七章OV5640摄像头LCD显示 摘自【正点原子】DFZU2EG_4EV MPSoC之嵌入式Vitis开发指南" />
+<meta property="og:description" content="1）实验平台：正点原子MPSoC开发板
+2）平台购买地址：https://detail.tmall.com/item.htm?id=692450874670
+3）全套实验源码&#43;手册&#43;视频下载地址： http://www.openedv.com/thread-340252-1-1.html
+第二十七章OV5640摄像头LCD显示 OV5640是OmniVision（豪威科技）公司生产的一颗CMOS图像传感器，该传感器功耗低、分辨率高以及采集速率快，主要应用在玩具、手机、电脑多媒体等领域。本章我们将使用MPSOC开发板实现对OV5640的数字图像采集并通过LCD实时显示。
+本章包括以下几个部分：
+2727.1简介
+27.2实验任务
+27.3硬件设计
+27.4软件设计
+27.5下载验证
+27.1简介 OV5640是一款1/4英寸单芯片图像传感器，其感光阵列达到25921944（即500W像素），能实现最快15fps QSXVGA（25921944）或者90fps VGA（640*480）分辨率的图像采集。传感器采用OmniVision推出的OmniBSI（背面照度）技术，使传感器达到更高的性能，如高灵敏度、低串扰和低噪声。传感器内部集成了图像处理的功能，包括自动曝光控制（AEC）、自动白平衡（AWB）等。同时该传感器支持LED补光、MIPI（移动产业处理器接口）输出接口和DVP（数字视频并行）输出接口选择、ISP（图像信号处理）以及AFC（自动聚焦控制）等功能。
+OV5640的功能框图如下图所示：
+图27.1.1 OV5640功能框图
+由上图可知，时序发生器（timing generator）控制着感光阵列（image array）、放大器（AMP）、AD转换以及输出外部时序信号（VSYNC、HREF和PCLK），外部时钟XVCLK经过PLL锁相环后输出的时钟作为系统的控制时钟；感光阵列将光信号转化成模拟信号，经过增益放大器之后进入10位AD转换器；AD转换器将模拟信号转化成数字信号，并且经过ISP进行相关图像处理，最终输出所配置格式的10位视频数据流。增益放大器控制以及ISP等都可以通过寄存器（registers）来配置，配置寄存器的接口就是SCCB接口，该接口协议兼容IIC协议。
+SCCB（Serial Camera Control Bus，串行摄像头控制总线）是由OV（OmniVision的简称）公司定义和发展的三线式串行总线，该总线控制着摄像头大部分的功能，包括图像数据格式、分辨率以及图像处理参数等。OV公司为了减少传感器引脚的封装，现在SCCB总线大多采用两线式接口总线。
+OV5640使用的是两线式接口总线，该接口总线包括SIO_C串行时钟输入线和SIO_D串行双向数据线，分别相当于IIC协议的SCL信号线和SDA信号线。我们在前面提到过SCCB协议兼容IIC协议，是因为SCCB协议和IIC协议非常相似，有关IIC协议的详细介绍请大家参考“EEPROM读写实验”章节。
+SCCB的写传输协议如下图所示：
+图27.1.2 SCCB写传输协议
+上图中的ID ADDRESS是由7位器件地址和1位读写控制位构成（0：写 1：读）；Sub-address为8位寄存器地址，一般有些寄存器是可改写的，有些是只读的，只有可改写的寄存器才能正确写入；Write Data为8位写数据，每一个寄存器地址对应8位的配置数据。上图中的第9位X表示Don’t Care（不必关心位），该位是由从机（此处指摄像头）发出应答信号来响应主机表示当前ID Address、Sub-address和Write Data是否传输完成，但是从机有可能不发出应答信号，因此主机（此处指FPGA）可不用判断此处是否有应答，直接默认当前传输完成即可。
+我们可以发现，SCCB和IIC写传输协议是极为相似的，只是在SCCB写传输协议中，第9位为不必关心位，而IIC写传输协议为应答位。SCCB的读传输协议和IIC有些差异，在IIC读传输协议中，写完寄存器地址后会有restart即重复开始的操作；而SCCB读传输协议中没有重复开始的概念，在写完寄存器地址后，发起总线停止信号，下图为SCCB的读传输协议。
+图27.1.3 SCCB读传输协议
+由上图可知，SCCB读传输协议分为两个部分。第一部分是写器件地址和寄存器地址，即先进行一次虚写操作，通过这种虚写操作使地址指针指向虚写操作中寄存器地址的位置，当然虚写操作也可以通过前面介绍的写传输协议来完成。第二部分是读器件地址和读数据，此时读取到的数据才是寄存器地址对应的数据。上图中的NA位由主机（这里指FPGA）产生，由于SCCB总线不支持连续读写，因此NA位必须为高电平。
+需要注意的是，对于OV5640摄像头来说，由于其可配置的寄存器非常多，所以OV5640摄像头的寄存器地址位数是16位（两个字节），OV5640 SCCB的写传输协议如下图所示：
+图27.1.4 OV5640 SCCB写传输协议
+上图中的ID ADDRESS是由7位器件地址和1位读写控制位构成（0：写 1：读），OV5640的器件地址为7’h3c，所以在写传输协议中，ID Address（W）= 8’h78（器件地址左移1位，低位补0）；Sub-address(H)为高8位寄存器地址，Sub-address(L)为低8位寄存器地址，在OV5640众多寄存器中，有些寄存器是可改写的，有些是只读的，只有可改写的寄存器才能正确写入；Write Data为8位写数据，每一个寄存器地址对应8位的配置数据。
+在OV5640正常工作之前，必须先对传感器进行初始化，即通过配置寄存器使其工作在预期的工作模式，以及得到较好画质的图像。因为SCCB的写传输协议和IIC几乎相同，因此我们可以直接使用IIC的驱动程序来配置摄像头。当然这么多寄存器也并非都需要配置，很多寄存器可以采用默认的值。OV公司提供了OV5640的软件应用手册（OV5640 Software Application Note，位于开发板所随附的资料“7_硬件资料/4_OV5640资料/OV5640_camera_module_software_application_notes.pdf”），如果某些寄存器不知道如何配置可以参考此手册，下表是本程序用到的关键寄存器的配置说明。
+表27.1.1 OV5640关键寄存器配置说明
+OV5640的寄存器较多，对于其它寄存器的描述可以参考OV5640的数据手册。需要注意的是，OV5640的数据手册并没有提供全部的寄存器描述，而大多数必要的寄存器配置在ov5640的软件应用手册中可以找到，可以结合这两个手册学习如何对OV5640进行配置。
+输出图像参数设置
+接下来，我们介绍一下OV5640的ISP输入窗口设置、预缩放窗口设置和输出大小窗口设置，这几个设置与我们的正常使用密切相关，有必要了解一下，它们的设置关系如下图所示：
+图27.1.5 图像窗口设置
+ISP输入窗口设置（ISP Input Size）允许用户设置整个传感器显示区域（physical pixel size，26321951，其中25921944像素是有效的），开窗范围从00~26321951都可以任意设置。也就是上图中的X_ADDR_ST（寄存器地址0x3800、0x3801）、Y_ADDR_ST（寄存器地址0x3802、0x3803）、X_ADDR_END（寄存器地址0x3804、0x3805）和Y_ADDR_END（寄存器地址0x3806、0x3807）寄存器。该窗口设置范围中的像素数据将进入ISP进行图像处理。
+预缩放窗口设置（pre-scaling size）允许用户在ISP输入窗口的基础上进行裁剪，用于设置将进行缩放的窗口大小，该设置仅在ISP输入窗口内进行X/Y方向的偏移。可以通过X_OFFSET（寄存器地址0x3810、0x3811）和Y_OFFSET（寄存器地址0x3812、0x3813）进行配置。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/27dba74aaf8655d54811dceed586e292/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-03-09T16:13:14+08:00" />
+<meta property="article:modified_time" content="2023-03-09T16:13:14+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【正点原子FPGA连载】 第二十七章OV5640摄像头LCD显示 摘自【正点原子】DFZU2EG_4EV MPSoC之嵌入式Vitis开发指南</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>1）实验平台：正点原子MPSoC开发板<br> 2）平台购买地址：<a href="https://detail.tmall.com/item.htm?id=692450874670" rel="nofollow">https://detail.tmall.com/item.htm?id=692450874670</a><br> 3）全套实验源码+手册+视频下载地址： <a href="http://www.openedv.com/thread-340252-1-1.html" rel="nofollow">http://www.openedv.com/thread-340252-1-1.html</a></p> 
+<h2><a id="OV5640LCD_3"></a>第二十七章OV5640摄像头LCD显示</h2> 
+<p>OV5640是OmniVision（豪威科技）公司生产的一颗CMOS图像传感器，该传感器功耗低、分辨率高以及采集速率快，主要应用在玩具、手机、电脑多媒体等领域。本章我们将使用MPSOC开发板实现对OV5640的数字图像采集并通过LCD实时显示。<br> 本章包括以下几个部分：<br> 2727.1简介<br> 27.2实验任务<br> 27.3硬件设计<br> 27.4软件设计<br> 27.5下载验证</p> 
+<h3><a id="271_13"></a>27.1简介</h3> 
+<p>OV5640是一款1/4英寸单芯片图像传感器，其感光阵列达到2592<em>1944（即500W像素），能实现最快15fps QSXVGA（2592</em>1944）或者90fps VGA（640*480）分辨率的图像采集。传感器采用OmniVision推出的OmniBSI（背面照度）技术，使传感器达到更高的性能，如高灵敏度、低串扰和低噪声。传感器内部集成了图像处理的功能，包括自动曝光控制（AEC）、自动白平衡（AWB）等。同时该传感器支持LED补光、MIPI（移动产业处理器接口）输出接口和DVP（数字视频并行）输出接口选择、ISP（图像信号处理）以及AFC（自动聚焦控制）等功能。<br> OV5640的功能框图如下图所示：<br> <img src="https://images2.imgbox.com/d2/13/k7uLcpt7_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.1 OV5640功能框图<br> 由上图可知，时序发生器（timing generator）控制着感光阵列（image array）、放大器（AMP）、AD转换以及输出外部时序信号（VSYNC、HREF和PCLK），外部时钟XVCLK经过PLL锁相环后输出的时钟作为系统的控制时钟；感光阵列将光信号转化成模拟信号，经过增益放大器之后进入10位AD转换器；AD转换器将模拟信号转化成数字信号，并且经过ISP进行相关图像处理，最终输出所配置格式的10位视频数据流。增益放大器控制以及ISP等都可以通过寄存器（registers）来配置，配置寄存器的接口就是SCCB接口，该接口协议兼容IIC协议。<br> SCCB（Serial Camera Control Bus，串行摄像头控制总线）是由OV（OmniVision的简称）公司定义和发展的三线式串行总线，该总线控制着摄像头大部分的功能，包括图像数据格式、分辨率以及图像处理参数等。OV公司为了减少传感器引脚的封装，现在SCCB总线大多采用两线式接口总线。<br> OV5640使用的是两线式接口总线，该接口总线包括SIO_C串行时钟输入线和SIO_D串行双向数据线，分别相当于IIC协议的SCL信号线和SDA信号线。我们在前面提到过SCCB协议兼容IIC协议，是因为SCCB协议和IIC协议非常相似，有关IIC协议的详细介绍请大家参考“EEPROM读写实验”章节。<br> SCCB的写传输协议如下图所示：<br> <img src="https://images2.imgbox.com/1e/75/m3SlN4Cn_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.2 SCCB写传输协议<br> 上图中的ID ADDRESS是由7位器件地址和1位读写控制位构成（0：写 1：读）；Sub-address为8位寄存器地址，一般有些寄存器是可改写的，有些是只读的，只有可改写的寄存器才能正确写入；Write Data为8位写数据，每一个寄存器地址对应8位的配置数据。上图中的第9位X表示Don’t Care（不必关心位），该位是由从机（此处指摄像头）发出应答信号来响应主机表示当前ID Address、Sub-address和Write Data是否传输完成，但是从机有可能不发出应答信号，因此主机（此处指FPGA）可不用判断此处是否有应答，直接默认当前传输完成即可。<br> 我们可以发现，SCCB和IIC写传输协议是极为相似的，只是在SCCB写传输协议中，第9位为不必关心位，而IIC写传输协议为应答位。SCCB的读传输协议和IIC有些差异，在IIC读传输协议中，写完寄存器地址后会有restart即重复开始的操作；而SCCB读传输协议中没有重复开始的概念，在写完寄存器地址后，发起总线停止信号，下图为SCCB的读传输协议。<br> <img src="https://images2.imgbox.com/b0/3e/VooREdUR_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.3 SCCB读传输协议<br> 由上图可知，SCCB读传输协议分为两个部分。第一部分是写器件地址和寄存器地址，即先进行一次虚写操作，通过这种虚写操作使地址指针指向虚写操作中寄存器地址的位置，当然虚写操作也可以通过前面介绍的写传输协议来完成。第二部分是读器件地址和读数据，此时读取到的数据才是寄存器地址对应的数据。上图中的NA位由主机（这里指FPGA）产生，由于SCCB总线不支持连续读写，因此NA位必须为高电平。<br> 需要注意的是，对于OV5640摄像头来说，由于其可配置的寄存器非常多，所以OV5640摄像头的寄存器地址位数是16位（两个字节），OV5640 SCCB的写传输协议如下图所示：<br> <img src="https://images2.imgbox.com/7f/56/LhCOQGH8_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.4 OV5640 SCCB写传输协议<br> 上图中的ID ADDRESS是由7位器件地址和1位读写控制位构成（0：写 1：读），OV5640的器件地址为7’h3c，所以在写传输协议中，ID Address（W）= 8’h78（器件地址左移1位，低位补0）；Sub-address(H)为高8位寄存器地址，Sub-address(L)为低8位寄存器地址，在OV5640众多寄存器中，有些寄存器是可改写的，有些是只读的，只有可改写的寄存器才能正确写入；Write Data为8位写数据，每一个寄存器地址对应8位的配置数据。<br> 在OV5640正常工作之前，必须先对传感器进行初始化，即通过配置寄存器使其工作在预期的工作模式，以及得到较好画质的图像。因为SCCB的写传输协议和IIC几乎相同，因此我们可以直接使用IIC的驱动程序来配置摄像头。当然这么多寄存器也并非都需要配置，很多寄存器可以采用默认的值。OV公司提供了OV5640的软件应用手册（OV5640 Software Application Note，位于开发板所随附的资料“7_硬件资料/4_OV5640资料/OV5640_camera_module_software_application_notes.pdf”），如果某些寄存器不知道如何配置可以参考此手册，下表是本程序用到的关键寄存器的配置说明。<br> 表27.1.1 OV5640关键寄存器配置说明<br> <img src="https://images2.imgbox.com/40/89/cCz0SYZH_o.png" alt="在这里插入图片描述"></p> 
+<p>OV5640的寄存器较多，对于其它寄存器的描述可以参考OV5640的数据手册。需要注意的是，OV5640的数据手册并没有提供全部的寄存器描述，而大多数必要的寄存器配置在ov5640的软件应用手册中可以找到，可以结合这两个手册学习如何对OV5640进行配置。<br> 输出图像参数设置<br> 接下来，我们介绍一下OV5640的ISP输入窗口设置、预缩放窗口设置和输出大小窗口设置，这几个设置与我们的正常使用密切相关，有必要了解一下，它们的设置关系如下图所示：<br> <img src="https://images2.imgbox.com/5d/71/HPUzAGOO_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.5 图像窗口设置<br> ISP输入窗口设置（ISP Input Size）允许用户设置整个传感器显示区域（physical pixel size，2632<em>1951，其中2592</em>1944像素是有效的），开窗范围从0<em>0~2632</em>1951都可以任意设置。也就是上图中的X_ADDR_ST（寄存器地址0x3800、0x3801）、Y_ADDR_ST（寄存器地址0x3802、0x3803）、X_ADDR_END（寄存器地址0x3804、0x3805）和Y_ADDR_END（寄存器地址0x3806、0x3807）寄存器。该窗口设置范围中的像素数据将进入ISP进行图像处理。<br> 预缩放窗口设置（pre-scaling size）允许用户在ISP输入窗口的基础上进行裁剪，用于设置将进行缩放的窗口大小，该设置仅在ISP输入窗口内进行X/Y方向的偏移。可以通过X_OFFSET（寄存器地址0x3810、0x3811）和Y_OFFSET（寄存器地址0x3812、0x3813）进行配置。<br> 输出大小窗口设置（data output size）是在预缩放窗口的基础上，经过内部DSP进行缩放处理，并将处理后的数据输出给外部的图像窗口，图像窗口控制着最终的图像输出尺寸。可以通过X_OUTPUT_SIZE（寄存器地址0x3808、0x3809）和Y_OUTPUT_SIZE（寄存器地址0x380A、0x380B）进行配置。注意：当输出大小窗口与预缩放窗口比例不一致时，图像将进行缩放处理（图像变形），仅当两者比例一致时，输出比例才是1:1（正常图像）。<br> 图27.1.5中，右侧data output size区域，才是OV5640输出给外部的图像尺寸，也就是显示在显示器或者液晶屏上面的图像大小。输出大小窗口与预缩放窗口比例不一致时，会进行缩放处理，在显示器上面看到的图像将会变形。<br> 输出像素格式<br> OV5640支持多种不同的数据像素格式，包括YUV（亮度参量和色度参量分开表示的像素格式）、RGB（其中RGB格式包含RGB565、RGB555等）以及RAW（原始图像数据），通过寄存器地址0x4300配置成不同的数据像素格式。<br> 由于数据像素格式常用RGB565，我们这里也将ov5640配置为RGB565格式。由上表（表27.1.1）可知，将寄存器0x4300寄存器的Bit[7:4]设置成0x6即可。OV5640支持调节RGB565输出格式中各颜色变量的顺序，对于我们常见的应用来说，一般是使用RGB或BGR序列。其中RGB序列最为常用，因此将寄存器0x4300寄存器的Bit[3:0]设置成0x1。<br> 由于摄像头采集的图像最终要通过RGB LCD接口显示在LCD液晶屏上，且MPSOC开发板上的LCD接口为RGB888格式（详情请参考“LCD彩条显示实验”章节），因此我们将OV5640摄像头输出的图像像素数据配置成RGB565格式，然后通过颜色分量低位补零的方式将RGB565格式转换为RGB888格式。下图为摄像头输出的时序图。<br> <img src="https://images2.imgbox.com/11/d7/5aSZ1umb_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.6 OV5640输出时序图<br> 在介绍时序图之前先了解几个基本的概念。<br> VSYNC：场同步信号，由摄像头输出，用于标志一帧数据的开始与结束。上图中VSYNC的高电平作为一帧的同步信号，在低电平时输出的数据有效。需要注意的是场同步信号是可以通过设置寄存器0x4740 Bit[0]位进行取反的，即低电平同步高电平有效，本次实验使用的是和上图一致的默认设置；<br> HREF/HSYNC：行同步信号，由摄像头输出，用于标志一行数据的开始与结束。上图中的HREF和HSYNC是由同一引脚输出的，只是数据的同步方式不一样。本次实验使用的是HREF格式输出，当HREF为高电平时，图像输出有效，可以通过寄存器0x4740 Bit[1]进行配置。本次实验使用的是HREF格式输出；<br> D[9:0]：数据信号，由摄像头输出，在RGB格式输出中，只有高8位D[9:2]是有效的；<br> tPCLK：一个像素时钟周期；<br> 下图为OV5640输出RGB565格式的时序图：<br> <img src="https://images2.imgbox.com/25/09/wiEvsExD_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.1.7 RGB565模式时序图<br> 上图中的PCLK为OV5640输出的像素时钟，HREF为行同步信号，D[9:2]为8位像素数据。OV5640最大可以输出10位数据，在RGB565输出模式中，只有高8位是有效的。像素数据在HREF为高电平时有效，第一次输出的数据为RGB565数据的高8位，第二次输出的数据为RGB565数据的低8位，first byte和second byte组成一个16位RGB565数据。由上图可知，数据是在像素时钟的下降沿改变的，为了在数据最稳定的时刻采集图像数据，所以我们需要在像素时钟的上升沿采集数据。<br> 27.2实验任务<br> 本节实验任务是使用MPSOC开发板及双目OV5640摄像头（实际只用到了其中一路）实现图像采集，并通过RGB LCD屏实时显示。<br> 27.3硬件设计<br> 我们的MPSOC开发板上有一个扩展接口（J19），该接口可以用来连接一些扩展模块，如双目OV5640摄像头、高速ADDA模块、IO扩展板模块等。本次实验就是通过连接双目OV5640摄像头，实现单个OV5640摄像头图像的采集和显示。扩展口原理图如图27.3.1所示：<br> <img src="https://images2.imgbox.com/16/1f/mZtiQGpG_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.1 扩展接口原理图<br> ATK-Dual-OV5640是正点原子推出的一款高性能双目OV5640 500W像素高清摄像头模块。该模块通过2*20排母（2.54mm间距）同外部连接，我们将摄像头的排母直接插在开发板上的扩展接口即可，模块外观如图27.3.2所示：<br> <img src="https://images2.imgbox.com/63/c1/XvDvsm7a_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.2 ATK-OV5640摄像头模块实物图<br> 我们在前面说过，OV5640在RGB565模式中只有高8位数据是有效的即D[9:2]，而我们的摄像头排母上数据引脚的个数是8位。实际上，摄像头排母上的8位数据连接的就是OV5640传感器的D[9:2]，所以我们直接使用摄像头排母上的8位数据引脚即可。<br> 由于RGB LCD屏的引脚数目较多，且在前面相应的章节中已经给出它们的管脚列表，这里<br> 只列出摄像头相关管脚分配， 如下表所示：<br> 表27.3.1 OV5640摄像头管脚分配<br> <img src="https://images2.imgbox.com/93/9a/q8gtwR7v_o.png" alt="在这里插入图片描述"></p> 
+<p>在“PS通过VDMA驱动LCD显示”实验中，我们使用了Xilinx提供的VDMA IP核，实现了RGB LCD液晶屏显示彩条的功能。在该实验中，数据源由PS通过向DDR4中写入彩条数据产生的，我们只使能了VDMA IP核的读通道，通过读通道来将AXI4 Memory Map格式的数据流转换成AXI4-Stream类的数据流。而对于本次实验来说，只需要在此基础上，将彩条数据替换成由OV5640摄像头输出的图像数据即可，因此对于本次实验的重点是将摄像头的图像数据写入VDMA IP核的帧缓存中，即DDR4内存中，即可实现摄像头的图像显示。<br> VDMA支持AXI4 Memory Map格式转换成AXI4-Stream格式，同时也支持AXI4-Stream格式转成AXI4 Memory Map格式，因此可以通过VDMA将图像数据写入帧缓存中，也就是使能VDMA的写通道，来将图像数据写入帧缓存中。需要注意的是，我们需要先将图像数据转换成AXI4-Stream的格式，才能通过VDMA的写通道写入帧缓存中，Xilinx提供了Video in to AXI4-Stream IP核，可以实现视频数据流转成AXI4-Stream流，因此本次实验可以通过添加Video in to AXI4-Stream IP核实现数据格式的转换。<br> Video in to AXI4-Stream IP核的输入端口为视频数据流，而OV5640摄像头输出的数据为行场同步信号控制的8位数据，这两个端口不可以直接连接，需要先经过数据的转换才能连接，因此本次实验通过添加了一个图像采集的IP核来实现这个数据的转换，本次实验的框图如下图所示：<br> <img src="https://images2.imgbox.com/a7/ed/atctvkVh_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.3 系统架构框图<br> 通过对比上图中的框图和“PS通过VDMA驱动LCD显示”实验的框图可知，我们只是在此基础上，添加了OV5640图像采集IP核和Video in to AXI4-Stream IP核，其它的IP核仍然和“PS通过VDMA驱动LCD显示”实验一致，只不过在VDMA IP核的配置上，需要使能VDMA的写通道。并且对于本次使用来说，需要对帧缓存进行频繁的写入和读出，为了避免读通道和写通道同时访问同一帧缓存，那么VMDA必须配置成动态同步锁相的模式，且帧缓存数量要大于等于3。由于分配过多的帧缓存区域对效率的提升已经微乎其微，且会占用更多的存储空间和消耗CPU的时间，因此本次实验将帧缓存空间设置为3，并采用动态同步锁相的模式。<br> 由于OV5640摄像头需要经过初始化之后，才能正常工作。本次实验通过SCCB接口对OV5640进行配置，SCCB端口是通过EMIO连接至PS中，SCCB的驱动由PS实现。<br> 最后我们再来看下图27.3.3中数据流的走向。OV5640图像采集是我们自定义的IP核，负责将OV5640的数据转成视频流数据；视频流数据经过Video in to AXI4-Stream IP核转换成AXI4-Stream IP格式数据流，然后通过VDMA的写通道转成AXI4 Memory Map格式，并最终写入DDR内存中。VDMA通过AXI Smartconnect IP核与AXI_HP端口进行连接，从而高效访问DDR4，VDMA从DDR4中读取的视频或图像数据传输给AXI4-Stream to Video Out IP核。AXI4-Stream to Video Out IP核在VTC IP核的控制下，把AXI4-Stream格式的数据转换成视频输出的数据格式（如RGB888），并将输出的视频数据流连接至RGB2LCD IP核（rgb2lcd）的输入端。RGB2LCD IP核是本次实验自定义的IP核，实现了获取LCD屏的ID，以及将LCD屏的引脚封装到总线接口上，以方便将LCD引脚引出至顶层模块端口上。<br> 本次实验的硬件平台在“PS通过VDMA驱动LCD显示”实验基础上搭建。首先需要对Zynq UltraScale+ MPSOC模块进行修改，使能EMIO的两个引脚，用来连接摄像头的SCCB接口，配置如下：<br> 在这里插入图片描述<br> <img src="https://images2.imgbox.com/d9/7a/Dvweius1_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.4 MPSOC处理系统EMIO配置<br> 接下来引出这个端口，并命名为“emio_sccb”，如下图所示：<br> <img src="https://images2.imgbox.com/46/dd/hpak2pbd_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.5 引出引脚<br> 接下来修改VDMA IP核的配置，修改后的配置界面如下图所示：<br> <img src="https://images2.imgbox.com/97/29/lO4qTfiR_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.6 VDMA IP核Basic配置页面<br> Frame Buffers（帧缓存）个数配置为3，使能写通道（Enable Write Channel），写通道的参数和读通道保持一致。注意这里的Stream Data Width（Stream数据宽度）是软件自动设置的，其位宽由连接至其它IP核的Stream数据位宽而定。<br> 在“PS通过VDMA驱动LCD显示”实验中向大家详细介绍了VDMA的帧缓存机制和同步锁相模式。为了避免读通道和写通道同时访问同一帧缓存，本次实验将帧缓存空间设置为3，并采用动态同步锁相的模式。另外，读通道需要实时读取写通道写入的帧缓存，因此将写通道设置为Dynamic-Master，读通道设置为Dynamic-Slave。<br> VDMA的同步锁相模式配置如下：<br> <img src="https://images2.imgbox.com/ef/bf/8vgB8EPT_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.7 VDMA IP核同步锁相配置<br> 接下来添加Video in to AXI4-Stream IP核，在IP核搜索框中输入“video in”，选择“Video in to AXI4-Stream”IP核，如下图所示：<br> <img src="https://images2.imgbox.com/8e/98/pbTn4L7Z_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.8 添加Video in to AXI4-Stream IP核<br> Video in to AXI4-Stream IP核配置界面如下图所示：<br> <img src="https://images2.imgbox.com/b0/20/QTjQ3eA3_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.9 Video in to AXI4-Stream IP核配置<br> Clock Mode时钟模式用于指定AXI4-Stream输入和视频输出信号，使用公共时钟还是独立时钟进行时钟控制，此处我们使用独立时钟进行控制，即勾选Independent，其它选项保持默认即可。<br> 接下来添加自定义的OV5640图像采集IP核，该IP核位于例程的ip_repo文件下，将该文件拷贝至工程目录下，并在工程中添加该IP核，添加的方法这里不再赘述。在IP核搜索框中输入“ov5640”，如下图所示：<br> <img src="https://images2.imgbox.com/83/68/wnj0JSHj_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.10 添加OV5640图像采集IP核<br> OV5640图像采集IP核无需设置，该IP核实现了OV5640的数据流转换成视频数据流格式，即转换成符合Video in to AXI-Stream IP核输入端的数据格式。视频数据流格式的时序图如下图所示：<br> <img src="https://images2.imgbox.com/39/50/dhPxEclQ_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.11 视频流格式时序图<br> vblank_out（output vertical blank）：垂直方向空白信号，为高电平时，表示当前处于垂直方向的无效数据区域；<br> vsync_out（output vertical synchronization）: 垂直方向同步信号，用于帧同步；<br> hblank_out（output horizontal blank）：水平方向空白信号，为高电平时，表示当前处于水平方向的无效数据区域；<br> hsync_out（output horizontal synchronization）：水平方向同步信号，用于行同步；<br> active_video_out：图像有效信号，高电平有效。<br> 图27.3.11是视频流的数据格式，除了这些信号外，还需要输出时钟（clk）、时钟使能（ce）和图像数据，我们只需要将摄像头输出的数据按照视频流的格式输出，即可连接至Video in to AXI-Stream IP核的输入端。由于摄像头只输出了cam_vsync和cam_href这两个用于控制数据是否有效的信号，为了简化设计，本次实验简化了视频数据流的接口，只输出了时钟信号、时钟有效信号、场同步信号、图像数据有效信号和图像数据。<br> OV5640图像采集IP核源代码如下：</p> 
+<pre><code class="prism language-c"><span class="token number">1</span>   module  <span class="token function">ov5640_capture_data</span><span class="token punctuation">(</span>
+<span class="token number">2</span>       input                 rst_n           <span class="token punctuation">,</span>  <span class="token comment">//复位信号</span>
+<span class="token number">3</span>   
+<span class="token number">4</span>       <span class="token comment">//摄像头接口</span>
+<span class="token number">5</span>       input                 cam_pclk        <span class="token punctuation">,</span>  <span class="token comment">//cam 数据像素时钟</span>
+<span class="token number">6</span>       input                 cam_vsync       <span class="token punctuation">,</span>  <span class="token comment">//cam 场同步信号</span>
+<span class="token number">7</span>       input                 cam_href        <span class="token punctuation">,</span>  <span class="token comment">//cam 行同步信号</span>
+<span class="token number">8</span>       input        <span class="token punctuation">[</span><span class="token number">7</span><span class="token operator">:</span><span class="token number">0</span><span class="token punctuation">]</span>    cam_data        <span class="token punctuation">,</span>  <span class="token comment">//cam 数据</span>
+<span class="token number">9</span>       output                cam_rst_n       <span class="token punctuation">,</span>  <span class="token comment">//cmos 复位信号，低电平有效</span>
+<span class="token number">10</span>      output                cam_pwdn        <span class="token punctuation">,</span>  <span class="token comment">//电源休眠模式选择</span>
+<span class="token number">11</span>  
+<span class="token number">12</span>      <span class="token comment">//RGB888接口</span>
+<span class="token number">13</span>      output                cmos_frame_clk<span class="token punctuation">,</span>    <span class="token comment">//时钟信号</span>
+<span class="token number">14</span>      output                cmos_frame_ce<span class="token punctuation">,</span>     <span class="token comment">//时钟使能信号</span>
+<span class="token number">15</span>  
+<span class="token number">16</span>      output                cmos_frame_vsync<span class="token punctuation">,</span>  <span class="token comment">//帧有效信号</span>
+<span class="token number">17</span>      output                cmos_active_video <span class="token punctuation">,</span><span class="token comment">//数据有效</span>
+<span class="token number">18</span>      output       <span class="token punctuation">[</span><span class="token number">23</span><span class="token operator">:</span><span class="token number">0</span><span class="token punctuation">]</span>   cmos_frame_data    <span class="token comment">//有效数据</span>
+<span class="token number">19</span>  <span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">20</span>  
+<span class="token number">21</span>  <span class="token comment">//parameter define</span>
+<span class="token number">22</span>  
+<span class="token number">23</span>  <span class="token comment">//寄存器全部配置完成后，先等待10帧数据</span>
+<span class="token number">24</span>  <span class="token comment">//待寄存器配置生效后再开始采集图像</span>
+<span class="token number">25</span>  localparam  WAIT_FRAME <span class="token operator">=</span> <span class="token number">4</span>'d10  <span class="token punctuation">;</span>            <span class="token comment">//寄存器数据稳定等待的帧个数</span>
+<span class="token number">26</span>  
+<span class="token number">27</span>  <span class="token comment">//reg define</span>
+<span class="token number">28</span>  reg          rst_n_d0 <span class="token operator">=</span><span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token number">29</span>  reg          rst_n_syn <span class="token operator">=</span><span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token number">30</span>  reg          cam_vsync_d0 <span class="token punctuation">;</span>
+<span class="token number">31</span>  reg          cam_vsync_d1 <span class="token punctuation">;</span>
+<span class="token number">32</span>  reg          cam_href_d0 <span class="token punctuation">;</span>
+<span class="token number">33</span>  reg          cam_href_d1 <span class="token punctuation">;</span>
+<span class="token number">34</span>  reg   <span class="token punctuation">[</span><span class="token number">3</span><span class="token operator">:</span><span class="token number">0</span><span class="token punctuation">]</span>  cmos_ps_cnt <span class="token punctuation">;</span>                  <span class="token comment">//等待帧数稳定计数器</span>
+<span class="token number">35</span>  reg          wait_done <span class="token punctuation">;</span>
+<span class="token number">36</span>  reg          byte_flag <span class="token punctuation">;</span>
+<span class="token number">37</span>  reg   <span class="token punctuation">[</span><span class="token number">7</span><span class="token operator">:</span><span class="token number">0</span><span class="token punctuation">]</span>  cam_data_d0 <span class="token punctuation">;</span>
+<span class="token number">38</span>  reg  <span class="token punctuation">[</span><span class="token number">15</span><span class="token operator">:</span><span class="token number">0</span><span class="token punctuation">]</span>  cmos_data_16b <span class="token punctuation">;</span>                <span class="token comment">//用于8位转16位的临时寄存器</span>
+<span class="token number">39</span>  reg          byte_flag_d0 <span class="token punctuation">;</span>
+<span class="token number">40</span>  
+<span class="token number">41</span>  <span class="token comment">//wire define</span>
+<span class="token number">42</span>  wire  pos_vsync <span class="token punctuation">;</span>
+<span class="token number">43</span>  
+<span class="token number">44</span>  <span class="token comment">//*****************************************************</span>
+<span class="token number">45</span>  <span class="token comment">//**                    main code</span>
+<span class="token number">46</span>  <span class="token comment">//*****************************************************</span>
+<span class="token number">47</span>  
+<span class="token number">48</span>  <span class="token comment">//采输入场同步信号的上升沿</span>
+<span class="token number">49</span>  assign  pos_vsync  <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token operator">~</span>cam_vsync_d1<span class="token punctuation">)</span> <span class="token operator">&amp;</span> cam_vsync_d0 <span class="token punctuation">;</span>
+<span class="token number">50</span>  
+<span class="token number">51</span>  <span class="token comment">//不对摄像头硬件复位,固定高电平</span>
+<span class="token number">52</span>  assign  cam_rst_n <span class="token operator">=</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+<span class="token number">53</span>  
+<span class="token number">54</span>  <span class="token comment">//电源休眠模式选择 0：正常模式 1：电源休眠模式</span>
+<span class="token number">55</span>  assign  cam_pwdn  <span class="token operator">=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">56</span>  
+<span class="token number">57</span>  assign  cmos_frame_clk   <span class="token operator">=</span> cam_pclk<span class="token punctuation">;</span>
+<span class="token number">58</span>  <span class="token comment">//由于摄像头输入接口的两个时钟周期对应于RGB888输出接口的一个有效时钟周期</span>
+<span class="token number">59</span>  <span class="token comment">//所以要给出数据有效标志即RGB888输出接口的时钟使能信号</span>
+<span class="token number">60</span>  assign  cmos_frame_ce     <span class="token operator">=</span> wait_done  <span class="token operator">?</span>  <span class="token punctuation">(</span>byte_flag_d0 <span class="token operator">&amp;</span> cmos_active_video<span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">(</span><span class="token operator">!</span>cmos_active_video<span class="token punctuation">)</span> <span class="token operator">:</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">61</span>  assign  cmos_frame_vsync  <span class="token operator">=</span> wait_done  <span class="token operator">?</span>  cam_vsync_d1  <span class="token operator">:</span>  <span class="token number">1</span>'b0<span class="token punctuation">;</span> <span class="token comment">//输出帧有效信号</span>
+<span class="token number">62</span>  assign  cmos_active_video <span class="token operator">=</span> wait_done  <span class="token operator">?</span>  cam_href_d1   <span class="token operator">:</span>  <span class="token number">1</span>'b0<span class="token punctuation">;</span> <span class="token comment">//输出行有效信号</span>
+<span class="token number">63</span>  assign  cmos_frame_data   <span class="token operator">=</span> wait_done  <span class="token operator">?</span>
+<span class="token number">64</span>      <span class="token punctuation">{<!-- --></span> cmos_data_16b<span class="token punctuation">[</span><span class="token number">15</span><span class="token operator">:</span><span class="token number">11</span><span class="token punctuation">]</span><span class="token punctuation">,</span><span class="token number">3</span><span class="token char">'d0 , cmos_data_16b[10:5],2'</span>d0 <span class="token punctuation">,</span> cmos_data_16b<span class="token punctuation">[</span><span class="token number">4</span><span class="token operator">:</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">,</span><span class="token number">3</span>'d0 <span class="token punctuation">}</span>
+<span class="token number">65</span>      <span class="token operator">:</span>  <span class="token number">24</span>'d0<span class="token punctuation">;</span> <span class="token comment">//输出数据</span>
+<span class="token number">66</span>  
+<span class="token number">67</span>  <span class="token comment">//复位信号的异步复位、同步释放处理</span>
+<span class="token number">68</span>  always @<span class="token punctuation">(</span>posedge cam_pclk or negedge rst_n<span class="token punctuation">)</span> begin
+<span class="token number">69</span>      <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n<span class="token punctuation">)</span> begin
+<span class="token number">70</span>          rst_n_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">71</span>          rst_n_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">72</span>      end
+<span class="token number">73</span>      <span class="token keyword">else</span> begin
+<span class="token number">74</span>          rst_n_d0  <span class="token operator">&lt;=</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+<span class="token number">75</span>          rst_n_syn <span class="token operator">&lt;=</span> rst_n_d0<span class="token punctuation">;</span>
+<span class="token number">76</span>      end
+<span class="token number">77</span>  end
+<span class="token number">78</span>  
+<span class="token number">79</span>  <span class="token comment">//对行、场同步信号的延迟打拍</span>
+<span class="token number">80</span>  always @<span class="token punctuation">(</span>posedge cam_pclk or negedge rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">81</span>      <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">82</span>          cam_vsync_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">83</span>          cam_vsync_d1 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">84</span>  
+<span class="token number">85</span>          cam_href_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">86</span>          cam_href_d1 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">87</span>      end
+<span class="token number">88</span>      <span class="token keyword">else</span> begin
+<span class="token number">89</span>          cam_vsync_d0 <span class="token operator">&lt;=</span> cam_vsync<span class="token punctuation">;</span>
+<span class="token number">90</span>          cam_vsync_d1 <span class="token operator">&lt;=</span> cam_vsync_d0<span class="token punctuation">;</span>
+<span class="token number">91</span>  
+<span class="token number">92</span>          cam_href_d0 <span class="token operator">&lt;=</span> cam_href<span class="token punctuation">;</span>
+<span class="token number">93</span>          cam_href_d1 <span class="token operator">&lt;=</span> cam_href_d0<span class="token punctuation">;</span>
+<span class="token number">94</span>      end
+<span class="token number">95</span>  end
+<span class="token number">96</span>  
+<span class="token number">97</span>  <span class="token comment">//寄存器全部配置完成后，先等待10帧数据</span>
+<span class="token number">98</span>  <span class="token comment">//待寄存器配置生效后再开始采集图像</span>
+<span class="token number">99</span>  always @<span class="token punctuation">(</span>posedge cam_pclk or negedge rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">100</span>     <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n_syn<span class="token punctuation">)</span>
+<span class="token number">101</span>         cmos_ps_cnt <span class="token operator">&lt;=</span> <span class="token number">4</span>'d0<span class="token punctuation">;</span>
+<span class="token number">102</span>     <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span>pos_vsync <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>cmos_ps_cnt <span class="token operator">&lt;</span> WAIT_FRAME<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">103</span>         cmos_ps_cnt <span class="token operator">&lt;=</span> cmos_ps_cnt <span class="token operator">+</span> <span class="token number">4</span>'d1<span class="token punctuation">;</span>  <span class="token comment">//对帧数进行计数</span>
+<span class="token number">104</span> end
+<span class="token number">105</span> 
+<span class="token number">106</span> <span class="token comment">//等待完成后 给出 等待完成信号</span>
+<span class="token number">107</span> always @<span class="token punctuation">(</span>posedge cam_pclk or negedge rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">108</span>     <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n_syn<span class="token punctuation">)</span>
+<span class="token number">109</span>         wait_done <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">110</span>     <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>cmos_ps_cnt <span class="token operator">==</span> WAIT_FRAME<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> pos_vsync<span class="token punctuation">)</span>
+<span class="token number">111</span>         wait_done <span class="token operator">&lt;=</span> <span class="token number">1</span>'b1<span class="token punctuation">;</span>
+<span class="token number">112</span> end
+<span class="token number">113</span> 
+<span class="token number">114</span> 
+<span class="token number">115</span> <span class="token comment">//8位数据转16位RGB565数据</span>
+<span class="token number">116</span> always @<span class="token punctuation">(</span>posedge cam_pclk or negedge rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">117</span>     <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">118</span>         cmos_data_16b <span class="token operator">&lt;=</span> <span class="token number">16</span>'d0<span class="token punctuation">;</span>
+<span class="token number">119</span>         cam_data_d0 <span class="token operator">&lt;=</span> <span class="token number">8</span>'d0<span class="token punctuation">;</span>
+<span class="token number">120</span>         byte_flag <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">121</span>     end
+<span class="token number">122</span>     <span class="token keyword">else</span> <span class="token keyword">if</span><span class="token punctuation">(</span> cam_href <span class="token punctuation">)</span> begin  <span class="token comment">//cam 行同步信号</span>
+<span class="token number">123</span>         byte_flag   <span class="token operator">&lt;=</span> <span class="token operator">~</span>byte_flag<span class="token punctuation">;</span>
+<span class="token number">124</span>         cam_data_d0 <span class="token operator">&lt;=</span> cam_data<span class="token punctuation">;</span>
+<span class="token number">125</span>         <span class="token keyword">if</span><span class="token punctuation">(</span>byte_flag<span class="token punctuation">)</span>
+<span class="token number">126</span>             cmos_data_16b <span class="token operator">&lt;=</span> <span class="token punctuation">{<!-- --></span>cam_data_d0<span class="token punctuation">,</span>cam_data<span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">127</span>     end
+<span class="token number">128</span>     <span class="token keyword">else</span> begin
+<span class="token number">129</span>         byte_flag <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">130</span>         cam_data_d0 <span class="token operator">&lt;=</span> <span class="token number">8</span>'b0<span class="token punctuation">;</span>
+<span class="token number">131</span>     end
+<span class="token number">132</span> end
+<span class="token number">133</span> 
+<span class="token number">134</span> always @<span class="token punctuation">(</span>posedge cam_pclk or negedge rst_n_syn<span class="token punctuation">)</span> begin
+<span class="token number">135</span>     <span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>rst_n_syn<span class="token punctuation">)</span>
+<span class="token number">136</span>         byte_flag_d0 <span class="token operator">&lt;=</span> <span class="token number">1</span>'b0<span class="token punctuation">;</span>
+<span class="token number">137</span>     <span class="token keyword">else</span>
+<span class="token number">138</span>         byte_flag_d0 <span class="token operator">&lt;=</span> byte_flag<span class="token punctuation">;</span>
+<span class="token number">139</span> end
+<span class="token number">140</span> 
+<span class="token number">141</span> endmodule
+</code></pre> 
+<p>该模块实现了摄像头输出数据流到视频数据流的转换，在程序的第13行至第18行代码，为模块输出的视频流端口信号。<br> OV5640摄像头输出的数据格式为RGB565，而数据位宽是8位，因此需要将两次输入的8位数据拼接成一个RGB565的数据格式，如代码中第116至第132行代码所示。我们知道，RGB LCD液晶屏是RGB888的数据格式，因此程序中将RGB565格式的各颜色分量的低位补0，拼成RGB888的数据格式，如代码中第63行至第65行代码所示。<br> 在程序的第57行代码至第65行代码，分别为输出的视频格式数据赋值。这里着重介绍cmos_frame_ce（时钟使能信号）和cmos_active_video（图像数据有效信号）的赋值。cmos_active_video信号在行有效期间，一直为高电平，因此在wait_done为高后，将摄像头的行有效信号赋值给cmos_active_video。我们知道，实际上输出的24位RGB888数据在行有效期间并不是一直有效的，这个由cmos_frame_ce信号来控制，分为行有效和行无效两种情况，只有当cmos_frame_ce信号和cmos_active_video信号同时为高电平时，输出的图像数据才有效。<br> 介绍完OV5640图像采集模块后，接下来对新添加IP核的端口进行手动连线，如下图所示：<br> <img src="https://images2.imgbox.com/fa/bf/fCW8qroZ_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.12 手动连线<br> 连线完成后点击框图界面上方的“Run Connection Automation”，下面列出了会自动连接的模块及其接口，勾选“All Automation”，然后点击“OK”按钮。<br> 接下来将OV5640图像采集IP核的摄像头引脚引出至顶层模块端口，并重新命名，如图27.3.13和图27.3.14所示：<br> <img src="https://images2.imgbox.com/aa/3f/auCNGGh6_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.13 引出摄像头引脚<br> <img src="https://images2.imgbox.com/d7/92/3e9Ru9Xs_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.14 引出摄像头其余引脚<br> 然后点击“Run Connnection Automation”，下面列出了会自动连接的模块及其接口，勾选“All Automation”，然后点击“OK”按钮。<br> 整体系统框图，如下图所示：<br> <img src="https://images2.imgbox.com/d2/cf/FKgRERKW_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.15 整体系统框图<br> 到这里我们的Block Design就设计完成了，在Diagram窗口空白处右击，然后选择“Validate Design”验证设计。验证完成后弹出对话框提示“Validation Successful”表明设计无误，点击“OK”确认。最后按快捷键“Ctrl + S”保存设计。<br> 接下来在Source窗口中右键点击Block Design设计文件“system.bd”，然后依次执行“Generate Output Products”和“Create HDL Wrapper”。<br> 为工程添加约束文件，约束文件如下：</p> 
+<pre><code class="prism language-c">#<span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span>摄像头接口的时钟<span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">--</span><span class="token operator">-</span>
+create_clock <span class="token operator">-</span>period <span class="token number">20</span> <span class="token operator">-</span>name cam_pclk <span class="token punctuation">[</span>get_ports cam_pclk<span class="token punctuation">]</span>
+set_property CLOCK_DEDICATED_ROUTE FALSE <span class="token punctuation">[</span>get_nets cam_pclk_IBUF<span class="token punctuation">]</span>
+
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN C13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports cam_pclk<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN F13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports cam_rst_n<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN B15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports cam_pwdn<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN E15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN D15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN E14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN D14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN E13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">4</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN B13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN C14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">6</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN A13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>cam_data<span class="token punctuation">[</span><span class="token number">7</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN G14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports cam_vsync<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN G13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports cam_href<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN H13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>emio_sccb_tri_io<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN F15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>emio_sccb_tri_io<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property PULLUP true <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>emio_sccb_tri_io<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property PULLUP true <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>emio_sccb_tri_io<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token expression">RGB LCD</span></span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN W14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN Y14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN W13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">2</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN Y13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN W12 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">4</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN Y12 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">5</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN W11 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">6</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AA12 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">7</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AC14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">8</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AD15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">9</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AC13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">10</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AD14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">11</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AE15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">12</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AA13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">13</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AE14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">14</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AB13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">15</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AG14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">16</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AB15 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">17</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AH14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">18</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AB14 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">19</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AG13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">20</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AE13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">21</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AH13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">22</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN AF13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports <span class="token punctuation">{<!-- --></span>lcd_rgb_tri_io<span class="token punctuation">[</span><span class="token number">23</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">]</span>
+
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN J11 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports lcd_hs<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN K12 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports lcd_vs<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN J10 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports lcd_de<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN J12 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports lcd_bl<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN K13 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports lcd_clk<span class="token punctuation">]</span>
+set_property <span class="token operator">-</span>dict <span class="token punctuation">{<!-- --></span>PACKAGE_PIN F10 IOSTANDARD LVCMOS33<span class="token punctuation">}</span> <span class="token punctuation">[</span>get_ports lcd_rst<span class="token punctuation">]</span>
+</code></pre> 
+<p>在约束文件的开头部分，我们通过create_clock语句对摄像头的像素时钟（cam_pclk）做了时序约束，以满足设计的时序要求。时序约束（Timing Constraints）用来描述设计人员对时序的要求，比如时钟频率，输入输出的延时等。对时钟频率的约束最简单的理解就是，设计者需要告诉EDA工具设计中所使用的时钟的频率是多少；然后工具才能按照所要求的时钟频率去优化布局布线，使设计能够在要求的时钟频率下正常工作。本次实验cam_pclk的时钟频率为72MHz，周期约为13.888ns，在做约束时可以等于这个值或者略低于这个值，不建议周期设置的太小，否则软件在布局布线时很难满足这个要求。<br> 当设计变得复杂起来，或者系统的时钟频率比较高的时候，如果不添加时序约束，那么就有可能在验证设计结果的时候出现一些意料之外的情况。那么为什么在前面的例程中很少提到呢？主要是因为我们的设计功能比较简单，像呼吸灯、蜂鸣器这样简单的外设，即使不进行时序约束，也不影响最终的功能。<br> 本次实验除了对输入的像素时钟做时序约束外，我们还需要增加“set_property CLOCK_DEDICATED_ROUTE FALSE”语句来取消软件对时钟专用引脚的检查。这是由于Vivado软件检测到像素时钟（cam_pclk）是一个时钟端口，而分配到芯片上的引脚并不是一个时钟专用引脚，因此增加这一语句可取消软件对cam_pclk时钟专用引脚的检查，否则软件会在综合时会报错。<br> 在约束文件的最后，通过“set_property PULLUP true”语句设置SCCB接口的SDA信号引脚上拉。这是由于这个信号是一个双向引脚，双向引脚需要连接上拉电阻才能在引脚作为输入时，读取到正确的值。由于OV5640摄像头模块在硬件上没有接上拉电阻，因此这里在Vivado软件中设置SCCB接口的SDA引脚上拉。<br> SCCB接口的SCL信号只作为输出，因此也可不必设置上拉。本次实验将EMIO引脚的Bit[0]作为SCCB接口的SCL信号，Bit[1]作为SCCB接口的SDA信号，本次实验将emio_sccb_tri_io[0]和emio_sccb_tri_io[1] 统一设置为上拉。<br> 设置引脚上拉的方式除了在约束文件里设置外，也可以在引脚分配的图像界面中设置，如下图所示：<br> <img src="https://images2.imgbox.com/a3/63/JOAYeXn9_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.3.16 SCCB SDA信号引脚上拉<br> 最后在左侧Flow Navigator导航栏中找到PROGRAM AND DEBUG，点击该选项中的“Generate Bitstream”，对设计进行综合、实现、并生成Bitstream文件。<br> 在生成Bitstream之后，在菜单栏中选择 File &gt; Export &gt; Export hardware导出硬件，并在弹出的对话框中，勾选“Include bitstream”。然后在菜单栏选择Tools&gt; Launch Vitis，启动Vitis软件。<br> 27.4软件设计<br> 在软件设计部分中，和“PS通过VDMA驱动LCD显示”实验相比，源文件下新增了emio_sccb_cfg和OV5640文件，分别实现了对SCCB接口的驱动和读OV5640初始化配置的功能，大家可以直接从例程中拷贝。<br> main函数的代码如下所示：</p> 
+<pre><code class="prism language-c"><span class="token number">1</span>   #include <span class="token operator">&lt;</span>stdio<span class="token punctuation">.</span>h<span class="token operator">&gt;</span>
+<span class="token number">2</span>   #include <span class="token operator">&lt;</span>stdlib<span class="token punctuation">.</span>h<span class="token operator">&gt;</span>
+<span class="token number">3</span>   #include <span class="token operator">&lt;</span>string<span class="token punctuation">.</span>h<span class="token operator">&gt;</span>
+<span class="token number">4</span>   #include <span class="token string">"xil_types.h"</span>
+<span class="token number">5</span>   #include <span class="token string">"xil_cache.h"</span>
+<span class="token number">6</span>   #include <span class="token string">"xparameters.h"</span>
+<span class="token number">7</span>   #include <span class="token string">"xgpio.h"</span>
+<span class="token number">8</span>   #include <span class="token string">"xaxivdma.h"</span>
+<span class="token number">9</span>   #include <span class="token string">"xaxivdma_i.h"</span>
+<span class="token number">10</span>  #include <span class="token string">"display_ctrl/display_ctrl.h"</span>
+<span class="token number">11</span>  #include <span class="token string">"vdma_api/vdma_api.h"</span>
+<span class="token number">12</span>  #include <span class="token string">"clk_wiz/clk_wiz.h"</span>
+<span class="token number">13</span>  #include <span class="token string">"emio_sccb_cfg/emio_sccb_cfg.h"</span>
+<span class="token number">14</span>  #include <span class="token string">"ov5640/ov5640_init.h"</span>
+<span class="token number">15</span>  
+<span class="token number">16</span>  <span class="token comment">//宏定义</span>
+<span class="token number">17</span>  #define CLK_WIZ_ID         XPAR_CLK_WIZ_0_DEVICE_ID   <span class="token comment">//时钟IP核器件ID</span>
+<span class="token number">18</span>  #define VDMA_ID            XPAR_AXIVDMA_0_DEVICE_ID   <span class="token comment">//VDMA器件ID</span>
+<span class="token number">19</span>  #define DISP_VTC_ID        XPAR_VTC_0_DEVICE_ID       <span class="token comment">//VTC器件ID</span>
+<span class="token number">20</span>  #define AXI_GPIO_0_ID      XPAR_AXI_GPIO_0_DEVICE_ID  <span class="token comment">//PL端  AXI GPIO 0(lcd_id)器件ID</span>
+<span class="token number">21</span>  #define AXI_GPIO_0_CHANEL  <span class="token number">1</span>                          <span class="token comment">//使用AXI GPIO(lcd_id)通道1</span>
+<span class="token number">22</span>  
+<span class="token number">23</span>  <span class="token comment">//全局变量</span>
+<span class="token number">24</span>  XAxiVdma     vdma<span class="token punctuation">;</span>
+<span class="token number">25</span>  DisplayCtrl  dispCtrl<span class="token punctuation">;</span>
+<span class="token number">26</span>  XGpio        axi_gpio_inst<span class="token punctuation">;</span>   <span class="token comment">//PL端 AXI GPIO 驱动实例</span>
+<span class="token number">27</span>  VideoMode    vd_mode<span class="token punctuation">;</span>
+<span class="token number">28</span>  <span class="token comment">//frame buffer的起始地址</span>
+<span class="token number">29</span>  <span class="token keyword">unsigned</span> <span class="token keyword">int</span> <span class="token keyword">const</span> frame_buffer_addr <span class="token operator">=</span> <span class="token punctuation">(</span>XPAR_PSU_DDR_0_S_AXI_BASEADDR <span class="token operator">+</span> <span class="token number">0x1000000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">30</span>  <span class="token keyword">unsigned</span> <span class="token keyword">int</span> lcd_id<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>        <span class="token comment">//LCD ID</span>
+<span class="token number">31</span>  
+<span class="token number">32</span>  <span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span>
+<span class="token number">33</span>  <span class="token punctuation">{<!-- --></span>
+<span class="token number">34</span>      u32 status<span class="token punctuation">;</span>
+<span class="token number">35</span>      u16 cmos_h_pixel<span class="token punctuation">;</span>   <span class="token comment">//ov5640 DVP 输出水平像素点数</span>
+<span class="token number">36</span>      u16 cmos_v_pixel<span class="token punctuation">;</span>   <span class="token comment">//ov5640 DVP 输出垂直像素点数</span>
+<span class="token number">37</span>      u16 total_h_pixel<span class="token punctuation">;</span>  <span class="token comment">//ov5640 水平总像素大小</span>
+<span class="token number">38</span>      u16 total_v_pixel<span class="token punctuation">;</span>  <span class="token comment">//ov5640 垂直总像素大小</span>
+<span class="token number">39</span>      
+<span class="token number">40</span>      <span class="token function">XGpio_Initialize</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>axi_gpio_inst<span class="token punctuation">,</span>AXI_GPIO_0_ID<span class="token punctuation">)</span><span class="token punctuation">;</span>                <span class="token comment">//GPIO初始化</span>
+<span class="token number">41</span>      <span class="token function">XGpio_SetDataDirection</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>axi_gpio_inst<span class="token punctuation">,</span>AXI_GPIO_0_CHANEL<span class="token punctuation">,</span><span class="token number">0x07</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">//设置AXI GPIO为输入</span>
+<span class="token number">42</span>      lcd_id <span class="token operator">=</span> <span class="token function">LTDC_PanelID_Read</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>axi_gpio_inst<span class="token punctuation">,</span>AXI_GPIO_0_CHANEL<span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//获取LCD的ID</span>
+<span class="token number">43</span>      <span class="token function">XGpio_SetDataDirection</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>axi_gpio_inst<span class="token punctuation">,</span>AXI_GPIO_0_CHANEL<span class="token punctuation">,</span><span class="token number">0x00</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">//设置AXI GPIO为输出</span>
+<span class="token number">44</span>      <span class="token function">xil_printf</span><span class="token punctuation">(</span><span class="token string">"LCD ID: %x\r\n"</span><span class="token punctuation">,</span>lcd_id<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">45</span>  
+<span class="token number">46</span>      <span class="token comment">//根据获取的LCD的ID号来进行ov5640显示分辨率参数的选择</span>
+<span class="token number">47</span>      <span class="token keyword">switch</span><span class="token punctuation">(</span>lcd_id<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+<span class="token number">48</span>          <span class="token keyword">case</span> <span class="token number">0x4342</span> <span class="token operator">:</span>  <span class="token comment">//4.3寸屏,480*272分辨率</span>
+<span class="token number">49</span>              cmos_h_pixel <span class="token operator">=</span> <span class="token number">480</span><span class="token punctuation">;</span>
+<span class="token number">50</span>              cmos_v_pixel <span class="token operator">=</span> <span class="token number">272</span><span class="token punctuation">;</span>
+<span class="token number">51</span>              total_h_pixel <span class="token operator">=</span> <span class="token number">1800</span><span class="token punctuation">;</span>
+<span class="token number">52</span>              total_v_pixel <span class="token operator">=</span> <span class="token number">1000</span><span class="token punctuation">;</span>
+<span class="token number">53</span>              <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">54</span>          <span class="token keyword">case</span> <span class="token number">0x4384</span> <span class="token operator">:</span>  <span class="token comment">//4.3寸屏,800*480分辨率</span>
+<span class="token number">55</span>              cmos_h_pixel <span class="token operator">=</span> <span class="token number">800</span><span class="token punctuation">;</span>
+<span class="token number">56</span>              cmos_v_pixel <span class="token operator">=</span> <span class="token number">480</span><span class="token punctuation">;</span>
+<span class="token number">57</span>              total_h_pixel <span class="token operator">=</span> <span class="token number">1800</span><span class="token punctuation">;</span>
+<span class="token number">58</span>              total_v_pixel <span class="token operator">=</span> <span class="token number">1000</span><span class="token punctuation">;</span>
+<span class="token number">59</span>              <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">60</span>          <span class="token keyword">case</span> <span class="token number">0x7084</span> <span class="token operator">:</span>  <span class="token comment">//7寸屏,800*480分辨率</span>
+<span class="token number">61</span>              cmos_h_pixel <span class="token operator">=</span> <span class="token number">800</span><span class="token punctuation">;</span>
+<span class="token number">62</span>              cmos_v_pixel <span class="token operator">=</span> <span class="token number">480</span><span class="token punctuation">;</span>
+<span class="token number">63</span>              total_h_pixel <span class="token operator">=</span> <span class="token number">1800</span><span class="token punctuation">;</span>
+<span class="token number">64</span>              total_v_pixel <span class="token operator">=</span> <span class="token number">1000</span><span class="token punctuation">;</span>
+<span class="token number">65</span>              <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">66</span>          <span class="token keyword">case</span> <span class="token number">0x7016</span> <span class="token operator">:</span>  <span class="token comment">//7寸屏,1024*600分辨率</span>
+<span class="token number">67</span>              cmos_h_pixel <span class="token operator">=</span> <span class="token number">1024</span><span class="token punctuation">;</span>
+<span class="token number">68</span>              cmos_v_pixel <span class="token operator">=</span> <span class="token number">600</span><span class="token punctuation">;</span>
+<span class="token number">69</span>              total_h_pixel <span class="token operator">=</span> <span class="token number">2200</span><span class="token punctuation">;</span>
+<span class="token number">70</span>              total_v_pixel <span class="token operator">=</span> <span class="token number">1000</span><span class="token punctuation">;</span>
+<span class="token number">71</span>              <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">72</span>          <span class="token keyword">case</span> <span class="token number">0x1018</span> <span class="token operator">:</span>  <span class="token comment">//10.1寸屏,1280*800分辨率</span>
+<span class="token number">73</span>              cmos_h_pixel <span class="token operator">=</span> <span class="token number">1280</span><span class="token punctuation">;</span>
+<span class="token number">74</span>              cmos_v_pixel <span class="token operator">=</span> <span class="token number">800</span><span class="token punctuation">;</span>
+<span class="token number">75</span>              total_h_pixel <span class="token operator">=</span> <span class="token number">2570</span><span class="token punctuation">;</span>
+<span class="token number">76</span>              total_v_pixel <span class="token operator">=</span> <span class="token number">980</span><span class="token punctuation">;</span>
+<span class="token number">77</span>              <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">78</span>          <span class="token keyword">default</span> <span class="token operator">:</span>
+<span class="token number">79</span>              cmos_h_pixel <span class="token operator">=</span> <span class="token number">480</span><span class="token punctuation">;</span>
+<span class="token number">80</span>              cmos_v_pixel <span class="token operator">=</span> <span class="token number">272</span><span class="token punctuation">;</span>
+<span class="token number">81</span>              total_h_pixel <span class="token operator">=</span> <span class="token number">1800</span><span class="token punctuation">;</span>
+<span class="token number">82</span>              total_v_pixel <span class="token operator">=</span> <span class="token number">1000</span><span class="token punctuation">;</span>
+<span class="token number">83</span>              <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">84</span>      <span class="token punctuation">}</span>
+<span class="token number">85</span>  
+<span class="token number">86</span>      <span class="token function">emio_init</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>                         <span class="token comment">//初始化EMIO</span>
+<span class="token number">87</span>      status <span class="token operator">=</span> <span class="token function">ov5640_init</span><span class="token punctuation">(</span> cmos_h_pixel<span class="token punctuation">,</span>  <span class="token comment">//初始化ov5640</span>
+<span class="token number">88</span>                            cmos_v_pixel<span class="token punctuation">,</span>
+<span class="token number">89</span>                           total_h_pixel<span class="token punctuation">,</span>
+<span class="token number">90</span>                           total_v_pixel<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">91</span>      <span class="token keyword">if</span><span class="token punctuation">(</span>status <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+<span class="token number">92</span>          <span class="token function">xil_printf</span><span class="token punctuation">(</span><span class="token string">"OV5640 detected successful!\r\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">93</span>      <span class="token keyword">else</span>
+<span class="token number">94</span>          <span class="token function">xil_printf</span><span class="token punctuation">(</span><span class="token string">"OV5640 detected failed!\r\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">95</span>  
+<span class="token number">96</span>      <span class="token comment">//根据获取的LCD的ID号来进行video参数的选择</span>
+<span class="token number">97</span>      <span class="token keyword">switch</span><span class="token punctuation">(</span>lcd_id<span class="token punctuation">)</span><span class="token punctuation">{<!-- --></span>
+<span class="token number">98</span>          <span class="token keyword">case</span> <span class="token number">0x4342</span> <span class="token operator">:</span> vd_mode <span class="token operator">=</span> VMODE_480x272<span class="token punctuation">;</span> <span class="token keyword">break</span><span class="token punctuation">;</span>  <span class="token comment">//4.3寸屏,480*272分辨率</span>
+<span class="token number">99</span>          <span class="token keyword">case</span> <span class="token number">0x4384</span> <span class="token operator">:</span> vd_mode <span class="token operator">=</span> VMODE_800x480<span class="token punctuation">;</span> <span class="token keyword">break</span><span class="token punctuation">;</span>  <span class="token comment">//4.3寸屏,800*480分辨率</span>
+<span class="token number">100</span>         <span class="token keyword">case</span> <span class="token number">0x7084</span> <span class="token operator">:</span> vd_mode <span class="token operator">=</span> VMODE_800x480<span class="token punctuation">;</span> <span class="token keyword">break</span><span class="token punctuation">;</span>  <span class="token comment">//7寸屏,800*480分辨率</span>
+<span class="token number">101</span>         <span class="token keyword">case</span> <span class="token number">0x7016</span> <span class="token operator">:</span> vd_mode <span class="token operator">=</span> VMODE_1024x600<span class="token punctuation">;</span> <span class="token keyword">break</span><span class="token punctuation">;</span> <span class="token comment">//7寸屏,1024*600分辨率</span>
+<span class="token number">102</span>         <span class="token keyword">case</span> <span class="token number">0x1018</span> <span class="token operator">:</span> vd_mode <span class="token operator">=</span> VMODE_1280x800<span class="token punctuation">;</span> <span class="token keyword">break</span><span class="token punctuation">;</span> <span class="token comment">//10.1寸屏,1280*800分辨率</span>
+<span class="token number">103</span>         <span class="token keyword">default</span> <span class="token operator">:</span> vd_mode <span class="token operator">=</span> VMODE_800x480<span class="token punctuation">;</span> <span class="token keyword">break</span><span class="token punctuation">;</span>
+<span class="token number">104</span>     <span class="token punctuation">}</span>
+<span class="token number">105</span> 
+<span class="token number">106</span>     <span class="token comment">//配置VDMA</span>
+<span class="token number">107</span>     <span class="token function">run_vdma_frame_buffer</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>vdma<span class="token punctuation">,</span> VDMA_ID<span class="token punctuation">,</span> vd_mode<span class="token punctuation">.</span>width<span class="token punctuation">,</span> vd_mode<span class="token punctuation">.</span>height<span class="token punctuation">,</span>
+<span class="token number">108</span>                             frame_buffer_addr<span class="token punctuation">,</span><span class="token number">0</span><span class="token punctuation">,</span><span class="token number">0</span><span class="token punctuation">,</span>BOTH<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">109</span> 
+<span class="token number">110</span>     <span class="token comment">//设置时钟IP核输出的时钟频率</span>
+<span class="token number">111</span>     <span class="token function">clk_wiz_cfg</span><span class="token punctuation">(</span>CLK_WIZ_ID<span class="token punctuation">,</span>vd_mode<span class="token punctuation">.</span>freq<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">112</span>     <span class="token comment">//初始化Display controller</span>
+<span class="token number">113</span>     <span class="token function">DisplayInitialize</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>dispCtrl<span class="token punctuation">,</span> DISP_VTC_ID<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">114</span>     <span class="token comment">//设置VideoMode</span>
+<span class="token number">115</span>     <span class="token function">DisplaySetMode</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>dispCtrl<span class="token punctuation">,</span> <span class="token operator">&amp;</span>vd_mode<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">116</span>     <span class="token function">DisplayStart</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>dispCtrl<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">117</span> 
+<span class="token number">118</span>     <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">119</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p>在main函数中，首先获取LCD屏的ID，将摄像头的分辨率配置成LCD屏的分辨率。OV5640能够对输出图像的分辨率大小进行调整，所以我们可以根据不同分辨率的LCD来使OV5640输出不同分辨率的视频图像。代码中的第35-38行定义了4个变量，用于存储ov5640的分辨率配置参数。代码中第47行的switch语句，根据读取到的LCD的ID号来对ov5640的分辨率配置参数进行赋值，然后这些变量值将作为实参来传递给ov5640_init()函数。<br> 随后通过emio_init()函数对emio引脚进行初始化，配置SCCB接口的两个引脚。然后通过ov5640_init()函数对OV5640进行初始化，即通过SCCB接口对摄像头进行配置，让OV5640在工作在预期的工作模式下，包括OV5640的输出格式、分辨率、像素PCLK时钟频率等。ov5640_init()函数的返回值为是否检测到OV5640的标志，程序中将检测的结果打印出来，如代码中第91行至第94行代码所示。<br> 在程序的第107行至第108行代码中，通过调用run_vdma_frame_buffer()函数配置VDMA。本次实验同时用到了VDMA的读通道和写通道，因此函数的最后一个参数设置为BOTH，表示同时配置读通道和写通道。<br> 在程序的第111行至第116行代码中，通过clk_wiz_cfg()对时钟IP核进行配置，通过DisplayInitialize()函数对显示相关的IP核进行初始化，包括VTC；DisplaySetMode函数设置VTC输出的分辨率；最后通过DisplayStart()函数启动VTC开始工作。<br> ov5640_init()函数的代码如下所示：</p> 
+<pre><code class="prism language-c"><span class="token number">1</span>   u8 <span class="token function">ov5640_init</span><span class="token punctuation">(</span> u16 cmos_h_pixel<span class="token punctuation">,</span>  u16 cmos_v_pixel<span class="token punctuation">,</span>  
+<span class="token number">2</span>                   u16 total_h_pixel<span class="token punctuation">,</span>  u16 total_v_pixel <span class="token punctuation">)</span>
+<span class="token number">3</span>   <span class="token punctuation">{<!-- --></span>
+<span class="token number">4</span>       u16 cam_id <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">5</span>       
+<span class="token number">6</span>       <span class="token function">usleep</span><span class="token punctuation">(</span><span class="token number">20000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//OV5640上电到开始配置sccb至少等待20ms</span>
+<span class="token number">7</span>   
+<span class="token number">8</span>       <span class="token comment">//读OV5640摄像头ID</span>
+<span class="token number">9</span>       cam_id  <span class="token operator">=</span> <span class="token function">sccb_read_reg16</span><span class="token punctuation">(</span><span class="token number">0x300b</span><span class="token punctuation">)</span><span class="token punctuation">;</span>       <span class="token comment">//LSB  0x40</span>
+<span class="token number">10</span>      cam_id <span class="token operator">|=</span> <span class="token function">sccb_read_reg16</span><span class="token punctuation">(</span><span class="token number">0x300a</span><span class="token punctuation">)</span> <span class="token operator">&lt;&lt;</span> <span class="token number">8</span><span class="token punctuation">;</span>  <span class="token comment">//MSB  0x56</span>
+<span class="token number">11</span>      
+<span class="token number">12</span>      <span class="token keyword">if</span><span class="token punctuation">(</span>cam_id <span class="token operator">!=</span> <span class="token number">0x5640</span><span class="token punctuation">)</span>  <span class="token comment">//获取到正确的OV5640 ID</span>
+<span class="token number">13</span>          <span class="token keyword">return</span> <span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token number">14</span>      <span class="token keyword">else</span><span class="token punctuation">{<!-- --></span>
+<span class="token number">15</span>          <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x3008</span><span class="token punctuation">,</span><span class="token number">0x02</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">//正常工作模式</span>
+配置代码较长，省略部分源代码……
+<span class="token number">244</span>         <span class="token comment">//设置输出像素个数</span>
+<span class="token number">245</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x3808</span><span class="token punctuation">,</span> cmos_h_pixel <span class="token operator">&gt;&gt;</span> <span class="token number">8</span>     <span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//DVP 输出水平像素点数高4位</span>
+<span class="token number">246</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x3809</span><span class="token punctuation">,</span> cmos_h_pixel <span class="token operator">&amp;</span> <span class="token number">0x00FF</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//DVP 输出水平像素点数低8位</span>
+<span class="token number">247</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x380a</span><span class="token punctuation">,</span> cmos_v_pixel <span class="token operator">&gt;&gt;</span> <span class="token number">8</span>     <span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//DVP 输出垂直像素点数高3位</span>
+<span class="token number">248</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x380b</span><span class="token punctuation">,</span> cmos_v_pixel <span class="token operator">&amp;</span> <span class="token number">0x00FF</span> <span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//DVP 输出垂直像素点数低8位</span>
+<span class="token number">249</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x380c</span><span class="token punctuation">,</span> total_h_pixel <span class="token operator">&gt;&gt;</span> <span class="token number">8</span>    <span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//水平总像素大小高5位</span>
+<span class="token number">250</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x380d</span><span class="token punctuation">,</span> total_h_pixel <span class="token operator">&amp;</span> <span class="token number">0x00FF</span><span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//水平总像素大小低8位</span>
+<span class="token number">251</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x380e</span><span class="token punctuation">,</span> total_v_pixel <span class="token operator">&gt;&gt;</span> <span class="token number">8</span>    <span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//垂直总像素大小高5位</span>
+<span class="token number">252</span>         <span class="token function">sccb_write_reg16</span><span class="token punctuation">(</span><span class="token number">0x380f</span><span class="token punctuation">,</span> total_v_pixel <span class="token operator">&amp;</span> <span class="token number">0x00FF</span><span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">//垂直总像素大小低8位</span>
+配置代码较长，省略部分源代码……
+<span class="token number">278</span>         <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">279</span>     <span class="token punctuation">}</span>
+</code></pre> 
+<p>代码中的第9-10行读取寄存器地址0x300B和0x300A来获取OV5640摄像头的ID，注意OV5640摄像头的ID为“0x5640”。如果获取的ID不等于0x5640，则返回1；否则开始对OV5640摄像头进行配置。第245-252行将在main函数中赋值的分辨率配置数据写入到0x5640中，配置完成后函数返回0。<br> 27.5下载验证<br> 首先我们将下载器与开发板上的JTAG接口连接，下载器另外一端与电脑连接。然后使用USB连接线将USB UART接口（PS_PORT）与电脑连接，用于串口通信。接下来使用FPC排线一端与RGB LCD液晶屏上的接口连接，另一端连接开发板上的RGB LCD接口。<br> 接下来将双目OV5640摄像头模块插在MPSOC开发板的J19扩展口（实际只用到了一路摄像头），注意在连接时，摄像头镜头方向朝外，如下图所示，最后连接开发板的电源。<br> <img src="https://images2.imgbox.com/7f/5d/zCX6p44c_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.5.1 摄像头镜头方向朝外<br> 打开Vitis Terminal终端，设置并连接串口。然后下载本次实验的程序，下载完成后，在下方的Terminal中可以看到应用程序打印的信息，如下图所示：<br> <img src="https://images2.imgbox.com/1a/e1/VbDEYAmm_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.5.2 串口打印的信息<br> 同时，RGB LCD液晶屏上显示出OV5640摄像头采集的图像，说明本次OV5640摄像头RGB LCD屏显示的实验在MPSOC开发板上验证成功，如下图所示：<br> <img src="https://images2.imgbox.com/b1/60/B1y9aup9_o.png" alt="在这里插入图片描述"></p> 
+<p>图27.5.3 RGB LCD屏显示图像数据<br> 实验的最后再补充一点，我们在动态同步锁相模式下，设置不同的帧数量做了测试。当帧缓存的数量小于等于2，在摄像头前快速移动时，会出现比较明显的卡顿（即前面说的割裂）现象；当帧缓存的数据大于等于3时，可以解决这一问题，且设置的值超过3时，也观察不到显示效果的提升，和前面分析的一致。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3715113058db643809fab29a4f90ba6e/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Linux命令 uname 等获取Linux系统详情命令分析</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/6f90817fab60c80060ed2552bce442dc/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">SSM框架搭建</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>redis系列，rdb为什么要这么做？深度剖析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="redis系列，rdb为什么要这么做？深度剖析" />
+<meta property="og:description" content="文章目录 本人 github 地址本篇文章看点rdb的触发条件bgsave的主流程为什么要fork子进程而不是用子线程去做 rdb保存数据到file的流程 总结 本人 github 地址 github 地址 里面有注释好的代码，下载下来可以方便阅读。
+本篇文章看点 rdb什么时候执行，条件是如何触发。rdb为什么用子进程而不是线程。什么是copy on write为什么是fork而不是其它 rdb的触发条件 rdb 有两种触发方式一种是主动触发一种是被动触发
+主动触发其实就是两个命令一个是sava 另外一个bgsave, 不同的是save会阻塞主线程，在save没有执行完的情况下,其它命令所有命令只能等待save 执行完才能被执行，redis的执行命令的线程还是单线程，所以一般情况下，请用bgsave代替save，bgsave和被动触发的逻辑相似都是会fork一个子线程来执行，bgsave 带有一个schedule 参数当有其它子进程在执行的时候会滞后执行。被动触发的入口跟之前键过期的入口一样，都是从serverCron这里来触发
+save 入口： void saveCommand(client *c) { //判断是否有rdb的子进程在运行 if (server.rdb_child_pid != -1) { addReplyError(c,&#34;Background save already in progress&#34;); return; } rdbSaveInfo rsi, *rsiptr; //这个是跟replication相关逻辑 rsiptr = rdbPopulateSaveInfo(&amp;rsi); //rdb的save主流程 if (rdbSave(server.rdb_filename,rsiptr) == C_OK) { addReply(c,shared.ok); } else { addReply(c,shared.err); } } bgsave 入口：
+/* BGSAVE [SCHEDULE] */ void bgsaveCommand(client *c) { int schedule = 0; /* The SCHEDULE option changes the behavior of BGSAVE when an AOF rewrite * is in progress." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/c3c428a98a8ab3cf490098a3a28eee16/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-12-04T14:38:35+08:00" />
+<meta property="article:modified_time" content="2020-12-04T14:38:35+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">redis系列，rdb为什么要这么做？深度剖析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><a href="#_github__7" rel="nofollow">本人 github 地址</a></li><li><a href="#_10" rel="nofollow">本篇文章看点</a></li><li><a href="#rdb_16" rel="nofollow">rdb的触发条件</a></li><li><ul><li><a href="#bgsave_140" rel="nofollow">bgsave的主流程</a></li><li><ul><li><a href="#fork_261" rel="nofollow">为什么要fork子进程而不是用子线程去做</a></li></ul> 
+   </li><li><a href="#rdbfile_266" rel="nofollow">rdb保存数据到file的流程</a></li></ul> 
+  </li><li><a href="#_639" rel="nofollow">总结</a></li></ul> 
+</div> 
+<p></p> 
+<hr color="#000000" size='1"'> 
+<h2><a id="_github__7"></a>本人 github 地址</h2> 
+<p><a href="https://github.com/pengyujia1234/redis-explain">github 地址</a> 里面有注释好的代码，下载下来可以方便阅读。</p> 
+<h2><a id="_10"></a>本篇文章看点</h2> 
+<ol><li>rdb什么时候执行，条件是如何触发。</li><li>rdb为什么用子进程而不是线程。</li><li>什么是copy on write</li><li>为什么是fork而不是其它</li></ol> 
+<h2><a id="rdb_16"></a>rdb的触发条件</h2> 
+<p>rdb 有两种触发方式一种是主动触发一种是被动触发</p> 
+<ol><li>主动触发其实就是两个命令一个是sava 另外一个bgsave, 不同的是save会阻塞主线程，在save没有执行完的情况下,其它命令所有命令只能等待save 执行完才能被执行，redis的执行命令的线程还是单线程，所以一般情况下，<strong>请用bgsave代替save</strong>，bgsave和被动触发的逻辑相似都是会fork一个子线程来执行，bgsave 带有一个schedule 参数当有其它子进程在执行的时候会滞后执行。</li><li>被动触发的入口跟之前键过期的入口一样，都是从serverCron这里来触发<br> <strong>save 入口：</strong></li></ol> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">saveCommand</span><span class="token punctuation">(</span>client <span class="token operator">*</span>c<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//判断是否有rdb的子进程在运行</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReplyError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span><span class="token string">"Background save already in progress"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    rdbSaveInfo rsi<span class="token punctuation">,</span> <span class="token operator">*</span>rsiptr<span class="token punctuation">;</span>
+    <span class="token comment">//这个是跟replication相关逻辑</span>
+    rsiptr <span class="token operator">=</span> <span class="token function">rdbPopulateSaveInfo</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>rsi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//rdb的save主流程</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSave</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_filename<span class="token punctuation">,</span>rsiptr<span class="token punctuation">)</span> <span class="token operator">==</span> C_OK<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReply</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span>shared<span class="token punctuation">.</span>ok<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReply</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span>shared<span class="token punctuation">.</span>err<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><strong>bgsave 入口：</strong></p> 
+<pre><code class="prism language-c"><span class="token comment">/* BGSAVE [SCHEDULE] */</span>
+<span class="token keyword">void</span> <span class="token function">bgsaveCommand</span><span class="token punctuation">(</span>client <span class="token operator">*</span>c<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">int</span> schedule <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/* The SCHEDULE option changes the behavior of BGSAVE when an AOF rewrite
+     * is in progress. Instead of returning an error a BGSAVE gets scheduled. */</span>
+    <span class="token comment">//如果带有schedule ，就会设置schedule边领</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>argc <span class="token operator">&gt;</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>argc <span class="token operator">==</span> <span class="token number">2</span> <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span><span class="token function">strcasecmp</span><span class="token punctuation">(</span>c<span class="token operator">-&gt;</span>argv<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token operator">-&gt;</span>ptr<span class="token punctuation">,</span><span class="token string">"schedule"</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            schedule <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">addReply</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span>shared<span class="token punctuation">.</span>syntaxerr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+
+    rdbSaveInfo rsi<span class="token punctuation">,</span> <span class="token operator">*</span>rsiptr<span class="token punctuation">;</span>
+    <span class="token comment">//replication </span>
+    rsiptr <span class="token operator">=</span> <span class="token function">rdbPopulateSaveInfo</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>rsi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//是否有rdb backgroud 正在执行</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReplyError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span><span class="token string">"Background save already in progress"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> 
+    <span class="token comment">//如果有其它子进程在执行则进入下面的schedule判断</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">hasActiveChildProcess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>schedule<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            server<span class="token punctuation">.</span>rdb_bgsave_scheduled <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+            <span class="token function">addReplyStatus</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span><span class="token string">"Background saving scheduled"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">addReplyError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span>
+            <span class="token string">"Another child process is active (AOF?): can't BGSAVE right now. "</span>
+            <span class="token string">"Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "</span>
+            <span class="token string">"possible."</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span> 
+    <span class="token comment">//save backgroud 主流程</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveBackground</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_filename<span class="token punctuation">,</span>rsiptr<span class="token punctuation">)</span> <span class="token operator">==</span> C_OK<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReplyStatus</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span><span class="token string">"Background saving started"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">addReply</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span>shared<span class="token punctuation">.</span>err<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p><strong>被动触发入口：</strong></p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">serverCron</span><span class="token punctuation">(</span><span class="token keyword">struct</span> aeEventLoop <span class="token operator">*</span>eventLoop<span class="token punctuation">,</span> <span class="token keyword">long</span> <span class="token keyword">long</span> id<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>clientData<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token comment">//判断是否有子线程在运行</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">hasActiveChildProcess</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token function">ldbPendingChildren</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token punctuation">{<!-- --></span>
+        <span class="token function">checkChildrenDone</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* If there is not a background saving/rewrite in progress check if
+         * we have to save/rewrite now. */</span>
+         <span class="token comment">//检查是否rdb的save和rewrite达到了条件</span>
+        <span class="token keyword">for</span> <span class="token punctuation">(</span>j <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> j <span class="token operator">&lt;</span> server<span class="token punctuation">.</span>saveparamslen<span class="token punctuation">;</span> j<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//saveparams 对应config文件里面的次数和seconds</span>
+            <span class="token keyword">struct</span> saveparam <span class="token operator">*</span>sp <span class="token operator">=</span> server<span class="token punctuation">.</span>saveparams<span class="token operator">+</span>j<span class="token punctuation">;</span>
+
+            <span class="token comment">/* Save if we reached the given amount of changes,
+             * the given amount of seconds, and if the latest bgsave was
+             * successful or if, in case of an error, at least
+             * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */</span>
+            <span class="token comment">//判断修改次数是否达到次数</span>
+            <span class="token comment">//比较上次时间内是否满足了条数</span>
+            <span class="token comment">//上次bgsave 时间大于设置的阈值5s或者上次bgsave状态是ok的</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>dirty <span class="token operator">&gt;=</span> sp<span class="token operator">-&gt;</span>changes <span class="token operator">&amp;&amp;</span>
+                server<span class="token punctuation">.</span>unixtime<span class="token operator">-</span>server<span class="token punctuation">.</span>lastsave <span class="token operator">&gt;</span> sp<span class="token operator">-&gt;</span>seconds <span class="token operator">&amp;&amp;</span>
+                <span class="token punctuation">(</span>server<span class="token punctuation">.</span>unixtime<span class="token operator">-</span>server<span class="token punctuation">.</span>lastbgsave_try <span class="token operator">&gt;</span>
+                 CONFIG_BGSAVE_RETRY_DELAY <span class="token operator">||</span>
+                 server<span class="token punctuation">.</span>lastbgsave_status <span class="token operator">==</span> C_OK<span class="token punctuation">)</span><span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_NOTICE<span class="token punctuation">,</span><span class="token string">"%d changes in %d seconds. Saving..."</span><span class="token punctuation">,</span>
+                    sp<span class="token operator">-&gt;</span>changes<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span>sp<span class="token operator">-&gt;</span>seconds<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                rdbSaveInfo rsi<span class="token punctuation">,</span> <span class="token operator">*</span>rsiptr<span class="token punctuation">;</span>
+                <span class="token comment">//这里主要是高可用数据逻辑</span>
+                <span class="token comment">//这里暂时略过</span>
+                rsiptr <span class="token operator">=</span> <span class="token function">rdbPopulateSaveInfo</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>rsi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token function">rdbSaveBackground</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_filename<span class="token punctuation">,</span>rsiptr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token keyword">break</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>被动触发主要有以下几个判断</p> 
+<div class="mermaid"> 
+ <svg id="mermaid-svg-b8LkU8oClik8TDac" width="849.03125" xmlns="http://www.w3.org/2000/svg" height="158" viewbox="0 0 849.03125 158"> 
+  <style>#mermaid-svg-b8LkU8oClik8TDac .label{font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family);fill:#333;color:#333}#mermaid-svg-b8LkU8oClik8TDac .label text{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .node rect,#mermaid-svg-b8LkU8oClik8TDac .node circle,#mermaid-svg-b8LkU8oClik8TDac .node ellipse,#mermaid-svg-b8LkU8oClik8TDac .node polygon,#mermaid-svg-b8LkU8oClik8TDac .node path{fill:#ECECFF;stroke:#9370db;stroke-width:1px}#mermaid-svg-b8LkU8oClik8TDac .node .label{text-align:center;fill:#333}#mermaid-svg-b8LkU8oClik8TDac .node.clickable{cursor:pointer}#mermaid-svg-b8LkU8oClik8TDac .arrowheadPath{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .edgePath .path{stroke:#333;stroke-width:1.5px}#mermaid-svg-b8LkU8oClik8TDac .flowchart-link{stroke:#333;fill:none}#mermaid-svg-b8LkU8oClik8TDac .edgeLabel{background-color:#e8e8e8;text-align:center}#mermaid-svg-b8LkU8oClik8TDac .edgeLabel rect{opacity:0.9}#mermaid-svg-b8LkU8oClik8TDac .edgeLabel span{color:#333}#mermaid-svg-b8LkU8oClik8TDac .cluster rect{fill:#ffffde;stroke:#aa3;stroke-width:1px}#mermaid-svg-b8LkU8oClik8TDac .cluster text{fill:#333}#mermaid-svg-b8LkU8oClik8TDac div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family);font-size:12px;background:#ffffde;border:1px solid #aa3;border-radius:2px;pointer-events:none;z-index:100}#mermaid-svg-b8LkU8oClik8TDac .actor{stroke:#ccf;fill:#ECECFF}#mermaid-svg-b8LkU8oClik8TDac text.actor&gt;tspan{fill:#000;stroke:none}#mermaid-svg-b8LkU8oClik8TDac .actor-line{stroke:grey}#mermaid-svg-b8LkU8oClik8TDac .messageLine0{stroke-width:1.5;stroke-dasharray:none;stroke:#333}#mermaid-svg-b8LkU8oClik8TDac .messageLine1{stroke-width:1.5;stroke-dasharray:2, 2;stroke:#333}#mermaid-svg-b8LkU8oClik8TDac #arrowhead path{fill:#333;stroke:#333}#mermaid-svg-b8LkU8oClik8TDac .sequenceNumber{fill:#fff}#mermaid-svg-b8LkU8oClik8TDac #sequencenumber{fill:#333}#mermaid-svg-b8LkU8oClik8TDac #crosshead path{fill:#333;stroke:#333}#mermaid-svg-b8LkU8oClik8TDac .messageText{fill:#333;stroke:#333}#mermaid-svg-b8LkU8oClik8TDac .labelBox{stroke:#ccf;fill:#ECECFF}#mermaid-svg-b8LkU8oClik8TDac .labelText,#mermaid-svg-b8LkU8oClik8TDac .labelText&gt;tspan{fill:#000;stroke:none}#mermaid-svg-b8LkU8oClik8TDac .loopText,#mermaid-svg-b8LkU8oClik8TDac .loopText&gt;tspan{fill:#000;stroke:none}#mermaid-svg-b8LkU8oClik8TDac .loopLine{stroke-width:2px;stroke-dasharray:2, 2;stroke:#ccf;fill:#ccf}#mermaid-svg-b8LkU8oClik8TDac .note{stroke:#aa3;fill:#fff5ad}#mermaid-svg-b8LkU8oClik8TDac .noteText,#mermaid-svg-b8LkU8oClik8TDac .noteText&gt;tspan{fill:#000;stroke:none}#mermaid-svg-b8LkU8oClik8TDac .activation0{fill:#f4f4f4;stroke:#666}#mermaid-svg-b8LkU8oClik8TDac .activation1{fill:#f4f4f4;stroke:#666}#mermaid-svg-b8LkU8oClik8TDac .activation2{fill:#f4f4f4;stroke:#666}#mermaid-svg-b8LkU8oClik8TDac .mermaid-main-font{font-family:"trebuchet ms", verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .section{stroke:none;opacity:0.2}#mermaid-svg-b8LkU8oClik8TDac .section0{fill:rgba(102,102,255,0.49)}#mermaid-svg-b8LkU8oClik8TDac .section2{fill:#fff400}#mermaid-svg-b8LkU8oClik8TDac .section1,#mermaid-svg-b8LkU8oClik8TDac .section3{fill:#fff;opacity:0.2}#mermaid-svg-b8LkU8oClik8TDac .sectionTitle0{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .sectionTitle1{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .sectionTitle2{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .sectionTitle3{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .sectionTitle{text-anchor:start;font-size:11px;text-height:14px;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .grid .tick{stroke:#d3d3d3;opacity:0.8;shape-rendering:crispEdges}#mermaid-svg-b8LkU8oClik8TDac .grid .tick text{font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .grid path{stroke-width:0}#mermaid-svg-b8LkU8oClik8TDac .today{fill:none;stroke:red;stroke-width:2px}#mermaid-svg-b8LkU8oClik8TDac .task{stroke-width:2}#mermaid-svg-b8LkU8oClik8TDac .taskText{text-anchor:middle;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .taskText:not([font-size]){font-size:11px}#mermaid-svg-b8LkU8oClik8TDac .taskTextOutsideRight{fill:#000;text-anchor:start;font-size:11px;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .taskTextOutsideLeft{fill:#000;text-anchor:end;font-size:11px}#mermaid-svg-b8LkU8oClik8TDac .task.clickable{cursor:pointer}#mermaid-svg-b8LkU8oClik8TDac .taskText.clickable{cursor:pointer;fill:#003163 !important;font-weight:bold}#mermaid-svg-b8LkU8oClik8TDac .taskTextOutsideLeft.clickable{cursor:pointer;fill:#003163 !important;font-weight:bold}#mermaid-svg-b8LkU8oClik8TDac .taskTextOutsideRight.clickable{cursor:pointer;fill:#003163 !important;font-weight:bold}#mermaid-svg-b8LkU8oClik8TDac .taskText0,#mermaid-svg-b8LkU8oClik8TDac .taskText1,#mermaid-svg-b8LkU8oClik8TDac .taskText2,#mermaid-svg-b8LkU8oClik8TDac .taskText3{fill:#fff}#mermaid-svg-b8LkU8oClik8TDac .task0,#mermaid-svg-b8LkU8oClik8TDac .task1,#mermaid-svg-b8LkU8oClik8TDac .task2,#mermaid-svg-b8LkU8oClik8TDac .task3{fill:#8a90dd;stroke:#534fbc}#mermaid-svg-b8LkU8oClik8TDac .taskTextOutside0,#mermaid-svg-b8LkU8oClik8TDac .taskTextOutside2{fill:#000}#mermaid-svg-b8LkU8oClik8TDac .taskTextOutside1,#mermaid-svg-b8LkU8oClik8TDac .taskTextOutside3{fill:#000}#mermaid-svg-b8LkU8oClik8TDac .active0,#mermaid-svg-b8LkU8oClik8TDac .active1,#mermaid-svg-b8LkU8oClik8TDac .active2,#mermaid-svg-b8LkU8oClik8TDac .active3{fill:#bfc7ff;stroke:#534fbc}#mermaid-svg-b8LkU8oClik8TDac .activeText0,#mermaid-svg-b8LkU8oClik8TDac .activeText1,#mermaid-svg-b8LkU8oClik8TDac .activeText2,#mermaid-svg-b8LkU8oClik8TDac .activeText3{fill:#000 !important}#mermaid-svg-b8LkU8oClik8TDac .done0,#mermaid-svg-b8LkU8oClik8TDac .done1,#mermaid-svg-b8LkU8oClik8TDac .done2,#mermaid-svg-b8LkU8oClik8TDac .done3{stroke:grey;fill:#d3d3d3;stroke-width:2}#mermaid-svg-b8LkU8oClik8TDac .doneText0,#mermaid-svg-b8LkU8oClik8TDac .doneText1,#mermaid-svg-b8LkU8oClik8TDac .doneText2,#mermaid-svg-b8LkU8oClik8TDac .doneText3{fill:#000 !important}#mermaid-svg-b8LkU8oClik8TDac .crit0,#mermaid-svg-b8LkU8oClik8TDac .crit1,#mermaid-svg-b8LkU8oClik8TDac .crit2,#mermaid-svg-b8LkU8oClik8TDac .crit3{stroke:#f88;fill:red;stroke-width:2}#mermaid-svg-b8LkU8oClik8TDac .activeCrit0,#mermaid-svg-b8LkU8oClik8TDac .activeCrit1,#mermaid-svg-b8LkU8oClik8TDac .activeCrit2,#mermaid-svg-b8LkU8oClik8TDac .activeCrit3{stroke:#f88;fill:#bfc7ff;stroke-width:2}#mermaid-svg-b8LkU8oClik8TDac .doneCrit0,#mermaid-svg-b8LkU8oClik8TDac .doneCrit1,#mermaid-svg-b8LkU8oClik8TDac .doneCrit2,#mermaid-svg-b8LkU8oClik8TDac .doneCrit3{stroke:#f88;fill:#d3d3d3;stroke-width:2;cursor:pointer;shape-rendering:crispEdges}#mermaid-svg-b8LkU8oClik8TDac .milestone{transform:rotate(45deg) scale(0.8, 0.8)}#mermaid-svg-b8LkU8oClik8TDac .milestoneText{font-style:italic}#mermaid-svg-b8LkU8oClik8TDac .doneCritText0,#mermaid-svg-b8LkU8oClik8TDac .doneCritText1,#mermaid-svg-b8LkU8oClik8TDac .doneCritText2,#mermaid-svg-b8LkU8oClik8TDac .doneCritText3{fill:#000 !important}#mermaid-svg-b8LkU8oClik8TDac .activeCritText0,#mermaid-svg-b8LkU8oClik8TDac .activeCritText1,#mermaid-svg-b8LkU8oClik8TDac .activeCritText2,#mermaid-svg-b8LkU8oClik8TDac .activeCritText3{fill:#000 !important}#mermaid-svg-b8LkU8oClik8TDac .titleText{text-anchor:middle;font-size:18px;fill:#000;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac g.classGroup text{fill:#9370db;stroke:none;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family);font-size:10px}#mermaid-svg-b8LkU8oClik8TDac g.classGroup text .title{font-weight:bolder}#mermaid-svg-b8LkU8oClik8TDac g.clickable{cursor:pointer}#mermaid-svg-b8LkU8oClik8TDac g.classGroup rect{fill:#ECECFF;stroke:#9370db}#mermaid-svg-b8LkU8oClik8TDac g.classGroup line{stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac .classLabel .box{stroke:none;stroke-width:0;fill:#ECECFF;opacity:0.5}#mermaid-svg-b8LkU8oClik8TDac .classLabel .label{fill:#9370db;font-size:10px}#mermaid-svg-b8LkU8oClik8TDac .relation{stroke:#9370db;stroke-width:1;fill:none}#mermaid-svg-b8LkU8oClik8TDac .dashed-line{stroke-dasharray:3}#mermaid-svg-b8LkU8oClik8TDac #compositionStart{fill:#9370db;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #compositionEnd{fill:#9370db;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #aggregationStart{fill:#ECECFF;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #aggregationEnd{fill:#ECECFF;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #dependencyStart{fill:#9370db;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #dependencyEnd{fill:#9370db;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #extensionStart{fill:#9370db;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac #extensionEnd{fill:#9370db;stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac .commit-id,#mermaid-svg-b8LkU8oClik8TDac .commit-msg,#mermaid-svg-b8LkU8oClik8TDac .branch-label{fill:lightgrey;color:lightgrey;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .pieTitleText{text-anchor:middle;font-size:25px;fill:#000;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .slice{font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac g.stateGroup text{fill:#9370db;stroke:none;font-size:10px;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac g.stateGroup text{fill:#9370db;fill:#333;stroke:none;font-size:10px}#mermaid-svg-b8LkU8oClik8TDac g.statediagram-cluster .cluster-label text{fill:#333}#mermaid-svg-b8LkU8oClik8TDac g.stateGroup .state-title{font-weight:bolder;fill:#000}#mermaid-svg-b8LkU8oClik8TDac g.stateGroup rect{fill:#ECECFF;stroke:#9370db}#mermaid-svg-b8LkU8oClik8TDac g.stateGroup line{stroke:#9370db;stroke-width:1}#mermaid-svg-b8LkU8oClik8TDac .transition{stroke:#9370db;stroke-width:1;fill:none}#mermaid-svg-b8LkU8oClik8TDac .stateGroup .composit{fill:white;border-bottom:1px}#mermaid-svg-b8LkU8oClik8TDac .stateGroup .alt-composit{fill:#e0e0e0;border-bottom:1px}#mermaid-svg-b8LkU8oClik8TDac .state-note{stroke:#aa3;fill:#fff5ad}#mermaid-svg-b8LkU8oClik8TDac .state-note text{fill:black;stroke:none;font-size:10px}#mermaid-svg-b8LkU8oClik8TDac .stateLabel .box{stroke:none;stroke-width:0;fill:#ECECFF;opacity:0.7}#mermaid-svg-b8LkU8oClik8TDac .edgeLabel text{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .stateLabel text{fill:#000;font-size:10px;font-weight:bold;font-family:'trebuchet ms', verdana, arial;font-family:var(--mermaid-font-family)}#mermaid-svg-b8LkU8oClik8TDac .node circle.state-start{fill:black;stroke:black}#mermaid-svg-b8LkU8oClik8TDac .node circle.state-end{fill:black;stroke:white;stroke-width:1.5}#mermaid-svg-b8LkU8oClik8TDac #statediagram-barbEnd{fill:#9370db}#mermaid-svg-b8LkU8oClik8TDac .statediagram-cluster rect{fill:#ECECFF;stroke:#9370db;stroke-width:1px}#mermaid-svg-b8LkU8oClik8TDac .statediagram-cluster rect.outer{rx:5px;ry:5px}#mermaid-svg-b8LkU8oClik8TDac .statediagram-state .divider{stroke:#9370db}#mermaid-svg-b8LkU8oClik8TDac .statediagram-state .title-state{rx:5px;ry:5px}#mermaid-svg-b8LkU8oClik8TDac .statediagram-cluster.statediagram-cluster .inner{fill:white}#mermaid-svg-b8LkU8oClik8TDac .statediagram-cluster.statediagram-cluster-alt .inner{fill:#e0e0e0}#mermaid-svg-b8LkU8oClik8TDac .statediagram-cluster .inner{rx:0;ry:0}#mermaid-svg-b8LkU8oClik8TDac .statediagram-state rect.basic{rx:5px;ry:5px}#mermaid-svg-b8LkU8oClik8TDac .statediagram-state rect.divider{stroke-dasharray:10,10;fill:#efefef}#mermaid-svg-b8LkU8oClik8TDac .note-edge{stroke-dasharray:5}#mermaid-svg-b8LkU8oClik8TDac .statediagram-note rect{fill:#fff5ad;stroke:#aa3;stroke-width:1px;rx:0;ry:0}:root{--mermaid-font-family: '"trebuchet ms", verdana, arial';--mermaid-font-family: "Comic Sans MS", "Comic Sans", cursive}#mermaid-svg-b8LkU8oClik8TDac .error-icon{fill:#522}#mermaid-svg-b8LkU8oClik8TDac .error-text{fill:#522;stroke:#522}#mermaid-svg-b8LkU8oClik8TDac .edge-thickness-normal{stroke-width:2px}#mermaid-svg-b8LkU8oClik8TDac .edge-thickness-thick{stroke-width:3.5px}#mermaid-svg-b8LkU8oClik8TDac .edge-pattern-solid{stroke-dasharray:0}#mermaid-svg-b8LkU8oClik8TDac .edge-pattern-dashed{stroke-dasharray:3}#mermaid-svg-b8LkU8oClik8TDac .edge-pattern-dotted{stroke-dasharray:2}#mermaid-svg-b8LkU8oClik8TDac .marker{fill:#333}#mermaid-svg-b8LkU8oClik8TDac .marker.cross{stroke:#333}
+
+:root { --mermaid-font-family: "trebuchet ms", verdana, arial;}</style> 
+  <style>#mermaid-svg-b8LkU8oClik8TDac {
+    color: rgba(0, 0, 0, 0.75);
+    font: ;
+  }</style> 
+  <g> 
+   <g class="output"> 
+    <g class="clusters"></g> 
+    <g class="edgePaths"> 
+     <g class="edgePath LS-A LE-B" id="L-A-B" style="opacity: 1;"> 
+      <path class="path" d="M148.9375,56L213,31L299.3671875,31" marker-end="url(#arrowhead1474)" style="fill:none"></path> 
+      <defs> 
+       <marker id="arrowhead1474" viewbox="0 0 10 10" refx="9" refy="5" markerunits="strokeWidth" markerwidth="8" markerheight="6" orient="auto"> 
+        <path d="M 0 0 L 10 5 L 0 10 z" class="arrowheadPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path> 
+       </marker> 
+      </defs> 
+     </g> 
+     <g class="edgePath LS-A LE-C" style="opacity: 1;" id="L-A-C"> 
+      <path class="path" d="M148.9375,102L213,127L254,127" marker-end="url(#arrowhead1475)" style="fill:none"></path> 
+      <defs> 
+       <marker id="arrowhead1475" viewbox="0 0 10 10" refx="9" refy="5" markerunits="strokeWidth" markerwidth="8" markerheight="6" orient="auto"> 
+        <path d="M 0 0 L 10 5 L 0 10 z" class="arrowheadPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path> 
+       </marker> 
+      </defs> 
+     </g> 
+     <g class="edgePath LS-C LE-D" style="opacity: 1;" id="L-C-D"> 
+      <path class="path" d="M540.734375,127L581.734375,127L622.734375,127" marker-end="url(#arrowhead1476)" style="fill:none"></path> 
+      <defs> 
+       <marker id="arrowhead1476" viewbox="0 0 10 10" refx="9" refy="5" markerunits="strokeWidth" markerwidth="8" markerheight="6" orient="auto"> 
+        <path d="M 0 0 L 10 5 L 0 10 z" class="arrowheadPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path> 
+       </marker> 
+      </defs> 
+     </g> 
+    </g> 
+    <g class="edgeLabels"> 
+     <g class="edgeLabel" transform="translate(213,31)" style="opacity: 1;"> 
+      <g transform="translate(-8,-13)" class="label"> 
+       <rect rx="0" ry="0" width="16" height="26" style="fill:#e8e8e8;"></rect> 
+       <foreignobject width="16" height="26"> 
+        <div style="display: inline-block; white-space: nowrap;"> 
+         <span id="L-L-A-B" class="edgeLabel L-LS-A' L-LE-B">有</span> 
+        </div> 
+       </foreignobject> 
+      </g> 
+     </g> 
+     <g class="edgeLabel" style="opacity: 1;" transform="translate(213,127)"> 
+      <g transform="translate(-16,-13)" class="label"> 
+       <rect rx="0" ry="0" width="32" height="26" style="fill:#e8e8e8;"></rect> 
+       <foreignobject width="32" height="26"> 
+        <div style="display: inline-block; white-space: nowrap;"> 
+         <span id="L-L-A-C" class="edgeLabel L-LS-A' L-LE-C">没有</span> 
+        </div> 
+       </foreignobject> 
+      </g> 
+     </g> 
+     <g class="edgeLabel" style="opacity: 1;" transform="translate(581.734375,127)"> 
+      <g transform="translate(-16,-13)" class="label"> 
+       <rect rx="0" ry="0" width="32" height="26" style="fill:#e8e8e8;"></rect> 
+       <foreignobject width="32" height="26"> 
+        <div style="display: inline-block; white-space: nowrap;"> 
+         <span id="L-L-C-D" class="edgeLabel L-LS-C' L-LE-D">达到</span> 
+        </div> 
+       </foreignobject> 
+      </g> 
+     </g> 
+    </g> 
+    <g class="nodes"> 
+     <g class="node default" id="A" transform="translate(90,79)" style="opacity: 1;"> 
+      <rect rx="0" ry="0" x="-82" y="-23" width="164" height="46" class="label-container"></rect> 
+      <g class="label" transform="translate(0,0)"> 
+       <g transform="translate(-72,-13)"> 
+        <foreignobject width="144" height="26"> 
+         <div style="display: inline-block; white-space: nowrap;">
+           是否有子进程在运行 
+         </div> 
+        </foreignobject> 
+       </g> 
+      </g> 
+     </g> 
+     <g class="node default" style="opacity: 1;" id="B" transform="translate(397.3671875,31)"> 
+      <rect rx="0" ry="0" x="-98" y="-23" width="196" height="46" class="label-container"></rect> 
+      <g class="label" transform="translate(0,0)"> 
+       <g transform="translate(-88,-13)"> 
+        <foreignobject width="176" height="26"> 
+         <div style="display: inline-block; white-space: nowrap;">
+           检查子进程进度是否完成 
+         </div> 
+        </foreignobject> 
+       </g> 
+      </g> 
+     </g> 
+     <g class="node default" style="opacity: 1;" id="C" transform="translate(397.3671875,127)"> 
+      <rect rx="0" ry="0" x="-143.3671875" y="-23" width="286.734375" height="46" class="label-container"></rect> 
+      <g class="label" transform="translate(0,0)"> 
+       <g transform="translate(-133.3671875,-13)"> 
+        <foreignobject width="266.734375" height="26"> 
+         <div style="display: inline-block; white-space: nowrap;">
+           查看db change的次数和时间是否达到 
+         </div> 
+        </foreignobject> 
+       </g> 
+      </g> 
+     </g> 
+     <g class="node default" style="opacity: 1;" id="D" transform="translate(731.8828125,127)"> 
+      <rect rx="0" ry="0" x="-109.1484375" y="-23" width="218.296875" height="46" class="label-container"></rect> 
+      <g class="label" transform="translate(0,0)"> 
+       <g transform="translate(-99.1484375,-13)"> 
+        <foreignobject width="198.296875" height="26"> 
+         <div style="display: inline-block; white-space: nowrap;">
+           开始进入backgroud rdb流程 
+         </div> 
+        </foreignobject> 
+       </g> 
+      </g> 
+     </g> 
+    </g> 
+   </g> 
+  </g> 
+ </svg> 
+</div> 
+<h3><a id="bgsave_140"></a>bgsave的主流程</h3> 
+<p>上面介绍了rdb的触发主流程，下面就是正式进入bgsave的过程</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">rdbSaveBackground</span><span class="token punctuation">(</span><span class="token keyword">char</span> <span class="token operator">*</span>filename<span class="token punctuation">,</span> rdbSaveInfo <span class="token operator">*</span>rsi<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    pid_t childpid<span class="token punctuation">;</span>
+    <span class="token comment">//判断是否有其它子线程存在</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">hasActiveChildProcess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token comment">//记录下dirty，dirty就是更改次数</span>
+    <span class="token comment">//相关write的命令都会导致dirty++</span>
+    <span class="token comment">//如set，hset。。。。</span>
+    server<span class="token punctuation">.</span>dirty_before_bgsave <span class="token operator">=</span> server<span class="token punctuation">.</span>dirty<span class="token punctuation">;</span>
+    <span class="token comment">//获取当前时间</span>
+    server<span class="token punctuation">.</span>lastbgsave_try <span class="token operator">=</span> <span class="token function">time</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//建立起通道</span>
+    <span class="token comment">//用父子进程的通信</span>
+    <span class="token function">openChildInfoPipe</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//fork一个子进程</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>childpid <span class="token operator">=</span> <span class="token function">redisFork</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">int</span> retval<span class="token punctuation">;</span>
+
+        <span class="token comment">/* Child */</span>
+        <span class="token comment">//设置子进程的title</span>
+        <span class="token function">redisSetProcTitle</span><span class="token punctuation">(</span><span class="token string">"redis-rdb-bgsave"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//设置cpu亲和</span>
+        <span class="token function">redisSetCpuAffinity</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>bgsave_cpulist<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//rdb的主方法</span>
+        retval <span class="token operator">=</span> <span class="token function">rdbSave</span><span class="token punctuation">(</span>filename<span class="token punctuation">,</span>rsi<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//保存成功后，向父进程发送消息</span>
+        <span class="token comment">//告诉父进程已经这次rdb已经处理完毕</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>retval <span class="token operator">==</span> C_OK<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        	<span class="token comment">//这里主要发送的信息是说子进程自己</span>
+        	<span class="token comment">//单独享用的内存空间是多少</span>
+        	<span class="token comment">//这个信息能在命令info里面看到</span>
+            <span class="token function">sendChildCOWInfo</span><span class="token punctuation">(</span>CHILD_INFO_TYPE_RDB<span class="token punctuation">,</span> <span class="token string">"RDB"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">//子进程退出</span>
+        <span class="token function">exitFromChild</span><span class="token punctuation">(</span><span class="token punctuation">(</span>retval <span class="token operator">==</span> C_OK<span class="token punctuation">)</span> <span class="token operator">?</span> <span class="token number">0</span> <span class="token punctuation">:</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//父进程运行</span>
+        <span class="token comment">/* Parent */</span>
+        <span class="token comment">//如果建立子进程没成功则关闭通道</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>childpid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">closeChildInfoPipe</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            server<span class="token punctuation">.</span>lastbgsave_status <span class="token operator">=</span> C_ERR<span class="token punctuation">;</span>
+            <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span><span class="token string">"Can't save in background: fork: %s"</span><span class="token punctuation">,</span>
+                <span class="token function">strerror</span><span class="token punctuation">(</span>errno<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_NOTICE<span class="token punctuation">,</span><span class="token string">"Background saving started by pid %d"</span><span class="token punctuation">,</span>childpid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>rdb_save_time_start <span class="token operator">=</span> <span class="token function">time</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">=</span> childpid<span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>rdb_child_type <span class="token operator">=</span> RDB_CHILD_TYPE_DISK<span class="token punctuation">;</span>
+        <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span> <span class="token comment">/* unreached */</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword">int</span> <span class="token function">redisFork</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">int</span> childpid<span class="token punctuation">;</span>
+    <span class="token keyword">long</span> <span class="token keyword">long</span> start <span class="token operator">=</span> <span class="token function">ustime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>childpid <span class="token operator">=</span> <span class="token function">fork</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* Child */</span>
+        <span class="token comment">//这里开始是子线程在运行</span>
+        <span class="token function">setOOMScoreAdj</span><span class="token punctuation">(</span>CONFIG_OOM_BGCHILD<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//设置信号handler</span>
+        <span class="token function">setupChildSignalHandlers</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//关闭sock端口</span>
+        <span class="token function">closeClildUnusedResourceAfterFork</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* Parent */</span>
+        server<span class="token punctuation">.</span>stat_fork_time <span class="token operator">=</span> <span class="token function">ustime</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token operator">-</span>start<span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>stat_fork_rate <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword">double</span><span class="token punctuation">)</span> <span class="token function">zmalloc_used_memory</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token number">1000000</span> <span class="token operator">/</span> server<span class="token punctuation">.</span>stat_fork_time <span class="token operator">/</span> <span class="token punctuation">(</span><span class="token number">1024</span><span class="token operator">*</span><span class="token number">1024</span><span class="token operator">*</span><span class="token number">1024</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">/* GB per second. */</span>
+        <span class="token comment">//记录延时操作</span>
+        <span class="token function">latencyAddSampleIfNeeded</span><span class="token punctuation">(</span><span class="token string">"fork"</span><span class="token punctuation">,</span>server<span class="token punctuation">.</span>stat_fork_time<span class="token operator">/</span><span class="token number">1000</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>childpid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">//如果rdb再运行，禁止rehash</span>
+        <span class="token function">updateDictResizePolicy</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword">return</span> childpid<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword">void</span> <span class="token function">sendChildCOWInfo</span><span class="token punctuation">(</span><span class="token keyword">int</span> ptype<span class="token punctuation">,</span> <span class="token keyword">char</span> <span class="token operator">*</span>pname<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//获取子进程单独使用的空间</span>
+    size_t private_dirty <span class="token operator">=</span> <span class="token function">zmalloc_get_private_dirty</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//如果private_dirty不为0</span>
+    <span class="token comment">//则打印出子进程所使用的空间</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>private_dirty<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_NOTICE<span class="token punctuation">,</span>
+            <span class="token string">"%s: %zu MB of memory used by copy-on-write"</span><span class="token punctuation">,</span>
+            pname<span class="token punctuation">,</span> private_dirty<span class="token operator">/</span><span class="token punctuation">(</span><span class="token number">1024</span><span class="token operator">*</span><span class="token number">1024</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//设置变量</span>
+    server<span class="token punctuation">.</span>child_info_data<span class="token punctuation">.</span>cow_size <span class="token operator">=</span> private_dirty<span class="token punctuation">;</span>
+    <span class="token function">sendChildInfo</span><span class="token punctuation">(</span>ptype<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">/* Send COW data to parent. The child should call this function after populating
+ * the corresponding fields it want to sent (according to the process type). */</span>
+<span class="token keyword">void</span> <span class="token function">sendChildInfo</span><span class="token punctuation">(</span><span class="token keyword">int</span> ptype<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>child_info_pipe<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span><span class="token punctuation">;</span>
+    <span class="token comment">//客户端魔术</span>
+    server<span class="token punctuation">.</span>child_info_data<span class="token punctuation">.</span>magic <span class="token operator">=</span> CHILD_INFO_MAGIC<span class="token punctuation">;</span>
+    server<span class="token punctuation">.</span>child_info_data<span class="token punctuation">.</span>process_type <span class="token operator">=</span> ptype<span class="token punctuation">;</span>
+    ssize_t wlen <span class="token operator">=</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>child_info_data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//通知到parent 端</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">write</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>child_info_pipe<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">,</span><span class="token operator">&amp;</span>server<span class="token punctuation">.</span>child_info_data<span class="token punctuation">,</span>wlen<span class="token punctuation">)</span> <span class="token operator">!=</span> wlen<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">/* Nothing to do on error, this will be detected by the other side. */</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>以上代码主要做了以下几件事</p> 
+<ol><li>fork了一个子进程</li><li>创建了一个通道用于子进程和父进程的通信</li><li>父进程关闭了rehash的通道</li><li>子进程关闭socket的监听通道。</li></ol> 
+<h4><a id="fork_261"></a>为什么要fork子进程而不是用子线程去做</h4> 
+<p>如果子线程去做备份的时候没法保证数据的一致性，因为子线程会共享内存，如果需要单独的内存需要重新copy一份内存这样对于性能而言是非常不适合的<br> 而用fork的话，子进程虽然会和父进程共享内存空间的页帧，但是fork的时候会把共享的页帧设置为只可读的状态，当任意一方尝试去写这个内存的时候，就产生一个异常，这时内核就把这个页复制到一个新的页帧中并标记为可写。这就是我们所说的copy on write.另外子进程退出的时候也会释放掉只属于子进程的内存空间，这样就创建了一个完美的snapshot。<br> 这样也能解释为什么要在fork完子进程的时候，要把redis的键值空间设置为禁止rehash<br> ，因为redis是采用的渐进式hash的方式，如果处于rehash 无论set 或者get方式都会对旧的空间进行更改，这样就会不断的触发页帧写的异常，而需要分配更多的内存空间，这样对于性能还是受比较多的影响，但是rdb触发并没有判断是否处于rehash状态，所以rdb的方案是在必须执行的条件下，在rdb过程中尽量减少对页帧的修改而不是完全禁止。</p> 
+<h3><a id="rdbfile_266"></a>rdb保存数据到file的流程</h3> 
+<p>rdb save file的主流程</p> 
+<pre><code class="prism language-c"><span class="token comment">/* Save the DB on disk. Return C_ERR on error, C_OK on success. */</span>
+<span class="token keyword">int</span> <span class="token function">rdbSave</span><span class="token punctuation">(</span><span class="token keyword">char</span> <span class="token operator">*</span>filename<span class="token punctuation">,</span> rdbSaveInfo <span class="token operator">*</span>rsi<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">char</span> tmpfile<span class="token punctuation">[</span><span class="token number">256</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token keyword">char</span> cwd<span class="token punctuation">[</span>MAXPATHLEN<span class="token punctuation">]</span><span class="token punctuation">;</span> <span class="token comment">/* Current working dir path for error messages. */</span>
+    FILE <span class="token operator">*</span>fp<span class="token punctuation">;</span>
+    rio rdb<span class="token punctuation">;</span>
+    <span class="token keyword">int</span> error <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token comment">//打印信息</span>
+    <span class="token function">snprintf</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span><span class="token number">256</span><span class="token punctuation">,</span><span class="token string">"temp-%d.rdb"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span> <span class="token function">getpid</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//打开一个文件，并给予写入权限</span>
+    fp <span class="token operator">=</span> <span class="token function">fopen</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span><span class="token string">"w"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>fp<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//get cwd 是获取当前路径</span>
+        <span class="token keyword">char</span> <span class="token operator">*</span>cwdp <span class="token operator">=</span> <span class="token function">getcwd</span><span class="token punctuation">(</span>cwd<span class="token punctuation">,</span>MAXPATHLEN<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span>
+            <span class="token string">"Failed opening the RDB file %s (in server root dir %s) "</span>
+            <span class="token string">"for saving: %s"</span><span class="token punctuation">,</span>
+            filename<span class="token punctuation">,</span>
+            cwdp <span class="token operator">?</span> cwdp <span class="token punctuation">:</span> <span class="token string">"unknown"</span><span class="token punctuation">,</span>
+            <span class="token function">strerror</span><span class="token punctuation">(</span>errno<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//初始化rdb的信息</span>
+    <span class="token function">rioInitWithFile</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>rdb<span class="token punctuation">,</span>fp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//通知开始rdb事件</span>
+    <span class="token function">startSaving</span><span class="token punctuation">(</span>RDBFLAGS_NONE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//设置自动sync</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_save_incremental_fsync<span class="token punctuation">)</span>
+        <span class="token function">rioSetAutoSync</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>rdb<span class="token punctuation">,</span>REDIS_AUTOSYNC_BYTES<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//下面这个方法是rdb 写入的主要流程    </span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveRio</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>rdb<span class="token punctuation">,</span><span class="token operator">&amp;</span>error<span class="token punctuation">,</span>RDBFLAGS_NONE<span class="token punctuation">,</span>rsi<span class="token punctuation">)</span> <span class="token operator">==</span> C_ERR<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        errno <span class="token operator">=</span> error<span class="token punctuation">;</span>
+        <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/* Make sure data will not remain on the OS's output buffers */</span>
+    <span class="token comment">//flush到磁盘而不是只在buf中</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fflush</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">EOF</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fsync</span><span class="token punctuation">(</span><span class="token function">fileno</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//关闭文件执政</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">fclose</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token constant">EOF</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token comment">/* Use RENAME to make sure the DB file is changed atomically only
+     * if the generate DB file is ok. */</span>
+    <span class="token comment">//保存文件在对应位置</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rename</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">,</span>filename<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">char</span> <span class="token operator">*</span>cwdp <span class="token operator">=</span> <span class="token function">getcwd</span><span class="token punctuation">(</span>cwd<span class="token punctuation">,</span>MAXPATHLEN<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span>
+            <span class="token string">"Error moving temp DB file %s on the final "</span>
+            <span class="token string">"destination %s (in server root dir %s): %s"</span><span class="token punctuation">,</span>
+            tmpfile<span class="token punctuation">,</span>
+            filename<span class="token punctuation">,</span>
+            cwdp <span class="token operator">?</span> cwdp <span class="token punctuation">:</span> <span class="token string">"unknown"</span><span class="token punctuation">,</span>
+            <span class="token function">strerror</span><span class="token punctuation">(</span>errno<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">unlink</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">stopSaving</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_NOTICE<span class="token punctuation">,</span><span class="token string">"DB saved on disk"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//把dirty置为0</span>
+    server<span class="token punctuation">.</span>dirty <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token comment">//设置last save time</span>
+    server<span class="token punctuation">.</span>lastsave <span class="token operator">=</span> <span class="token function">time</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//设置bgsave的状态</span>
+    server<span class="token punctuation">.</span>lastbgsave_status <span class="token operator">=</span> C_OK<span class="token punctuation">;</span>
+    <span class="token function">stopSaving</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span>
+
+werr<span class="token punctuation">:</span>
+    <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span><span class="token string">"Write error saving DB on disk: %s"</span><span class="token punctuation">,</span> <span class="token function">strerror</span><span class="token punctuation">(</span>errno<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">fclose</span><span class="token punctuation">(</span>fp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">unlink</span><span class="token punctuation">(</span>tmpfile<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">stopSaving</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>上面要关注的几点，</p> 
+<ol><li>rdb可以设置autosync的条件，意思是写磁盘的时候首先还是写入buffer里面，为了防止在写入过程中因为没有及时的sync而导致数据全部丢失的情况还是需要每隔一段flush一次到磁盘。</li><li>要注意上面的方法同样用于非bgsave的状态，所以你可以看到dirty的更改等等，但是如果bgsave状态下面，实际上这些值是无法通知到parent，parent的判断会有地方判断</li></ol> 
+<p>下面这段笔者没有特别的注释<br> 下面这段代码是解释，父进程如何发现子进程已经结束，以及结束后做的一些动作。</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">checkChildrenDone</span><span class="token punctuation">(</span><span class="token keyword">void</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token keyword">int</span> statloc<span class="token punctuation">;</span>
+    pid_t pid<span class="token punctuation">;</span>
+
+    <span class="token comment">/* If we have a diskless rdb child (note that we support only one concurrent
+     * child), we want to avoid collecting it's exit status and acting on it
+     * as long as we didn't finish to drain the pipe, since then we're at risk
+     * of starting a new fork and a new pipe before we're done with the previous
+     * one. */</span>
+    <span class="token comment">//检查是否有rdb 在运行</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> server<span class="token punctuation">.</span>rdb_pipe_conns<span class="token punctuation">)</span>
+        <span class="token keyword">return</span><span class="token punctuation">;</span>
+ 	<span class="token comment">//检查子进程是否已经完成</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>pid <span class="token operator">=</span> <span class="token function">wait3</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>statloc<span class="token punctuation">,</span>WNOHANG<span class="token punctuation">,</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">int</span> exitcode <span class="token operator">=</span> <span class="token function">WEXITSTATUS</span><span class="token punctuation">(</span>statloc<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">int</span> bysignal <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">WIFSIGNALED</span><span class="token punctuation">(</span>statloc<span class="token punctuation">)</span><span class="token punctuation">)</span> bysignal <span class="token operator">=</span> <span class="token function">WTERMSIG</span><span class="token punctuation">(</span>statloc<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* sigKillChildHandler catches the signal and calls exit(), but we
+         * must make sure not to flag lastbgsave_status, etc incorrectly.
+         * We could directly terminate the child process via SIGUSR1
+         * without handling it, but in this case Valgrind will log an
+         * annoying error. */</span>
+         
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>exitcode <span class="token operator">==</span> SERVER_CHILD_NOERROR_RETVAL<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            bysignal <span class="token operator">=</span> SIGUSR1<span class="token punctuation">;</span>
+            exitcode <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>pid <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span><span class="token string">"wait3() returned an error: %s. "</span>
+                <span class="token string">"rdb_child_pid = %d, aof_child_pid = %d, module_child_pid = %d"</span><span class="token punctuation">,</span>
+                <span class="token function">strerror</span><span class="token punctuation">(</span>errno<span class="token punctuation">)</span><span class="token punctuation">,</span>
+                <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span> server<span class="token punctuation">.</span>rdb_child_pid<span class="token punctuation">,</span>
+                <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span> server<span class="token punctuation">.</span>aof_child_pid<span class="token punctuation">,</span>
+                <span class="token punctuation">(</span><span class="token keyword">int</span><span class="token punctuation">)</span> server<span class="token punctuation">.</span>module_child_pid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>pid <span class="token operator">==</span> server<span class="token punctuation">.</span>rdb_child_pid<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        	<span class="token comment">//这里是处理backgroud完成滞后的一些逻辑</span>
+            <span class="token function">backgroundSaveDoneHandler</span><span class="token punctuation">(</span>exitcode<span class="token punctuation">,</span>bysignal<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//这里接收子进程发送过来的信息</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token function">receiveChildInfo</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>pid <span class="token operator">==</span> server<span class="token punctuation">.</span>aof_child_pid<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">backgroundRewriteDoneHandler</span><span class="token punctuation">(</span>exitcode<span class="token punctuation">,</span>bysignal<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token function">receiveChildInfo</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>pid <span class="token operator">==</span> server<span class="token punctuation">.</span>module_child_pid<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token function">ModuleForkDoneHandler</span><span class="token punctuation">(</span>exitcode<span class="token punctuation">,</span>bysignal<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token function">receiveChildInfo</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">ldbRemoveChild</span><span class="token punctuation">(</span>pid<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+                <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span>
+                    <span class="token string">"Warning, detected child with unmatched pid: %ld"</span><span class="token punctuation">,</span>
+                    <span class="token punctuation">(</span><span class="token keyword">long</span><span class="token punctuation">)</span>pid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token comment">//调整rehash的策略</span>
+        <span class="token function">updateDictResizePolicy</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//关闭通道</span>
+        <span class="token function">closeChildInfoPipe</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">/* A background saving child (BGSAVE) terminated its work. Handle this.
+ * This function covers the case of actual BGSAVEs. */</span>
+<span class="token keyword">void</span> <span class="token function">backgroundSaveDoneHandlerDisk</span><span class="token punctuation">(</span><span class="token keyword">int</span> exitcode<span class="token punctuation">,</span> <span class="token keyword">int</span> bysignal<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//正常退出</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_NOTICE<span class="token punctuation">,</span>
+            <span class="token string">"Background saving terminated with success"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        server<span class="token punctuation">.</span>dirty <span class="token operator">=</span> server<span class="token punctuation">.</span>dirty <span class="token operator">-</span> server<span class="token punctuation">.</span>dirty_before_bgsave<span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>lastsave <span class="token operator">=</span> <span class="token function">time</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>lastbgsave_status <span class="token operator">=</span> C_OK<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> 
+    <span class="token comment">//处理失败</span>
+    <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span> <span class="token string">"Background saving error"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        server<span class="token punctuation">.</span>lastbgsave_status <span class="token operator">=</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span> 
+    <span class="token comment">//通过signal退出</span>
+    <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+        mstime_t latency<span class="token punctuation">;</span>
+
+        <span class="token function">serverLog</span><span class="token punctuation">(</span>LL_WARNING<span class="token punctuation">,</span>
+            <span class="token string">"Background saving terminated by signal %d"</span><span class="token punctuation">,</span> bysignal<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">latencyStartMonitor</span><span class="token punctuation">(</span>latency<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">rdbRemoveTempFile</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_child_pid<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">latencyEndMonitor</span><span class="token punctuation">(</span>latency<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">latencyAddSampleIfNeeded</span><span class="token punctuation">(</span><span class="token string">"rdb-unlink-temp-file"</span><span class="token punctuation">,</span>latency<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">/* SIGUSR1 is whitelisted, so we have a way to kill a child without
+         * tirggering an error condition. */</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>bysignal <span class="token operator">!=</span> SIGUSR1<span class="token punctuation">)</span>
+            server<span class="token punctuation">.</span>lastbgsave_status <span class="token operator">=</span> C_ERR<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    server<span class="token punctuation">.</span>rdb_child_pid <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    server<span class="token punctuation">.</span>rdb_child_type <span class="token operator">=</span> RDB_CHILD_TYPE_NONE<span class="token punctuation">;</span>
+    server<span class="token punctuation">.</span>rdb_save_time_last <span class="token operator">=</span> <span class="token function">time</span><span class="token punctuation">(</span><span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token operator">-</span>server<span class="token punctuation">.</span>rdb_save_time_start<span class="token punctuation">;</span>
+    server<span class="token punctuation">.</span>rdb_save_time_start <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token comment">/* Possibly there are slaves waiting for a BGSAVE in order to be served
+     * (the first stage of SYNC is a bulk transfer of dump.rdb) */</span>
+    <span class="token function">updateSlavesWaitingBgsave</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token operator">!</span>bysignal <span class="token operator">&amp;&amp;</span> exitcode <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">?</span> C_OK <span class="token punctuation">:</span> C_ERR<span class="token punctuation">,</span> RDB_CHILD_TYPE_DISK<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<p>下面是rdb save写文件的一些流程判断，这个地方同样会在aof rewrite的时候被用到</p> 
+<pre><code class="prism language-c"><span class="token comment">/* Produces a dump of the database in RDB format sending it to the specified
+ * Redis I/O channel. On success C_OK is returned, otherwise C_ERR
+ * is returned and part of the output, or all the output, can be
+ * missing because of I/O errors.
+ *
+ * When the function returns C_ERR and if 'error' is not NULL, the
+ * integer pointed by 'error' is set to the value of errno just after the I/O
+ * error. */</span>
+<span class="token keyword">int</span> <span class="token function">rdbSaveRio</span><span class="token punctuation">(</span>rio <span class="token operator">*</span>rdb<span class="token punctuation">,</span> <span class="token keyword">int</span> <span class="token operator">*</span>error<span class="token punctuation">,</span> <span class="token keyword">int</span> rdbflags<span class="token punctuation">,</span> rdbSaveInfo <span class="token operator">*</span>rsi<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    dictIterator <span class="token operator">*</span>di <span class="token operator">=</span> <span class="token constant">NULL</span><span class="token punctuation">;</span>
+    dictEntry <span class="token operator">*</span>de<span class="token punctuation">;</span>
+    <span class="token keyword">char</span> magic<span class="token punctuation">[</span><span class="token number">10</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+    <span class="token keyword">int</span> j<span class="token punctuation">;</span>
+    uint64_t cksum<span class="token punctuation">;</span>
+    size_t processed <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token comment">//设置rdb checksum</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_checksum<span class="token punctuation">)</span>
+        rdb<span class="token operator">-&gt;</span>update_cksum <span class="token operator">=</span> rioGenericUpdateChecksum<span class="token punctuation">;</span>
+    <span class="token comment">//设置rdbversion     </span>
+    <span class="token function">snprintf</span><span class="token punctuation">(</span>magic<span class="token punctuation">,</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span>magic<span class="token punctuation">)</span><span class="token punctuation">,</span><span class="token string">"REDIS%04d"</span><span class="token punctuation">,</span>RDB_VERSION<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//写入魔数值</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbWriteRaw</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>magic<span class="token punctuation">,</span><span class="token number">9</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//写入rdb一些前置信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveInfoAuxFields</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>rdbflags<span class="token punctuation">,</span>rsi<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token comment">//写入module相关信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveModulesAux</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span> REDISMODULE_AUX_BEFORE_RDB<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token keyword">for</span> <span class="token punctuation">(</span>j <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> j <span class="token operator">&lt;</span> server<span class="token punctuation">.</span>dbnum<span class="token punctuation">;</span> j<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//开始遍历键值空间</span>
+        redisDb <span class="token operator">*</span>db <span class="token operator">=</span> server<span class="token punctuation">.</span>db<span class="token operator">+</span>j<span class="token punctuation">;</span>
+        dict <span class="token operator">*</span>d <span class="token operator">=</span> db<span class="token operator">-&gt;</span>dict<span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">dictSize</span><span class="token punctuation">(</span>d<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token keyword">continue</span><span class="token punctuation">;</span>
+        di <span class="token operator">=</span> <span class="token function">dictGetSafeIterator</span><span class="token punctuation">(</span>d<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+        <span class="token comment">/* Write the SELECT DB opcode */</span>
+        <span class="token comment">//写入db标示</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>RDB_OPCODE_SELECTDB<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+        <span class="token comment">//db编号</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveLen</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>j<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+        <span class="token comment">/* Write the RESIZE DB opcode. */</span>
+        uint64_t db_size<span class="token punctuation">,</span> expires_size<span class="token punctuation">;</span>
+        db_size <span class="token operator">=</span> <span class="token function">dictSize</span><span class="token punctuation">(</span>db<span class="token operator">-&gt;</span>dict<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        expires_size <span class="token operator">=</span> <span class="token function">dictSize</span><span class="token punctuation">(</span>db<span class="token operator">-&gt;</span>expires<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">//写入字典的总共size</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>RDB_OPCODE_RESIZEDB<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+        <span class="token comment">//第一个是键值空间</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveLen</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>db_size<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+        <span class="token comment">//第二个是设置了过期时间的size</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveLen</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>expires_size<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+        <span class="token comment">/* Iterate this DB writing every entry */</span>
+        <span class="token comment">//开始来遍历db</span>
+        <span class="token keyword">while</span><span class="token punctuation">(</span><span class="token punctuation">(</span>de <span class="token operator">=</span> <span class="token function">dictNext</span><span class="token punctuation">(</span>di<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token constant">NULL</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            <span class="token comment">//获得key</span>
+            sds keystr <span class="token operator">=</span> <span class="token function">dictGetKey</span><span class="token punctuation">(</span>de<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//获得val</span>
+            robj key<span class="token punctuation">,</span> <span class="token operator">*</span>o <span class="token operator">=</span> <span class="token function">dictGetVal</span><span class="token punctuation">(</span>de<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">long</span> <span class="token keyword">long</span> expire<span class="token punctuation">;</span>
+            <span class="token comment">//包装成一个redis obj</span>
+            <span class="token function">initStaticStringObject</span><span class="token punctuation">(</span>key<span class="token punctuation">,</span>keystr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//获取key的expire time</span>
+            expire <span class="token operator">=</span> <span class="token function">getExpire</span><span class="token punctuation">(</span>db<span class="token punctuation">,</span><span class="token operator">&amp;</span>key<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token comment">//这里是存储键值的地方</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveKeyValuePair</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span><span class="token operator">&amp;</span>key<span class="token punctuation">,</span>o<span class="token punctuation">,</span>expire<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+            <span class="token comment">/* When this RDB is produced as part of an AOF rewrite, move
+             * accumulated diff from parent to child while rewriting in
+             * order to have a smaller final write. */</span>
+            <span class="token comment">//aof rewrite部分会调用到下面这个逻辑，后面我们讲aof部分再来详细看一段</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span>rdbflags <span class="token operator">&amp;</span> RDBFLAGS_AOF_PREAMBLE <span class="token operator">&amp;&amp;</span>
+                rdb<span class="token operator">-&gt;</span>processed_bytes <span class="token operator">&gt;</span> processed<span class="token operator">+</span>AOF_READ_DIFF_INTERVAL_BYTES<span class="token punctuation">)</span>
+            <span class="token punctuation">{<!-- --></span>
+                processed <span class="token operator">=</span> rdb<span class="token operator">-&gt;</span>processed_bytes<span class="token punctuation">;</span>
+                <span class="token function">aofReadDiffFromParent</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token punctuation">}</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">dictReleaseIterator</span><span class="token punctuation">(</span>di<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        di <span class="token operator">=</span> <span class="token constant">NULL</span><span class="token punctuation">;</span> <span class="token comment">/* So that we don't release it again on error. */</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/* If we are storing the replication information on disk, persist
+     * the script cache as well: on successful PSYNC after a restart, we need
+     * to be able to process any EVALSHA inside the replication backlog the
+     * master will send us. */</span>
+    <span class="token comment">//保存lua的脚本信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>rsi <span class="token operator">&amp;&amp;</span> <span class="token function">dictSize</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>lua_scripts<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        di <span class="token operator">=</span> <span class="token function">dictGetIterator</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>lua_scripts<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token keyword">while</span><span class="token punctuation">(</span><span class="token punctuation">(</span>de <span class="token operator">=</span> <span class="token function">dictNext</span><span class="token punctuation">(</span>di<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token constant">NULL</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+            robj <span class="token operator">*</span>body <span class="token operator">=</span> <span class="token function">dictGetVal</span><span class="token punctuation">(</span>de<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveAuxField</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span><span class="token string">"lua"</span><span class="token punctuation">,</span><span class="token number">3</span><span class="token punctuation">,</span>body<span class="token operator">-&gt;</span>ptr<span class="token punctuation">,</span><span class="token function">sdslen</span><span class="token punctuation">(</span>body<span class="token operator">-&gt;</span>ptr<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+                <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        <span class="token function">dictReleaseIterator</span><span class="token punctuation">(</span>di<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        di <span class="token operator">=</span> <span class="token constant">NULL</span><span class="token punctuation">;</span> <span class="token comment">/* So that we don't release it again on error. */</span>
+    <span class="token punctuation">}</span>
+    <span class="token comment">//完成后写入模块信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveModulesAux</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span> REDISMODULE_AUX_AFTER_RDB<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token comment">/* EOF opcode */</span>
+    <span class="token comment">//rdb结束符号</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>RDB_OPCODE_EOF<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+
+    <span class="token comment">/* CRC64 checksum. It will be zero if checksum computation is disabled, the
+     * loading code skips the check in this case. */</span>
+    cksum <span class="token operator">=</span> rdb<span class="token operator">-&gt;</span>cksum<span class="token punctuation">;</span>
+    <span class="token function">memrev64ifbe</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>cksum<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">//写入cksum</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rioWrite</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span><span class="token operator">&amp;</span>cksum<span class="token punctuation">,</span><span class="token number">8</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token keyword">goto</span> werr<span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_OK<span class="token punctuation">;</span>
+
+werr<span class="token punctuation">:</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span> <span class="token operator">*</span>error <span class="token operator">=</span> errno<span class="token punctuation">;</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>di<span class="token punctuation">)</span> <span class="token function">dictReleaseIterator</span><span class="token punctuation">(</span>di<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">return</span> C_ERR<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">/* Save a key-value pair, with expire time, type, key, value.
+ * On error -1 is returned.
+ * On success if the key was actually saved 1 is returned, otherwise 0
+ * is returned (the key was already expired). */</span>
+<span class="token comment">//rdb写入的主要方法</span>
+<span class="token keyword">int</span> <span class="token function">rdbSaveKeyValuePair</span><span class="token punctuation">(</span>rio <span class="token operator">*</span>rdb<span class="token punctuation">,</span> robj <span class="token operator">*</span>key<span class="token punctuation">,</span> robj <span class="token operator">*</span>val<span class="token punctuation">,</span> <span class="token keyword">long</span> <span class="token keyword">long</span> expiretime<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+    <span class="token comment">//使用的淘汰策略是啥</span>
+    <span class="token keyword">int</span> savelru <span class="token operator">=</span> server<span class="token punctuation">.</span>maxmemory_policy <span class="token operator">&amp;</span> MAXMEMORY_FLAG_LRU<span class="token punctuation">;</span>
+    <span class="token keyword">int</span> savelfu <span class="token operator">=</span> server<span class="token punctuation">.</span>maxmemory_policy <span class="token operator">&amp;</span> MAXMEMORY_FLAG_LFU<span class="token punctuation">;</span>
+
+    <span class="token comment">/* Save the expire time */</span>
+    <span class="token comment">//如果</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>expiretime <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>RDB_OPCODE_EXPIRETIME_MS<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveMillisecondTime</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>expiretime<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/* Save the LRU info. */</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>savelru<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        <span class="token comment">//存储lru的信息</span>
+        uint64_t idletime <span class="token operator">=</span> <span class="token function">estimateObjectIdleTime</span><span class="token punctuation">(</span>val<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        idletime <span class="token operator">/</span><span class="token operator">=</span> <span class="token number">1000</span><span class="token punctuation">;</span> <span class="token comment">/* Using seconds is enough and requires less space.*/</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>RDB_OPCODE_IDLE<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveLen</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>idletime<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/* Save the LFU info. */</span>
+    <span class="token comment">//存储lfu的信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>savelfu<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+        uint8_t buf<span class="token punctuation">[</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+        buf<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token function">LFUDecrAndReturn</span><span class="token punctuation">(</span>val<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">/* We can encode this in exactly two bytes: the opcode and an 8
+         * bit counter, since the frequency is logarithmic with a 0-255 range.
+         * Note that we do not store the halving time because to reset it
+         * a single time when loading does not affect the frequency much. */</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>RDB_OPCODE_FREQ<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbWriteRaw</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>buf<span class="token punctuation">,</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">/* Save type, key, value */</span>
+    <span class="token comment">//写入vald的type</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveObjectType</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>val<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token comment">//写入key</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveStringObject</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>key<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token comment">//写入val的信息</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">rdbSaveObject</span><span class="token punctuation">(</span>rdb<span class="token punctuation">,</span>val<span class="token punctuation">,</span>key<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span> <span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+
+    <span class="token comment">/* Delay return if required (for testing) */</span>
+    <span class="token comment">//如果是测试的时候这里可以设置sleep,delay整个运行</span>
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_key_save_delay<span class="token punctuation">)</span>
+        <span class="token function">usleep</span><span class="token punctuation">(</span>server<span class="token punctuation">.</span>rdb_key_save_delay<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token keyword">return</span> <span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+
+</code></pre> 
+<p>可以看到rbd写的部分第一个要对键值空间做遍历，然后会有自己的魔术值编号，来确认rdb文件的版本。<br> 内存数据转换到文件，基本写法都是，先写type，然后再写length，然后在写内容的方式到文件里面。<br> 当然里面还有一些像rdb压缩算法并没有详细去讲，感兴趣的朋友可以自行下载源码来观看，因为这边主要讲的一个重点，是为什么要这么去backgroud，以及父子进程如何通信的一个过程。</p> 
+<h2><a id="_639"></a>总结</h2> 
+<p>本章主要讲了redis，rdb的一个过程，着重讲了什么是rdb的copy on write 部分，和父子进程交互的部分，代码里面还有一些没有注释得特别详细，因为里面涉及到一些对于父子进程操作的逻辑，这些需要各位看官自行去搜索这些信息，没有在文章中详细的展开。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/42b54711adc7c9a51ce336225548bbbc/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">windows10配置make命令</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/f35da7373529cafa4dc59c9144698f50/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">企业内部应用实现钉钉免登录及登录成功后推送消息</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

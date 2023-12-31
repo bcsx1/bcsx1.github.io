@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Linux电源管理(6)_Generic PM之Suspend功能 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Linux电源管理(6)_Generic PM之Suspend功能" />
+<meta property="og:description" content="1. 前言 Linux内核提供了三种Suspend: Freeze、Standby和STR(Suspend to RAM)，在用户空间向”/sys/power/state”文件分别写入”freeze”、”standby”和”mem”，即可触发它们。
+内核中，Suspend及Resume过程涉及到PM Core、Device PM、各个设备的驱动、Platform dependent PM、CPU control等多个模块，涉及了console switch、process freeze、CPU hotplug、wakeup处理等过个知识点。就让我们跟着内核代码，一一见识它们吧。
+2. Suspend功能有关的代码分布 内核中Suspend功能有关的代码包括PM core、Device PM、Platform PM等几大块，具体如下：
+1）PM Core kernel/power/main.c----提供用户空间接口(/sys/power/state) kernel/power/suspend.c----Suspend功能的主逻辑 kernel/power/suspend_test.c----Suspend功能的测试逻辑 kernel/power/console.c----Suspend过程中对控制台的处理逻辑 kernel/power/process.c----Suspend过程中对进程的处理逻辑 2）Device PM drivers/base/power/*----具体可参考“Linux电源管理(4)_Power Management Interface”的描述。 设备驱动----具体设备驱动的位置，不再涉及。 3）Platform dependent PM include/linux/suspend.h----定义platform dependent PM有关的操作函数集 arch/xxx/mach-xxx/xxx.c或者 arch/xxx/plat-xxx/xxx.c----平台相关的电源管理操作 3. suspend&amp;resume过程概述 下面图片对Linux suspend&amp;resume过程做了一个概述，读者可以顺着这个流程阅读内核源代码。具体的说明，可以参考后面的代码分析。
+4. 代码分析 4.1 suspend入口 在用户空间执行如下操作：
+echo &#34;freeze&#34; &gt; /sys/power/state echo &#34;standby&#34; &gt; /sys/power/state echo &#34;mem&#34; &gt; /sys/power/state 会通过sysfs触发suspend的执行，相应的处理代码如下：
+kernel/power/main.c static ssize_t state_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t n) { suspend_state_t state; int error; // 获取 pm_autosleep 的锁 error = pm_autosleep_lock(); if (error) return error; // 检查是否支持挂起操作 if (pm_autosleep_state() &gt; PM_SUSPEND_ON) { // 如果不支持挂起，则返回 EBUSY 错误 error = -EBUSY; goto out; } // 解析挂起状态值 state = decode_state(buf, n); if (state &lt; PM_SUSPEND_MAX) { // 如果是挂起到内存状态，将状态值替换为当前内存挂起状态 if (state == PM_SUSPEND_MEM) state = mem_sleep_current; // 执行挂起操作 error = pm_suspend(state); } else if (state == PM_SUSPEND_MAX) { // 如果是挂起到休眠状态，执行休眠操作 error = hibernate(); } else { // 挂起状态值无效，返回 EINVAL 错误 error = -EINVAL; } out: // 释放 pm_autosleep 的锁 pm_autosleep_unlock(); return error ?" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/0557f7da503d1a9be5bb9ae1c712d4bd/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-06-14T12:33:57+08:00" />
+<meta property="article:modified_time" content="2023-06-14T12:33:57+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Linux电源管理(6)_Generic PM之Suspend功能</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <h2><a id="1__0"></a>1. 前言</h2> 
+<p>Linux内核提供了三种Suspend: Freeze、Standby和STR(Suspend to RAM)，在用户空间向”/sys/power/state”文件分别写入”freeze”、”standby”和”mem”，即可触发它们。</p> 
+<p>内核中，Suspend及Resume过程涉及到PM Core、Device PM、各个设备的驱动、Platform dependent PM、CPU control等多个模块，涉及了console switch、process freeze、CPU hotplug、wakeup处理等过个知识点。就让我们跟着内核代码，一一见识它们吧。</p> 
+<h2><a id="2_Suspend_5"></a>2. Suspend功能有关的代码分布</h2> 
+<p>内核中Suspend功能有关的代码包括PM core、Device PM、Platform PM等几大块，具体如下：</p> 
+<h3><a id="1PM_Core_8"></a>1）PM Core</h3> 
+<pre><code class="prism language-javascript">kernel<span class="token operator">/</span>power<span class="token operator">/</span>main<span class="token punctuation">.</span>c<span class="token operator">--</span><span class="token operator">--</span><span class="token function">提供用户空间接口</span><span class="token punctuation">(</span><span class="token operator">/</span>sys<span class="token operator">/</span>power<span class="token operator">/</span>state<span class="token punctuation">)</span>
+
+kernel<span class="token operator">/</span>power<span class="token operator">/</span>suspend<span class="token punctuation">.</span>c<span class="token operator">--</span><span class="token operator">--</span>Suspend功能的主逻辑
+
+kernel<span class="token operator">/</span>power<span class="token operator">/</span>suspend_test<span class="token punctuation">.</span>c<span class="token operator">--</span><span class="token operator">--</span>Suspend功能的测试逻辑
+
+kernel<span class="token operator">/</span>power<span class="token operator">/</span>console<span class="token punctuation">.</span>c<span class="token operator">--</span><span class="token operator">--</span>Suspend过程中对控制台的处理逻辑
+
+kernel<span class="token operator">/</span>power<span class="token operator">/</span>process<span class="token punctuation">.</span>c<span class="token operator">--</span><span class="token operator">--</span>Suspend过程中对进程的处理逻辑
+</code></pre> 
+<h3><a id="2Device_PM_21"></a>2）Device PM</h3> 
+<pre><code class="prism language-javascript">drivers<span class="token operator">/</span>base<span class="token operator">/</span>power<span class="token comment">/*----具体可参考“Linux电源管理(4)_Power Management Interface”的描述。
+
+设备驱动----具体设备驱动的位置，不再涉及。
+</span></code></pre> 
+<h3><a id="3Platform_dependent_PM_28"></a>3）Platform dependent PM</h3> 
+<pre><code class="prism language-javascript">include<span class="token operator">/</span>linux<span class="token operator">/</span>suspend<span class="token punctuation">.</span>h<span class="token operator">--</span><span class="token operator">--</span>定义platform dependent <span class="token constant">PM</span>有关的操作函数集
+
+arch<span class="token operator">/</span>xxx<span class="token operator">/</span>mach<span class="token operator">-</span>xxx<span class="token operator">/</span>xxx<span class="token punctuation">.</span>c或者
+
+arch<span class="token operator">/</span>xxx<span class="token operator">/</span>plat<span class="token operator">-</span>xxx<span class="token operator">/</span>xxx<span class="token punctuation">.</span>c<span class="token operator">--</span><span class="token operator">--</span>平台相关的电源管理操作
+</code></pre> 
+<h2><a id="3_suspendresume_37"></a>3. suspend&amp;resume过程概述</h2> 
+<p>下面图片对Linux suspend&amp;resume过程做了一个概述，读者可以顺着这个流程阅读内核源代码。具体的说明，可以参考后面的代码分析。<br> <img src="https://images2.imgbox.com/80/b4/vKQAX5Rq_o.png" alt="在这里插入图片描述"></p> 
+<h2><a id="4__40"></a>4. 代码分析</h2> 
+<h3><a id="41_suspend_42"></a>4.1 suspend入口</h3> 
+<p>在用户空间执行如下操作：</p> 
+<pre><code class="prism language-javascript">echo <span class="token string">"freeze"</span> <span class="token operator">&gt;</span> <span class="token operator">/</span>sys<span class="token operator">/</span>power<span class="token operator">/</span>state
+
+echo <span class="token string">"standby"</span> <span class="token operator">&gt;</span> <span class="token operator">/</span>sys<span class="token operator">/</span>power<span class="token operator">/</span>state
+
+echo <span class="token string">"mem"</span> <span class="token operator">&gt;</span> <span class="token operator">/</span>sys<span class="token operator">/</span>power<span class="token operator">/</span>state
+</code></pre> 
+<p>会通过sysfs触发suspend的执行，相应的处理代码如下：</p> 
+<pre><code class="prism language-javascript">kernel<span class="token operator">/</span>power<span class="token operator">/</span>main<span class="token punctuation">.</span>c
+<span class="token keyword">static</span> ssize_t <span class="token function">state_store</span><span class="token punctuation">(</span><span class="token parameter">struct kobject <span class="token operator">*</span>kobj<span class="token punctuation">,</span> struct kobj_attribute <span class="token operator">*</span>attr<span class="token punctuation">,</span>
+			   <span class="token keyword">const</span> char <span class="token operator">*</span>buf<span class="token punctuation">,</span> size_t n</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	suspend_state_t state<span class="token punctuation">;</span>
+	int error<span class="token punctuation">;</span>
+
+	<span class="token comment">// 获取 pm_autosleep 的锁</span>
+	error <span class="token operator">=</span> <span class="token function">pm_autosleep_lock</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+
+	<span class="token comment">// 检查是否支持挂起操作</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">pm_autosleep_state</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token constant">PM_SUSPEND_ON</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果不支持挂起，则返回 EBUSY 错误</span>
+		error <span class="token operator">=</span> <span class="token operator">-</span><span class="token constant">EBUSY</span><span class="token punctuation">;</span>
+		goto out<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 解析挂起状态值</span>
+	state <span class="token operator">=</span> <span class="token function">decode_state</span><span class="token punctuation">(</span>buf<span class="token punctuation">,</span> n<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">&lt;</span> <span class="token constant">PM_SUSPEND_MAX</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果是挂起到内存状态，将状态值替换为当前内存挂起状态</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_MEM</span><span class="token punctuation">)</span>
+			state <span class="token operator">=</span> mem_sleep_current<span class="token punctuation">;</span>
+
+		<span class="token comment">// 执行挂起操作</span>
+		error <span class="token operator">=</span> <span class="token function">pm_suspend</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_MAX</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果是挂起到休眠状态，执行休眠操作</span>
+		error <span class="token operator">=</span> <span class="token function">hibernate</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 挂起状态值无效，返回 EINVAL 错误</span>
+		error <span class="token operator">=</span> <span class="token operator">-</span><span class="token constant">EINVAL</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+<span class="token literal-property property">out</span><span class="token operator">:</span>
+	<span class="token comment">// 释放 pm_autosleep 的锁</span>
+	<span class="token function">pm_autosleep_unlock</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> error <span class="token operator">?</span> error <span class="token operator">:</span> n<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+
+<span class="token function">power_attr</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>总体来说，该函数实现了处理挂起和休眠操作的逻辑。首先获取挂起操作的锁，然后检查系统是否支持挂起操作。根据写入的数据解析出挂起状态值，如果是合法的挂起状态，则执行相应的挂起操作。最后释放挂起操作的锁，并返回结果。</p> 
+<p>power_attr定义了一个名称为state的attribute文件，该文件的store接口为state_store，该接口在lock住autosleep功能后，解析用户传入的buffer（freeze、standby or mem），转换成state参数。</p> 
+<p>state参数的类型为suspend_state_t，在include\linux\suspend.h中定义，为电源管理状态在内核中的表示。具体如下：</p> 
+<pre><code class="prism language-javascript">typedef int __bitwise suspend_state_t<span class="token punctuation">;</span>
+
+#define <span class="token constant">PM_SUSPEND_ON</span>		<span class="token punctuation">(</span><span class="token punctuation">(</span>__force suspend_state_t<span class="token punctuation">)</span> <span class="token number">0</span><span class="token punctuation">)</span>
+#define <span class="token constant">PM_SUSPEND_TO_IDLE</span>	<span class="token punctuation">(</span><span class="token punctuation">(</span>__force suspend_state_t<span class="token punctuation">)</span> <span class="token number">1</span><span class="token punctuation">)</span>
+#define <span class="token constant">PM_SUSPEND_STANDBY</span>	<span class="token punctuation">(</span><span class="token punctuation">(</span>__force suspend_state_t<span class="token punctuation">)</span> <span class="token number">2</span><span class="token punctuation">)</span>
+#define <span class="token constant">PM_SUSPEND_MEM</span>		<span class="token punctuation">(</span><span class="token punctuation">(</span>__force suspend_state_t<span class="token punctuation">)</span> <span class="token number">3</span><span class="token punctuation">)</span>
+#define <span class="token constant">PM_SUSPEND_MIN</span>		<span class="token constant">PM_SUSPEND_TO_IDLE</span>
+#define <span class="token constant">PM_SUSPEND_MAX</span>		<span class="token punctuation">(</span><span class="token punctuation">(</span>__force suspend_state_t<span class="token punctuation">)</span> <span class="token number">4</span><span class="token punctuation">)</span>
+</code></pre> 
+<pre><code class="prism language-javascript"><span class="token constant">PM_SUSPEND_ON</span><span class="token operator">:</span> 表示系统处于挂起状态。它的值为 <span class="token number">0</span>。
+
+<span class="token constant">PM_SUSPEND_TO_IDLE</span><span class="token operator">:</span> 表示系统挂起至空闲状态。它的值为 <span class="token number">1</span>。
+
+<span class="token constant">PM_SUSPEND_STANDBY</span><span class="token operator">:</span> 表示系统挂起至待机状态。它的值为 <span class="token number">2</span>。
+
+<span class="token constant">PM_SUSPEND_MEM</span><span class="token operator">:</span> 表示系统挂起至内存状态。它的值为 <span class="token number">3</span>。
+
+<span class="token constant">PM_SUSPEND_MIN</span><span class="token operator">:</span> 表示最小的挂起状态，即 <span class="token constant">PM_SUSPEND_TO_IDLE</span>。
+
+<span class="token constant">PM_SUSPEND_MAX</span><span class="token operator">:</span> 表示最大的挂起状态，它的值为 <span class="token number">4</span>。
+</code></pre> 
+<p>根据state的值，如果不是（PM_SUSPEND_MAX，对应hibernate功能），则调用pm_suspend接口，进行后续的处理。</p> 
+<p>pm_suspend在kernel/power/suspend.c定义，处理所有的suspend过程。</p> 
+<h3><a id="42_pm_suspend__enter_state_135"></a>4.2 pm_suspend &amp; enter_state</h3> 
+<p>pm_suspend的实现非常简单，简单的做一下参数合法性判断，直接调用enter_state接口，如下：</p> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * pm_suspend - Externally visible function for suspending the system.
+ * @state: System sleep state to enter.
+ *
+ * Check if the value of @state represents one of the supported states,
+ * execute enter_state() and update system suspend statistics.
+ */</span>
+int <span class="token function">pm_suspend</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	int error<span class="token punctuation">;</span>
+
+	<span class="token comment">// 检查挂起状态是否有效，如果无效则返回错误</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">&lt;=</span> <span class="token constant">PM_SUSPEND_ON</span> <span class="token operator">||</span> state <span class="token operator">&gt;=</span> <span class="token constant">PM_SUSPEND_MAX</span><span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token constant">EINVAL</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 打印挂起入口信息，使用 mem_sleep_labels 数组根据状态索引获取状态名称</span>
+	<span class="token function">pr_info</span><span class="token punctuation">(</span><span class="token string">"suspend entry (%s)\n"</span><span class="token punctuation">,</span> mem_sleep_labels<span class="token punctuation">[</span>state<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用 enter_state() 函数执行实际的挂起操作</span>
+	error <span class="token operator">=</span> <span class="token function">enter_state</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果挂起操作失败，则增加挂起失败的统计计数</span>
+		suspend_stats<span class="token punctuation">.</span>fail<span class="token operator">++</span><span class="token punctuation">;</span>
+		<span class="token function">dpm_save_failed_errno</span><span class="token punctuation">(</span>error<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果挂起操作成功，则增加挂起成功的统计计数</span>
+		suspend_stats<span class="token punctuation">.</span>success<span class="token operator">++</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 打印挂起退出信息</span>
+	<span class="token function">pr_info</span><span class="token punctuation">(</span><span class="token string">"suspend exit\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+<span class="token constant">EXPORT_SYMBOL</span><span class="token punctuation">(</span>pm_suspend<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>总之，pm_suspend() 函数用于处理系统的挂起操作。它会检查状态的有效性，执行相应的挂起操作，并更新系统的挂起统计信息。</p> 
+<p>enter_state代码为：</p> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * enter_state - Do common work needed to enter system sleep state.
+ * @state: System sleep state to enter.
+ *
+ * Make sure that no one else is trying to put the system into a sleep state.
+ * Fail if that's not the case. Otherwise, prepare for system suspend, make the
+ * system enter the given sleep state, and clean up after wakeup.
+ */</span>
+<span class="token keyword">static</span> int <span class="token function">enter_state</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	int error<span class="token punctuation">;</span>
+
+	<span class="token comment">// 跟踪挂起和恢复事件，记录挂起入口的追踪信息</span>
+	<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"suspend_enter"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> state<span class="token punctuation">,</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果挂起状态是 PM_SUSPEND_TO_IDLE，则检查测试级别是否支持</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_TO_IDLE</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+#ifdef <span class="token constant">CONFIG_PM_DEBUG</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span>pm_test_level <span class="token operator">!=</span> <span class="token constant">TEST_NONE</span> <span class="token operator">&amp;&amp;</span> pm_test_level <span class="token operator">&lt;=</span> <span class="token constant">TEST_CPUS</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token function">pr_warn</span><span class="token punctuation">(</span><span class="token string">"Unsupported test mode for suspend to idle, please choose none/freezer/devices/platform.\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token keyword">return</span> <span class="token operator">-</span><span class="token constant">EAGAIN</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+#endif
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 否则，检查挂起状态的有效性</span>
+	<span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">valid_state</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token constant">EINVAL</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 尝试获取系统转换互斥锁，确保没有其他操作正在尝试进入睡眠状态</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">mutex_trylock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>system_transition_mutex<span class="token punctuation">)</span><span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token constant">EBUSY</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果挂起状态是 PM_SUSPEND_TO_IDLE，则调用 s2idle_begin() 准备进入 idle 状态</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_TO_IDLE</span><span class="token punctuation">)</span>
+		<span class="token function">s2idle_begin</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果启用了挂起时同步文件系统的选项，则调用 ksys_sync_helper() 同步文件系统</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>sync_on_suspend_enabled<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"sync_filesystems"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">ksys_sync_helper</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"sync_filesystems"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 打印准备进入挂起状态的日志信息</span>
+	<span class="token function">pm_pr_dbg</span><span class="token punctuation">(</span><span class="token string">"Preparing system for sleep (%s)\n"</span><span class="token punctuation">,</span> mem_sleep_labels<span class="token punctuation">[</span>state<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 清除挂起标志位</span>
+	<span class="token function">pm_suspend_clear_flags</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用 suspend_prepare() 函数准备进入挂起状态</span>
+	error <span class="token operator">=</span> <span class="token function">suspend_prepare</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		goto Unlock<span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果挂起测试标志位设置为 TEST_FREEZER，则跳过挂起操作</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">suspend_test</span><span class="token punctuation">(</span><span class="token constant">TEST_FREEZER</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+		goto Finish<span class="token punctuation">;</span>
+
+	<span class="token comment">// 跟踪挂起和恢复事件，记录挂起退出的追踪信息</span>
+	<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"suspend_enter"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> state<span class="token punctuation">,</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 打印进入挂起状态的日志信息</span>
+	<span class="token function">pm_pr_dbg</span><span class="token punctuation">(</span><span class="token string">"Suspending system (%s)\n"</span><span class="token punctuation">,</span> mem_sleep_labels<span class="token punctuation">[</span>state<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 限制内存分配的 GFP 标志位，以便在挂起期间只能使用更保守的标志位</span>
+	<span class="token function">pm_restrict_gfp_mask</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用 suspend_devices_and_enter() 函数挂起设备并进入挂起状态</span>
+	error <span class="token operator">=</span> <span class="token function">suspend_devices_and_enter</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 恢复内存分配的 GFP 标志位</span>
+	<span class="token function">pm_restore_gfp_mask</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token literal-property property">Finish</span><span class="token operator">:</span>
+	<span class="token comment">// 禁用事件检查</span>
+	events_check_enabled <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 打印挂起唤醒完成的日志信息</span>
+	<span class="token function">pm_pr_dbg</span><span class="token punctuation">(</span><span class="token string">"Finishing wakeup.\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 执行挂起完成的清理操作</span>
+	<span class="token function">suspend_finish</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token literal-property property">Unlock</span><span class="token operator">:</span>
+	<span class="token comment">// 释放系统转换互斥锁</span>
+	<span class="token function">mutex_unlock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>system_transition_mutex<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<pre><code class="prism language-javascript">这段代码的主要功能是执行进入系统睡眠状态所需的公共工作。具体分析如下：
+
+函数接受一个 suspend_state_t 类型的参数 state，表示要进入的系统睡眠状态。
+首先，使用 <span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 跟踪挂起和恢复事件，并记录挂起入口的追踪信息。
+如果挂起状态是 <span class="token constant">PM_SUSPEND_TO_IDLE</span>，则检查测试级别是否支持。如果测试级别不支持挂起到空闲状态，则返回 <span class="token operator">-</span><span class="token constant">EAGAIN</span> 错误码。
+否则，检查挂起状态的有效性。如果状态无效，则返回 <span class="token operator">-</span><span class="token constant">EINVAL</span> 错误码。
+接着，尝试获取系统转换互斥锁，以确保没有其他操作正在尝试进入睡眠状态。如果获取锁失败，则返回 <span class="token operator">-</span><span class="token constant">EBUSY</span> 错误码。
+如果挂起状态是 <span class="token constant">PM_SUSPEND_TO_IDLE</span>，则调用 <span class="token function">s2idle_begin</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 准备进入空闲状态。
+如果启用了挂起时同步文件系统的选项，先使用 <span class="token function">ksys_sync_helper</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 同步文件系统。
+打印准备进入挂起状态的日志信息。
+清除挂起标志位。
+调用 <span class="token function">suspend_prepare</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 函数准备进入挂起状态。该函数会根据挂起状态执行一些准备工作，如停止定时器、保存设备状态等。
+如果挂起测试标志位设置为 <span class="token constant">TEST_FREEZER</span>，则跳过挂起操作。
+跟踪挂起和恢复事件，并记录挂起退出的追踪信息。
+打印进入挂起状态的日志信息。
+限制内存分配的 <span class="token constant">GFP</span>（Get Free Page）标志位，以便在挂起期间只能使用更保守的标志位。
+调用 <span class="token function">suspend_devices_and_enter</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 函数挂起设备并进入挂起状态。该函数会依次调用每个设备的 <span class="token function">suspend</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 方法，并将系统进入指定的挂起状态。
+恢复内存分配的 <span class="token constant">GFP</span> 标志位。
+如果执行了挂起测试，则直接跳到 Finish 标签处，绕过一些后续操作。
+禁用事件检查。
+打印挂起唤醒完成的日志信息。
+执行挂起完成的清理操作，如恢复定时器、恢复设备状态等。
+释放系统转换互斥锁。
+返回挂起操作的结果。
+</code></pre> 
+<p>这段代码实现了进入系统睡眠状态的通用工作，包括准备系统、挂起设备、限制内存分配等。具体的操作在不同的挂起状态下可能会有所不同。代码中还考虑了一些特殊情况，如挂起测试模式、同步文件系统等。</p> 
+<p>主要工作包括：</p> 
+<ol><li>调用valid_state，判断该平台是否支持该电源状态。<br> suspend的最终目的，是让系统进入可恢复的挂起状态，而该功能必须有平台相关代码的参与才能完成，因此内核PM Core就提供了一系列的回调函数（封装在platform_suspend_ops中），让平台代码（如arch/arm/mach-xxx/pm.c）实现，然后由PM Core在合适的时机调用。这些回调函数包含一个valid函数，就是用来告知PM Core，支持哪些state。</li></ol> 
+<pre><code class="prism language-javascript"><span class="token keyword">static</span> bool <span class="token function">valid_state</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	<span class="token comment">/*
+	 * The PM_SUSPEND_STANDBY and PM_SUSPEND_MEM states require low-level
+	 * support and need to be valid to the low-level implementation.
+	 *
+	 * No -&gt;valid() or -&gt;enter() callback implies that none are valid.
+	 */</span>
+	<span class="token keyword">return</span> suspend_ops <span class="token operator">&amp;&amp;</span> suspend_ops<span class="token operator">-</span><span class="token operator">&gt;</span>valid <span class="token operator">&amp;&amp;</span> suspend_ops<span class="token operator">-</span><span class="token operator">&gt;</span><span class="token function">valid</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span>
+		suspend_ops<span class="token operator">-</span><span class="token operator">&gt;</span>enter<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>这段代码的作用是在运行时电源管理的过程中，验证给定的挂起状态是否有效。通过检查相关回调函数的存在与否，以及低层支持的要求，可以判断给定的挂起状态是否可以被处理。这个函数在系统挂起前的准备阶段被调用，以确保所选的挂起状态是可行的，并且相关的操作可以被执行。</p> 
+<pre><code class="prism language-javascript">
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span> Call trace<span class="token operator">:</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  dump_backtrace<span class="token operator">+</span><span class="token number">0xf4</span><span class="token operator">/</span><span class="token number">0x11c</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  show_stack<span class="token operator">+</span><span class="token number">0x18</span><span class="token operator">/</span><span class="token number">0x24</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  dump_stack_lvl<span class="token operator">+</span><span class="token number">0x60</span><span class="token operator">/</span><span class="token number">0x90</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  suspend_set_ops<span class="token operator">+</span><span class="token number">0x24</span><span class="token operator">/</span><span class="token number">0x134</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  psci_init_system_suspend<span class="token operator">+</span><span class="token number">0x5c</span><span class="token operator">/</span><span class="token number">0x6c</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  psci_probe<span class="token operator">+</span><span class="token number">0x108</span><span class="token operator">/</span><span class="token number">0x158</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  psci_1_0_init<span class="token operator">+</span><span class="token number">0x24</span><span class="token operator">/</span><span class="token number">0x54</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  psci_dt_init<span class="token operator">+</span><span class="token number">0x70</span><span class="token operator">/</span><span class="token number">0xa8</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  setup_arch<span class="token operator">+</span><span class="token number">0x170</span><span class="token operator">/</span><span class="token number">0x238</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  start_kernel<span class="token operator">+</span><span class="token number">0x7c</span><span class="token operator">/</span><span class="token number">0x4f4</span>
+<span class="token punctuation">[</span>    <span class="token number">0.000000</span><span class="token punctuation">]</span><span class="token punctuation">[</span>    <span class="token constant">T0</span><span class="token punctuation">]</span>  __primary_switched<span class="token operator">+</span><span class="token number">0xc4</span><span class="token operator">/</span><span class="token number">0x7bbc</span>
+
+</code></pre> 
+<pre><code class="prism language-javascript">suspend_ops回调函数调用的流程。
+</code></pre> 
+<ol start="2"><li>调用suspend_prepare，进行suspend前的准备，主要包括switch console和process&amp;thread freezing。如果失败，则终止suspend过程。</li><li>然后，调用suspend_devices_and_enter接口，该接口负责suspend和resume的所有实际动作。前半部分，suspend console、suspend device、关中断、调用平台相关的suspend_ops使系统进入低功耗状态。后半部分，在系统被事件唤醒后，处理相关动作，调用平台相关的suspend_ops恢复系统、开中断、resume device、resume console</li><li>最后，调用suspend_finish，恢复（或等待恢复）process&amp;thread，还原console。</li></ol> 
+<h3><a id="43_suspend_prepare_347"></a>4.3 suspend_prepare</h3> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * suspend_prepare - Prepare for entering system sleep state.
+ * @state: Target system sleep state.
+ *  * Common code run for every system sleep state that can be entered (except for
+ * hibernation).  Run suspend notifiers, allocate the "suspend" console and
+ * freeze processes.
+ */</span>
+<span class="token keyword">static</span> int <span class="token function">suspend_prepare</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	int error<span class="token punctuation">;</span>
+
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">sleep_state_supported</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token constant">EPERM</span><span class="token punctuation">;</span>
+
+	<span class="token function">pm_prepare_console</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	error <span class="token operator">=</span> <span class="token function">pm_notifier_call_chain_robust</span><span class="token punctuation">(</span><span class="token constant">PM_SUSPEND_PREPARE</span><span class="token punctuation">,</span> <span class="token constant">PM_POST_SUSPEND</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		goto Restore<span class="token punctuation">;</span>
+
+	<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"freeze_processes"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	error <span class="token operator">=</span> <span class="token function">suspend_freeze_processes</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"freeze_processes"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>error<span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+	<span class="token function">log_suspend_abort_reason</span><span class="token punctuation">(</span><span class="token string">"One or more tasks refusing to freeze"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	suspend_stats<span class="token punctuation">.</span>failed_freeze<span class="token operator">++</span><span class="token punctuation">;</span>
+	<span class="token function">dpm_save_failed_step</span><span class="token punctuation">(</span><span class="token constant">SUSPEND_FREEZE</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">pm_notifier_call_chain</span><span class="token punctuation">(</span><span class="token constant">PM_POST_SUSPEND</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ <span class="token literal-property property">Restore</span><span class="token operator">:</span>
+	<span class="token function">pm_restore_console</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ul><li>该函数以目标系统休眠状态（state）作为参数。</li><li>首先，它通过调用sleep_state_supported函数检查给定的休眠状态是否受系统支持。如果不支持，则返回错误码EPERM，表示权限错误。</li><li>接下来，它分配“suspend”控制台，用于系统的休眠和恢复操作。这确保在休眠/恢复期间可以捕获控制台输出。</li><li>函数通过调用pm_notifier_call_chain_robust来运行休眠通知器。休眠通知器是由各个模块/驱动程序注册的回调函数，用于通知系统休眠操作的发生。在进入休眠状态之前触发PM_SUSPEND_PREPARE事件，在系统恢复后触发PM_POST_SUSPEND事件。</li><li>如果在运行休眠通知器链时出现错误，它跳转到Restore标签处，并在返回错误之前恢复控制台状态。</li><li>如果休眠通知器顺利执行，函数接着调用suspend_freeze_processes冻结进程，即暂停进程的执行，以确保它们不会影响系统休眠的进行。</li><li>在冻结进程期间，通过调用trace_suspend_resume函数记录冻结进程的跟踪信息。</li><li>如果所有进程成功冻结，函数返回0，表示准备进入休眠状态的操作成功。</li><li>如果冻结进程时发生错误，函数记录失败原因，包括一些任务拒绝冻结，并更新相关的统计信息。</li><li>最后，函数调用pm_notifier_call_chain触发PM_POST_SUSPEND事件，通知已注册的模块/驱动程序系统休眠操作的完成。</li><li>在函数结尾处，它恢复控制台状态并返回错误码（如果有）。</li></ul> 
+<p>该函数的目的是在进入系统休眠状态之前执行一些通用的准备工作，包括运行休眠通知器、分配控制台和冻结进程。它确保系统处于适当的状态，以便顺利进入休眠状态，并处理可能出现的错误情况。</p> 
+<h3><a id="44_suspend_devices_and_enter_401"></a>4.4 suspend_devices_and_enter</h3> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * suspend_devices_and_enter - 挂起设备并进入系统休眠状态
+ * @state: 要进入的系统休眠状态
+ */</span>
+int <span class="token function">suspend_devices_and_enter</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	int error<span class="token punctuation">;</span>
+	bool wakeup <span class="token operator">=</span> <span class="token boolean">false</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 检查给定的休眠状态是否受支持</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">sleep_state_supported</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token constant">ENOSYS</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 设置全局变量pm_suspend_target_state为目标休眠状态</span>
+	pm_suspend_target_state <span class="token operator">=</span> state<span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果目标状态为PM_SUSPEND_TO_IDLE，则设置挂起时不执行平台操作</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_TO_IDLE</span><span class="token punctuation">)</span>
+		<span class="token function">pm_set_suspend_no_platform</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 执行平台特定的挂起前准备操作</span>
+	error <span class="token operator">=</span> <span class="token function">platform_suspend_begin</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		goto Close<span class="token punctuation">;</span>
+
+	<span class="token comment">// 挂起控制台</span>
+	<span class="token function">suspend_console</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 开始挂起测试</span>
+	<span class="token function">suspend_test_start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 执行设备电源管理层次的挂起操作</span>
+	error <span class="token operator">=</span> <span class="token function">dpm_suspend_start</span><span class="token punctuation">(</span><span class="token constant">PMSG_SUSPEND</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">pr_err</span><span class="token punctuation">(</span><span class="token string">"Some devices failed to suspend, or early wake event detected\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">log_suspend_abort_reason</span><span class="token punctuation">(</span>
+			<span class="token string">"Some devices failed to suspend, or early wake event detected"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		goto Recover_platform<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 结束挂起测试</span>
+	<span class="token function">suspend_test_finish</span><span class="token punctuation">(</span><span class="token string">"suspend devices"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 如果挂起测试中指定了TEST_DEVICES，则跳转到Recover_platform标签处</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">suspend_test</span><span class="token punctuation">(</span><span class="token constant">TEST_DEVICES</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+		goto Recover_platform<span class="token punctuation">;</span>
+
+	<span class="token comment">// 进入挂起状态，直到出现错误、唤醒事件或平台要求重新挂起</span>
+	<span class="token keyword">do</span> <span class="token punctuation">{<!-- --></span>
+		error <span class="token operator">=</span> <span class="token function">suspend_enter</span><span class="token punctuation">(</span>state<span class="token punctuation">,</span> <span class="token operator">&amp;</span>wakeup<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span> <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token operator">!</span>error <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span>wakeup <span class="token operator">&amp;&amp;</span> <span class="token function">platform_suspend_again</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token literal-property property">Resume_devices</span><span class="token operator">:</span>
+	<span class="token comment">// 开始恢复测试</span>
+	<span class="token function">suspend_test_start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 结束设备电源管理层次的恢复操作</span>
+	<span class="token function">dpm_resume_end</span><span class="token punctuation">(</span><span class="token constant">PMSG_RESUME</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 结束恢复测试</span>
+	<span class="token function">suspend_test_finish</span><span class="token punctuation">(</span><span class="token string">"resume devices"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 记录恢复控制台的追踪信息</span>
+	<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"resume_console"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> state<span class="token punctuation">,</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 恢复控制台</span>
+	<span class="token function">resume_console</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"resume_console"</span><span class="token punctuation">)</span><span class="token punctuation">,</span> state<span class="token punctuation">,</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token literal-property property">Close</span><span class="token operator">:</span>
+	<span class="token comment">// 结束平台特定的恢复操作</span>
+	<span class="token function">platform_resume_end</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 恢复pm_suspend_target_state为默认值PM_SUSPEND_ON</span>
+	pm_suspend_target_state <span class="token operator">=</span> <span class="token constant">PM_SUSPEND_ON</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+
+<span class="token literal-property property">Recover_platform</span><span class="token operator">:</span>
+	<span class="token comment">// 恢复平台特定的挂起前准备操作</span>
+	<span class="token function">platform_recover</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 跳转到Resume_devices标签处，执行设备电源管理层次的恢复操作</span>
+	goto Resume_devices<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>该函数的作用是在挂起设备之前进行准备工作，并在挂起状态退出后执行相应的恢复操作。它涵盖了挂起和恢复的各个阶段，包括准备设备、执行挂起操作、处理错误情况以及执行设备的恢复操作。</p> 
+<pre><code class="prism language-javascript"><span class="token keyword">static</span> int <span class="token function">platform_suspend_begin</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 如果目标状态是PM_SUSPEND_TO_IDLE，并且s2idle_ops和s2idle_ops-&gt;begin回调函数存在，则调用s2idle_ops-&gt;begin函数</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_TO_IDLE</span> <span class="token operator">&amp;&amp;</span> s2idle_ops <span class="token operator">&amp;&amp;</span> s2idle_ops<span class="token operator">-</span><span class="token operator">&gt;</span>begin<span class="token punctuation">)</span>
+		<span class="token keyword">return</span> s2idle_ops<span class="token operator">-</span><span class="token operator">&gt;</span><span class="token function">begin</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 否则，如果suspend_ops和suspend_ops-&gt;begin回调函数存在，则调用suspend_ops-&gt;begin函数</span>
+	<span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>suspend_ops <span class="token operator">&amp;&amp;</span> suspend_ops<span class="token operator">-</span><span class="token operator">&gt;</span>begin<span class="token punctuation">)</span>
+		<span class="token keyword">return</span> suspend_ops<span class="token operator">-</span><span class="token operator">&gt;</span><span class="token function">begin</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token comment">// 如果上述条件都不满足，则返回0</span>
+	<span class="token keyword">else</span>
+		<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * dpm_suspend_start - 准备设备进行电源管理转换并将其挂起
+ * @state: 正在进行的系统电源管理转换
+ *
+ * 准备所有非系统设备进行系统电源管理转换，并执行相应的"挂起"回调函数。
+ */</span>
+int <span class="token function">dpm_suspend_start</span><span class="token punctuation">(</span><span class="token parameter">pm_message_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	ktime_t starttime <span class="token operator">=</span> <span class="token function">ktime_get</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	int error<span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用 dpm_prepare 函数准备设备进行电源管理转换</span>
+	error <span class="token operator">=</span> <span class="token function">dpm_prepare</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		suspend_stats<span class="token punctuation">.</span>failed_prepare<span class="token operator">++</span><span class="token punctuation">;</span>
+		<span class="token function">dpm_save_failed_step</span><span class="token punctuation">(</span><span class="token constant">SUSPEND_PREPARE</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 调用 dpm_suspend 函数挂起设备</span>
+		error <span class="token operator">=</span> <span class="token function">dpm_suspend</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 显示挂起操作的时间和结果</span>
+	<span class="token function">dpm_show_time</span><span class="token punctuation">(</span>starttime<span class="token punctuation">,</span> state<span class="token punctuation">,</span> error<span class="token punctuation">,</span> <span class="token string">"start"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+<span class="token constant">EXPORT_SYMBOL_GPL</span><span class="token punctuation">(</span>dpm_suspend_start<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+</code></pre> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * suspend_enter - Make the system enter the given sleep state.
+ * @state: System sleep state to enter.
+ * @wakeup: Returns information that the sleep state should not be re-entered.
+ *
+ * This function should be called after devices have been suspended.
+ */</span>
+<span class="token keyword">static</span> int <span class="token function">suspend_enter</span><span class="token punctuation">(</span><span class="token parameter">suspend_state_t state<span class="token punctuation">,</span> bool <span class="token operator">*</span>wakeup</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	int error<span class="token punctuation">,</span> last_dev<span class="token punctuation">;</span>
+
+	<span class="token comment">// 准备平台相关的挂起操作</span>
+	error <span class="token operator">=</span> <span class="token function">platform_suspend_prepare</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		goto Platform_finish<span class="token punctuation">;</span>
+
+	<span class="token comment">// 进行延迟设备挂起</span>
+	error <span class="token operator">=</span> <span class="token function">dpm_suspend_late</span><span class="token punctuation">(</span><span class="token constant">PMSG_SUSPEND</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		last_dev <span class="token operator">=</span> suspend_stats<span class="token punctuation">.</span>last_failed_dev <span class="token operator">+</span> <span class="token constant">REC_FAILED_NUM</span> <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">;</span>
+		last_dev <span class="token operator">%=</span> <span class="token constant">REC_FAILED_NUM</span><span class="token punctuation">;</span>
+		<span class="token function">pr_err</span><span class="token punctuation">(</span><span class="token string">"late suspend of devices failed\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">log_suspend_abort_reason</span><span class="token punctuation">(</span><span class="token string">"late suspend of %s device failed"</span><span class="token punctuation">,</span>
+					 suspend_stats<span class="token punctuation">.</span>failed_devs<span class="token punctuation">[</span>last_dev<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		goto Platform_finish<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 准备平台相关的延迟挂起操作</span>
+	error <span class="token operator">=</span> <span class="token function">platform_suspend_prepare_late</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		goto Devices_early_resume<span class="token punctuation">;</span>
+
+	<span class="token comment">// 进行设备挂起（无中断）</span>
+	error <span class="token operator">=</span> <span class="token function">dpm_suspend_noirq</span><span class="token punctuation">(</span><span class="token constant">PMSG_SUSPEND</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		last_dev <span class="token operator">=</span> suspend_stats<span class="token punctuation">.</span>last_failed_dev <span class="token operator">+</span> <span class="token constant">REC_FAILED_NUM</span> <span class="token operator">-</span> <span class="token number">1</span><span class="token punctuation">;</span>
+		last_dev <span class="token operator">%=</span> <span class="token constant">REC_FAILED_NUM</span><span class="token punctuation">;</span>
+		<span class="token function">pr_err</span><span class="token punctuation">(</span><span class="token string">"noirq suspend of devices failed\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">log_suspend_abort_reason</span><span class="token punctuation">(</span><span class="token string">"noirq suspend of %s device failed"</span><span class="token punctuation">,</span>
+					 suspend_stats<span class="token punctuation">.</span>failed_devs<span class="token punctuation">[</span>last_dev<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		goto Platform_early_resume<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 准备平台相关的无中断挂起操作</span>
+	error <span class="token operator">=</span> <span class="token function">platform_suspend_prepare_noirq</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+		goto Platform_wake<span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果设置了 TEST_PLATFORM 标志，则直接唤醒系统并跳过挂起过程</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">suspend_test</span><span class="token punctuation">(</span><span class="token constant">TEST_PLATFORM</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+		goto Platform_wake<span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果挂起状态是 PM_SUSPEND_TO_IDLE，则进入 s2idle 循环</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>state <span class="token operator">==</span> <span class="token constant">PM_SUSPEND_TO_IDLE</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">s2idle_loop</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		goto Platform_wake<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 禁用辅助 CPU 并进行相关测试</span>
+	error <span class="token operator">=</span> <span class="token function">pm_sleep_disable_secondary_cpus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>error <span class="token operator">||</span> <span class="token function">suspend_test</span><span class="token punctuation">(</span><span class="token constant">TEST_CPUS</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token function">log_suspend_abort_reason</span><span class="token punctuation">(</span><span class="token string">"Disabling non-boot cpus failed"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		goto Enable_cpus<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 禁用中断</span>
+	<span class="token function">arch_suspend_disable_irqs</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token constant">BUG_ON</span><span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">irqs_disabled</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 设置系统状态为 SYSTEM_SUSPEND</span>
+	system_state <span class="token operator">=</span> <span class="token constant">SYSTEM_SUSPEND</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用系统核心挂起操作</span>
+	error <span class="token operator">=</span> <span class="token function">syscore_suspend</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>error<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 检查是否存在挂起唤醒请求</span>
+		<span class="token operator">*</span>wakeup <span class="token operator">=</span> <span class="token function">pm_wakeup_pending</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token punctuation">(</span><span class="token function">suspend_test</span><span class="token punctuation">(</span><span class="token constant">TEST_CORE</span><span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token operator">*</span>wakeup<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// 调用具体的挂起操作函数</span>
+			<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"machine_suspend"</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+				state<span class="token punctuation">,</span> <span class="token boolean">true</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+			error <span class="token operator">=</span> suspend_ops<span class="token operator">-</span><span class="token operator">&gt;</span><span class="token function">enter</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+			<span class="token function">trace_suspend_resume</span><span class="token punctuation">(</span><span class="token constant">TPS</span><span class="token punctuation">(</span><span class="token string">"machine_suspend"</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+				state<span class="token punctuation">,</span> <span class="token boolean">false</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">*</span>wakeup<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+			error <span class="token operator">=</span> <span class="token operator">-</span><span class="token constant">EBUSY</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">// 恢复系统核心</span>
+		<span class="token function">syscore_resume</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">// 恢复系统状态为 SYSTEM_RUNNING</span>
+	system_state <span class="token operator">=</span> <span class="token constant">SYSTEM_RUNNING</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 启用中断</span>
+	<span class="token function">arch_suspend_enable_irqs</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token constant">BUG_ON</span><span class="token punctuation">(</span><span class="token function">irqs_disabled</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+ <span class="token literal-property property">Enable_cpus</span><span class="token operator">:</span>
+	<span class="token comment">// 启用辅助 CPU</span>
+	<span class="token function">pm_sleep_enable_secondary_cpus</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+ <span class="token literal-property property">Platform_wake</span><span class="token operator">:</span>
+	<span class="token comment">// 无中断唤醒平台相关操作</span>
+	<span class="token function">platform_resume_noirq</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">dpm_resume_noirq</span><span class="token punctuation">(</span><span class="token constant">PMSG_RESUME</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+ <span class="token literal-property property">Platform_early_resume</span><span class="token operator">:</span>
+	<span class="token comment">// 早期设备恢复平台相关操作</span>
+	<span class="token function">platform_resume_early</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+ <span class="token literal-property property">Devices_early_resume</span><span class="token operator">:</span>
+	<span class="token comment">// 早期设备恢复操作</span>
+	<span class="token function">dpm_resume_early</span><span class="token punctuation">(</span><span class="token constant">PMSG_RESUME</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+ <span class="token literal-property property">Platform_finish</span><span class="token operator">:</span>
+	<span class="token comment">// 平台恢复操作</span>
+	<span class="token function">platform_resume_finish</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> error<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>suspend_enter() 函数是用于将系统进入指定的睡眠状态的函数。以下是对该函数的总结分析：</p> 
+<p>函数开始执行时，先进行平台相关的挂起准备操作，以确保系统处于合适的状态进入睡眠状态。</p> 
+<p>接下来，执行延迟设备挂起操作，将系统中的设备逐个挂起。如果延迟挂起操作失败，则记录错误信息并跳转到平台恢复操作，终止进入睡眠状态的流程。</p> 
+<p>然后，执行平台相关的延迟挂起准备操作，为设备的延迟挂起做准备。</p> 
+<p>进行设备挂起操作（无中断），将设备进一步挂起。如果挂起操作失败，则记录错误信息并跳转到早期设备恢复操作，终止进入睡眠状态的流程。</p> 
+<p>执行平台相关的无中断挂起准备操作，为设备的无中断挂起做准备。</p> 
+<p>如果设置了 TEST_PLATFORM 标志，表示需要测试平台恢复，此时直接唤醒系统并跳过挂起过程。</p> 
+<p>如果挂起状态是 PM_SUSPEND_TO_IDLE，表示进入了空闲挂起状态，进入 s2idle 循环，直到有唤醒事件发生。</p> 
+<p>禁用辅助 CPU 并进行相关测试，确保非引导 CPU 处于禁用状态。</p> 
+<p>禁用中断，保证在挂起过程中不会发生中断。</p> 
+<p>设置系统状态为 SYSTEM_SUSPEND，表示系统正在挂起状态。</p> 
+<p>执行系统核心挂起操作，包括调用 syscore_suspend() 函数和具体的挂起操作函数。在此期间，会检查是否存在挂起唤醒请求，若无请求且挂起操作成功，则正常进入睡眠状态；若有挂起唤醒请求，则返回忙碌状态。</p> 
+<p>恢复系统核心，包括调用 syscore_resume() 函数。</p> 
+<p>恢复系统状态为 SYSTEM_RUNNING，表示系统已经恢复运行状态。</p> 
+<p>启用中断，允许中断再次发生。</p> 
+<p>启用辅助 CPU，确保非引导 CPU 处于启用状态。</p> 
+<p>执行无中断唤醒平台相关操作，准备系统唤醒过程。</p> 
+<p>执行早期设备恢复平台相关操作，将设备恢复到正常工作状态。</p> 
+<p>执行早期设备恢复操作，恢复设备的功能。</p> 
+<p>执行平台恢复操作，完成整个系统的恢复过程。</p> 
+<p>最后，函数返回挂起过程中可能出现的错误。</p> 
+<p>通过这个函数，系统可以根据指定的睡眠状态进入相应的挂起过程，并在恢复时逆向执行相应的操作，以确保设备和系统的正确恢复和运行。</p> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * dpm_suspend_noirq - Execute "noirq suspend" callbacks for all devices.
+ * @state: PM transition of the system being carried out.
+ *
+ * Prevent device drivers' interrupt handlers from being called and invoke
+ * "noirq" suspend callbacks for all non-sysdev devices.
+ */</span>
+int <span class="token function">dpm_suspend_noirq</span><span class="token punctuation">(</span><span class="token parameter">pm_message_t state</span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	int ret<span class="token punctuation">;</span>
+
+	<span class="token comment">// 使设备唤醒并启用唤醒中断</span>
+	<span class="token function">device_wakeup_arm_wake_irqs</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 暂停设备的中断处理程序</span>
+	<span class="token function">suspend_device_irqs</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用所有非系统设备的"noirq"挂起回调函数</span>
+	ret <span class="token operator">=</span> <span class="token function">dpm_noirq_suspend_devices</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 如果挂起失败，则恢复设备的中断处理程序</span>
+	<span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span>
+		<span class="token function">dpm_resume_noirq</span><span class="token punctuation">(</span><span class="token function">resume_event</span><span class="token punctuation">(</span>state<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token keyword">return</span> ret<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>该函数用于执行所有设备的 “noirq suspend” 回调函数。以下是对函数的详细分析：</p> 
+<p>首先，调用 device_wakeup_arm_wake_irqs() 函数使设备唤醒并启用唤醒中断。这是为了确保设备在进入挂起状态后能够响应唤醒事件。</p> 
+<p>然后，调用 suspend_device_irqs() 函数暂停设备的中断处理程序。这是为了阻止设备驱动程序的中断处理程序在挂起过程中被调用，以确保设备在挂起期间不会产生中断。</p> 
+<p>接下来，调用 dpm_noirq_suspend_devices() 函数，它会遍历所有非系统设备，并调用它们的 “noirq suspend” 回调函数。这些回调函数是设备驱动程序提供的，在设备进入挂起状态之前执行必要的操作。</p> 
+<p>如果挂起过程中出现错误，函数会调用 dpm_resume_noirq() 函数，恢复设备的中断处理程序，以确保设备的正常操作。</p> 
+<p>最后，函数返回挂起过程中可能出现的错误代码。</p> 
+<p>总体来说，该函数用于在挂起过程中控制设备的中断处理程序，并执行设备驱动程序提供的回调函数，以便在设备进入挂起状态之前完成必要的清理和准备工作。这有助于确保设备在挂起和恢复过程中的正确操作。</p> 
+<pre><code class="prism language-javascript"><span class="token punctuation">[</span>   <span class="token number">80.195517</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span> Call trace<span class="token operator">:</span>
+<span class="token punctuation">[</span>   <span class="token number">80.198750</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  dump_backtrace<span class="token operator">+</span><span class="token number">0x104</span><span class="token operator">/</span><span class="token number">0x12c</span>
+<span class="token punctuation">[</span>   <span class="token number">80.203388</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  show_stack<span class="token operator">+</span><span class="token number">0x20</span><span class="token operator">/</span><span class="token number">0x30</span>
+<span class="token punctuation">[</span>   <span class="token number">80.207500</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  dump_stack_lvl<span class="token operator">+</span><span class="token number">0x6c</span><span class="token operator">/</span><span class="token number">0xa0</span>
+<span class="token punctuation">[</span>   <span class="token number">80.211957</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  genpd_suspend_noirq<span class="token operator">+</span><span class="token number">0x28</span><span class="token operator">/</span><span class="token number">0x4c</span>
+<span class="token punctuation">[</span>   <span class="token number">80.216850</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  dpm_run_callback<span class="token operator">+</span><span class="token number">0x6c</span><span class="token operator">/</span><span class="token number">0x26c</span>
+<span class="token punctuation">[</span>   <span class="token number">80.221571</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  __device_suspend_noirq<span class="token operator">+</span><span class="token number">0x1c8</span><span class="token operator">/</span><span class="token number">0x2b8</span>
+<span class="token punctuation">[</span>   <span class="token number">80.226899</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  dpm_suspend_noirq<span class="token operator">+</span><span class="token number">0x110</span><span class="token operator">/</span><span class="token number">0x50c</span>
+<span class="token punctuation">[</span>   <span class="token number">80.231792</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  suspend_devices_and_enter<span class="token operator">+</span><span class="token number">0x214</span><span class="token operator">/</span><span class="token number">0xb18</span>
+<span class="token punctuation">[</span>   <span class="token number">80.237378</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  pm_suspend<span class="token operator">+</span><span class="token number">0x33c</span><span class="token operator">/</span><span class="token number">0x6bc</span>
+<span class="token punctuation">[</span>   <span class="token number">80.241661</span><span class="token punctuation">]</span><span class="token punctuation">[</span> <span class="token constant">T1831</span><span class="token punctuation">]</span>  state_store<span class="token operator">+</span><span class="token number">0x10c</span><span class="token operator">/</span><span class="token number">0x14c</span>
+</code></pre> 
+<h3><a id="44_suspend_finish_752"></a>4.4 suspend_finish</h3> 
+<pre><code class="prism language-javascript"><span class="token comment">/**
+ * suspend_finish - Clean up before finishing the suspend sequence.
+ *
+ * Call platform code to clean up, restart processes, and free the console that
+ * we've allocated. This routine is not called for hibernation.
+ */</span>
+<span class="token keyword">static</span> <span class="token keyword">void</span> <span class="token function">suspend_finish</span><span class="token punctuation">(</span><span class="token parameter"><span class="token keyword">void</span></span><span class="token punctuation">)</span>
+<span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 恢复挂起前被冻结的进程</span>
+	<span class="token function">suspend_thaw_processes</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 调用所有注册的后挂起通知器</span>
+	<span class="token function">pm_notifier_call_chain</span><span class="token punctuation">(</span><span class="token constant">PM_POST_SUSPEND</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+	<span class="token comment">// 恢复控制台设置</span>
+	<span class="token function">pm_restore_console</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+</code></pre> 
+<p>该函数用于在挂起序列结束之前进行清理操作。以下是对函数的详细分析：</p> 
+<p>首先，调用 suspend_thaw_processes() 函数来恢复之前被冻结的进程。在挂起过程中，为了确保系统状态的一致性，一些进程可能会被暂停运行，而在恢复过程中需要重新启动它们。</p> 
+<p>然后，调用 pm_notifier_call_chain(PM_POST_SUSPEND) 函数，它会调用所有已注册的后挂起通知器。这些通知器允许设备驱动程序和其他系统组件在挂起完成后执行特定的操作，如重新初始化设备、重新启动服务等。</p> 
+<p>最后，调用 pm_restore_console() 函数来恢复控制台设置。在挂起过程中，为了保持挂起过程的可见性，可能会分配和修改控制台资源，而在挂起完成后需要将其恢复为原始设置。</p> 
+<p>总体来说，该函数用于在挂起序列的最后阶段进行清理操作，包括恢复被冻结的进程、调用后挂起通知器以及恢复控制台设置。这些步骤有助于确保系统在挂起过程完成后能够正常运行，并恢复到正常的工作状态。</p> 
+<h2><a id="5_device_PM_ops_platform_PM_ops_784"></a>5. device PM ops 和platform PM ops的调用时机</h2> 
+<p><img src="https://images2.imgbox.com/e7/eb/ffbkBjwK_o.png" alt="在这里插入图片描述"></p> 
+<p>参考链接：http://www.wowotech.net/pm_subsystem/suspend_and_resume.html</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/628753fa11716b151bb514da94599b92/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">远程 -- MobaXterm的安装与使用</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/4fcbce287bd1d1b750e05a10931491b9/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">JavaWeb之JSP</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

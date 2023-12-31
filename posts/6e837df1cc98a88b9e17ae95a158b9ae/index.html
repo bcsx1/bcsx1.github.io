@@ -1,0 +1,1862 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>torch.optim.lr_scheduler：调整学习率 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="torch.optim.lr_scheduler：调整学习率" />
+<meta property="og:description" content="本文是笔者在学习cycleGAN的代码时，发现其实现了根据需求选择不同调整学习率方法的策略，遂查资料了解pytorch各种调整学习率的方法。主要参考：https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+1 综述 1.1 lr_scheduler综述 torch.optim.lr_scheduler模块提供了一些根据epoch训练次数来调整学习率（learning rate）的方法。一般情况下我们会设置随着epoch的增大而逐渐减小学习率从而达到更好的训练效果。
+而torch.optim.lr_scheduler.ReduceLROnPlateau则提供了基于训练中某些测量值使学习率动态下降的方法。
+学习率的调整应该放在optimizer更新之后，下面是一个参考蓝本：
+&gt;&gt;&gt; scheduler = ... &gt;&gt;&gt; for epoch in range(100): &gt;&gt;&gt; train(...) &gt;&gt;&gt; validate(...) &gt;&gt;&gt; scheduler.step() 注意： 在PyTorch 1.1.0之前的版本，学习率的调整应该被放在optimizer更新之前的。如果我们在 1.1.0 及之后的版本仍然将学习率的调整（即 scheduler.step()）放在 optimizer’s update（即 optimizer.step()）之前，那么 learning rate schedule 的第一个值将会被跳过。所以如果某个代码是在 1.1.0 之前的版本下开发，但现在移植到 1.1.0及之后的版本运行，发现效果变差，需要检查一下是否将scheduler.step()放在了optimizer.step()之前。
+1.2 optimizer综述 为了了解lr_scheduler，我们先以Adam()为例了解一下优化器（所有optimizers都继承自torch.optim.Optimizer类）：
+语法：
+class torch.optim.Adam(params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False) 参数：
+params (iterable)：需要优化的网络参数，传进来的网络参数必须是Iterable（官网对这个参数用法讲的不太清楚，下面有例子清楚的说明param具体用法）。 如果优化一个网络，网络的每一层看做一个parameter group，一整个网络就是parameter groups（一般给赋值为net.parameters()），补充一点，net.parameters()函数返回的parameter groups实际上是一个变成了generator的字典；如果同时优化多个网络，有两种方法： 将多个网络的参数合并到一起，当成一个网络的参数来优化（一般赋值为[*net_1.parameters(), *net_2.parameters(), ..., *net_n.parameters()]或itertools.chain(net_1.parameters(), net_2.parameters(), ..., net_n.parameters()))；当成多个网络优化，这样可以很容易的让多个网络的学习率各不相同（一般赋值为[{&#39;params&#39;: net_1.parameters()}, {&#39;params&#39;: net_2.parameters()}, ." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/6e837df1cc98a88b9e17ae95a158b9ae/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2019-11-13T10:46:53+08:00" />
+<meta property="article:modified_time" content="2019-11-13T10:46:53+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">torch.optim.lr_scheduler：调整学习率</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>本文是笔者在学习<a href="https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix">cycleGAN</a>的代码时，发现其实现了根据需求选择不同调整学习率方法的策略，遂查资料了解pytorch各种调整学习率的方法。主要参考：<a href="https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate" rel="nofollow">https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate</a></p> 
+<h2><a id="1__1"></a>1 综述</h2> 
+<h3><a id="11_lr_scheduler_2"></a>1.1 lr_scheduler综述</h3> 
+<p><code>torch.optim.lr_scheduler</code>模块提供了一些根据epoch训练次数来调整学习率（learning rate）的方法。一般情况下我们会设置随着epoch的增大而逐渐减小学习率从而达到更好的训练效果。<br> 而<code>torch.optim.lr_scheduler.ReduceLROnPlateau</code>则提供了基于训练中某些测量值使学习率动态下降的方法。</p> 
+<p>学习率的调整应该放在optimizer更新之后，下面是一个参考蓝本：</p> 
+<pre><code class="prism language-python"><span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span> scheduler <span class="token operator">=</span> <span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span> <span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+<span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>     train<span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span>
+<span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>     validate<span class="token punctuation">(</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">)</span>
+<span class="token operator">&gt;&gt;</span><span class="token operator">&gt;</span>     scheduler<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>注意：</strong> 在PyTorch 1.1.0之前的版本，学习率的调整应该被放在optimizer更新之前的。如果我们在 1.1.0 及之后的版本仍然将学习率的调整（即 <code>scheduler.step()</code>）放在 optimizer’s update（即 <code>optimizer.step()</code>）之前，那么 learning rate schedule 的第一个值将会被跳过。所以如果某个代码是在 1.1.0 之前的版本下开发，但现在移植到 1.1.0及之后的版本运行，发现效果变差，需要检查一下是否将<code>scheduler.step()</code>放在了<code>optimizer.step()</code>之前。</p> 
+<h3><a id="12_optimizer_16"></a>1.2 optimizer综述</h3> 
+<p>为了了解lr_scheduler，我们先以<code>Adam()</code>为例了解一下优化器（所有optimizers都继承自<code>torch.optim.Optimizer</code>类）：<br> <strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>params<span class="token punctuation">,</span> lr<span class="token operator">=</span><span class="token number">0.001</span><span class="token punctuation">,</span> betas<span class="token operator">=</span><span class="token punctuation">(</span><span class="token number">0.9</span><span class="token punctuation">,</span> <span class="token number">0.999</span><span class="token punctuation">)</span><span class="token punctuation">,</span> eps<span class="token operator">=</span><span class="token number">1e</span><span class="token operator">-</span><span class="token number">08</span><span class="token punctuation">,</span> weight_decay<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">,</span> amsgrad<span class="token operator">=</span><span class="token boolean">False</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>参数：</strong></p> 
+<ol><li><strong>params</strong> (iterable)：需要优化的网络参数，传进来的网络参数必须是<code>Iterable</code>（官网对这个参数用法讲的不太清楚，下面有例子清楚的说明param具体用法）。 
+  <ol><li>如果优化一个网络，网络的每一层看做一个parameter group，一整个网络就是parameter groups（一般给赋值为<code>net.parameters()</code>），补充一点，<code>net.parameters()</code>函数返回的parameter groups实际上是一个变成了generator的字典；</li><li>如果同时优化多个网络，有两种方法： 
+    <ol><li>将多个网络的参数合并到一起，当成一个网络的参数来优化（一般赋值为<code>[*net_1.parameters(), *net_2.parameters(), ..., *net_n.parameters()]</code>或<code>itertools.chain(net_1.parameters(), net_2.parameters(), ..., net_n.parameters())</code>)；</li><li>当成多个网络优化，这样可以很容易的让多个网络的学习率各不相同（一般赋值为<code>[{'params': net_1.parameters()}, {'params': net_2.parameters()}, ..., {'params': net_n.parameters()}</code>)。</li></ol> </li></ol> </li><li><strong>lr</strong> (float, optional)：学习率；</li><li><strong>betas</strong> (Tuple[float, float], optional) – coefficients used for computing running averages of gradient and its square (default: (0.9, 0.999))；</li><li><strong>eps</strong> (float, optional) – term added to the denominator to improve numerical stability (default: 1e-8)；</li><li><strong>weight_decay</strong> (float, optional) – weight decay (L2 penalty) (default: 0)；</li><li><strong>amsgrad</strong> (boolean, optional) – whether to use the AMSGrad variant of this algorithm from the paper On the Convergence of Adam and Beyond (default: False)。</li></ol> 
+<p><strong>两个属性:</strong></p> 
+<ol><li>optimizer.defaults： 字典，存放这个优化器的一些初始参数，有：<code>'lr'</code>, <code>'betas'</code>, <code>'eps'</code>, <code>'weight_decay'</code>, <code>'amsgrad'</code>。事实上这个属性继承自<code>torch.optim.Optimizer</code>父类；</li><li>optimizer.param_groups：列表，每个元素都是一个字典，每个元素包含的关键字有：<code>'params'</code>, <code>'lr'</code>, <code>'betas'</code>, <code>'eps'</code>, <code>'weight_decay'</code>, <code>'amsgrad'</code>，<code>params</code>类是各个网络的参数放在了一起。这个属性也继承自<code>torch.optim.Optimizer</code>父类。</li></ol> 
+<p>由于上述两个属性都继承自所有优化器共同的基类，所以是所有优化器类都有的属性，并且两者字典中键名相同的元素值也相同（经过lr_scheduler后<code>lr</code>就不同了）。</p> 
+<p>下面是用法示例：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> LambdaLR
+<span class="token keyword">import</span> itertools
+
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv2 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+net_2 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"******************optimizer_1*********************"</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_1.defaults："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_1.param_groups长度："</span><span class="token punctuation">,</span> <span class="token builtin">len</span><span class="token punctuation">(</span>optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_1.param_groups一个元素包含的键："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>keys<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_2 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token operator">*</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token operator">*</span>net_2<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">]</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+<span class="token comment"># optimizer_2 = torch.opotim.Adam(itertools.chain(net_1.parameters(), net_2.parameters())) # 和上一行作用相同</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"******************optimizer_2*********************"</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_2.defaults："</span><span class="token punctuation">,</span> optimizer_2<span class="token punctuation">.</span>defaults<span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_2.param_groups长度："</span><span class="token punctuation">,</span> <span class="token builtin">len</span><span class="token punctuation">(</span>optimizer_2<span class="token punctuation">.</span>param_groups<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_2.param_groups一个元素包含的键："</span><span class="token punctuation">,</span> optimizer_2<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>keys<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_3 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token punctuation">{<!-- --></span><span class="token string">"params"</span><span class="token punctuation">:</span> net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">,</span> <span class="token punctuation">{<!-- --></span><span class="token string">"params"</span><span class="token punctuation">:</span> net_2<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">]</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"******************optimizer_3*********************"</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_3.defaults："</span><span class="token punctuation">,</span> optimizer_3<span class="token punctuation">.</span>defaults<span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_3.param_groups长度："</span><span class="token punctuation">,</span> <span class="token builtin">len</span><span class="token punctuation">(</span>optimizer_3<span class="token punctuation">.</span>param_groups<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"optimizer_3.param_groups一个元素包含的键："</span><span class="token punctuation">,</span> optimizer_3<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>keys<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>输出为：</p> 
+<pre><code class="prism language-sh">******************optimizer_1*********************
+optimizer_1.defaults： {'lr': 0.1, 'betas': (0.9, 0.999), 'eps': 1e-08, 'weight_decay': 0, 'amsgrad': False}
+optimizer_1.param_groups长度： 1
+optimizer_1.param_groups一个元素包含的键： dict_keys(['params', 'lr', 'betas', 'eps', 'weight_decay', 'amsgrad'])
+
+******************optimizer_2*********************
+optimizer_2.defaults： {'lr': 0.1, 'betas': (0.9, 0.999), 'eps': 1e-08, 'weight_decay': 0, 'amsgrad': False}
+optimizer_2.param_groups长度： 1
+optimizer_2.param_groups一个元素包含的键： dict_keys(['params', 'lr', 'betas', 'eps', 'weight_decay', 'amsgrad'])
+
+******************optimizer_3*********************
+optimizer_3.defaults： {'lr': 0.1, 'betas': (0.9, 0.999), 'eps': 1e-08, 'weight_decay': 0, 'amsgrad': False}
+optimizer_3.param_groups长度： 2
+optimizer_3.param_groups一个元素包含的键： dict_keys(['params', 'lr', 'betas', 'eps', 'weight_decay', 'amsgrad'])
+
+</code></pre> 
+<p><strong>注意：</strong><br> lr_scheduler更新optimizer的lr，是更新的optimizer.param_groups[n][‘lr’]，而不是optimizer.defaults[‘lr’]。</p> 
+<h2><a id="2_lr_scheduler_104"></a>2 lr_scheduler调整策略：根据训练次数</h2> 
+<p>torch.optim.lr_scheduler中大部分调整学习率的方法都是根据epoch训练次数，这里介绍常见的几种方法，其他方法以后用到再补充。<br> 要了解每个类的<strong>更新策略</strong>，可直接查看官网doc中的<a href="https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html" rel="nofollow">源码</a>，每类都有个<code>get_lr</code>方法，定义了更新策略。</p> 
+<h3><a id="21_torchoptimlr_schedulerLambdaLR_108"></a>2.1 torch.optim.lr_scheduler.LambdaLR</h3> 
+<p><strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler<span class="token punctuation">.</span>LambdaLR<span class="token punctuation">(</span>optimizer<span class="token punctuation">,</span> lr_lambda<span class="token punctuation">,</span> last_epoch<span class="token operator">=</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>更新策略：</strong><br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          n 
+         
+        
+          e 
+         
+        
+          w 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          = 
+         
+        
+          λ 
+         
+        
+          × 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          i 
+         
+        
+          t 
+         
+        
+          i 
+         
+        
+          a 
+         
+        
+          l 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+       
+         new\_lr = \lambda \times initial\_lr 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.77777em; vertical-align: -0.08333em;"></span><span class="mord mathdefault">λ</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span></span><br> 其中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         n 
+        
+       
+         e 
+        
+       
+         w 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        new\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是得到的新的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         i 
+        
+       
+         n 
+        
+       
+         i 
+        
+       
+         t 
+        
+       
+         i 
+        
+       
+         a 
+        
+       
+         l 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        initial\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是初始的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         λ 
+        
+       
+      
+        \lambda 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.69444em; vertical-align: 0em;"></span><span class="mord mathdefault">λ</span></span></span></span></span>是通过参数lr_lambda和epoch得到的。</p> 
+<p><strong>参数：</strong></p> 
+<ol><li>optimizer （Optimizer）：要更改学习率的优化器；</li><li>lr_lambda（function or list）：根据epoch计算<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          λ 
+         
+        
+       
+         \lambda 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.69444em; vertical-align: 0em;"></span><span class="mord mathdefault">λ</span></span></span></span></span>的函数；或者是一个<code>list</code>的这样的function，分别计算各个parameter groups的学习率更新用到的<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          λ 
+         
+        
+       
+         \lambda 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.69444em; vertical-align: 0em;"></span><span class="mord mathdefault">λ</span></span></span></span></span>；</li><li>last_epoch （int）：最后一个epoch的index，如果是训练了很多个epoch后中断了，继续训练，这个值就等于加载的模型的epoch。默认为-1表示从头开始训练，即从epoch=1开始。</li></ol> 
+<p><strong>注意：</strong><br> 在将optimizer传给scheduler后，在shcduler类的<code>__init__</code>方法中会给<code>optimizer.param_groups</code>列表中的那个元素（字典）增加一个<code>key = "initial_lr"</code>的元素表示初始学习率，等于<code>optimizer.defaults['lr']</code>。</p> 
+<p>下面举例说明：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> LambdaLR
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+scheduler_1 <span class="token operator">=</span> LambdaLR<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">,</span> lr_lambda<span class="token operator">=</span><span class="token keyword">lambda</span> epoch<span class="token punctuation">:</span> <span class="token number">1</span><span class="token operator">/</span><span class="token punctuation">(</span>epoch<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"初始化的学习率："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+<span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">11</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># train</span>
+
+    optimizer_1<span class="token punctuation">.</span>zero_grad<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    optimizer_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"第%d个epoch的学习率：%f"</span> <span class="token operator">%</span> <span class="token punctuation">(</span>epoch<span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    scheduler_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>输出：</p> 
+<pre><code class="prism language-sh">初始化的学习率： 0.1
+第1个epoch的学习率：0.100000
+第2个epoch的学习率：0.050000
+第3个epoch的学习率：0.033333
+第4个epoch的学习率：0.025000
+第5个epoch的学习率：0.020000
+第6个epoch的学习率：0.016667
+第7个epoch的学习率：0.014286
+第8个epoch的学习率：0.012500
+第9个epoch的学习率：0.011111
+第10个epoch的学习率：0.010000
+
+</code></pre> 
+<p>下面解析关键行：<br> <strong>第1~3行</strong><br> <code>import</code>一些包。<br> <strong>第7~13行</strong><br> 简单定义一个网络类，并没有实现网络应有的功能，只是用来定义optimizer的。<br> <strong>第15行</strong><br> 实例化一个网络。<br> <strong>第17行</strong><br> 实例化一个<code>Adam</code>对象。<br> <strong>第18行</strong><br> 实例化一个<code>LambdaLR</code>对象。<code>lr_lambda</code>是根据epoch更新lr的函数。<br> <strong>第20行</strong><br> 打印出初始的lr。<code>optimizer_1.defaults</code>保存的是初始的参数。<br> <strong>第22~28行</strong><br> 模仿训练的epoch。<br> <strong>第25～26行</strong><br> 更新网络参数（这里省略了<code>loss.backward()</code>）。<br> <strong>第27行</strong><br> 打印这一个epoch更新参数所用的学习率，由于我们只给optimizer_1传了一个<code>net.parameters()</code>，所以<code>optimizer_1.param_groups</code>长度为1。<br> <strong>第28行</strong><br> 更新学习率。</p> 
+<p><strong>补充：</strong><br> cycleGAN中使用<code>torch.optim.lr_scheduler.LambdaLR</code>实现了前<code>niter</code>个epoch用<code>initial_lr</code>为学习率，之后的<code>niter_decay</code>个epoch线性衰减lr，直到最后一个epoch衰减为0。详情参考：<a href="https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py">https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py</a>的第52~55行。</p> 
+<h3><a id="22_torchoptimlr_schedulerStepLR_197"></a>2.2 torch.optim.lr_scheduler.StepLR</h3> 
+<p><strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler<span class="token punctuation">.</span>StepLR<span class="token punctuation">(</span>optimizer<span class="token punctuation">,</span> step_size<span class="token punctuation">,</span> gamma<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">,</span> last_epoch<span class="token operator">=</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>更新策略：</strong><br> 每过<code>step_size</code>个epoch，做一次更新：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          n 
+         
+        
+          e 
+         
+        
+          w 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          = 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          i 
+         
+        
+          t 
+         
+        
+          i 
+         
+        
+          a 
+         
+        
+          l 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          × 
+         
+         
+         
+           γ 
+          
+          
+          
+            e 
+           
+          
+            p 
+           
+          
+            o 
+           
+          
+            c 
+           
+          
+            h 
+           
+          
+            / 
+           
+          
+            / 
+           
+          
+            s 
+           
+          
+            t 
+           
+          
+            e 
+           
+          
+            p 
+           
+          
+            _ 
+           
+          
+            s 
+           
+          
+            i 
+           
+          
+            z 
+           
+          
+            e 
+           
+          
+         
+        
+       
+         new\_lr = initial\_lr \times \gamma^{epoch // step\_size} 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.13244em; vertical-align: -0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.05556em;">γ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.938em;"><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">p</span><span class="mord mathdefault mtight">o</span><span class="mord mathdefault mtight">c</span><span class="mord mathdefault mtight">h</span><span class="mord mtight">/</span><span class="mord mtight">/</span><span class="mord mathdefault mtight">s</span><span class="mord mathdefault mtight">t</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">p</span><span class="mord mtight" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault mtight">s</span><span class="mord mathdefault mtight">i</span><span class="mord mathdefault mtight" style="margin-right: 0.04398em;">z</span><span class="mord mathdefault mtight">e</span></span></span></span></span></span></span></span></span></span></span></span></span></span><br> 其中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         n 
+        
+       
+         e 
+        
+       
+         w 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        new\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是得到的新的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         i 
+        
+       
+         n 
+        
+       
+         i 
+        
+       
+         t 
+        
+       
+         i 
+        
+       
+         a 
+        
+       
+         l 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        initial\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是初始的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         s 
+        
+       
+         t 
+        
+       
+         e 
+        
+       
+         p 
+        
+       
+         _ 
+        
+       
+         s 
+        
+       
+         i 
+        
+       
+         z 
+        
+       
+         e 
+        
+       
+      
+        step\_size 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.96952em; vertical-align: -0.31em;"></span><span class="mord mathdefault">s</span><span class="mord mathdefault">t</span><span class="mord mathdefault">e</span><span class="mord mathdefault">p</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault">s</span><span class="mord mathdefault">i</span><span class="mord mathdefault" style="margin-right: 0.04398em;">z</span><span class="mord mathdefault">e</span></span></span></span></span>是参数<code>step_size</code>，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         γ 
+        
+       
+      
+        \gamma 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.625em; vertical-align: -0.19444em;"></span><span class="mord mathdefault" style="margin-right: 0.05556em;">γ</span></span></span></span></span>是参数<code>gamma</code>。</p> 
+<p><strong>参数：</strong></p> 
+<ol><li>optimizer （Optimizer）：要更改学习率的优化器；</li><li>step_size（int）：每训练step_size个epoch，更新一次参数；</li><li>gamma（float）：更新lr的乘法因子；</li><li>last_epoch （int）：最后一个epoch的index，如果是训练了很多个epoch后中断了，继续训练，这个值就等于加载的模型的epoch。默认为-1表示从头开始训练，即从epoch=1开始。</li></ol> 
+<p>下面举例说明：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> StepLR
+<span class="token keyword">import</span> itertools
+
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+scheduler_1 <span class="token operator">=</span> StepLR<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">,</span> step_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> gamma<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">)</span>
+
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"初始化的学习率："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+<span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">11</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># train</span>
+
+    optimizer_1<span class="token punctuation">.</span>zero_grad<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    optimizer_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"第%d个epoch的学习率：%f"</span> <span class="token operator">%</span> <span class="token punctuation">(</span>epoch<span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    scheduler_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>输出为：</p> 
+<pre><code class="prism language-sh">初始化的学习率： 0.1
+第1个epoch的学习率：0.100000
+第2个epoch的学习率：0.100000
+第3个epoch的学习率：0.100000
+第4个epoch的学习率：0.010000
+第5个epoch的学习率：0.010000
+第6个epoch的学习率：0.010000
+第7个epoch的学习率：0.001000
+第8个epoch的学习率：0.001000
+第9个epoch的学习率：0.001000
+第10个epoch的学习率：0.000100
+
+</code></pre> 
+<h3><a id="23_torchoptimlr_schedulerMultiStepLR_263"></a>2.3 torch.optim.lr_scheduler.MultiStepLR</h3> 
+<p><strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler<span class="token punctuation">.</span>MultiStepLR<span class="token punctuation">(</span>optimizer<span class="token punctuation">,</span> milestones<span class="token punctuation">,</span> gamma<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">,</span> last_epoch<span class="token operator">=</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>更新策略：</strong><br> 每次遇到<code>milestones</code>中的epoch，做一次更新：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          n 
+         
+        
+          e 
+         
+        
+          w 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          = 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          i 
+         
+        
+          t 
+         
+        
+          i 
+         
+        
+          a 
+         
+        
+          l 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          × 
+         
+         
+         
+           γ 
+          
+          
+          
+            b 
+           
+          
+            i 
+           
+          
+            s 
+           
+          
+            e 
+           
+          
+            c 
+           
+          
+            t 
+           
+          
+            _ 
+           
+          
+            r 
+           
+          
+            i 
+           
+          
+            g 
+           
+          
+            h 
+           
+          
+            t 
+           
+          
+            ( 
+           
+          
+            m 
+           
+          
+            i 
+           
+          
+            l 
+           
+          
+            e 
+           
+          
+            s 
+           
+          
+            t 
+           
+          
+            o 
+           
+          
+            n 
+           
+          
+            e 
+           
+          
+            s 
+           
+          
+            , 
+           
+          
+            e 
+           
+          
+            p 
+           
+          
+            o 
+           
+          
+            c 
+           
+          
+            h 
+           
+          
+            ) 
+           
+          
+         
+        
+       
+         new\_lr = initial\_lr \times \gamma^{bisect\_right(milestones, epoch)} 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.13244em; vertical-align: -0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.05556em;">γ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.938em;"><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">b</span><span class="mord mathdefault mtight">i</span><span class="mord mathdefault mtight">s</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">c</span><span class="mord mathdefault mtight">t</span><span class="mord mtight" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault mtight" style="margin-right: 0.02778em;">r</span><span class="mord mathdefault mtight">i</span><span class="mord mathdefault mtight" style="margin-right: 0.03588em;">g</span><span class="mord mathdefault mtight">h</span><span class="mord mathdefault mtight">t</span><span class="mopen mtight">(</span><span class="mord mathdefault mtight">m</span><span class="mord mathdefault mtight">i</span><span class="mord mathdefault mtight" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">s</span><span class="mord mathdefault mtight">t</span><span class="mord mathdefault mtight">o</span><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">s</span><span class="mpunct mtight">,</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">p</span><span class="mord mathdefault mtight">o</span><span class="mord mathdefault mtight">c</span><span class="mord mathdefault mtight">h</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span></span></span></span></span></span><br> 其中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         n 
+        
+       
+         e 
+        
+       
+         w 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        new\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是得到的新的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         i 
+        
+       
+         n 
+        
+       
+         i 
+        
+       
+         t 
+        
+       
+         i 
+        
+       
+         a 
+        
+       
+         l 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        initial\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是初始的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         γ 
+        
+       
+      
+        \gamma 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.625em; vertical-align: -0.19444em;"></span><span class="mord mathdefault" style="margin-right: 0.05556em;">γ</span></span></span></span></span>是参数<code>gamma</code>，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         b 
+        
+       
+         i 
+        
+       
+         s 
+        
+       
+         e 
+        
+       
+         c 
+        
+       
+         t 
+        
+       
+         _ 
+        
+       
+         r 
+        
+       
+         i 
+        
+       
+         g 
+        
+       
+         h 
+        
+       
+         t 
+        
+       
+         ( 
+        
+       
+         m 
+        
+       
+         i 
+        
+       
+         l 
+        
+       
+         e 
+        
+       
+         s 
+        
+       
+         t 
+        
+       
+         o 
+        
+       
+         n 
+        
+       
+         e 
+        
+       
+         s 
+        
+       
+         , 
+        
+       
+         e 
+        
+       
+         p 
+        
+       
+         o 
+        
+       
+         c 
+        
+       
+         h 
+        
+       
+         ) 
+        
+       
+      
+        bisect\_right(milestones, epoch) 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.06em; vertical-align: -0.31em;"></span><span class="mord mathdefault">b</span><span class="mord mathdefault">i</span><span class="mord mathdefault">s</span><span class="mord mathdefault">e</span><span class="mord mathdefault">c</span><span class="mord mathdefault">t</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mord mathdefault">i</span><span class="mord mathdefault" style="margin-right: 0.03588em;">g</span><span class="mord mathdefault">h</span><span class="mord mathdefault">t</span><span class="mopen">(</span><span class="mord mathdefault">m</span><span class="mord mathdefault">i</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault">e</span><span class="mord mathdefault">s</span><span class="mord mathdefault">t</span><span class="mord mathdefault">o</span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right: 0.166667em;"></span><span class="mord mathdefault">e</span><span class="mord mathdefault">p</span><span class="mord mathdefault">o</span><span class="mord mathdefault">c</span><span class="mord mathdefault">h</span><span class="mclose">)</span></span></span></span></span>就是bisect模块中的<code>bisect_right</code>函数，返回值是把epoch插入排序好的列表milestones式的位置。</p> 
+<p><strong>参数：</strong></p> 
+<ol><li>optimizer （Optimizer）：要更改学习率的优化器；</li><li>milestones（list）：递增的list，存放要更新lr的epoch；</li><li>gamma（float）：更新lr的乘法因子；</li><li>last_epoch （int）：最后一个epoch的index，如果是训练了很多个epoch后中断了，继续训练，这个值就等于加载的模型的epoch。默认为-1表示从头开始训练，即从epoch=1开始。</li></ol> 
+<p>下面举例说明：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> MultiStepLR
+<span class="token keyword">import</span> itertools
+
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+scheduler_1 <span class="token operator">=</span> MultiStepLR<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">,</span> milestones<span class="token operator">=</span><span class="token punctuation">[</span><span class="token number">3</span><span class="token punctuation">,</span> <span class="token number">7</span><span class="token punctuation">]</span><span class="token punctuation">,</span> gamma<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">)</span>
+
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"初始化的学习率："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+<span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">11</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># train</span>
+
+    optimizer_1<span class="token punctuation">.</span>zero_grad<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    optimizer_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"第%d个epoch的学习率：%f"</span> <span class="token operator">%</span> <span class="token punctuation">(</span>epoch<span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    scheduler_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>输出为：</p> 
+<pre><code class="prism language-sh">初始化的学习率： 0.1
+第1个epoch的学习率：0.100000
+第2个epoch的学习率：0.100000
+第3个epoch的学习率：0.100000
+第4个epoch的学习率：0.010000
+第5个epoch的学习率：0.010000
+第6个epoch的学习率：0.010000
+第7个epoch的学习率：0.010000
+第8个epoch的学习率：0.001000
+第9个epoch的学习率：0.001000
+第10个epoch的学习率：0.001000
+
+</code></pre> 
+<h3><a id="24_torchoptimlr_schedulerExponentialLR_329"></a>2.4 torch.optim.lr_scheduler.ExponentialLR</h3> 
+<p><strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler<span class="token punctuation">.</span>ExponentialLR<span class="token punctuation">(</span>optimizer<span class="token punctuation">,</span> gamma<span class="token punctuation">,</span> last_epoch<span class="token operator">=</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>更新策略：</strong><br> 每个epoch都做一次更新：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          n 
+         
+        
+          e 
+         
+        
+          w 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          = 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          i 
+         
+        
+          t 
+         
+        
+          i 
+         
+        
+          a 
+         
+        
+          l 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          × 
+         
+         
+         
+           γ 
+          
+          
+          
+            e 
+           
+          
+            p 
+           
+          
+            o 
+           
+          
+            c 
+           
+          
+            h 
+           
+          
+         
+        
+       
+         new\_lr = initial\_lr \times \gamma^{epoch} 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.09355em; vertical-align: -0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.05556em;">γ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height: 0.899108em;"><span class="" style="top: -3.113em; margin-right: 0.05em;"><span class="pstrut" style="height: 2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">p</span><span class="mord mathdefault mtight">o</span><span class="mord mathdefault mtight">c</span><span class="mord mathdefault mtight">h</span></span></span></span></span></span></span></span></span></span></span></span></span></span><br> 其中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         n 
+        
+       
+         e 
+        
+       
+         w 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        new\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是得到的新的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         i 
+        
+       
+         n 
+        
+       
+         i 
+        
+       
+         t 
+        
+       
+         i 
+        
+       
+         a 
+        
+       
+         l 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        initial\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是初始的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         γ 
+        
+       
+      
+        \gamma 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.625em; vertical-align: -0.19444em;"></span><span class="mord mathdefault" style="margin-right: 0.05556em;">γ</span></span></span></span></span>是参数<code>gamma</code>.</p> 
+<p><strong>参数：</strong></p> 
+<ol><li>optimizer （Optimizer）：要更改学习率的优化器；</li><li>gamma（float）：更新lr的乘法因子；</li><li>last_epoch （int）：最后一个epoch的index，如果是训练了很多个epoch后中断了，继续训练，这个值就等于加载的模型的epoch。默认为-1表示从头开始训练，即从epoch=1开始。</li></ol> 
+<p>下面举例说明：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> ExponentialLR
+<span class="token keyword">import</span> itertools
+
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+scheduler_1 <span class="token operator">=</span> ExponentialLR<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">,</span> gamma<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">)</span>
+
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"初始化的学习率："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+<span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">11</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># train</span>
+
+    optimizer_1<span class="token punctuation">.</span>zero_grad<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    optimizer_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"第%d个epoch的学习率：%f"</span> <span class="token operator">%</span> <span class="token punctuation">(</span>epoch<span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    scheduler_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>输出为：</p> 
+<pre><code class="prism language-sh">初始化的学习率： 0.1
+第1个epoch的学习率：0.100000
+第2个epoch的学习率：0.010000
+第3个epoch的学习率：0.001000
+第4个epoch的学习率：0.000100
+第5个epoch的学习率：0.000010
+第6个epoch的学习率：0.000001
+第7个epoch的学习率：0.000000
+第8个epoch的学习率：0.000000
+第9个epoch的学习率：0.000000
+第10个epoch的学习率：0.000000
+
+</code></pre> 
+<h3><a id="25_torchoptimlr_schedulerCosineAnnealingLR_394"></a>2.5 torch.optim.lr_scheduler.CosineAnnealingLR</h3> 
+<p><strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler<span class="token punctuation">.</span>CosineAnnealingLR<span class="token punctuation">(</span>optimizer<span class="token punctuation">,</span> T_max<span class="token punctuation">,</span> eta_min<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">,</span> last_epoch<span class="token operator">=</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>更新策略：</strong><br> 让lr随着epoch的变化图类似于cos：<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          n 
+         
+        
+          e 
+         
+        
+          w 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          = 
+         
+        
+          e 
+         
+        
+          t 
+         
+        
+          a 
+         
+        
+          _ 
+         
+        
+          m 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          + 
+         
+        
+          ( 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          i 
+         
+        
+          t 
+         
+        
+          i 
+         
+        
+          a 
+         
+        
+          l 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          − 
+         
+        
+          e 
+         
+        
+          t 
+         
+        
+          a 
+         
+        
+          _ 
+         
+        
+          m 
+         
+        
+          i 
+         
+        
+          n 
+         
+        
+          ) 
+         
+        
+          × 
+         
+        
+          ( 
+         
+        
+          1 
+         
+        
+          + 
+         
+        
+          c 
+         
+        
+          o 
+         
+        
+          s 
+         
+        
+          ( 
+         
+         
+          
+          
+            e 
+           
+          
+            p 
+           
+          
+            o 
+           
+          
+            c 
+           
+          
+            h 
+           
+          
+          
+          
+            T 
+           
+          
+            _ 
+           
+          
+            m 
+           
+          
+            a 
+           
+          
+            x 
+           
+          
+         
+        
+          π 
+         
+        
+          ) 
+         
+        
+          ) 
+         
+        
+       
+         new\_lr = eta\_min + (initial\_lr-eta\_min) \times (1+cos(\frac{epoch}{T\_max}\pi)) 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.96952em; vertical-align: -0.31em;"></span><span class="mord mathdefault">e</span><span class="mord mathdefault">t</span><span class="mord mathdefault">a</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault">m</span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.06em; vertical-align: -0.31em;"></span><span class="mopen">(</span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.06em; vertical-align: -0.31em;"></span><span class="mord mathdefault">e</span><span class="mord mathdefault">t</span><span class="mord mathdefault">a</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault">m</span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mclose">)</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1em; vertical-align: -0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 2.36744em; vertical-align: -0.996em;"></span><span class="mord mathdefault">c</span><span class="mord mathdefault">o</span><span class="mord mathdefault">s</span><span class="mopen">(</span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 1.37144em;"><span class="" style="top: -2.314em;"><span class="pstrut" style="height: 3em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right: 0.13889em;">T</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault">m</span><span class="mord mathdefault">a</span><span class="mord mathdefault">x</span></span></span><span class="" style="top: -3.23em;"><span class="pstrut" style="height: 3em;"></span><span class="frac-line" style="border-bottom-width: 0.04em;"></span></span><span class="" style="top: -3.677em;"><span class="pstrut" style="height: 3em;"></span><span class="mord"><span class="mord mathdefault">e</span><span class="mord mathdefault">p</span><span class="mord mathdefault">o</span><span class="mord mathdefault">c</span><span class="mord mathdefault">h</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.996em;"><span class=""></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord mathdefault" style="margin-right: 0.03588em;">π</span><span class="mclose">)</span><span class="mclose">)</span></span></span></span></span></span><br> 其中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         n 
+        
+       
+         e 
+        
+       
+         w 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        new\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是得到的新的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         i 
+        
+       
+         n 
+        
+       
+         i 
+        
+       
+         t 
+        
+       
+         i 
+        
+       
+         a 
+        
+       
+         l 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        initial\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span><span class="mord mathdefault">i</span><span class="mord mathdefault">t</span><span class="mord mathdefault">i</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是初始的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         e 
+        
+       
+         t 
+        
+       
+         a 
+        
+       
+         _ 
+        
+       
+         m 
+        
+       
+         i 
+        
+       
+         n 
+        
+       
+      
+        eta\_min 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.96952em; vertical-align: -0.31em;"></span><span class="mord mathdefault">e</span><span class="mord mathdefault">t</span><span class="mord mathdefault">a</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault">m</span><span class="mord mathdefault">i</span><span class="mord mathdefault">n</span></span></span></span></span>是参数<code>eta_min</code>表示最小学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         T 
+        
+       
+         _ 
+        
+       
+         m 
+        
+       
+         a 
+        
+       
+         x 
+        
+       
+      
+        T\_max 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.99333em; vertical-align: -0.31em;"></span><span class="mord mathdefault" style="margin-right: 0.13889em;">T</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault">m</span><span class="mord mathdefault">a</span><span class="mord mathdefault">x</span></span></span></span></span>是参数<code>T_max</code>表示cos的周期的1/4。</p> 
+<p><strong>参数：</strong></p> 
+<ol><li>optimizer （Optimizer）：要更改学习率的优化器；</li><li>T_max（int）：lr的变化是周期性的，T_max是周期的 <span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+         
+         
+           1 
+          
+         
+           4 
+          
+         
+        
+       
+         \frac{1}{4} 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.19011em; vertical-align: -0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height: 0.845108em;"><span class="" style="top: -2.655em;"><span class="pstrut" style="height: 3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">4</span></span></span></span><span class="" style="top: -3.23em;"><span class="pstrut" style="height: 3em;"></span><span class="frac-line" style="border-bottom-width: 0.04em;"></span></span><span class="" style="top: -3.394em;"><span class="pstrut" style="height: 3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height: 0.345em;"><span class=""></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span>；</li><li>eta_min（float）：lr的最小值，默认为0；</li><li>last_epoch （int）：最后一个epoch的index，如果是训练了很多个epoch后中断了，继续训练，这个值就等于加载的模型的epoch。默认为-1表示从头开始训练，即从epoch=1开始。</li></ol> 
+<p>下面举例说明：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> CosineAnnealingLR
+<span class="token keyword">import</span> itertools
+
+<span class="token keyword">import</span> matplotlib<span class="token punctuation">.</span>pyplot <span class="token keyword">as</span> plt
+
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+scheduler_1 <span class="token operator">=</span> CosineAnnealingLR<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">,</span> T_max<span class="token operator">=</span><span class="token number">20</span><span class="token punctuation">)</span>
+
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"初始化的学习率："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+lr_list <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token punctuation">]</span> <span class="token comment"># 把使用过的lr都保存下来，之后画出它的变化</span>
+
+<span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">101</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># train</span>
+
+    optimizer_1<span class="token punctuation">.</span>zero_grad<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    optimizer_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"第%d个epoch的学习率：%f"</span> <span class="token operator">%</span> <span class="token punctuation">(</span>epoch<span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    lr_list<span class="token punctuation">.</span>append<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+    scheduler_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+<span class="token comment"># 画出lr的变化</span>
+plt<span class="token punctuation">.</span>plot<span class="token punctuation">(</span><span class="token builtin">list</span><span class="token punctuation">(</span><span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">101</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr_list<span class="token punctuation">)</span>
+plt<span class="token punctuation">.</span>xlabel<span class="token punctuation">(</span><span class="token string">"epoch"</span><span class="token punctuation">)</span>
+plt<span class="token punctuation">.</span>ylabel<span class="token punctuation">(</span><span class="token string">"lr"</span><span class="token punctuation">)</span>
+plt<span class="token punctuation">.</span>title<span class="token punctuation">(</span><span class="token string">"learning rate's curve changes as epoch goes on!"</span><span class="token punctuation">)</span>
+plt<span class="token punctuation">.</span>show<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre> 
+<p>输出结果过长不再展示，下面展示lr的变化图：<br> <img src="https://images2.imgbox.com/60/ce/NXZ7vtzE_o.png" alt="在这里插入图片描述"><br> 可以看到lr的变化类似于cos函数的变化图。</p> 
+<h3><a id="26_torchoptimlr_schedulerCyclicLR_460"></a>2.6 torch.optim.lr_scheduler.CyclicLR</h3> 
+<h3><a id="27_torchoptimlr_schedulerOneCycleLR_461"></a>2.7 torch.optim.lr_scheduler.OneCycleLR</h3> 
+<h3><a id="28_torchoptimlr_schedulerCosineAnnealingWarmRestarts_462"></a>2.8 torch.optim.lr_scheduler.CosineAnnealingWarmRestarts</h3> 
+<h2><a id="3_lr_scheduler_463"></a>3 lr_scheduler调整策略：根据训练中某些测量值</h2> 
+<p>不依赖epoch更新lr的只有<code>torch.optim.lr_scheduler.ReduceLROnPlateau</code>。</p> 
+<p><strong>语法：</strong></p> 
+<pre><code class="prism language-python"><span class="token keyword">class</span> <span class="token class-name">torch</span><span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler<span class="token punctuation">.</span>ReduceLROnPlateau<span class="token punctuation">(</span>optimizer<span class="token punctuation">,</span> mode<span class="token operator">=</span><span class="token string">'min'</span><span class="token punctuation">,</span> factor<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">,</span> patience<span class="token operator">=</span><span class="token number">10</span><span class="token punctuation">,</span> verbose<span class="token operator">=</span><span class="token boolean">False</span><span class="token punctuation">,</span> threshold<span class="token operator">=</span><span class="token number">0.0001</span><span class="token punctuation">,</span> threshold_mode<span class="token operator">=</span><span class="token string">'rel'</span><span class="token punctuation">,</span> cooldown<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">,</span> min_lr<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">,</span> eps<span class="token operator">=</span><span class="token number">1e</span><span class="token operator">-</span><span class="token number">08</span><span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>更新策略：</strong><br> 给定一个metric，当metric停止优化时减小学习率。<br> <span class="katex--display"><span class="katex-display"><span class="katex"><span class="katex-mathml"> 
+      
+       
+        
+        
+          n 
+         
+        
+          e 
+         
+        
+          w 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+          = 
+         
+        
+          λ 
+         
+        
+          × 
+         
+        
+          o 
+         
+        
+          l 
+         
+        
+          d 
+         
+        
+          _ 
+         
+        
+          l 
+         
+        
+          r 
+         
+        
+       
+         new\_lr = \lambda \times old\_lr 
+        
+       
+     </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span><span class="mspace" style="margin-right: 0.277778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right: 0.277778em;"></span></span><span class="base"><span class="strut" style="height: 0.77777em; vertical-align: -0.08333em;"></span><span class="mord mathdefault">λ</span><span class="mspace" style="margin-right: 0.222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right: 0.222222em;"></span></span><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">o</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault">d</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span></span><br> 其中<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         n 
+        
+       
+         e 
+        
+       
+         w 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        new\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">n</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right: 0.02691em;">w</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是得到的新的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         o 
+        
+       
+         l 
+        
+       
+         d 
+        
+       
+         _ 
+        
+       
+         l 
+        
+       
+         r 
+        
+       
+      
+        old\_lr 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 1.00444em; vertical-align: -0.31em;"></span><span class="mord mathdefault">o</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault">d</span><span class="mord" style="margin-right: 0.02778em;">_</span><span class="mord mathdefault" style="margin-right: 0.01968em;">l</span><span class="mord mathdefault" style="margin-right: 0.02778em;">r</span></span></span></span></span>是上一次优化使用的学习率，<span class="katex--inline"><span class="katex"><span class="katex-mathml"> 
+     
+      
+       
+       
+         λ 
+        
+       
+      
+        \lambda 
+       
+      
+    </span><span class="katex-html"><span class="base"><span class="strut" style="height: 0.69444em; vertical-align: 0em;"></span><span class="mord mathdefault">λ</span></span></span></span></span>是通过参数<code>factor</code>。</p> 
+<p><strong>参数：</strong></p> 
+<ol><li>optimizer （Optimizer）：要更改学习率的优化器；</li><li>mode（str）：只能是<code>‘min’</code>或<code>'max'</code>，默认<code>’min'</code>： 
+  <ol><li><code>‘min'</code>模式下，当metric不再下降时减小lr；</li><li><code>'max'</code>模式下，当metric不再增长时减小lr；</li></ol> </li><li>factor（float）：lr减小的乘法因子，默认为0.1；</li><li>patience（int）：在metric停止优化<code>patience</code>个epoch后减小lr，例如，如果<code>patience=2</code>，那metric不再优化的前两个epoch不做任何事，第三个epoch后metric仍然没有优化，那么更新lr，默认为10；</li><li>verbose（bool）：如果为<code>True</code>，在更新lr后<code>print</code>一个更新信息，默认为<code>False</code>；</li><li>threshold (float) – Threshold for measuring the new optimum, to only focus on significant changes. Default: 1e-4.</li><li>threshold_mode (str) – One of rel, abs. In rel mode, dynamic_threshold = best * ( 1 + threshold ) in ‘max’ mode or best * ( 1 - threshold ) in min mode. In abs mode, dynamic_threshold = best + threshold in max mode or best - threshold in min mode. Default: ‘rel’.</li><li>cooldown (int) – Number of epochs to wait before resuming normal operation after lr has been reduced. Default: 0.</li><li>min_lr (float or list) – A scalar or a list of scalars. A lower bound on the learning rate of all param groups or each group respectively. Default: 0.</li><li>eps (float) – Minimal decay applied to lr. If the difference between new and old lr is smaller than eps, the update is ignored. Default: 1e-8.</li></ol> 
+<p>下面举例说明：</p> 
+<pre><code class="prism language-python"><span class="token keyword">import</span> torch
+<span class="token keyword">import</span> torch<span class="token punctuation">.</span>nn <span class="token keyword">as</span> nn
+<span class="token keyword">from</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>lr_scheduler <span class="token keyword">import</span> ReduceLROnPlateau
+<span class="token keyword">import</span> itertools
+
+
+initial_lr <span class="token operator">=</span> <span class="token number">0.1</span>
+
+<span class="token keyword">class</span> <span class="token class-name">model</span><span class="token punctuation">(</span>nn<span class="token punctuation">.</span>Module<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>__init__<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>conv1 <span class="token operator">=</span> nn<span class="token punctuation">.</span>Conv2d<span class="token punctuation">(</span>in_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> out_channels<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">,</span> kernel_size<span class="token operator">=</span><span class="token number">3</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">forward</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> x<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">pass</span>
+
+net_1 <span class="token operator">=</span> model<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+optimizer_1 <span class="token operator">=</span> torch<span class="token punctuation">.</span>optim<span class="token punctuation">.</span>Adam<span class="token punctuation">(</span>net_1<span class="token punctuation">.</span>parameters<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> lr <span class="token operator">=</span> initial_lr<span class="token punctuation">)</span>
+scheduler_1 <span class="token operator">=</span> ReduceLROnPlateau<span class="token punctuation">(</span>optimizer_1<span class="token punctuation">,</span> mode<span class="token operator">=</span><span class="token string">'min'</span><span class="token punctuation">,</span> factor<span class="token operator">=</span><span class="token number">0.1</span><span class="token punctuation">,</span> patience<span class="token operator">=</span><span class="token number">2</span><span class="token punctuation">)</span>
+
+<span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"初始化的学习率："</span><span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>defaults<span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+<span class="token keyword">for</span> epoch <span class="token keyword">in</span> <span class="token builtin">range</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">15</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># train</span>
+
+    test <span class="token operator">=</span> <span class="token number">2</span>
+    optimizer_1<span class="token punctuation">.</span>zero_grad<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    optimizer_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">"第%d个epoch的学习率：%f"</span> <span class="token operator">%</span> <span class="token punctuation">(</span>epoch<span class="token punctuation">,</span> optimizer_1<span class="token punctuation">.</span>param_groups<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">[</span><span class="token string">'lr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+    scheduler_1<span class="token punctuation">.</span>step<span class="token punctuation">(</span>test<span class="token punctuation">)</span>
+</code></pre> 
+<p>输出为：</p> 
+<pre><code class="prism language-sh">初始化的学习率： 0.1
+第1个epoch的学习率：0.100000
+第2个epoch的学习率：0.100000
+第3个epoch的学习率：0.100000
+第4个epoch的学习率：0.100000
+第5个epoch的学习率：0.010000
+第6个epoch的学习率：0.010000
+第7个epoch的学习率：0.010000
+第8个epoch的学习率：0.001000
+第9个epoch的学习率：0.001000
+第10个epoch的学习率：0.001000
+第11个epoch的学习率：0.000100
+第12个epoch的学习率：0.000100
+第13个epoch的学习率：0.000100
+第14个epoch的学习率：0.000010
+
+</code></pre>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/e99b9aaf5a5a9f1d78ad1b7227ca1dfb/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">111. 二叉树的最小深度</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e2c394dc0eb06351456d4657f3380de5/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">ocr---训练自己的数据实现文本检测（kears实现east网络）</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

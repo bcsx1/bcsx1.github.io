@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>hugging face参数高效微调peft源码解析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="hugging face参数高效微调peft源码解析" />
+<meta property="og:description" content="大模型参数高效微调(PEFT) - 知乎
+让天下没有难Tuning的大模型-PEFT技术简介 - 知乎
+大模型参数高效微调技术原理综述（三）-P-Tuning、P-Tuning v2 - 知乎
+你似乎来到了没有知识存在的荒原 - 知乎
+大模型参数高效微调技术原理综述（六）-MAM Adapter、UniPELT - 知乎
+GitHub - huggingface/peft: 🤗 PEFT: State-of-the-art Parameter-Efficient Fine-Tuning.
+ChatGPT等大模型高效调参大法——PEFT库的算法简介 - 知乎
+PEFT
+PEFT：Parameter Efficient Fine-Tuning技术旨在通过最小化微调参数的数量和计算复杂度，来提高预训练模型在新任务上的性能，从而缓解大型预训练模型的训练成本。 Prefix-Tuning（软提示/连续提示）
+在每一层的token之前构造一段任务相关的tokens作为Prefix，训练时只更新Prefix部分的参数，而Transformer中的其他部分参数固定一个Prefix模块就是一个可学习的id到embedding映射表，可以在多层分别添加Prefix模块为了防止直接更新Prefix的参数导致训练不稳定的情况，在Prefix层前面加了MLP结构作用阶段：所有transformer block的Attention注意力计算 Prompt-Tuning（软提示/连续提示）
+可看做是Prefix-Tuning的简化版本，只在输入层加入prompt tokens，并不需要加入MLP进行调整提出 Prompt Ensembling 方法来集成预训练语言模型的多种 prompts在只额外对增加的3.6%参数规模（相比原来预训练模型的参数量）的情况下取得和Full-finetuning接近的效果作用阶段：第一层transformer block的Attention注意力计算 P-Tuning（软提示/连续提示）
+P-Tuning只是在输入的时候加入Embedding，并通过LSTM&#43;MLP对prompt embedding序列进行编码根据人工设计模板动态确定prompt token的添加位置，可以放在开始，也可以放在中间作用阶段：第一层transformer block的Attention注意力计算 P-Tuning V2（软提示/连续提示）
+可看做是Prefix-Tuning的优化版本。在模型的每一层都添加连续的 promptsP-Tuning v2在不同规模和任务中都可与微调效果相媲美移除重参数化的编码器（如：Prefix Tuning中的MLP、P-Tuning中的LSTM）、针对不同任务采用不同的提示长度、引入多任务学习等作用阶段：所有transformer block的Attention注意力计算 Adapter（变体：AdapterFusion、AdapterDrop）
+在Transformer Block中加入两层MLP，固定住原来预训练模型的参数不变，只对新增的Adapter结构进行微调在只额外对增加的3.6%参数规模（相比原来预训练模型的参数量）的情况下取得和Full-finetuning接近的效果作用阶段：Transformer Block主体 LoRA（变体：AdaLoRA、QLoRA）
+在训练阶段，预训练参数W固定，只更新A和B参数，A和B模拟W的变化量。在推理阶段，用A、B参数与原预训练参数相加替换原有预训练模型的参数。推理过程没有额外的参数量和计算量相当于是用LoRA去模拟Full-finetune的过程，几乎不会带来效果损失由于没有使用Prompt方式，避免了Prompt方法的一系列问题（Prompt的问题：难训练、序列长度受限、效果不如finetune），在推理阶段也没有引入额外的参数作用阶段：Transformer Block主体query、value BitFit
+不需要对预训练模型做任何改动，只微调训练指定神经网络中的偏置Bias参数量只有不到2%，但是效果可以接近全量参数作用阶段：模型Backbone主体 PEFT方法总结
+增加额外参数，如：Prefix Tuning、Prompt Tuning、Adapter Tuning及其变体选取一部分参数更新，如：BitFit引入重参数化，如：LoRA、AdaLoRA、QLoRA混合高效微调，如：MAM Adapter、UniPELT 由于peft更在快速开发迭代中，代码变动可能会比较大，本文相关代码来自于peft的0." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/30e699a9a26b6abff3474fc498170046/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-07-19T09:08:33+08:00" />
+<meta property="article:modified_time" content="2023-07-19T09:08:33+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">hugging face参数高效微调peft源码解析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p style="margin-left:.0001pt;text-align:justify;"><a href="https://zhuanlan.zhihu.com/p/621700272" rel="nofollow" title="大模型参数高效微调(PEFT) - 知乎">大模型参数高效微调(PEFT) - 知乎</a></p> 
+<p><a href="https://zhuanlan.zhihu.com/p/618894319" rel="nofollow" title="让天下没有难Tuning的大模型-PEFT技术简介 - 知乎">让天下没有难Tuning的大模型-PEFT技术简介 - 知乎</a></p> 
+<p><a href="https://zhuanlan.zhihu.com/p/635848732" rel="nofollow" title="大模型参数高效微调技术原理综述（三）-P-Tuning、P-Tuning v2 - 知乎">大模型参数高效微调技术原理综述（三）-P-Tuning、P-Tuning v2 - 知乎</a></p> 
+<p><a href="https://zhuanlan.zhihu.com/p/636999010" rel="nofollow" title="你似乎来到了没有知识存在的荒原 - 知乎">你似乎来到了没有知识存在的荒原 - 知乎</a></p> 
+<p><a href="https://zhuanlan.zhihu.com/p/636362246" rel="nofollow" title="大模型参数高效微调技术原理综述（六）-MAM Adapter、UniPELT - 知乎">大模型参数高效微调技术原理综述（六）-MAM Adapter、UniPELT - 知乎</a></p> 
+<p><a href="https://github.com/huggingface/peft" title="GitHub - huggingface/peft: 🤗 PEFT: State-of-the-art Parameter-Efficient Fine-Tuning.">GitHub - huggingface/peft: 🤗 PEFT: State-of-the-art Parameter-Efficient Fine-Tuning.</a></p> 
+<p><a href="https://zhuanlan.zhihu.com/p/613863520" rel="nofollow" title="ChatGPT等大模型高效调参大法——PEFT库的算法简介 - 知乎">ChatGPT等大模型高效调参大法——PEFT库的算法简介 - 知乎</a></p> 
+<p><a href="https://huggingface.co/docs/peft/index" rel="nofollow" title="PEFT">PEFT</a></p> 
+<p></p> 
+<p>PEFT：Parameter Efficient Fine-Tuning技术旨在通过最小化微调参数的数量和计算复杂度，来提高预训练模型在新任务上的性能，从而缓解大型预训练模型的训练成本。 </p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>Prefix-Tuning（软提示/连续提示）</strong></strong></p> 
+<ol><li style="text-align:justify;">在每一层的token之前构造一段任务相关的tokens作为Prefix，训练时只更新Prefix部分的参数，而Transformer中的其他部分参数固定</li><li style="text-align:justify;">一个Prefix模块就是一个可学习的id到embedding映射表，可以在多层分别添加Prefix模块</li><li style="text-align:justify;">为了防止直接更新Prefix的参数导致训练不稳定的情况，在Prefix层前面加了MLP结构</li><li style="text-align:justify;"><strong><strong>作用阶段：</strong></strong>所有transformer block的Attention注意力计算</li></ol> 
+<p class="img-center"><img alt="" height="303" src="https://images2.imgbox.com/eb/41/ipotiOOj_o.png" width="535"></p> 
+<p style="margin-left:.0001pt;text-align:center;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>Prompt-Tuning（软提示/连续提示）</strong></strong></p> 
+<ol><li style="text-align:justify;">可看做是Prefix-Tuning的简化版本，只在输入层加入prompt tokens，并不需要加入MLP进行调整</li><li style="text-align:justify;">提出 Prompt Ensembling 方法来集成预训练语言模型的多种 prompts</li><li style="text-align:justify;">在只额外对增加的3.6%参数规模（相比原来预训练模型的参数量）的情况下取得和Full-finetuning接近的效果</li><li style="text-align:justify;"><strong><strong>作用阶段：</strong></strong>第一层transformer block的Attention注意力计算</li></ol> 
+<p class="img-center"><img alt="" height="331" src="https://images2.imgbox.com/23/e1/tZrfmCOi_o.png" width="623"></p> 
+<p style="margin-left:.0001pt;text-align:center;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>P-Tuning（软提示/连续提示）</strong></strong></p> 
+<ol><li style="text-align:justify;">P-Tuning只是在输入的时候加入Embedding，并通过LSTM+MLP对prompt embedding序列进行编码</li><li style="text-align:justify;">根据人工设计模板动态确定prompt token的添加位置，可以放在开始，也可以放在中间</li><li style="text-align:justify;"><strong><strong>作用阶段：</strong></strong>第一层transformer block的Attention注意力计算</li></ol> 
+<p class="img-center"><img alt="" height="191" src="https://images2.imgbox.com/4a/83/XWpRW1wJ_o.png" width="827"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>P-Tuning V2（软提示/连续提示）</strong></strong></p> 
+<ol><li style="text-align:justify;">可看做是Prefix-Tuning的优化版本。在模型的每一层都添加连续的 prompts</li><li style="text-align:justify;">P-Tuning v2在不同规模和任务中都可与微调效果相媲美</li><li style="text-align:justify;">移除重参数化的编码器（如：Prefix Tuning中的MLP、P-Tuning中的LSTM）、针对不同任务采用不同的提示长度、引入多任务学习等</li><li style="text-align:justify;"><strong><strong>作用阶段：</strong></strong>所有transformer block的Attention注意力计算</li></ol> 
+<p style="margin-left:.0001pt;text-align:justify;"></p> 
+<p class="img-center"><img alt="" height="237" src="https://images2.imgbox.com/39/af/EnRSYq9f_o.png" width="827"></p> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>Adapter（变体：AdapterFusion、AdapterDrop）</strong></strong></p> 
+<ol><li style="text-align:justify;">在Transformer Block中加入两层MLP，固定住原来预训练模型的参数不变，只对新增的Adapter结构进行微调</li><li style="text-align:justify;">在只额外对增加的3.6%参数规模（相比原来预训练模型的参数量）的情况下取得和Full-finetuning接近的效果</li><li style="text-align:justify;"><strong>作用阶段：</strong>Transformer Block主体</li></ol> 
+<p class="img-center"><img alt="" height="361" src="https://images2.imgbox.com/f7/26/NMHxl80d_o.png" width="407"></p> 
+<p style="margin-left:.0001pt;text-align:center;"></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>L</strong></strong><strong><strong>oRA（变体：AdaLoRA、QLoRA）</strong></strong></p> 
+<ol><li style="text-align:justify;">在训练阶段，预训练参数W固定，只更新A和B参数，A和B模拟W的变化量。</li><li style="text-align:justify;">在推理阶段，用A、B参数与原预训练参数相加替换原有预训练模型的参数。推理过程没有额外的参数量和计算量</li><li style="text-align:justify;">相当于是用LoRA去模拟Full-finetune的过程，几乎不会带来效果损失</li><li style="text-align:justify;">由于没有使用Prompt方式，避免了Prompt方法的一系列问题（Prompt的问题：难训练、序列长度受限、效果不如finetune），在推理阶段也没有引入额外的参数</li><li style="text-align:justify;"><strong>作用阶段：</strong>Transformer Block主体query、value</li></ol> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p class="img-center"><img alt="" height="278" src="https://images2.imgbox.com/d1/95/8b4GiVVj_o.png" width="504"></p> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>BitFit</strong></strong></p> 
+<ol><li style="text-align:justify;">不需要对预训练模型做任何改动，只微调训练指定神经网络中的偏置Bias</li><li style="text-align:justify;">参数量只有不到2%，但是效果可以接近全量参数</li><li style="text-align:justify;">作用阶段：模型Backbone主体</li></ol> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong><strong>PEFT方法总结</strong></strong></p> 
+<ol><li style="text-align:justify;">增加额外参数，如：Prefix Tuning、Prompt Tuning、Adapter Tuning及其变体</li><li style="text-align:justify;">选取一部分参数更新，如：BitFit</li><li style="text-align:justify;">引入重参数化，如：LoRA、AdaLoRA、QLoRA</li><li style="text-align:justify;">混合高效微调，如：MAM Adapter、UniPELT</li></ol> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p class="img-center"><img alt="" height="557" src="https://images2.imgbox.com/7a/73/mwPNgBGS_o.png" width="640"></p> 
+<p></p> 
+<hr> 
+<p style="margin-left:.0001pt;text-align:justify;"><strong>由于peft更在快速开发迭代中，代码变动可能会比较大，本文相关代码来自于peft的0.3.0版本。</strong></p> 
+<p></p> 
+<p>        下面看一下<a class="link-info" href="https://github.com/huggingface/peft" title="hugging face peft">hugging face peft</a>开源代码中对于上述几种方法的实现。tuners目录下实现了PrefixTuning、PromptTuning、PTuning、Adapter、LoRA、AdaLoRA这些方法配置文件的构造、解析，新增训练参数模型的构造，各种PEFT方法配置文件类之间的继承关系，如下：</p> 
+<pre><code>PeftConfig -&gt; PromptLearningConfig -&gt; (PrefixTuningConfig、PromptEncoderConfig、PromptTuningConfig)
+
+PeftConfig -&gt; LoraConfig -&gt; AdaLoraConfig
+
+PushToHubMixin -&gt; PeftConfigMixin -&gt; PeftConfig</code></pre> 
+<p style="margin-left:.0001pt;text-align:left;">        下面先看一下PrefixTuning、PromptTuning、PTuningV1模块的输入、输出情况：</p> 
+<p style="margin-left:.0001pt;text-align:left;"><strong>Prefix-Tuning</strong></p> 
+<p>PrefixEncoder(<br>   (embedding): Embedding(20, 18432)<br> )<br> 在每一层transformer block的key和value的前面都加上virtual embedding，2 * layers * hidden = 2 * 12 * 768 = 18432，其中2就对应key和value </p> 
+<pre><code class="language-python">from peft import PrefixEncoder, PrefixTuningConfig
+import torch
+
+config = PrefixTuningConfig(
+    peft_type="PREFIX_TUNING",
+    task_type="SEQ_2_SEQ_LM",
+    num_virtual_tokens=20,
+    token_dim=768,
+    num_transformer_submodules=1,
+    num_attention_heads=12,
+    num_layers=12,
+    encoder_hidden_size=768,
+    prefix_projection=False
+)
+print(config)
+
+# 初始化PrefixEncoder
+prefix_encoder = PrefixEncoder(config)
+print(prefix_encoder)
+</code></pre> 
+<p style="margin-left:.0001pt;text-align:left;"><strong>Prompt-Tuning</strong></p> 
+<p>PromptEmbedding(<br>   (embedding): Embedding(20, 768)<br> )<br> 只在输入层的原始序列上面添加prompt embedding </p> 
+<pre><code class="language-python">from peft import PromptTuningConfig, PromptEmbedding
+import torch
+
+word_embedding = torch.nn.Embedding(num_embeddings=100, embedding_dim=768)
+config = PromptTuningConfig(
+    peft_type="PROMPT_TUNING",
+    task_type="SEQ_2_SEQ_LM",
+    num_virtual_tokens=20,
+    token_dim=768,
+    num_transformer_submodules=1,
+    num_attention_heads=12,
+    num_layers=12,
+    # encoder_hidden_size=768
+)
+print(config)
+
+# 初始化PromptEncoder
+prompt_encoder = PromptEmbedding(config, word_embedding)
+print(prompt_encoder)
+</code></pre> 
+<p><strong>PTuningV1</strong></p> 
+<p>PromptEncoder(<br>   (embedding): Embedding(20, 768)<br>   (mlp_head): Sequential(<br>     (0): Linear(in_features=768, out_features=768, bias=True)<br>     (1): ReLU()<br>     (2): Linear(in_features=768, out_features=768, bias=True)<br>     (3): ReLU()<br>     (4): Linear(in_features=768, out_features=768, bias=True)<br>   )<br> )<br> 只在输入层的原始序列上面添加prompt embedding，并且使用了MLP加强学习能力 </p> 
+<pre><code class="language-python">from peft import PromptEncoderConfig, PromptEncoder
+import torch
+
+config = PromptEncoderConfig(
+    peft_type="PREFIX_TUNING",
+    task_type="SEQ_2_SEQ_LM",
+    num_virtual_tokens=20,
+    token_dim=768,
+    num_transformer_submodules=1,
+    num_attention_heads=12,
+    num_layers=12,
+    encoder_hidden_size=768,
+    # prefix_projection=False
+)
+print(config)
+
+# 初始化PrefixEncoder
+p_encoder = PromptEncoder(config)
+print(p_encoder)
+</code></pre> 
+<p><strong> PTuningV2</strong></p> 
+<p>PrefixEncoder(<br>   (embedding): Embedding(20, 768)<br>   (transform): Sequential(<br>     (0): Linear(in_features=768, out_features=768, bias=True)<br>     (1): Tanh()<br>     (2): Linear(in_features=768, out_features=18432, bias=True)<br>   )<br> )<br> 与PrefixTuning一样（实际上也是使用同一个类来实现的），在每一层transformer block的key和value的前面都加上virtual embedding，2 * layers * hidden = 2 * 12 * 768 = 18432，2对应的就是key和value </p> 
+<pre><code class="language-python">from peft import PrefixEncoder, PrefixTuningConfig
+import torch
+
+config = PrefixTuningConfig(
+    peft_type="PREFIX_TUNING",
+    task_type="SEQ_2_SEQ_LM",
+    num_virtual_tokens=20,
+    token_dim=768,
+    num_transformer_submodules=1,
+    num_attention_heads=12,
+    num_layers=12,
+    encoder_hidden_size=768,
+    prefix_projection=True
+)
+print(config)
+
+# 初始化PrefixEncoder
+prefix_encoder = PrefixEncoder(config)
+print(prefix_encoder)
+</code></pre> 
+<p>        PrefixTuning和PTuningV2在实现上基本上是一样的，其实就是一样的。下面是peft作者回复的关于PrefixTuning和PTuningV2在实现上的关系。</p> 
+<p class="img-center"><img alt="" height="838" src="https://images2.imgbox.com/90/86/hOi9ePQm_o.png" width="1138"></p> 
+<p><strong>LoRA</strong></p> 
+<pre><code class="language-python">from peft import LoraConfig, LoraModel, get_peft_model
+from peft.tuners.lora import LoraLayer
+import os
+from transformers import AutoModelForSequenceClassification
+from torch import nn
+from typing import Any, List, Optional, Union
+
+os.environ["HF_HOME"] = "./hf_downloads"
+
+
+model_name_or_path = "bert-base-chinese"
+tokenizer_name_or_path = "bert-base-chinese"
+
+lora_config = LoraConfig(
+    peft_type="LORA",
+    task_type="SEQ_2_SEQ_LM",
+    inference_mode=False,
+    # 如果r=0，bias='all'，就变成了了BitFit微调方法
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.1,
+    fan_in_fan_out=False,
+    # bias -&gt; none 所有层的bias都不微调
+    # bias -&gt; all 所有层的bias都微调
+    # bias -&gt; lora_only 只有LoRA相关层的bias进行微调
+    # bias 对应BitFit高效微调方法
+    bias='lora_only'
+)
+
+model = AutoModelForSequenceClassification.from_pretrained(model_name_or_path)
+model = get_peft_model(model, lora_config)
+print(model)</code></pre> 
+<p>         打印出来的model结构中包含LoRA在query和value部分添加的权重参数：</p> 
+<pre><code class="language-python">PeftModelForSeq2SeqLM(
+  (base_model): LoraModel(
+    (model): BertForSequenceClassification(
+      (bert): BertModel(
+        (embeddings): BertEmbeddings(
+          (word_embeddings): Embedding(21128, 768, padding_idx=0)
+          (position_embeddings): Embedding(512, 768)
+          (token_type_embeddings): Embedding(2, 768)
+          (LayerNorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+        )
+        (encoder): BertEncoder(
+          (layer): ModuleList(
+            (0-11): 12 x BertLayer(
+              (attention): BertAttention(
+                (self): BertSelfAttention(
+                  (query): Linear(
+                    in_features=768, out_features=768, bias=True
+                    (lora_dropout): ModuleDict(
+                      (default): Dropout(p=0.1, inplace=False)
+                    )
+                    (lora_A): ModuleDict(
+                      (default): Linear(in_features=768, out_features=8, bias=False)
+                    )
+                    (lora_B): ModuleDict(
+                      (default): Linear(in_features=8, out_features=768, bias=False)
+                    )
+                    (lora_embedding_A): ParameterDict()
+                    (lora_embedding_B): ParameterDict()
+                  )
+                  (key): Linear(in_features=768, out_features=768, bias=True)
+                  (value): Linear(
+                    in_features=768, out_features=768, bias=True
+                    (lora_dropout): ModuleDict(
+                      (default): Dropout(p=0.1, inplace=False)
+                    )
+                    (lora_A): ModuleDict(
+                      (default): Linear(in_features=768, out_features=8, bias=False)
+                    )
+                    (lora_B): ModuleDict(
+                      (default): Linear(in_features=8, out_features=768, bias=False)
+                    )
+                    (lora_embedding_A): ParameterDict()
+                    (lora_embedding_B): ParameterDict()
+                  )
+                  (dropout): Dropout(p=0.1, inplace=False)
+                )
+                (output): BertSelfOutput(
+                  (dense): Linear(in_features=768, out_features=768, bias=True)
+                  (LayerNorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+                  (dropout): Dropout(p=0.1, inplace=False)
+                )
+              )
+              (intermediate): BertIntermediate(
+                (dense): Linear(in_features=768, out_features=3072, bias=True)
+                (intermediate_act_fn): GELUActivation()
+              )
+              (output): BertOutput(
+                (dense): Linear(in_features=3072, out_features=768, bias=True)
+                (LayerNorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+                (dropout): Dropout(p=0.1, inplace=False)
+              )
+            )
+          )
+        )
+        (pooler): BertPooler(
+          (dense): Linear(in_features=768, out_features=768, bias=True)
+          (activation): Tanh()
+        )
+      )
+      (dropout): Dropout(p=0.1, inplace=False)
+      (classifier): Linear(in_features=768, out_features=2, bias=True)
+    )
+  )
+)</code></pre> 
+<p>        下面看一下模型里面的可训练参数有哪些，因为在LoraConfig中设置了bias参数为lora_only，所以所有lora层的bias参数也会被设置为可训练：</p> 
+<pre><code class="language-python">for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(name)</code></pre> 
+<pre><code class="language-python">base_model.model.bert.encoder.layer.0.attention.self.query.bias
+base_model.model.bert.encoder.layer.0.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.0.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.0.attention.self.value.bias
+base_model.model.bert.encoder.layer.0.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.0.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.1.attention.self.query.bias
+base_model.model.bert.encoder.layer.1.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.1.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.1.attention.self.value.bias
+base_model.model.bert.encoder.layer.1.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.1.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.2.attention.self.query.bias
+base_model.model.bert.encoder.layer.2.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.2.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.2.attention.self.value.bias
+base_model.model.bert.encoder.layer.2.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.2.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.3.attention.self.query.bias
+base_model.model.bert.encoder.layer.3.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.3.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.3.attention.self.value.bias
+base_model.model.bert.encoder.layer.3.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.3.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.4.attention.self.query.bias
+base_model.model.bert.encoder.layer.4.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.4.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.4.attention.self.value.bias
+base_model.model.bert.encoder.layer.4.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.4.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.5.attention.self.query.bias
+base_model.model.bert.encoder.layer.5.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.5.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.5.attention.self.value.bias
+base_model.model.bert.encoder.layer.5.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.5.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.6.attention.self.query.bias
+base_model.model.bert.encoder.layer.6.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.6.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.6.attention.self.value.bias
+base_model.model.bert.encoder.layer.6.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.6.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.7.attention.self.query.bias
+base_model.model.bert.encoder.layer.7.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.7.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.7.attention.self.value.bias
+base_model.model.bert.encoder.layer.7.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.7.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.8.attention.self.query.bias
+base_model.model.bert.encoder.layer.8.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.8.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.8.attention.self.value.bias
+base_model.model.bert.encoder.layer.8.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.8.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.9.attention.self.query.bias
+base_model.model.bert.encoder.layer.9.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.9.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.9.attention.self.value.bias
+base_model.model.bert.encoder.layer.9.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.9.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.10.attention.self.query.bias
+base_model.model.bert.encoder.layer.10.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.10.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.10.attention.self.value.bias
+base_model.model.bert.encoder.layer.10.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.10.attention.self.value.lora_B.default.weight
+base_model.model.bert.encoder.layer.11.attention.self.query.bias
+base_model.model.bert.encoder.layer.11.attention.self.query.lora_A.default.weight
+base_model.model.bert.encoder.layer.11.attention.self.query.lora_B.default.weight
+base_model.model.bert.encoder.layer.11.attention.self.value.bias
+base_model.model.bert.encoder.layer.11.attention.self.value.lora_A.default.weight
+base_model.model.bert.encoder.layer.11.attention.self.value.lora_B.default.weight</code></pre> 
+<p>        下面将LoRA参数合并到预训练参数中，合并之后的模型和原始预训练模型一模一样：</p> 
+<pre><code class="language-python">merged_model = model.merge_and_unload()
+print(merged_model)</code></pre> 
+<pre><code class="language-python">BertForSequenceClassification(
+  (bert): BertModel(
+    (embeddings): BertEmbeddings(
+      (word_embeddings): Embedding(21128, 768, padding_idx=0)
+      (position_embeddings): Embedding(512, 768)
+      (token_type_embeddings): Embedding(2, 768)
+      (LayerNorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+      (dropout): Dropout(p=0.1, inplace=False)
+    )
+    (encoder): BertEncoder(
+      (layer): ModuleList(
+        (0-11): 12 x BertLayer(
+          (attention): BertAttention(
+            (self): BertSelfAttention(
+              (query): Linear(in_features=768, out_features=768, bias=True)
+              (key): Linear(in_features=768, out_features=768, bias=True)
+              (value): Linear(in_features=768, out_features=768, bias=True)
+              (dropout): Dropout(p=0.1, inplace=False)
+            )
+            (output): BertSelfOutput(
+              (dense): Linear(in_features=768, out_features=768, bias=True)
+              (LayerNorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+              (dropout): Dropout(p=0.1, inplace=False)
+            )
+          )
+          (intermediate): BertIntermediate(
+            (dense): Linear(in_features=768, out_features=3072, bias=True)
+            (intermediate_act_fn): GELUActivation()
+          )
+          (output): BertOutput(
+            (dense): Linear(in_features=3072, out_features=768, bias=True)
+            (LayerNorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+    )
+    (pooler): BertPooler(
+      (dense): Linear(in_features=768, out_features=768, bias=True)
+      (activation): Tanh()
+    )
+  )
+  (dropout): Dropout(p=0.1, inplace=False)
+  (classifier): Linear(in_features=768, out_features=2, bias=True)
+)</code></pre> 
+<hr> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:left;">        下面以peft_model.py文件中PeftModelForSequenceClassification的forward函数实现为例，看一下在推理阶段如何对于PrefixTuning、PromptTuning、PTuningV1、PTuningV2、Adapter、LoRA进行操作。</p> 
+<p style="text-align:left;">        1、首先通过配置文件的所继承的父类类型来判断PEFT方法是否属于Prompt相关的，如果不是，就表示使用的是Adapter、LoRA等方法，直接执行推理。LoRA的具体推理计算过程后面再补充</p> 
+<p class="img-center"><img alt="" height="300" src="https://images2.imgbox.com/2d/e7/z5UPJ2jQ_o.png" width="692"></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p style="text-align:left;">        2、如果通过配置文件的所继承的父类类型判断PEFT方法属于Prompt相关的，因为要在transformer block的序列开始位置添加虚拟token的embedding，所以也要补全attention mask</p> 
+<p class="img-center"><img alt="" height="362" src="https://images2.imgbox.com/9f/57/DK4ULr1w_o.png" width="692"></p> 
+<p style="text-align:left;">        3、通过配置文件的类型来判断PEFT方法到底是PrefixTuning/PTuningV2，还是PromptTuning/PTuningV1。如果是PromptTuning/PTuningV1，则将虚拟token的embedding直接concat到原始输入序列的前面，送入base model模型进行推理。如果是PrefixTuning/PTuningV2，由于涉及到给每一个transformer block的key和value添加虚拟token的embedding，还需要使用_prefix_tuning_forward函数进行额外的处理。</p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p class="img-center"><img alt="" height="410" src="https://images2.imgbox.com/7e/92/FzFnqTtU_o.png" width="692"></p> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:left;"><strong><strong>PromptTuning/PTuningV1源码</strong></strong></p> 
+<p style="margin-left:.0001pt;text-align:left;">        PromptTuning和PTuningV1的共同点都是使用了浅层的Prompt，只在输入层使用。所以PromptTuning和PTuningV1在使用时的方式基本相同。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        PromptTuning的源码详见src/peft/tuners/prompt_tuning.py，里面包含了相关的配置项以及Encoder的创建过程。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        PTuningV1的源码详见src/peft/tuners/p_tuning.py，里面包含了相关的配置项以及Encoder的创建过程。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        PromptTuning/PTuningV1的推理过程就是将虚拟token的embedding直接concat到原始输入序列的前面，并对attention mask进行扩充，送入base model模型进行推理。对应上面讲到的2和3。</p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><strong><strong>PrefixTuning/PTuningV2源码</strong></strong></p> 
+<p style="margin-left:.0001pt;text-align:left;">        PrefixTuning和PTuningV2的共同点都是使用了深层的Prompt，在每层Transformer Block都使用，所以PrefixTuning和PTuningV2的实现放在一起。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        上面说到当执行的PEFT类型是PrefixTuning/PTuningV2时，由于要给每个Transformer Block的Key和Value前面都加上可以学习的virtual token embedding，需要使用_prefix_tuning_forward函数进行额外的处理。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        在看_prefix_tuning_forward函数之前先了解一些相关知识。自然语言处理任务可以分为Auto-Encoding（也叫NLU、自然语言理解、Masked Language Model）和Auto-Regressive（也叫NLG、自然语言生成、Language Model）。对于Auto-Encoding类型的任务，在模型的训练和预测阶段，self-attention都可以并行计算。对于Auto-Regressive类型的任务，在模型训练阶段通过使用attention mask也能够进行并行计算，但是在模型预测阶段，由于是时序生成任务，只能一步一步的生成，没办法并行。我们来看一下在生成阶段每个时间步有哪些计算：</p> 
+<p style="margin-left:.0001pt;text-align:left;">        <strong>时间步t：</strong></p> 
+<p style="margin-left:.0001pt;text-align:left;">        Query：来自前一个时间步t-1时刻的输出，使用query矩阵（就是一个全连接层）转换之后得到</p> 
+<p style="margin-left:.0001pt;text-align:left;">        Key：来自前t-1个时间步[1,……,t-1]的输出，使用key矩阵（就是一个全连接层）转换之后得到</p> 
+<p style="margin-left:.0001pt;text-align:left;">        Value：来自前t-1个时间步[1,……,t-1]的输出，使用value矩阵（就是一个全连接层）转换之后得到</p> 
+<p style="margin-left:.0001pt;text-align:left;">        <strong>时间步t + 1：</strong></p> 
+<p style="margin-left:.0001pt;text-align:left;">        Query：来自前一个时间步t时刻的输出，使用query矩阵（就是一个全连接层）转换之后得到</p> 
+<p style="margin-left:.0001pt;text-align:left;">        Key：来自前t个时间步[1,……,t-1,t]的输出，使用key矩阵（就是一个全连接层）转换之后得到</p> 
+<p style="margin-left:.0001pt;text-align:left;">        Value：来自前t个时间步[1,……,t-1,t]的输出，使用value矩阵（就是一个全连接层）转换之后得到</p> 
+<p style="margin-left:.0001pt;text-align:left;">        可以看到，每个时间步的Query都和上一个时间步的输出相关，每一步都需要重新计算Query，但是key和value来自前t-1个时间步的输出相关，所以t+1时刻的key和value与t时刻的key和value在[1,……,t-1]时刻上的计算结果是相同的，也就是这些结果是可以复用的，在每个时刻可以复用前一时刻计算的key和value，然后追加上当前时刻新增的key和value，构成完整的key和value。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        在hugging face实现的self-attention模块中，为了复用decode生成阶段的key和value，会传入一个past_key_values参数，如果past_key_values不是None，表示前面时间步已经有计算结果了，直接复用上一步的结果，然后将当前时间步的key和value拼接上去，更新后的past_key_values将继续传递到下一个时间步。</p> 
+<p style="margin-left:.0001pt;text-align:left;">        有了上面的背景知识，对于_prefix_tuning_forward函数中关于PrefixTuning/PTuningV2方法的实现就很好理解了，就是将生成的virtual token embedding通过past_key_values参数带入到transformer block的每一层，放在每一层key和value的前面。</p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p class="img-center"><img alt="" height="825" src="https://images2.imgbox.com/d8/22/I8em2q1Y_o.png" width="1067"></p> 
+<p></p> 
+<p><strong>LoRA源码</strong></p> 
+<p style="margin-left:.0001pt;text-align:left;">        LoRA算法的主要流程可以分为以下几步：</p> 
+<ol><li style="text-align:left;">根据LoraConfig中的target_module参数在base model中找到需要进行Lora操作的module</li><li style="text-align:left;">为找到的target module添加Lora相关参数，将进行Lora操作之后的module封装成LoraLayer层，然后使用Lora后的新module替换掉base model中老的module。</li><li style="text-align:left;">在训练阶段，将新添加的Lora参数和bias参数（如果bias设置为all或者lora_only的话）设置为可训练的，requires_grad=True，其余预训练参数都冻结</li><li style="text-align:left;">在推理阶段，将所有参数设置为requires_grad=False，并将做了Lora操作的层进行参数融合，将新添加的Lora参数融合到预训练参数中</li></ol> 
+<p style="margin-left:.0001pt;text-align:justify;">        上述这些流程在add_adapter函数中进行串联起来：</p> 
+<pre><code class="language-python">    def add_adapter(self, adapter_name, config=None):
+        if config is not None:
+            # 基于model config更新lora config，主要补充的是target_module参数
+            model_config = self.model.config.to_dict() if hasattr(self.model.config, "to_dict") else self.model.config
+            config = self._prepare_lora_config(config, model_config)
+            self.peft_config[adapter_name] = config
+        # 根据target module参数，在base model中寻找并更新目标模块，将lora相关内容更新到模型架构中
+        self._find_and_replace(adapter_name)
+        if len(self.peft_config) &gt; 1 and self.peft_config[adapter_name].bias != "none":
+            raise ValueError(
+                "LoraModel supports only 1 adapter with bias. When using multiple adapters, set bias to 'none' for all adapters."
+            )
+        # 设置只有lora相关的参数可以微调，冻结其他参数
+        mark_only_lora_as_trainable(self.model, self.peft_config[adapter_name].bias)
+        if self.peft_config[adapter_name].inference_mode:
+            # 在推理模式下冻结所有参数
+            _freeze_adapter(self.model, adapter_name)</code></pre> 
+<p style="margin-left:.0001pt;text-align:left;">基于上述流程，Lora源码主要包括以下大的模块（类）：</p> 
+<p style="text-align:left;">1、LoraConfig：Lora配置文件</p> 
+<p style="text-align:left;">        a)、LoraConfig中记录Lora相关的配置参数，其中重点看一下target_module、bias、modules_to_save这几个参数。</p> 
+<p style="text-align:left;">        b)、target_module参数用来指出base model中叫什么名字的参数需要执行Lora操作，在other.py中TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING列出了每个模型中需要进行Lora操作的参数名称。</p> 
+<p style="text-align:left;">        c)、bias对应的就是BitFit参数微调方法，就是在微调时是否微调bias参数：</p> 
+<pre><code># bias -&gt; none 所有层的bias都不微调
+# bias -&gt; all 所有层的bias都微调
+# bias -&gt; lora_only 只有LoRA相关层的bias进行微调</code></pre> 
+<p style="margin-left:.0001pt;text-align:left;">        modules_to_save用来存放哪些模型参数是重新训练过的，保存模型的时候可以只保存这些参数，其他的都是预训练参数，可以不保存。</p> 
+<p style="text-align:left;">2、LoraLayer：用于记录Lora相关参数，初始化Lora部分的模型。在LoraLayer部分目前仅支持两种子模型的Lora操作，分别是nn.Embedding和nn.Linear（Conv1D等价于nn.Linear），下面看一下这部分主要的三个类：</p> 
+<p style="margin-left:.0001pt;text-align:justify;">        a)、LoraLayer：LoraLayer中实现了在Linear层中添加Lora操作的方法update_layer和在Embedding层中添加Lora操作的update_layer_embedding方法，这两个方法中根据原始参数形状初始化了Lora参数，分别在子类Linear和子类Embedding中调用。</p> 
+<p class="img-center"><img alt="" height="356" src="https://images2.imgbox.com/c3/c8/a9VBAMth_o.png" width="692"></p> 
+<p class="img-center"><img alt="" height="411" src="https://images2.imgbox.com/13/3a/q7lw5I5i_o.png" width="692"></p> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:justify;">        b)、Linear：Linear层继承nn.Linear和LoraLayer，实现了在nn.Linear层和Conv1D层（hugging face的transformers中实现）中使用Lora。使用nn.Linear创建和原始参数相同形状的参数，后面用来存储预训练的参数部分，使用LoraLayer的update_layer函数创建Lora新增的参数部分，这样就将一个Linear子模块改造成了添加了Lora的子模块。Linear层中还实现了merge和unmerge函数用来将Lora参数合入原始Linear层的预训练参数中，或者将Lora参数从原始Linear层的参数中分离出来。</p> 
+<p class="img-center"><img alt="" height="458" src="https://images2.imgbox.com/08/1e/PyliZIQG_o.png" width="692"></p> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:justify;">        c)、Embedding：Embedding层继承nn.Embedding和LoraLayer，与Linear的实现几乎一样，Embedding也是创建了和原始Embedding参数相同形状的参数，后面用来存储预训练的参数部分，使用update_layer_embedding函数创建Lora新增的参数部分，这样就将一个Embedding子模块改造成了添加了Lora的子模块。Embedding层中也实现了merge和unmerge函数用来将Lora参数合入原始Embedding层的预训练参数中，或者将Lora参数从原始Embedding层的参数中分离出来。</p> 
+<p class="img-center"><img alt="" height="477" src="https://images2.imgbox.com/08/8f/4iu37NCp_o.png" width="692"></p> 
+<p>3、LoraModel：基于上述组件，LoraModel可以拆解为以下部分：</p> 
+<p style="text-align:left;">        a)、遍历base model的所有子module，根据LoraConfig中的target_module参数找到需要进行Lora操作的module，在LoraModel的_find_and_replace函数中实现</p> 
+<p class="img-center"><img alt="" height="285" src="https://images2.imgbox.com/5c/bd/kUj0TVSy_o.png" width="692"></p> 
+<p></p> 
+<p style="text-align:left;">        b)、基于上一步找到的target module，找到其父模块parent，并为找到的target module添加Lora相关参数，将进行Lora操作之后的module封装成LoraLayer层</p> 
+<p class="img-center"><img alt="" height="50" src="https://images2.imgbox.com/47/54/uOCUnL7v_o.png" width="692"></p> 
+<p class="img-center"><img alt="" height="534" src="https://images2.imgbox.com/06/20/soUzT6eC_o.png" width="692"></p> 
+<p></p> 
+<p style="margin-left:.0001pt;text-align:left;"><strong><strong>备注：</strong></strong>当前PEFT版本中支持进行Lora的层只有nn.Linear、nn.Embedding和Conv1D（来自hugging face的transformers库，实际上就是一个weight做了转置的nn.Linear层）。根据重参数化Reparameterization的思想（重参数化详见RepVGG），卷积操作也可以使用Lora，peft-main分支里面已经正在开发这个功能了。</p> 
+<p style="text-align:left;">        c)、根据找到的target module的父模块，使用Lora后的新module替换掉base model中对应的老的module，在_replace_module函数中实现</p> 
+<p class="img-center"><img alt="" height="462" src="https://images2.imgbox.com/33/d9/D1IAv9VK_o.png" width="692"></p> 
+<p></p> 
+<p style="text-align:left;">        d)、在训练阶段，将新添加的Lora参数和bias参数（如果bias设置为all或者lora_only的话）设置为可训练的，requires_grad=True，其余预训练参数都冻结</p> 
+<p class="img-center"><img alt="" height="418" src="https://images2.imgbox.com/de/9c/2ZlNTFtL_o.png" width="692"></p> 
+<p></p> 
+<p style="text-align:left;">        e)、在推理阶段，将所有参数设置为requires_grad=False，并将做了Lora操作的层进行参数融合，将新添加的Lora参数融合到预训练参数中</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/4e7c144d676d4c4927b266d5a431244a/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">MySQL-多表设计-一对多</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/4112a8339148fc034a3d043da55bfd00/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">企业微信双开实操记录</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

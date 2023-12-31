@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>深入探讨：Elasticsearch索引的构建与优化 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="深入探讨：Elasticsearch索引的构建与优化" />
+<meta property="og:description" content="最近在做es相关的工作，所以记录下自己的一些想法，可能很多方面不会很全面，但是基本都是经过验证的。本文主要是围绕着思考，从多个方面进行考虑，怎么设计索引比较好，直接进入主题吧，本文的es版本为elasticsearch7.8.1。
+一、索引设计的重要性 首先索引创建后，索引的分片只能通过_split和_shrink接口对其进行成倍的增加和缩减，主要是因为es的数据是通过_routing分配到各个分片上面的，所以本质上是不推荐去改变索引的分片数量的，因为这样都会对数据进行重新的移动。还有就是索引只能新增字段，不能对字段进行修改和删除，缺乏灵活性，所以每次都只能通过_reindex重建索引了。还有就是一个分片的大小以及所以分片数量的多少严重影响到了索引的查询和写入性能。所以可想而知，设计一个好的索引能够减少后期的运维管理和提高不少性能。所以前期对索引的设计是相当的重要的。
+好的索引设计在整个集群规划中占据举足轻重的作用，索引的设计直接影响集群设计的好坏和复杂度。好的索引设计应该是充分结合业务场景的时间维度和空间维度，结合业务场景充分考量增、删、改、查等全维度设计的。好的索引设计是完全基于“设计先行，编码在后”的原则，前期会花很长时间，为的是后期工作更加顺畅，避免不必要的返工 二、如何设计索引 在设计索引之前我们要明白索引有些什么内容，明白索引的构成，比如索引的基本配置setting，映射mapping，还有重要的分片，副本，模板，索引的生命周期等。知道这些之后就可以有针对性的设计了。首先要结合公司的业务场景，数据量的大小，每天增量如何，数据的特点，会不会对历史数据进行重新更新。数据存多久，是永久还是有一定的周期。数据需要准实时呢还是不需要准实时呢。所以清楚索引的构成和知道业务场景，才能够结合起来做更好的设计。
+2.1、考虑索引的公共基本配置 由于elasticsearch7.x不允许把索引级别的设置配置在elasticsearch.yml中，所以需要对每个索引进行单独的配置，这样的话就比较麻烦，所以可以把这些公共的配置配置在索引模板中，这样就可以在新建索引的时候可以自动的设置到索引中，关于索引模板的操作可以看考：聊聊elasticsearch7.8的模板和动态映射
+接下来看看一些常用索引级别的配置
+当然索引的配置还有很多其他的，可以根据实际情况进行调整，这样就可以把需要配置公共索引配置设计成索引模板：
+这样新建index-开头的索引的时候都会默认配置好如上的配置，这样就是考虑到基本设置公共化。
+2.2、索引命名规范 这部分主要说下索引命名规范，包括别名，通过别名可以使得索引的操作变得更加灵活，一个索引可以有多个别名，当然一个别名可以配置多个索引，这样的话就极大的增加了索引的的灵活性。在索引的命名上规定特殊字段开头，同样对其方便进行权限控制，关于权限控制可以参考：elasticsearch7.8权限控制和规划
+必须严格按照如下命名格式：（否则将无法使用，因为这里设置了相关权限）；
+索引命名规范：index-{行业}-{业务}-{版本}别名命名规范：index-{行业}-{业务} 如果是索引拆分后（有多个索引），需要一个全局的读的别名对所有拆分后的所有进行命名，和一个最新索引写的别名（只对可更新的索引），如果这里没有描述清楚，请见2.5大索引的设计，两个别名可规范如下：
+读别名：index-{行业}-{业务}-read写别名：index-{行业}-{业务}-insert 2.3、mapping的设计 mapping设置主要就是怎么选择数据类型，分词等
+中文分词：推荐使用：&#34;analyzer&#34;: &#34;ik_max_word&#34; ，这样可以更细粒度的进行中文分词
+设置字段的时候，务必过一下如下图示的流程。根据实际业务需要，主要关注点：
+数据类型选型；是否需要检索；是否需要排序&#43;聚合分析；是否需要另行存储 核心参数的含义，梳理如下
+2.4、分片的设计
+这个很重要，直接影响到后期的管理和性能。
+Elasticsearch中的数据组织成索引。每一个索引由一个或多个分片组成。每个分片是Luncene索引的一个实例，你可以把实例理解成自管理的搜索引擎，用于在Elasticsearch集群中对一部分数据进行索引和处理查询。
+分片设计原则
+推荐每个分片的大小：20-40G，建议不超过30G，但是也会有特殊的情况，有些索引字段少，但是数据量大，这样的话也可以增加一些分片数确保每个节点的分片数量保持在低于每1GB堆内存对应集群的分片在20-25之间。 因此，具有30GB堆内存的节点最多可以有600-750个分片每个索引的分片：一般为节点数的1-3倍，假设我们有15个数据节点，则15*3*40G=1.8T，这样一个索引最多设置真的大，如果超过了，就需要参考大索引的设计分片数量尽量为数据节点的倍数，这样就可以使得数据进来均衡，但是数据量极少的索引，根据情况进行分片数量的设计 下面写一个简单的参考表（都可以根据实际情况进行调整，只是个人的建议）：
+索引的大小分片数量设置0-20G220-100G8100-400G15400-900G30900G-1.6T45
+如上设置是基于15个数据节点进行配置的，基本都给增量预留了一些空间，最好是根据实际情况进行设定，如果一个索引已经很大了，上面的配置不能满足了的话需要对对索引进行拆分了，使用索引模板&#43;Rollover&#43;索引生命周期进行自动滚动，拆分索引。见2.5节
+2.5、大索引的设计 当一个索引太大时就会有很多的风险，首先会影响性能，当分片数一定的情况下，数据越来越多，一个分片就会越来越大，就会违背了上面的设计原则，其次就是一个索引出问题，很难恢复，并且影响范围广，那如何对很大的索引进行设计呢。可以使用索引模板&#43;Rollover&#43;生命周期进行自动滚动创建索引，所有的索引都用一个别名进行读，并且设置一个索引为写，这样就能够很好的拆分索引。先看看这么设计的原理图。
+上面有三个索引，通过index_all索引进行检索，使用index_latest保证只写入到一个最新的索引中，每次索引满足三个条件（文档数，时间，索引大小）中的一个，就会自动的滚动生成新的索引。接下来做个实操，这样更方便理解。
+先来个官网，有兴趣的可以参考：https://www.elastic.co/guide/en/elasticsearch/reference/7.8/getting-started-index-lifecycle-management.html
+主要分为四个步骤：
+创建索引生命周期的规则创建索引模板并应用该生命周期初始化一个索引验证 首先创建生命周期的规则，对于索引的生命周期可以参考：对Elasticsearch生命周期的思考，如果数据是定期存储的，比如一些日志，只保留最近30天，这样的数据结合索引的生命周期可以自动的进行清理。我们首先创建一个策略policy_index，这里是测试，所以把时间调至5分钟，这些配置都应该根据实际情况进行设置。
+接下来设计索引模板，并且该策略应用进去。
+这里的模板只是为了演示该小节的内容，实际情况应该把基本配置以及mapping相关的设置好
+接下来就是创建一个索引了
+PUT index-test-000001 创建好之后，然后给索引添加别名index-test-insert，索引就自动有了两个别名，read负责读，insert负责写
+接下来，只要通过验证即可：GET index-*/_ilm/explain
+最后达到条件后就会自动生成新的索引，然后把index-test-insert别名切换到新的索引上面，就是这样子的
+大索引的设计就是拆分，很多都是根据时间进行切分索引的，如果记得没错的话，上面的000001这些可以配置为日期的。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/a3961a25c5a8e935128a3ccc4f002e28/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-11-25T13:54:15+08:00" />
+<meta property="article:modified_time" content="2023-11-25T13:54:15+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">深入探讨：Elasticsearch索引的构建与优化</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p><span style="background-color:rgb(255,255,255);color:rgba(0,0,0,.65);">最近在做es相关的工作，所以记录下自己的一些想法，可能很多方面不会很全面，但是基本都是经过验证的。本文主要是围绕着思考，从多个方面进行考虑，怎么设计索引比较好，直接进入主题吧，本文的es版本为elasticsearch7.8.1。</span><br></p> 
+<h2>一、索引设计的重要性</h2> 
+<p style="text-align:left;">首先索引创建后，索引的分片只能通过_split和_shrink接口对其进行成倍的增加和缩减，主要是因为es的数据是通过_routing分配到各个分片上面的，所以本质上是不推荐去改变索引的分片数量的，因为这样都会对数据进行重新的移动。还有就是索引只能新增字段，不能对字段进行修改和删除，缺乏灵活性，所以每次都只能通过_reindex重建索引了。还有就是一个分片的大小以及所以分片数量的多少严重影响到了索引的查询和写入性能。所以可想而知，设计一个好的索引能够减少后期的运维管理和提高不少性能。所以前期对索引的设计是相当的重要的。</p> 
+<ul><li>好的索引设计在整个集群规划中占据举足轻重的作用，索引的设计直接影响集群设计的好坏和复杂度。</li><li>好的索引设计应该是充分结合业务场景的时间维度和空间维度，结合业务场景充分考量增、删、改、查等全维度设计的。</li><li>好的索引设计是完全基于“设计先行，编码在后”的原则，前期会花很长时间，为的是后期工作更加顺畅，避免不必要的返工</li></ul> 
+<h2>二、如何设计索引</h2> 
+<p style="text-align:left;">在设计索引之前我们要明白索引有些什么内容，明白索引的构成，比如索引的基本配置setting，映射mapping，还有重要的分片，副本，模板，索引的生命周期等。知道这些之后就可以有针对性的设计了。首先要结合公司的业务场景，数据量的大小，每天增量如何，数据的特点，会不会对历史数据进行重新更新。数据存多久，是永久还是有一定的周期。数据需要准实时呢还是不需要准实时呢。所以清楚索引的构成和知道业务场景，才能够结合起来做更好的设计。</p> 
+<h2>2.1、考虑索引的公共基本配置</h2> 
+<p style="text-align:left;">由于elasticsearch7.x不允许把索引级别的设置配置在elasticsearch.yml中，所以需要对每个索引进行单独的配置，这样的话就比较麻烦，所以可以把这些公共的配置配置在索引模板中，这样就可以在新建索引的时候可以自动的设置到索引中，关于索引模板的操作可以看考：聊聊elasticsearch7.8的模板和动态映射</p> 
+<p style="text-align:left;">接下来看看一些常用索引级别的配置</p> 
+<p><img src="https://images2.imgbox.com/9f/78/EniSiHXC_o.jpg" alt="6f906f6c5f834e5c04c9031ff45dc257.jpeg"></p> 
+<p style="text-align:left;">当然索引的配置还有很多其他的，可以根据实际情况进行调整，这样就可以把需要配置公共索引配置设计成索引模板：</p> 
+<p style="text-align:left;"><img src="https://images2.imgbox.com/fd/ba/PaszdnYs_o.jpg" alt="66100494709e5394184e672a022b1b5e.jpeg">这样新建index-开头的索引的时候都会默认配置好如上的配置，这样就是考虑到基本设置公共化。</p> 
+<h2>2.2、索引命名规范</h2> 
+<p style="text-align:left;">这部分主要说下索引命名规范，包括别名，通过别名可以使得索引的操作变得更加灵活，一个索引可以有多个别名，当然一个别名可以配置多个索引，这样的话就极大的增加了索引的的灵活性。在索引的命名上规定特殊字段开头，同样对其方便进行权限控制，关于权限控制可以参考：elasticsearch7.8权限控制和规划</p> 
+<p style="text-align:left;">必须严格按照如下命名格式：（否则将无法使用，因为这里设置了相关权限）；</p> 
+<ul><li><strong>索引命名规范：index-{行业}-{业务}-{版本}</strong></li><li><strong>别名命名规范：index-{行业}-{业务}</strong></li></ul> 
+<p style="text-align:left;"><strong> </strong>如果是索引拆分后（有多个索引），需要一个全局的读的别名对所有拆分后的所有进行命名，和一个最新索引写的别名（只对可更新的索引），如果这里没有描述清楚，请见<strong>2.5大索引的设计</strong>，两个别名可规范如下：</p> 
+<ul><li>读别名：index-{行业}-{业务}-read</li><li>写别名：index-{行业}-{业务}-insert</li></ul> 
+<h2>2.3、mapping的设计</h2> 
+<p style="text-align:left;">mapping设置主要就是怎么选择数据类型，分词等</p> 
+<p style="text-align:left;">中文分词：推荐使用："analyzer": "ik_max_word" ，这样可以更细粒度的进行中文分词</p> 
+<p style="text-align:left;">设置字段的时候，务必过一下如下图示的流程。根据实际业务需要，主要关注点：</p> 
+<ul><li>数据类型选型；</li><li>是否需要检索；</li><li>是否需要排序+聚合分析；</li><li>是否需要另行存储</li></ul> 
+<img src="https://images2.imgbox.com/af/ff/zYkEDOta_o.jpg" alt="eb3b85f08647b191f014189a6ffe9b74.jpeg"> 
+<p style="text-align:left;">核心参数的含义，梳理如下</p> 
+<img src="https://images2.imgbox.com/3d/ae/u9vyOvWc_o.jpg" alt="2e48620d9434a0f1c92b821c654b123c.jpeg"> 
+<p style="text-align:left;">2.4、分片的设计</p> 
+<p style="text-align:left;">这个很重要，直接影响到后期的管理和性能。</p> 
+<p style="text-align:left;">Elasticsearch中的数据组织成索引。每一个索引由一个或多个分片组成。每个分片是Luncene索引的一个实例，你可以把实例理解成自管理的搜索引擎，用于在Elasticsearch集群中对一部分数据进行索引和处理查询。</p> 
+<p style="text-align:left;">分片设计原则</p> 
+<ul><li>推荐每个分片的大小：20-40G，建议不超过30G，但是也会有特殊的情况，有些索引字段少，但是数据量大，这样的话也可以增加一些分片数</li><li>确保每个节点的分片数量保持在低于每1GB堆内存对应集群的分片在20-25之间。 因此，具有30GB堆内存的节点最多可以有600-750个分片</li><li>每个索引的分片：一般为节点数的1-3倍，假设我们有15个数据节点，则15*3*40G=1.8T，这样一个索引最多设置真的大，如果超过了，就需要参考大索引的设计</li><li>分片数量尽量为数据节点的倍数，这样就可以使得数据进来均衡，但是数据量极少的索引，根据情况进行分片数量的设计</li></ul> 
+<p style="text-align:left;">下面写一个简单的参考表（都可以根据实际情况进行调整，只是个人的建议）：</p> 
+<p>索引的大小分片数量设置0-20G220-100G8100-400G15400-900G30900G-1.6T45</p> 
+<p style="text-align:left;">如上设置是基于15个数据节点进行配置的，基本都给增量预留了一些空间，最好是根据实际情况进行设定，如果一个索引已经很大了，上面的配置不能满足了的话需要对对索引进行拆分了，使用索引模板+Rollover+索引生命周期进行自动滚动，拆分索引。见2.5节</p> 
+<h2>2.5、大索引的设计</h2> 
+<p style="text-align:left;">　　当一个索引太大时就会有很多的风险，首先会影响性能，当分片数一定的情况下，数据越来越多，一个分片就会越来越大，就会违背了上面的设计原则，其次就是一个索引出问题，很难恢复，并且影响范围广，那如何对很大的索引进行设计呢。可以使用索引模板+Rollover+生命周期进行自动滚动创建索引，所有的索引都用一个别名进行读，并且设置一个索引为写，这样就能够很好的拆分索引。先看看这么设计的原理图。</p> 
+<img src="https://images2.imgbox.com/22/99/pLNVi47J_o.jpg" alt="7387f2f9108a795bd1d52f2ac9dcc716.jpeg"> 
+<p style="text-align:left;">上面有三个索引，通过index_all索引进行检索，使用index_latest保证只写入到一个最新的索引中，每次索引满足三个条件（文档数，时间，索引大小）中的一个，就会自动的滚动生成新的索引。接下来做个实操，这样更方便理解。</p> 
+<p style="text-align:left;">先来个官网，有兴趣的可以参考：https://www.elastic.co/guide/en/elasticsearch/reference/7.8/getting-started-index-lifecycle-management.html</p> 
+<p style="text-align:left;">主要分为四个步骤：</p> 
+<ol><li>创建索引生命周期的规则</li><li>创建索引模板并应用该生命周期</li><li>初始化一个索引</li><li>验证</li></ol> 
+<p style="text-align:left;">首先创建生命周期的规则，对于索引的生命周期可以参考：对Elasticsearch生命周期的思考，如果数据是定期存储的，比如一些日志，只保留最近30天，这样的数据结合索引的生命周期可以自动的进行清理。我们首先创建一个策略policy_index，这里是测试，所以把时间调至5分钟，这些配置都应该根据实际情况进行设置。</p> 
+<img src="https://images2.imgbox.com/d7/13/QObuDR4S_o.jpg" alt="fb74fc79d45af3593422de38632b3b37.jpeg"> 
+<img src="https://images2.imgbox.com/87/ce/bfdYsSjG_o.jpg" alt="b7725deded9a4a7170a796ea88964af4.jpeg"> 
+<p style="text-align:left;"> 接下来设计索引模板，并且该策略应用进去。</p> 
+<p style="text-align:left;"><img src="https://images2.imgbox.com/e3/31/J0dlofre_o.jpg" alt="ec65bc9eb7340911d013477c559e2a60.jpeg"></p> 
+<p style="text-align:left;">这里的模板只是为了演示该小节的内容，实际情况应该把基本配置以及mapping相关的设置好</p> 
+<img src="https://images2.imgbox.com/29/6d/AbWWvEz7_o.jpg" alt="68584d9dab0fcd422b47adb98df89265.jpeg"> 
+<p style="text-align:left;">接下来就是创建一个索引了</p>PUT index-test-000001 
+<img src="https://images2.imgbox.com/21/b2/2gimT8af_o.jpg" alt="27cd1402a29ff48c866f3d713c84ec13.jpeg"> 
+<p style="text-align:left;"> 创建好之后，然后给索引添加别名index-test-insert，索引就自动有了两个别名，read负责读，insert负责写</p> 
+<img src="https://images2.imgbox.com/87/89/O0goxA7N_o.jpg" alt="2f04bca2cc02518054ca00d00aac2e99.jpeg"> 
+<p style="text-align:left;"> 接下来，只要通过验证即可：GET index-*/_ilm/explain</p> 
+<img src="https://images2.imgbox.com/96/93/lSMnJdff_o.jpg" alt="02208687bb26e1e74938bf6fbf302285.jpeg"> 
+<p style="text-align:left;">最后达到条件后就会自动生成新的索引，然后把index-test-insert别名切换到新的索引上面，就是这样子的</p> 
+<img src="https://images2.imgbox.com/14/4b/l4hrN85a_o.jpg" alt="2976b81937d75d2f46291103209a9dc2.jpeg"> 
+<p style="text-align:left;"> 大索引的设计就是拆分，很多都是根据时间进行切分索引的，如果记得没错的话，上面的000001这些可以配置为日期的。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/5ef33a68806e7e14d4198775fc789dfd/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Python学习笔记（4）元组的基础操作及方法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2dfb4b9687a8086a7cdfa3ef17990e88/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">机器学习探索计划——KNN算法流程的简易了解</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>应用调度和锁定对MySQL查询执行 优化 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="应用调度和锁定对MySQL查询执行 优化" />
+<meta property="og:description" content="数据库管理员工作中常会遇到让单独的查询执行的速度变快。MySQL还允许你改动语句调度的优先级，它可以使来自多个客户端的查询更好地协作，这样单个客户端就不会由于锁定而等待很长时间。改动优先级还可以确保特定类型的查询被处理得更快。下面我们来讲解MySQL的默认的调度策略和可以用来影响这些策略的选项。还有并发性插入操作的运用和存储引擎锁定层次对客户端的并发性的影响。为了讨论的方便，我们把执行检索(SELECT)的客户端称为&#34;读取者&#34;，把执行修改操作(DELETE、INSERT、REPLACE或UPDATE)的客户端称为&#34;写入者&#34;。
+MySQL的默认的调度策略可用总结如下：
+写入操作优先于读取操作。
+对某张数据表的写入操作某一时刻只能发生一次，写入请求按照它们到达的次序来处理。
+对某张数据表的多个读取操作可以同时地执行 。
+MyISAM和MEMORY存储引擎借助于数据表锁来实现这样的调度策略。当客户端访问某张表的时候，首先必须获取它的锁。当客户端完成对表的操作的时候，锁就会被解除。通过LOCK TABLES和UNLOCK TABLES语句来显式地获取或释放锁是可行的，但是在通常情况下，服务器的锁管理器会自动地在须要的时候获取锁，在不再须要的时候释放锁。获取的锁的类型依赖于客户端是写入还是读取操作。
+对某张表执行 写入操作的客户端必须拥有独占的(排他的)访问权的锁。操作在执行 的流程中，该数据表处于不一致的(inconsistent)状态，因为数据记录在删除、添加或修改的时候，数据表上的索引也可能须要更新以相互匹配。这个数据表在变化的流程中，如果允许其它的客户端访问，会出现疑问。非常明显，允许两个客户端同时写入一张数据表是不利的，因为这样的操作会很快使数据表中的信息成为一堆无用的垃圾。但是允许客户端读取变化之中的数据表也不好，因为正在读取的位置中的数据可能正在变化(修改)，读取的结果可能不是真实的。
+对某张表执行读取操作的客户端必须获取一个锁，防止 在读取的流程中，其它的客户端写入或改动表。但是这个锁不须要独占的访问权。读取操作不会改动数据，因此没有理由让某个读取者阻止其它的读取者访问这张表。因此读取锁允许其它的客户端在同一时刻读取这张表。
+MySQL提供了多个语句调节符，允许你修改它的调度策略：
+LOW_PRIORITY关键字运用 于DELETE、INSERT、LOAD DATA、REPLACE和UPDATE。
+HIGH_PRIORITY关键字运用 于SELECT和INSERT语句。
+DELAYED关键字运用 于INSERT和REPLACE语句。
+LOW_PRIORITY和HIGH_PRIORITY调节符影响那些运用数据表锁的存储引擎(例如MyISAM和MEMORY)。DELAYED调节符作用于MyISAM和MEMORY数据表。
+改动语句调度的优先级
+LOW_PRIORITY关键字影响DELETE、INSERT、LOAD DATA、REPLACE和UPDATE语句的执行调度。通常情况下，某张数据表正在被读取的时候，如果有写入操作到达，那么写入者一直等待读取者完成操作(查询开始之后就不能 中断，因此允许读取者完成操作)。如果写入者正在等待的时候，另一个读取操作到达了，该读取操作也会被阻塞(block)，因为默认的调度策略是写入者优先于读取者。当第一个读取者完成操作的时候，写入者开始操作，并且直到该写入者完成操作，第二个读取者才开始操作。
+如果写入操作是一个LOW_PRIORITY(低优先级)请求，那么系统就不会认为它的优先级高于读取操作。在这种情况下，如果写入者在等待的时候，第二个读取者到达了，那么就允许第二个读取者插到写入者之前。只有在没有其它的读取者的时候，才允许写入者开始操作。理论上，这种调度修改暗示着，可能存在LOW_PRIORITY写入操作永远被阻塞的情况。如果前面的读取操作在执行 的流程中一直有其它的读取操作到达，那么新的请求都会插入到LOW_PRIORITY写入操作之前。 SELECT查询的HIGH_PRIORITY(高优先级)关键字也类似。它允许SELECT插入正在等待的写入操作之前，即使在正常情况下写入操作的优先级更高。另外一种影响是，高优先级的SELECT在正常的SELECT语句之前执行，因为这些语句会被写入操作阻塞。
+如果你希望所有支撑 LOW_PRIORITY选项的语句都默认地按照低优先级来处理，那么请运用 --low-priority-updates选项来启动服务器。通过运用 INSERT HIGH_PRIORITY来把INSERT语句提高到正常的写入优先级，可以消除该选项对单个INSERT语句的影响。
+运用延迟插入操作
+DELAYED调节符运用 于INSERT和REPLACE语句。当DELAYED插入操作到达的时候，服务器把数据行放入一个队列中，并立即给客户端返回一个状态信息，这样客户端就可以在数据表被真实地插入记录之前继续执行 操作了。如果读取者从该数据表中读取数据，队列中的数据就会被保持着，直到没有读取者为止。接着服务器开始插入延迟数据行(delayed-row)队列中的数据行。在插入操作的同时，服务器还要检查能不能有新的读取请求到达和等待。如果有，延迟数据行队列就被挂起，允许读取者继续操作。当没有读取者的时候，服务器再次开始插入延迟的数据行。这个流程一直执行 ，直到队列空了为止。
+感觉上LOW_PRIORITY和DELAYED是相似的，两者都允许数据行插入操作被延迟，但是它们对客户端操作的影响却有很大的差异。LOW_ PRIORITY强迫客户端等待，直到那些数据行可以被插入数据表。DELAYED允许客户端继续操作，服务器在内存中缓冲那些数据行，直到自己有时间处理它们。
+如果其它的客户端可能运行很长的SELECT语句并且你不希望阻塞，等待插入操作完成的时候，INSERT DELAYED就非常有用处了。客户端提交INSERT DELAYED的时候可能处理得很快，因为服务器只是基本地把要插入的数据行排队。
+但是，你也必须知晓正常的INSERT与INSERT DELAYED行为之间的一些其它的差异。如果INSERT DELAYED语句包含语法不正确，客户端会得到一个不正确，但是却不能得到其它一些在正常情况下可以运用的信息。例如，当语句返回的时候，你不能依赖(得到)AUTO_INCREMENT(自动增长)值。同样，你不能得到唯一索引的副本数量。发生这种情况的原由在于插入操作在真实地被执行之前已经返回了状态信息。另一种可能出现的情况是，由于INSERT DELAYED语句的数据行都在内存中排队，当服务器崩溃或者运用 kill -9退出的时候，数据行可能丢失(正常情况下，kill -TERM终止命令不会导致这种情况，因为服务器在退出之前会把数据行插入表中)。
+运用并发的插入操作 MyISAM存储引擎有一条例外的准则，它允许读取者阻塞写入者。这种现象发生在MyISAM数据表中间没有&#34;空洞&#34;(可能是删除或更新数据行的结果)的情况下。当数据表没有&#34;空洞&#34;的时候，任何INSERT语句必然在末尾而不是中部添加数据行。在这种情况下，MySQL允许其它客户端在读取数据的同时向数据表添加数据行。这就是&#34;并发性插入操作&#34;，因为它们同时发生，检索并没有被阻塞。
+如果你希望运用并发性插入操作，请留心下面一些事项：
+在INSERT语句中不要运用 LOW_PRIORITY调节符。它会惹起 INSERT经常被读取者阻塞，因此阻碍了并发性插入操作的执行。
+如果读取者须要显式地锁定数据表以执行并发性插入操作，就应该运用 LOCK TABLES ... READ LOCAL，而不是LOCK TABLES ... READ。LOCAL关键字会获取一个锁，允许并发性操作继续执行 ，因为它只能运用 于数据表中已有的数据行，不会阻塞那些添加到末尾的新数据行。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/6d4aaff72f58dc39f04fba2556c3897a/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2010-09-08T16:06:00+08:00" />
+<meta property="article:modified_time" content="2010-09-08T16:06:00+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">应用调度和锁定对MySQL查询执行 优化</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>数据库管理员工作中常会遇到让单独的查询执行的速度变快。MySQL还允许你改动语句调度的优先级，它可以使来自多个客户端的查询更好地协作，这样单个客户端就不会由于锁定而等待很长时间。改动优先级还可以确保特定类型的查询被处理得更快。下面我们来讲解MySQL的默认的调度策略和可以用来影响这些策略的选项。还有并发性插入操作的运用和存储引擎锁定层次对客户端的并发性的影响。为了讨论的方便，我们把执行检索(SELECT)的客户端称为"读取者"，把执行修改操作(DELETE、INSERT、REPLACE或UPDATE)的客户端称为"写入者"。</p> 
+<p>　　<strong>MySQL的默认的调度策略可用总结如下：</strong></p> 
+<p>　　写入操作优先于读取操作。</p> 
+<p>　　对某张数据表的写入操作某一时刻只能发生一次，写入请求按照它们到达的次序来处理。</p> 
+<p>　　对某张数据表的多个读取操作可以同时地执行 。</p> 
+<p>　　MyISAM和MEMORY存储引擎借助于数据表锁来实现这样的调度策略。当客户端访问某张表的时候，首先必须获取它的锁。当客户端完成对表的操作的时候，锁就会被解除。通过LOCK TABLES和UNLOCK TABLES语句来显式地获取或释放锁是可行的，但是在通常情况下，服务器的锁管理器会自动地在须要的时候获取锁，在不再须要的时候释放锁。获取的锁的类型依赖于客户端是写入还是读取操作。</p> 
+<p>　　对某张表执行 写入操作的客户端必须拥有独占的(排他的)访问权的锁。操作在执行 的流程中，该数据表处于不一致的(inconsistent)状态，因为数据记录在删除、添加或修改的时候，数据表上的索引也可能须要更新以相互匹配。这个数据表在变化的流程中，如果允许其它的客户端访问，会出现疑问。非常明显，允许两个客户端同时写入一张数据表是不利的，因为这样的操作会很快使数据表中的信息成为一堆无用的垃圾。但是允许客户端读取变化之中的数据表也不好，因为正在读取的位置中的数据可能正在变化(修改)，读取的结果可能不是真实的。</p> 
+<p>　　对某张表执行读取操作的客户端必须获取一个锁，防止 在读取的流程中，其它的客户端写入或改动表。但是这个锁不须要独占的访问权。读取操作不会改动数据，因此没有理由让某个读取者阻止其它的读取者访问这张表。因此读取锁允许其它的客户端在同一时刻读取这张表。</p> 
+<p>　　MySQL提供了多个语句调节符，允许你修改它的调度策略：</p> 
+<p>　　LOW_PRIORITY关键字运用 于DELETE、INSERT、LOAD DATA、REPLACE和UPDATE。</p> 
+<p>　　HIGH_PRIORITY关键字运用 于SELECT和INSERT语句。</p> 
+<p>　　DELAYED关键字运用 于INSERT和REPLACE语句。</p> 
+<p>　　LOW_PRIORITY和HIGH_PRIORITY调节符影响那些运用数据表锁的存储引擎(例如MyISAM和MEMORY)。DELAYED调节符作用于MyISAM和MEMORY数据表。</p> 
+<p>　　<strong>改动语句调度的优先级</strong></p> 
+<p>　　LOW_PRIORITY关键字影响DELETE、INSERT、LOAD DATA、REPLACE和UPDATE语句的执行调度。通常情况下，某张数据表正在被读取的时候，如果有写入操作到达，那么写入者一直等待读取者完成操作(查询开始之后就不能 中断，因此允许读取者完成操作)。如果写入者正在等待的时候，另一个读取操作到达了，该读取操作也会被阻塞(block)，因为默认的调度策略是写入者优先于读取者。当第一个读取者完成操作的时候，写入者开始操作，并且直到该写入者完成操作，第二个读取者才开始操作。</p> 
+<p>如果写入操作是一个LOW_PRIORITY(低优先级)请求，那么系统就不会认为它的优先级高于读取操作。在这种情况下，如果写入者在等待的时候，第二个读取者到达了，那么就允许第二个读取者插到写入者之前。只有在没有其它的读取者的时候，才允许写入者开始操作。理论上，这种调度修改暗示着，可能存在LOW_PRIORITY写入操作永远被阻塞的情况。如果前面的读取操作在执行 的流程中一直有其它的读取操作到达，那么新的请求都会插入到LOW_PRIORITY写入操作之前。 </p> 
+<p> </p> 
+<p>　　SELECT查询的HIGH_PRIORITY(高优先级)关键字也类似。它允许SELECT插入正在等待的写入操作之前，即使在正常情况下写入操作的优先级更高。另外一种影响是，高优先级的SELECT在正常的SELECT语句之前执行，因为这些语句会被写入操作阻塞。</p> 
+<p>　　如果你希望所有支撑 LOW_PRIORITY选项的语句都默认地按照低优先级来处理，那么请运用 --low-priority-updates选项来启动服务器。通过运用 INSERT HIGH_PRIORITY来把INSERT语句提高到正常的写入优先级，可以消除该选项对单个INSERT语句的影响。</p> 
+<p>　　运用延迟插入操作</p> 
+<p>　　DELAYED调节符运用 于INSERT和REPLACE语句。当DELAYED插入操作到达的时候，服务器把数据行放入一个队列中，并立即给客户端返回一个状态信息，这样客户端就可以在数据表被真实地插入记录之前继续执行 操作了。如果读取者从该数据表中读取数据，队列中的数据就会被保持着，直到没有读取者为止。接着服务器开始插入延迟数据行(delayed-row)队列中的数据行。在插入操作的同时，服务器还要检查能不能有新的读取请求到达和等待。如果有，延迟数据行队列就被挂起，允许读取者继续操作。当没有读取者的时候，服务器再次开始插入延迟的数据行。这个流程一直执行 ，直到队列空了为止。</p> 
+<p>　　感觉上LOW_PRIORITY和DELAYED是相似的，两者都允许数据行插入操作被延迟，但是它们对客户端操作的影响却有很大的差异。LOW_ PRIORITY强迫客户端等待，直到那些数据行可以被插入数据表。DELAYED允许客户端继续操作，服务器在内存中缓冲那些数据行，直到自己有时间处理它们。</p> 
+<p>　　如果其它的客户端可能运行很长的SELECT语句并且你不希望阻塞，等待插入操作完成的时候，INSERT DELAYED就非常有用处了。客户端提交INSERT DELAYED的时候可能处理得很快，因为服务器只是基本地把要插入的数据行排队。</p> 
+<p>　　但是，你也必须知晓正常的INSERT与INSERT DELAYED行为之间的一些其它的差异。如果INSERT DELAYED语句包含语法不正确，客户端会得到一个不正确，但是却不能得到其它一些在正常情况下可以运用的信息。例如，当语句返回的时候，你不能依赖(得到)AUTO_INCREMENT(自动增长)值。同样，你不能得到唯一索引的副本数量。发生这种情况的原由在于插入操作在真实地被执行之前已经返回了状态信息。另一种可能出现的情况是，由于INSERT DELAYED语句的数据行都在内存中排队，当服务器崩溃或者运用 kill -9退出的时候，数据行可能丢失(正常情况下，kill -TERM终止命令不会导致这种情况，因为服务器在退出之前会把数据行插入表中)。</p> 
+<p><strong>运用并发的插入操作</strong> </p> 
+<p> </p> 
+<p>　　MyISAM存储引擎有一条例外的准则，它允许读取者阻塞写入者。这种现象发生在MyISAM数据表中间没有"空洞"(可能是删除或更新数据行的结果)的情况下。当数据表没有"空洞"的时候，任何INSERT语句必然在末尾而不是中部添加数据行。在这种情况下，MySQL允许其它客户端在读取数据的同时向数据表添加数据行。这就是"并发性插入操作"，因为它们同时发生，检索并没有被阻塞。</p> 
+<p>　　如果你希望运用并发性插入操作，请留心下面一些事项：</p> 
+<p>　　在INSERT语句中不要运用 LOW_PRIORITY调节符。它会惹起 INSERT经常被读取者阻塞，因此阻碍了并发性插入操作的执行。</p> 
+<p>　　如果读取者须要显式地锁定数据表以执行并发性插入操作，就应该运用 LOCK TABLES ... READ LOCAL，而不是LOCK TABLES ... READ。LOCAL关键字会获取一个锁，允许并发性操作继续执行 ，因为它只能运用 于数据表中已有的数据行，不会阻塞那些添加到末尾的新数据行。</p> 
+<p>　　LOAD DATA操作应该运用 CONCURRENT调节符，允许该数据表上的SELECT语句同时执行。</p> 
+<p>　　中间包含了"空洞"的MyISAM数据表不能 运用并发性插入操作。但是，你可以运用 OPTIMIZE TABLE语句来整理该数据表的碎片。</p> 
+<p><strong>　　锁的层次和并发性</strong></p> 
+<p>　　前面讨论的调度调节符允许你改动默认的调度策略。其中的大部分内容都是介绍运用这些调节符来处理数据表层次(table-level)的锁惹起的疑问，这都是MyISAM和MEMORY存储引擎用来管理数据表争用的疑问的。</p> 
+<p>　　BDB和InnoDB存储引擎实现了不同层次的锁，所以其性能特征和对争用的管理是不同的。BDB引擎运用页面层次(page-level)的锁。InnoDB引擎运用数据行层次(row-level)的锁，但是只在必要的时候运用 (在很多情况下，例如当读取操作都完成的时候，InnoDB可能根本就不运用锁)。</p> 
+<p>　　存储引擎运用的锁的层次对客户端的并发操作有很大的影响。假设两个客户端都希望更新某个数据表中的一行。由于要执行更新，每个客户端都须要一个写入锁。对于MyISAM数据表，引擎会为第一个客户端分配一个锁，这会惹起第二个客户端阻塞，直到第一个客户端完成操作。对于BDB数据表，它可以实现更大的并发性：两个更新操作会同步执行 ，除非两个数据行都位于同一个页面中。在InnoDB数据表中，并发性更高;只要两个客户端没有更新同一行，两个更新操作就能同时发生。</p> 
+<p>　　一般的准则是，锁的层次越细微，并发性越好，因为只要客户端运用数据表的部分不同，那么运用表的客户端就可以更多。它实际暗示着不同的存储引擎适合于不同的语句混合(mixes)：</p> 
+<p>　　MyISAM检索的速度非常快。但是运用表层次的锁可能成为混合的检索和更新环境中的疑问，特别是检索倾向于长时间运行的时候。在这些条件下，更新可能须要等待很久才能执行 。</p> 
+<p>　　当更新操作很多的时候，BDB和InnoDB数据表可以提供更好的性能。由于锁在页面或数据行层次执行 ，表被锁定的范围较小。这会减少锁的争用，提高并发性。</p> 
+<p>在防止 死锁(deadlock)方面，表层次的锁比细微层次的锁更有优势。运用表层次的锁的时候，死锁不会发生。服务器可以通过查看语句来检测须要的数据表，并提前锁定它们。而InnoDB和BDB数据表会发生死锁，因为这些存储引擎没有在事务开始的时候分配所有必要的锁。作为代替，在事务处理的流程中，当检测到须要锁的时候才分配。这就可能出现两个语句获取了锁，接着试图进一步获取锁(须要多个锁)，但是这些锁却被对方保持着，等待对方释放。其结果是每个客户端都拥有一个锁，同时还须要运用 其它的客户端拥有的锁才能继续执行。这会导致死锁，服务器必须终止其中一个事务。 </p> 
+<p> </p> 
+<p> </p> 
+<p align="right">（出处：http://www.hackhome.com）</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/44d118d5a897172426c14ddd919da1d0/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">API函数导航(三)</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/5a91fd8b81cc1dec7bb43d6f5db2b55f/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Mnesia fragment 应用研究和性能调优</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>大语言模型处理时间序列：Time-Series Forecasting with Pre-Trained LLMs - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="大语言模型处理时间序列：Time-Series Forecasting with Pre-Trained LLMs" />
+<meta property="og:description" content="本期将继续介绍一篇利用大语言模型进行时间序列预测任务的工作。文章下载地址为https://arxiv.org/pdf/2308.08469.pdf 。
+1. 前期提要 大家都知道预训练大型语言模型（LLMs）具有强大的表示学习能力和少样本学习，但要利用LLM处理时间序列，需要解决两个关键问题：
+1） 如何将时间序列数据输入LLMs： 为了将时间序列输入到LLM，需要对齐进行tokenize，近期的研究工作（Zhang等人，2023年）强调通过‘’patching‘’的方式对时间序列、图像、音频等各类数据进行torkenize都是非常有效的。PatchTST方法（这个后期博文会进行介绍）基于通道独立性的思想将多变量时间序列数据视为多个单变量时间序列，将单个序列划分成不同的patch。而一些基于transformer的时间序列预测相关的工作强调了整合时间信息可以增强模型的预测性能，因此本篇文章一种新方法，使用patch和通道独立思想的同时对时序信息进行整合。
+2） 如何在不破坏LLM固有特性的情况下对其进行微调使其能够适配时间序列任务： 构建像InstructGPT和ChatGPT这些对话系统时，通常利用有监督微调将模型与基于指令的数据进行对其，使得大模型熟悉数据的格式和特性。基于此，本篇文章提出了一种两阶段微调方法，首先通过监督微调将模型与时间序列的特性进行对其，引导LLM适应时间序列，接下来以下游预测任务为导向进一步对模型进行微调，从而保障不破坏语言模型固有特性的基础上使得模型能够更好地适配配各类不同域的数据（ Cross-Modality Knowledge Transfer）及不同的下游任务（In-Modality Knowledge Transfer）。
+2. 方法介绍 给定完整且均匀采样的多变量时间序列，利用长度为的窗口以步长1进行移动，将数据分成不同的窗口数据，其中每个窗口中数据可进一步分为历史数据窗口和未来数据窗口。对于每个时间步t， 代表一个M维向量。此方法的目标是利用过去数据来预测未来数据，以GPT-2为backbone，下面具体此方法的训练和微调步骤
+Instance Normalization： 这里作者采用了标准的instance noramlization，即在对于每个窗口内序列的各个序列，根据其均值和标准差进行z-score标准化。
+Patching and Channel-Independence： 接下来，采用patchTST相同的思想，首先将多变量序列视作多个单个变量序列（即认为通道间相互独立）由单个模型进行处理。相比于通道混合的方式来提取通道间的相关性，patchTST通过不同序列共享模型参数的方式来捕捉通道间的关联，能够避免过拟合。然后，将每个序列分成指定长度的多个patch作为llm的基础分析单元token，这些patch可以是相互重叠的，也可以为不重叠的，具体可根据数据输入长度调整。patching的操作，在增大输入数据历史时间跨度的同时并不会增加输入token的长度，能够有效提升效率。
+Three Encodings： 获得上述的基础token后，有必要进一步对其进行编码，使其变成LLM能够兼容的形式，文中采用的是一维卷积层，位置编码采用的是与NLP模型中的标准形式（关于时间序列位置编码下次会专门出一篇博文来进行介绍）。相比于NLP模型，获取时间序列数据token时通常面临两个挑战：1）每个分段涵盖多个时间戳，2）每个时间戳都带有各种时间属性，如分钟、小时、星期几、日期和月份。对于第一个问题，文章将时间戳引入token中，针对于第二个问题，借鉴NLP中构建token方式，论文为分钟/小时/日期/月份等时间相关属性构建了可训练和查找的embedding，并将各个属性的embedding相加作为最终的temporal embedding，保存patch内的时间相关信息。最终，每个patch对应的最终token由三部分组成：经过一位卷积层的token&#43;position embedding&#43;temporal embedding。
+Pre-Trained LLM and PEFT： 论文使用了GPT-2作为backbone。为了保留模型的基本知识，论文冻结了大部分参数，特别是Transformer模块内的多头注意力和前馈层所涉及的参数。论文融合了两种参数高效微调技术（PEFT），层归一化调整（ Layer Normalization Tuning ）和 LoRA（LowRank Adaptation）来提高模型面对未知数据的泛化性能和灵活性。对于可训练的部分参数，论文采用了两阶段微调的方式。1）Supervised Fine-tuning: Autoregressive 首先第一阶段以自回归形式进行有监督微调，来使得模型适配时序数据，这是因为GPT-2是一个因果语言模型（这里的因果是指以自回归的形式，仅利用历史数据进行预测，并不会采用未来的数据）。这样既保留了语言模型本身的知识，又使模型能够适应时间序列数据。在这个阶段模型输出为patch形式，这里可以利用一个线性层来改变输出的维度。2）Downstream Fine-tuning: Forecasting 接下来，针对下游预测任务进行微调，文章在前部分迭代中采用线性微调策略（仅调整最后的线性输出层），而在后一阶段的迭代中采用完全微调的策略（调整所有可训练参数）。这个阶段的模型输出也位patch形式，可以将其展平后再输入线性层获取指定维度。
+3. 实验效果 论文主要利用了如下五个数据集来比较所提方法与现有sota算法在长序列预测和少样本预测任务上的性能，具体参数设置细节大家可以去看论文，目前好像并未找到论文代码。
+推荐阅读：
+我的2022届互联网校招分享
+我的2021总结
+浅谈算法岗和开发岗的区别
+互联网校招研发薪资汇总
+2022届互联网求职现状，金9银10快变成铜9铁10！！
+公众号：AI蜗牛车
+保持谦逊、保持自律、保持进步
+发送【蜗牛】获取一份《手把手AI项目》（AI蜗牛车著）
+发送【1222】获取一份不错的leetcode刷题笔记
+发送【AI四大名著】获取四本经典AI电子书" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/fff5b33aafe3e506800a37d8b044368c/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-09-20T22:40:43+08:00" />
+<meta property="article:modified_time" content="2023-09-20T22:40:43+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">大语言模型处理时间序列：Time-Series Forecasting with Pre-Trained LLMs</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div id="js_content"> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/ab/1e/gXfSurbH_o.png" alt="5e513de359919b5ff3581a0bdc56d320.png"></p> 
+ <p>本期将继续介绍一篇利用大语言模型进行时间序列预测任务的工作。文章下载地址为https://arxiv.org/pdf/2308.08469.pdf 。</p> 
+ <h4>1. 前期提要</h4> 
+ <p>大家都知道预训练大型语言模型（LLMs）具有强大的表示学习能力和少样本学习，但要利用LLM处理时间序列，需要解决两个关键问题：</p> 
+ <p>1） <strong>如何将时间序列数据输入LLMs：</strong> 为了将时间序列输入到LLM，需要对齐进行tokenize，近期的研究工作（Zhang等人，2023年）强调通过‘’patching‘’的方式对时间序列、图像、音频等各类数据进行torkenize都是非常有效的。PatchTST方法（这个后期博文会进行介绍）基于通道独立性的思想将多变量时间序列数据视为多个单变量时间序列，将单个序列划分成不同的patch。而一些基于transformer的时间序列预测相关的工作强调了整合时间信息可以增强模型的预测性能，因此本篇文章一种新方法，使用patch和通道独立思想的同时对时序信息进行整合。</p> 
+ <p>2） <strong>如何在不破坏LLM固有特性的情况下对其进行微调使其能够适配时间序列任务：</strong> 构建像InstructGPT和ChatGPT这些对话系统时，通常利用有监督微调将模型与基于指令的数据进行对其，使得大模型熟悉数据的格式和特性。基于此，本篇文章提出了一种两阶段微调方法，首先通过监督微调将模型与时间序列的特性进行对其，引导LLM适应时间序列，接下来以下游预测任务为导向进一步对模型进行微调，从而保障不破坏语言模型固有特性的基础上使得模型能够更好地适配配各类不同域的数据（ Cross-Modality Knowledge Transfer）及不同的下游任务（In-Modality Knowledge Transfer）。</p> 
+ <img src="https://images2.imgbox.com/c6/ba/MLFKm9Wb_o.png" alt="698eecb6024237109440ea7c7043d896.png"> 
+ <h4>2. 方法介绍</h4> 
+ <p>给定完整且均匀采样的多变量时间序列，利用长度为的窗口以步长1进行移动，将数据分成不同的窗口数据，其中每个窗口中数据可进一步分为历史数据窗口和未来数据窗口。对于每个时间步t， 代表一个M维向量。此方法的目标是利用过去数据来预测未来数据，以GPT-2为backbone，下面具体此方法的训练和微调步骤</p> 
+ <img src="https://images2.imgbox.com/94/aa/iq43IhBn_o.png" alt="f63f972a2d41b81abc1cd95e3eaf9b46.png"> 
+ <p><strong>Instance Normalization：</strong> 这里作者采用了标准的instance noramlization，即在对于每个窗口内序列的各个序列，根据其均值和标准差进行z-score标准化。</p> 
+ <p><strong>Patching and Channel-Independence：</strong> 接下来，采用patchTST相同的思想，首先将多变量序列视作多个单个变量序列（即认为通道间相互独立）由单个模型进行处理。相比于通道混合的方式来提取通道间的相关性，patchTST通过不同序列共享模型参数的方式来捕捉通道间的关联，能够避免过拟合。然后，将每个序列分成指定长度的多个patch作为llm的基础分析单元token，这些patch可以是相互重叠的，也可以为不重叠的，具体可根据数据输入长度调整。patching的操作，在增大输入数据历史时间跨度的同时并不会增加输入token的长度，能够有效提升效率。</p> 
+ <img src="https://images2.imgbox.com/e5/3c/fOW4calg_o.png" alt="97ccc2a005d049cdd156873f97d6847a.png"> 
+ <p><strong>Three Encodings：</strong> 获得上述的基础token后，有必要进一步对其进行编码，使其变成LLM能够兼容的形式，文中采用的是一维卷积层，位置编码采用的是与NLP模型中的标准形式（关于时间序列位置编码下次会专门出一篇博文来进行介绍）。相比于NLP模型，获取时间序列数据token时通常面临两个挑战：1）每个分段涵盖多个时间戳，2）每个时间戳都带有各种时间属性，如分钟、小时、星期几、日期和月份。对于第一个问题，文章将时间戳引入token中，针对于第二个问题，借鉴NLP中构建token方式，论文为分钟/小时/日期/月份等时间相关属性构建了可训练和查找的embedding，并将各个属性的embedding相加作为最终的temporal embedding，保存patch内的时间相关信息。最终，每个patch对应的最终token由三部分组成：经过一位卷积层的token+position embedding+temporal embedding。</p> 
+ <p><strong>Pre-Trained LLM and PEFT：</strong> 论文使用了GPT-2作为backbone。为了保留模型的基本知识，论文冻结了大部分参数，特别是Transformer模块内的多头注意力和前馈层所涉及的参数。论文融合了两种参数高效微调技术（PEFT），层归一化调整（ Layer Normalization Tuning ）和 LoRA（LowRank Adaptation）来提高模型面对未知数据的泛化性能和灵活性。对于可训练的部分参数，论文采用了两阶段微调的方式。1）Supervised Fine-tuning: Autoregressive 首先第一阶段以自回归形式进行有监督微调，来使得模型适配时序数据，这是因为GPT-2是一个因果语言模型（这里的因果是指以自回归的形式，仅利用历史数据进行预测，并不会采用未来的数据）。这样既保留了语言模型本身的知识，又使模型能够适应时间序列数据。在这个阶段模型输出为patch形式，这里可以利用一个线性层来改变输出的维度。2）Downstream Fine-tuning: Forecasting 接下来，针对下游预测任务进行微调，文章在前部分迭代中采用线性微调策略（仅调整最后的线性输出层），而在后一阶段的迭代中采用完全微调的策略（调整所有可训练参数）。这个阶段的模型输出也位patch形式，可以将其展平后再输入线性层获取指定维度。</p> 
+ <h4>3. 实验效果</h4> 
+ <p>论文主要利用了如下五个数据集来比较所提方法与现有sota算法在长序列预测和少样本预测任务上的性能，具体参数设置细节大家可以去看论文，目前好像并未找到论文代码。<img src="https://images2.imgbox.com/56/3b/y7vjFjsJ_o.png" alt="45ba8848c0e6f4c481e596ae55598fac.png"></p> 
+ <img src="https://images2.imgbox.com/09/e5/L1NaHIF5_o.png" alt="bb1593543aa320410a012077c41b2b99.png"> 
+ <img src="https://images2.imgbox.com/49/0c/C7OFp528_o.png" alt="c036de18252d5dcb046ac80660e02485.png"> 
+ <p style="text-align:left;">推荐阅读：</p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">我的2022届互联网校招分享</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">我的2021总结</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">浅谈算法岗和开发岗的区别</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">互联网校招研发薪资汇总</a></p> 
+ <p style="text-align:left;"><a href="" rel="nofollow">2022届互联网求职现状，金9银10快变成铜9铁10！！</a></p> 
+ <p style="text-align:center;"><strong>公众号：</strong><strong>AI蜗牛车</strong></p> 
+ <p style="text-align:center;">保持谦逊、保持自律、保持进步</p> 
+ <p style="text-align:center;"><img src="https://images2.imgbox.com/b1/7c/LlGRQMPo_o.jpg" alt="61ee80b798ce539898475d6ad9e191cb.jpeg"></p> 
+ <p style="text-align:center;">发送【蜗牛】获取一份《手把手AI项目》（AI蜗牛车著）</p> 
+ <p style="text-align:center;">发送【1222】获取一份不错的leetcode刷题笔记</p> 
+ <p style="text-align:center;"><strong>发送【AI四大名著】获取四本经典AI电子书</strong></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3805131cc0c37bcc123d9ce290080753/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">python爬虫爬取电影数据并做可视化</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b205ba7eaed6308ee0f6ff334aca4616/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">无法打开VS code解决办法之一</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

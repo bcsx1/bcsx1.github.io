@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>postgresql pg_rewind 类似oracle的flashback&#43;基于scn的恢复 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="postgresql pg_rewind 类似oracle的flashback&#43;基于scn的恢复" />
+<meta property="og:description" content="PostgreSQL 在操作的过程中，如果利用物理复制的过程中，另一台从库，或者主库由于某些原因，不再与主库同步，或者主库crash 起不来了，怎么办，如果在利用现在的主库或备库，弄出一个 twins 。
+其实PG 早就想到这个问题了，PG有一个独特的命令 pg_rewind 可以帮助你，再造一个你。
+我们看看pg_rewind能帮我们什么
+pg_rewind 的工作原理有点类似rsync，它可以无缝的读取源目录与目的目录之间不同的数据块，而重复的数据块将不再被读取。这样的方式其实对于上面的问题是一个好的解决方案，因为如果主从复制，任何一方坏了，使用PG_REWIND 可以快速将你认为的数据完全的一方的数据同步到另一方，而不用做全量复制，这样最大的好处就是节省了时间。
+当然如果大概率知道checksum的（包括MYSQL的binlog checksum ）大多可以想到，怎么知道这两边的数据是否一致，必须的校验块，postgresql 如果要使用pg_rewind 功能需要你做以下的一些设置
+1 full_page_writes = on
+2 wal_log_hints = on
+3 hot_standby = on
+4 如果你在初始化数据库集群（postgresql 单机也叫数据库集群，别和真正的集群的含义搞混）做了data checksum 也是可以的。
+其主要的工作原理，在目的集群中对比源，与目的端之间的不同点，就是什么时候两个服务器之间的数据开始不同步的。通过知道这些不同点开始进行
+1 使用文件系统的方式进行拷贝
+2 使用libpq 建立连接的方式将数据进行拷贝
+在拷贝数据文件的以外还需要拷贝事务提交的文件，pg_xact 以及配置文件等等。生成backup label 文件，并且指定开始要恢复的 wal 日志点，并应用恢复点以后的日志，并且还要刷新 pg_control 文件（在设置了检查点并刷新日志之后，检查点的位置将保存在文件pg_control中）,最后执行initdb -S 将数据刷入到磁盘后，关闭。
+问题1 ，PG_REWIND 怎么识别两台PG 是曾经为primary 和 standby的管理
+其实就是通过 database system identifier 来鉴别，同样的主从的 database system identifier 的编码是一致的。同时也要看version 与 catalog version number 是否一致。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5cec682f8d8fc9b2fb3cb93bdea135de/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-03-31T14:49:07+08:00" />
+<meta property="article:modified_time" content="2023-03-31T14:49:07+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">postgresql pg_rewind 类似oracle的flashback&#43;基于scn的恢复</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>PostgreSQL 在操作的过程中，如果利用物理复制的过程中，另一台从库，或者主库由于某些原因，不再与主库同步，或者主库crash 起不来了，怎么办，如果在利用现在的主库或备库，弄出一个 twins 。</p> 
+<p>其实PG 早就想到这个问题了，PG有一个独特的命令 pg_rewind 可以帮助你，再造一个你。</p> 
+<p>我们看看pg_rewind能帮我们什么</p> 
+<p>pg_rewind 的工作原理有点类似<span style="color:#fe2c24;">rsync，</span>它可以无缝的读取源目录与目的目录之间不同的数据块，而重复的数据块将不再被读取。这样的方式其实对于上面的问题是一个好的解决方案，因为如果主从复制，任何一方坏了，使用PG_REWIND 可以快速将你认为的数据完全的一方的数据同步到另一方，而不用做全量复制，这样最大的好处就是节省了时间。</p> 
+<p>当然如果大概率知道checksum的（包括MYSQL的binlog checksum ）大多可以想到，怎么知道这两边的数据是否一致，必须的校验块，<a href="https://cloud.tencent.com/product/postgresql?from=20065&amp;from_column=20065" rel="nofollow" title="postgresql">postgresql</a> 如果要使用pg_rewind 功能需要你做以下的一些设置</p> 
+<p>1 full_page_writes = on</p> 
+<p>2 wal_log_hints = on</p> 
+<p>3 hot_standby = on</p> 
+<p>4 如果你在初始化<a href="https://cloud.tencent.com/solution/database?from=20065&amp;from_column=20065" rel="nofollow" title="数据库">数据库</a>集群（postgresql 单机也叫数据库集群，别和真正的集群的含义搞混）做了data checksum 也是可以的。</p> 
+<p>其主要的工作原理，在目的集群中对比源，与目的端之间的不同点，就是什么时候两个<a href="https://cloud.tencent.com/product/cvm?from=20065&amp;from_column=20065" rel="nofollow" title="服务器">服务器</a>之间的数据开始不同步的。通过知道这些不同点开始进行</p> 
+<p>1 使用文件系统的方式进行拷贝</p> 
+<p>2 使用libpq 建立连接的方式将数据进行拷贝</p> 
+<p>在拷贝数据文件的以外还需要拷贝事务提交的文件，pg_xact 以及配置文件等等。生成backup label 文件，并且指定开始要恢复的 wal 日志点，并应用恢复点以后的日志，并且还要刷新 pg_control 文件（在设置了检查点并刷新日志之后，检查点的位置将保存在文件pg_control中）,最后执行initdb -S 将数据刷入到磁盘后，关闭。</p> 
+<p>问题1 ，PG_REWIND 怎么识别两台PG 是曾经为primary 和 standby的管理</p> 
+<p>其实就是通过 database system identifier 来鉴别，同样的主从的 database system identifier 的编码是一致的。同时也要看version 与 catalog version number 是否一致。</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/62/74/fsXgUE64_o.png"></p> 
+<p>而关于bakcup label 其中包含了check point ，而后续的复制也是要依靠这个check point 点 目的集群就可以不断应用源集群从CHECKPOINT LOCATION 之后的WAL 日志。</p> 
+<p>当然其中的原理不光如此，下面就开始做一个实验看看pg_rewind的强大的功能。</p> 
+<p>首先下面有两台PG ， 192.168.198.120 主库 192.168.198.176 从库</p> 
+<p>通过pg_basebackup 进行数据同步后，在 192.168.198.120 上在进行相关的一些建库，曾表，插入数据的事情，看看PG_REWIND 是否可以进行相关的数据同步</p> 
+<p>pg_basebackup 命令就不在讲了，默认大家都会了，不会的可以百度，或者看我之前的关于这方面的东西。</p> 
+<p>1 下面的两个服务器的数据已经是一致的，通过pg_basebackup 进行的复制</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/ac/2f/uSDmXjR3_o.png"></p> 
+<p>2 对176 进行promote 操作，模拟主库失效，从库接替主库，此时主库和从库之间不再有任何关系 （需要修改176 的 postgresql 的监听地址，这点是基础就不再提了）</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/cc/11/gmDmtKNM_o.png"></p> 
+<p>4 我们在176上进行创建一个pg_rewind库的操作，此时 两个库已经数据不一致了</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/d3/d7/8erZK9B2_o.png"></p> 
+<p>最后在120 上执行</p> 
+<p>pg_rewind --target-pgdata=/pgdata/data --source-server='host=192.168.198.176 port=5432 user=repl dbname=postgres password=repl' -P --debug</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/4c/53/8H8XrU4j_o.png"></p> 
+<p>将数据追齐后，修改120 的配置文件，模拟失效的主库和已经提升为主库的“从库” 数据已经一致了</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/1a/c6/omFVjCtk_o.png"></p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/81/29/UcpTE0Hq_o.png"></p> 
+<p>到这里本来就完事了，但实际上有些评论说pg_rewind 是可以做数据同步的，我是比较感兴趣的，到底 pg_rewind 可不可以做数据同步。</p> 
+<p>首先我们要确认几点，在达到共识的基础上才能继续下面的工作</p> 
+<p>1 即使是数据同步，也必须是在之前两个节点之间的关系是主从关系，或者至少是有关系，如果两个节点之间没有任何关系，则这个工作是没有办法做的。</p> 
+<p>2 数据同步是否需要 promote 操作作为前提，或者直接去修改 recovery.conf 文件</p> 
+<p>测试1 ：</p> 
+<p>进行数据同步，然后将从库关闭，将recover.conf 变为 recover.done，然后重启动从库，在关闭，变更主库的数据，使用pg_rewind进行数据同步</p> 
+<p>结果失败，通过失败可以证明，如果主从失败后，想直接通过提升当前从库的方法，在通过 pg_rewind 进行数据同步的想法可以凉快去了</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/0d/91/NrU1x7pv_o.png"></p> 
+<p>测试2 同步长时间的主库已经和原来的从库（从库已经提升为主库）的数据是否可行，这里的长时间其实也是看数据量，下面的情况就是报找不到pg_wal 文件，这边可以尝试从原来的从库上拷贝缺少的pg_wal 或者开启 archive 等方式保证你的pg_wal 是充足的。</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/48/2c/ioRr26Ii_o.png"></p> 
+<p>图中源主库报没有00000004000000000000003F 文件，找到原来的从库，现在的主库将这个文件拷贝到原来的主库，则pg_rewind 正常工作。</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/b3/2e/tu0DUwu9_o.png"></p> 
+<p>所以相关的pg_wal 文件也要留存好，最好是有archive 来做数据恢复的后盾。</p> 
+<p>总结，某些帖子中假想的想通过pg_rewind 来进行数据库之间的复制的想法是不可以的，同时pg_wal 中的日志数据应该进行archive 以防止出现找不到pg_wal 的问题。</p> 
+<p></p> 
+<p></p> 
+<p></p> 
+<h2>pg_rewind</h2> 
+<h3><a id="pg_rewind_1"></a>一、pg_rewind介绍</h3> 
+<p><strong>pg_rewind功能：</strong><br> 流复制主备数据库间数据目录同步工具。<br><strong>pg_rewind优点：</strong><br> 仅复制产生变化的数据块和一些文件：新数据文件、配置文件、WAL segments。<br><strong>基本原理：</strong><br> pg_rewind检查源和目标集群的时间线历史以确定它们的分歧点，并在目标集群的pg_wal目录中找到WAL，一直到达分歧点。分歧点可以在目标时间线、源时间线或它们的共同祖先上找到。<br> 在典型的故障转移场景中，目标集群在产生分歧后很快被关闭，这不是问题，但如果目标集群在生生分歧后运行很长时间，它的旧WAL文件可能不再存在。在这种情况下，您可以手动将它们从WAL归档目录复制到pg_wal目录，或者使用 -c 选项运行pg_rewind以自动从WAL归档中目录中检索它们。<br> **pg_rewind 的使用不限于故障转移，**例如，可以提升备用服务器主库，运行一些写入事务，然后重新回滚再次成为备用服务器。<br> 运行pg_rewind后，需要完成WAL重放以使数据目录处于一致状态。当目标服务器再次启动时，它将进入归档恢复，并从分歧点之前的最后一个检查点重放源服务器中生成的所有 WAL。如果pg_rewind运行时源服务器中的某些WAL不再可用，因此无法被 pg_rewind 会话复制，则必须在目标服务器启动时使其可用。这可以通过在目标数据目录中创建 recovery.signal 文件并在 postgresql.conf 中配置合适的 restore_command 来完成。<br> pg_rewind 要求目标服务器在 postgresql.conf 中启用 wal_log_hints 选项或在使用 initdb 初始化集群时启用数据校验和。默认情况下，这些当前均未启用。full_page_writes 也必须设置为 on，但默认情况下启用。<br><strong>使用pg_rewind命令前提条件：</strong><br> postgresql.conf<br> wal_log_hints = on # default:off 或者initdb初始化集群时启用数据校验<br> full_page_writes = on # default:on</p> 
+<p><strong>注意点：</strong></p> 
+<ol><li>如果pg_rewind在处理过程中失败，那么目标的数据目录很可能不在可以恢复的状态。在这种情况下，建议进行新的全新备份。</li><li>由于pg_rewind完全从源复制配置文件，可能需要在重新启动目标服务器之前更正用于恢复的配置，特别是如果目标被重新引入作为源的备用服务器。如果在倒带操作完成后重新启动服务器但未配置恢复，则目标可能会再次与主服务器分离。</li><li>如果pg_rewind找到无法直接写入的文件，它将立即失败。例如，当源服务器和目标服务器对只读 SSL 密钥和证书使用相同的文件映射时，就会发生这种情况。如果目标服务器上存在此类文件，建议在运行 pg_rewind 之前将其删除。执行倒带后，其中一些文件可能已从源复制，在这种情况下，可能需要删除复制的数据并恢复回倒前使用的链接集。</li></ol> 
+<h3><a id="pg_rewind_22"></a>二、pg_rewind参数</h3> 
+<p>-D directory --target-pgdata=directory<br> 此选项指定与源同步的目标数据目录。在运行 pg_rewind 之前必须彻底关闭目标服务器</p> 
+<p>–source-pgdata=directory<br> 指定要与目标同步的源服务器数据目录的文件系统路径。此选项要求完全关闭源服务器。</p> 
+<p>–source-server=connstr<br> 指定一个 libpq 连接字符串以连接到源 PostgreSQL 服务器以与目标同步。连接必须是普通（非复制）连接，角色有足够的权限来执行源服务器上pg_rewind使用的功能或超级用户角色。此选项要求源服务器正在运行并接受连接。</p> 
+<p>-n --dry-run <br> 除了实际修改目标目录之外，做任何事情。</p> 
+<p>-N --no-sync<br> 默认情况下，pg_rewind将等待所有文件安全写入磁盘。此选项会导致 pg_rewind 无需等待就返回，这更快，但意味着随后的操作系统崩溃可能会使同步数据目录损坏。通常，此选项对测试很有用，但不应用于生产安装。</p> 
+<p>-P --progress<br> 启用进度报告。启用此选项将在从源集群复制数据时提供大致进度报告。</p> 
+<p>-c --restore-target-wal<br> 如果这些文件在 pg_wal 目录中不再可用，请使用目标集群配置中定义的 restore_command 从 WAL 归档中检索 WAL 文件。</p> 
+<p>–debug<br> 打印对开发人员调试 pg_rewind 最有用的详细调试输出。</p> 
+<p>–no-ensure-shutdown<br> pg_rewind 要求目标服务器在倒带之前彻底关闭。默认情况下，如果目标服务器没有完全关闭，pg_rewind 会以单用户模式启动目标服务器，先完成崩溃恢复，然后停止它。<br> 通过传递这个选项，如果服务器没有完全关闭，pg_rewind 会跳过这个并立即出错。在这种情况下，用户应该自己处理这种情况。</p> 
+<h3><a id="pg_rewind_54"></a>三、执行pg_rewind所需权限</h3> 
+<p>当使用在线集群作为源执行 pg_rewind 时，可以使用源集群上具有足够权限来执行 pg_rewind 的角色来代替超级用户。下面是如何创建这样一个角色，这里命名为 rewind_user：</p> 
+<p>CREATE USER rewind_user LOGIN;<br> GRANT EXECUTE ON function pg_catalog.pg_ls_dir(text, boolean, boolean) TO rewind_user;<br> GRANT EXECUTE ON function pg_catalog.pg_stat_file(text, boolean) TO rewind_user;<br> GRANT EXECUTE ON function pg_catalog.pg_read_binary_file(text) TO rewind_user;<br> GRANT EXECUTE ON function pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean) TO rewind_user;</p> 
+<p>当在完成主备切换的老主库上执行 pg_rewind 时，需要蝗前在新主库上执行 CHECKPOINT 使其控制文件反映最新的时间线信息，pg_rewind 使用它来检查目标集群是否可以使用指定的源簇重绕。</p> 
+<h3><a id="pg_rewind_65"></a>四、pg_rewind如何工作</h3> 
+<p>基本思路是将所文件系统级别的更改从源集群复制到目标集群。</p> 
+<ol><li>以源集簇的历史时间线从目标集簇分叉出来的点之前的最后一个检查点为起点，扫描目标集簇的 WAL 日志。对于每一个 WAL 记录，读取每一个被动过的数据块。这会得到在目标集簇中从源集簇被分支出去以后所有被更改过的数据块列表。</li><li>使用直接的文件系统访问（–source-pgdata）或者 SQL （–source-server），把所有那些更改过的块从源集簇拷贝到目标集簇。</li><li>把所有其他诸如pg_xact和配置文件（除了关系文件之外所有的东西）从源集簇拷贝到目标集簇。与基础备份类似，在从源集簇拷贝的数据中，目录pg_dynshmem/、pg_notify/、pg_replslot/、pg_serial/、pg_snapshots/、pg_stat_tmp/以及pg_subtrans/的内容会被忽略。任何以pgsql_tmp开始的文件或目录都会被忽略，backup_label、tablespace_map、pg_internal.init、postmaster.opts以及postmaster.pid也是这样。</li><li>从源集簇应用 WAL，从失效处创建的检查点开始（严格来说，pg_rewind并不应用 WAL，它只是创建一个备份标签文件，该文件让PostgreSQL从那个检查点开始向前重放所有 WAL）。</li></ol> 
+<h3><a id="_72"></a>五、测试</h3> 
+<table><thead><tr><th>主库</th><th>192.168.150.161</th><th>pg01</th></tr></thead><tbody><tr><td>备库</td><td>192.168.150.163</td><td>pg03</td></tr></tbody></table> 
+<p>创建主库：<br> initdb -D /pgdata/12/data -U postgres<br> alter user postgres with password ‘123456’;</p> 
+<p>pg_hba.conf添加：<br> host replication all 192.168.150.163/32 trust<br> host replication all 192.168.150.161/32 trust</p> 
+<p>postgresql.conf<br> wal_level = replica<br> synchronous_commit = on<br><strong>full_page_writes = on</strong><br><strong>wal_log_hints = on</strong><br> min_wal_size = 800MB<br> archive_mode = on<br> archive_command = ‘test ! -f /pgdata/12/archive/%f &amp;&amp; cp %p /pgdata/12/archive/%f’<br> max_wal_senders = 10<br> hot_standby = on<br> primary_conninfo = ‘user=postgres passfile=’’/home/postgres/.pgpass’’ host=192.168.150.163 port=1921 sslmode=disable sslcompression=0 gssencmode=disable krbsrvname=postgres target_session_attrs=any’</p> 
+<p>启动主库：<br> pg_ctl -D /pgdata/12/data start</p> 
+<p>备库：<br> pg_basebackup -h 192.168.150.161 -p 1921 -U postgres -F p -P -X stream -R -D /pgdata/12/data -l backup20211027_02</p> 
+<p>-F —format 指定备份输出格式 p plain 表示把主库中各个数据文件、配置文件、目录结构都完全一样的地写到备份目录中； t tar 表示把备库文件打包到一个tar文件中<br> -P --progress 输出备份进度条<br> -X --xlog-method= 取值为f fetch 时与参数-x 含义一样。取s stream时表示备份开始后，启动另一个流复制进程接收WAL日志，此方式需要主库max_wal_senders参数大于或等于2。<br> -R --write-recovery-conf 是否生成recovery.conf文件 12版本中是standby.signal文件<br> -l 表示备份标识，类似select pg_start_backup(‘lable’)<br> -U 表示连接用户</p> 
+<p>postgresql.auto.conf自动生成下列信息，不需手功配置<br> primary_conninfo = ‘user=postgres passfile=’’/home/postgres/.pgpass’’ host=192.168.150.161 port=1921 sslmode=disable sslcompression=0 gssencmode=disable krbsrvname=postgres target_session_attrs=any’</p> 
+<p>启动备库：<br> pg_ctl -D /pgdata/12/data/start</p> 
+<pre><code>postgres=# select * from pg_stat_replication;
+-[ RECORD 1 ]----+------------------------------
+pid              | 482735
+usesysid         | 10
+usename          | postgres
+application_name | walreceiver
+client_addr      | 192.168.150.161
+client_hostname  | 
+client_port      | 42286
+backend_start    | 2021-10-27 21:33:59.122261+08
+backend_xmin     | 
+state            | streaming
+sent_lsn         | 0/10000448
+write_lsn        | 0/10000448
+flush_lsn        | 0/10000448
+replay_lsn       | 0/10000448
+write_lag        | 
+flush_lag        | 
+replay_lag       | 
+sync_priority    | 0
+sync_state       | async
+reply_time       | 2021-10-27 21:52:41.704105+08
+
+</code></pre> 
+<p>主备切换：<br> 备库执行切换命令pg_ctl promote</p> 
+<pre><code>[postgres@pg03 data]$ pg_ctl promote -D /pgdata/12/data
+waiting for server to promote....2021-10-29 09:38:32.722 CST [779689] LOG:  received promote request
+2021-10-29 09:38:32.722 CST [779693] FATAL:  terminating walreceiver process due to administrator command
+2021-10-29 09:38:32.722 CST [779689] LOG:  invalid record length at 0/10021400: wanted 24, got 0
+2021-10-29 09:38:32.722 CST [779689] LOG:  redo done at 0/100213C8
+2021-10-29 09:38:32.722 CST [779689] LOG:  last completed transaction was at log time 2021-10-29 09:34:36.921164+08
+2021-10-29 09:38:32.723 CST [779689] LOG:  selected new timeline ID: 6
+2021-10-29 09:38:32.761 CST [779689] LOG:  archive recovery complete
+2021-10-29 09:38:32.765 CST [779688] LOG:  database system is ready to accept connections
+ done
+server promoted
+</code></pre> 
+<p>备库已成为主库：</p> 
+<pre><code>[postgres@pg03 data]$ psql -p 1921
+psql (12.8)
+Type "help" for help.
+
+postgres=# select pg_is_in_recovery();
+ pg_is_in_recovery 
+-------------------
+ f
+(1 row)
+</code></pre> 
+<p>原主库执行pg_rewind命令：<br> 问题：</p> 
+<pre><code>[postgres@pg01 data]$ pg_rewind -D /pgdata/12/data --source-server='host=192.168.150.163  port=1921 user=postgres password=123456' -P
+pg_rewind: connected to server
+pg_rewind: fatal: target server must be shut down cleanly
+</code></pre> 
+<p>出现以上问题，需要先将老主为关闭：</p> 
+<pre><code>[postgres@pg01 data]$ pg_ctl -D /pgdata/12/data stop
+waiting for server to shut down....2021-10-29 09:42:30.879 CST [99487] LOG:  received fast shutdown request
+2021-10-29 09:42:30.881 CST [99487] LOG:  aborting any active transactions
+2021-10-29 09:42:30.881 CST [99487] LOG:  background worker "logical replication launcher" (PID 103645) exited with exit code 1
+2021-10-29 09:42:30.882 CST [99489] LOG:  shutting down
+2021-10-29 09:42:31.000 CST [99487] LOG:  database system is shut down
+ done
+server stopped
+</code></pre> 
+<p>再次执行：pg_rewind命令：</p> 
+<pre><code>[postgres@pg01 data]$ pg_rewind -D /pgdata/12/data --source-server='host=192.168.150.163  port=1921 user=postgres password=123456' -P
+pg_rewind: connected to server
+pg_rewind: servers diverged at WAL location 0/10021400 on timeline 5
+pg_rewind: rewinding from last common checkpoint at 0/10000650 on timeline 5
+pg_rewind: reading source file list
+pg_rewind: reading target file list
+pg_rewind: reading WAL in target
+pg_rewind: need to copy 132 MB (total source directory size is 151 MB)
+135219/135219 kB (100%) copied
+pg_rewind: creating backup label and updating control file
+pg_rewind: syncing target data directory
+pg_rewind: Done!
+</code></pre> 
+<p>原主库生成表示备库文件：standby.signal<br> 修改配置文件postgresql.auto.conf中primary_conninfo参数，指向新的主库</p> 
+<pre><code>primary_conninfo = 'user=postgres passfile=''/home/postgres/.pgpass'' host=192.168.150.163 port=1921 sslmode=disable sslcompression=0 gssencmode=disable krbsrvname=postg
+res target_session_attrs=any'
+</code></pre> 
+<p>启动备库：</p> 
+<pre><code>[postgres@pg01 data]$ pg_ctl -D /pgdata/12/data start
+waiting for server to start....2021-10-29 09:45:46.563 CST [105924] LOG:  starting PostgreSQL 12.8 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 4.8.5 20150623 (Red Hat 4.8.5-36), 64-bit
+2021-10-29 09:45:46.563 CST [105924] LOG:  listening on IPv4 address "0.0.0.0", port 1921
+2021-10-29 09:45:46.563 CST [105924] LOG:  listening on IPv6 address "::", port 1921
+2021-10-29 09:45:46.564 CST [105924] LOG:  listening on Unix socket "/tmp/.s.PGSQL.1921"
+2021-10-29 09:45:46.573 CST [105925] LOG:  database system was interrupted while in recovery at log time 2021-10-29 09:38:32 CST
+2021-10-29 09:45:46.573 CST [105925] HINT:  If this has occurred more than once some data might be corrupted and you might need to choose an earlier recovery target.
+2021-10-29 09:45:46.579 CST [105925] LOG:  entering standby mode
+2021-10-29 09:45:46.580 CST [105925] LOG:  redo starts at 0/10000618
+2021-10-29 09:45:46.582 CST [105925] LOG:  consistent recovery state reached at 0/1003EC08
+2021-10-29 09:45:46.582 CST [105925] LOG:  invalid record length at 0/1003EC08: wanted 24, got 0
+2021-10-29 09:45:46.582 CST [105924] LOG:  database system is ready to accept read only connections
+2021-10-29 09:45:46.587 CST [105929] LOG:  started streaming WAL from primary at 0/10000000 on timeline 6
+ done
+server started
+</code></pre> 
+<p>验证是否为备库：</p> 
+<pre><code>[postgres@pg01 data]$ psql -p 1921
+psql (12.8)
+Type "help" for help.
+
+postgres@[local]:1921=#select pg_is_in_recovery();
+ pg_is_in_recovery 
+-------------------
+ t
+(1 row)
+</code></pre> 
+<pre><code>postgres 105924      1  0 09:45 ?        00:00:00 /opt/pg12/bin/postgres -D /pgdata/12/data
+postgres 105925 105924  0 09:45 ?        00:00:00 postgres: startup   recovering 000000060000000000000010
+postgres 105926 105924  0 09:45 ?        00:00:00 postgres: checkpointer   
+postgres 105927 105924  0 09:45 ?        00:00:00 postgres: background writer   
+postgres 105928 105924  0 09:45 ?        00:00:00 postgres: stats collector   
+postgres 105929 105924  0 09:45 ?        00:00:00 postgres: walreceiver   streaming 0/1003F998
+</code></pre> 
+<p>验证数据库是否传输，主库插入数据，查看是否同步到备库：<br> 主库：</p> 
+<pre><code>postgres=# select * from test;
+ a | b 
+---+---
+ 2 | 2
+ 3 | 3
+ 4 | 4
+(3 rows)
+
+postgres=# **insert into test values (5,5);**
+INSERT 0 1
+postgres=# select * from test;
+ a | b 
+---+---
+ 2 | 2
+ 3 | 3
+ 4 | 4
+ 5 | 5
+(4 rows)
+
+postgres=# 
+</code></pre> 
+<p>备库：</p> 
+<pre><code>postgres@[local]:1921=#select * from test;
+ a | b 
+---+---
+ 2 | 2
+ 3 | 3
+ 4 | 4
+** 5 | 5**
+(4 rows)
+
+postgres@[local]:1921=#
+</code></pre> 
+<p>到此主库切换命令pg_rewind解释完成。</p> 
+<p></p> 
+<p></p> 
+<p></p> 
+<p>repmgr 出现切换后，原主库停止服务。手动启动原主库会导致数据库集群状态异常，变为双主。</p> 
+<p>解决方案<br> 原主库（192.168.80.221）查询集群状态，发现备库1（192.168.80.222）已经成为新的主库，但是原主库（192.168.80.221）仍然以主库的模式启动，这时候集群就出现了双主的问题。检查后发现，备库2（192.168.80.236）已经连接到了新主库（192.168.80.222），此时可将原主库（192.168.80.221）重新加入集群作为备库运行。</p> 
+<p>[highgo@localhost HighGo5.6.5-cluster]$ repmgr cluster show<br> ID | Name           | Role    | Status               | Upstream       | Location | Priority | Replication lag | Last replayed LSN<br> ----+----------------+---------+----------------------+----------------+----------+----------+-----------------+-------------------<br> 1  | 192.168.80.221 | primary | * running            |                | default  | 100      | n/a             | none            <br> 2  | 192.168.80.222 | standby | ! running as primary | 192.168.80.221 | default  | 100      | 96 MB           | 2/D2013F28      <br> 3  | 192.168.80.236 | standby |   running            | 192.168.80.221 | default  | 100      | 96 MB           | 2/D2013F28      </p> 
+<p><br> WARNING: following issues were detected<br>   - node "192.168.80.222" (ID: 2) is registered as standby but running as primary<br> [highgo@localhost HighGo5.6.5-cluster]$ pg_ctl stop -m f<br> 等待服务器进程关闭 ..... 完成<br> 服务器进程已经关闭<br> 1<br>  <br> 测试是否可以将本节点重新加入集群：</p> 
+<p>[highgo@localhost HighGo5.6.5-cluster]$ repmgr node rejoin  -d 'host=192.168.80.222 dbname=highgo user=highgo' --force-rewind --config-files=postgresql.conf --verbose --dry-run  <br> INFO: looking for configuration file in "/opt/HighGo5.6.5-cluster"<br> INFO: configuration file found at: "/opt/HighGo5.6.5-cluster/conf/hg_repmgr.conf"<br> DEBUG: set_config():<br>   SET synchronous_commit TO 'local'<br> DEBUG: get_primary_node_id():<br> SELECT node_id                   FROM repmgr.nodes     WHERE type = 'primary'    AND active IS TRUE <br> DEBUG: get_node_record():<br>   SELECT n.node_id, n.type, n.upstream_node_id, n.node_name, n.conninfo, n.repluser, n.slot_name, n.location, n.priority, n.active, n.config_file, '' AS upstream_node_name   FROM repmgr.nodes n  WHERE n.node_id = 2<br> DEBUG: connecting to: "user=highgo connect_timeout=2 dbname=highgo host=192.168.80.222 port=5866 fallback_application_name=repmgr"<br> DEBUG: set_config():<br>   SET synchronous_commit TO 'local'<br> DEBUG: get_recovery_type(): SELECT pg_catalog.pg_is_in_recovery()<br> INFO: replication connection to the rejoin target node was successful<br> INFO: local and rejoin target system identifiers match<br> DETAIL: system identifier is 6823598896860049498<br> DEBUG: local timeline: 25; rejoin target timeline: 26<br> DEBUG: get_timeline_history():<br> TIMELINE_HISTORY 26<br> DEBUG: local tli: 25; local_xlogpos: 2/DE000028; follow_target_history-&gt;tli: 25; follow_target_history-&gt;end: 2/D2013F28<br> NOTICE: pg_rewind execution required for this node to attach to rejoin target node 2<br> DETAIL: rejoin target server's timeline 26 forked off current database system timeline 25 before current recovery point 2/DE000028<br> DEBUG: guc_set():<br> SELECT true FROM pg_catalog.pg_settings  WHERE name = 'full_page_writes' AND setting = 'off'<br> DEBUG: guc_set():<br> SELECT true FROM pg_catalog.pg_settings  WHERE name = 'wal_log_hints' AND setting = 'on'<br> INFO: prerequisites for using pg_rewind are met<br> DEBUG: using archive directory "/tmp/repmgr-config-archive-192.168.80.221"<br> INFO: temporary archive directory "/tmp/repmgr-config-archive-192.168.80.221" created<br> INFO: file "postgresql.conf" would be copied to "/tmp/repmgr-config-archive-192.168.80.221/postgresql.conf"<br> INFO: 1 files would have been copied to "/tmp/repmgr-config-archive-192.168.80.221"<br> INFO: temporary archive directory "/tmp/repmgr-config-archive-192.168.80.221" deleted<br> INFO: pg_rewind would now be executed<br> DETAIL: pg_rewind command is:<br>   /opt/HighGo5.6.5-cluster/bin/pg_rewind -D '/opt/HighGo5.6.5-cluster/data' --source-server='host=192.168.80.222 user=highgo dbname=highgo port=5866 connect_timeout=2'<br> INFO: prerequisites for executing NODE REJOIN are met<br> 1</p> 
+<p><br> 正式将节点重新加入集群：</p> 
+<p>[highgo@localhost HighGo5.6.5-cluster]$ repmgr node rejoin  -d 'host=192.168.80.222 dbname=highgo user=highgo' --force-rewind --config-files=postgresql.conf --verbose<br> INFO: looking for configuration file in "/opt/HighGo5.6.5-cluster"<br> INFO: configuration file found at: "/opt/HighGo5.6.5-cluster/conf/hg_repmgr.conf"<br> DEBUG: set_config():<br>   SET synchronous_commit TO 'local'<br> DEBUG: get_primary_node_id():<br> SELECT node_id                   FROM repmgr.nodes     WHERE type = 'primary'    AND active IS TRUE <br> DEBUG: get_node_record():<br>   SELECT n.node_id, n.type, n.upstream_node_id, n.node_name, n.conninfo, n.repluser, n.slot_name, n.location, n.priority, n.active, n.config_file, '' AS upstream_node_name   FROM repmgr.nodes n  WHERE n.node_id = 2<br> DEBUG: connecting to: "user=highgo connect_timeout=2 dbname=highgo host=192.168.80.222 port=5866 fallback_application_name=repmgr"<br> DEBUG: set_config():<br>   SET synchronous_commit TO 'local'<br> DEBUG: get_recovery_type(): SELECT pg_catalog.pg_is_in_recovery()<br> DEBUG: local timeline: 25; rejoin target timeline: 26<br> DEBUG: get_timeline_history():<br> TIMELINE_HISTORY 26<br> DEBUG: local tli: 25; local_xlogpos: 2/DE000028; follow_target_history-&gt;tli: 25; follow_target_history-&gt;end: 2/D2013F28<br> NOTICE: pg_rewind execution required for this node to attach to rejoin target node 2<br> DETAIL: rejoin target server's timeline 26 forked off current database system timeline 25 before current recovery point 2/DE000028<br> DEBUG: guc_set():<br> SELECT true FROM pg_catalog.pg_settings  WHERE name = 'full_page_writes' AND setting = 'off'<br> DEBUG: guc_set():<br> SELECT true FROM pg_catalog.pg_settings  WHERE name = 'wal_log_hints' AND setting = 'on'<br> INFO: prerequisites for using pg_rewind are met<br> DEBUG: using archive directory "/tmp/repmgr-config-archive-192.168.80.221"<br> DEBUG: copying "postgresql.conf" to "/tmp/repmgr-config-archive-192.168.80.221/postgresql.conf"<br> INFO: 1 files copied to "/tmp/repmgr-config-archive-192.168.80.221"<br> NOTICE: executing pg_rewind<br> DETAIL: pg_rewind command is "/opt/HighGo5.6.5-cluster/bin/pg_rewind -D '/opt/HighGo5.6.5-cluster/data' --source-server='host=192.168.80.222 user=highgo dbname=highgo port=5866 connect_timeout=2'"<br> DEBUG: executing:<br>   /opt/HighGo5.6.5-cluster/bin/pg_rewind -D '/opt/HighGo5.6.5-cluster/data' --source-server='host=192.168.80.222 user=highgo dbname=highgo port=5866 connect_timeout=2'<br> DEBUG: result of command was 0 (13)<br> DEBUG: local_command(): output returned was:<br> servers diverged at WAL location 2/D2013F28 on timeline 25</p> 
+<p>DEBUG: using archive directory "/tmp/repmgr-config-archive-192.168.80.221"<br> DEBUG: copying "/tmp/repmgr-config-archive-192.168.80.221/postgresql.conf" to "/opt/HighGo5.6.5-cluster/data/postgresql.conf"<br> NOTICE: 1 files copied to /opt/HighGo5.6.5-cluster/data<br> INFO: directory "/tmp/repmgr-config-archive-192.168.80.221" deleted<br> INFO: deleting "recovery.done"<br> DEBUG: get_node_record():<br>   SELECT n.node_id, n.type, n.upstream_node_id, n.node_name, n.conninfo, n.repluser, n.slot_name, n.location, n.priority, n.active, n.config_file, '' AS upstream_node_name   FROM repmgr.nodes n  WHERE n.node_id = 1<br> NOTICE: setting node 1's upstream to node 2<br> DEBUG: create_recovery_file(): creating "/opt/HighGo5.6.5-cluster/data/recovery.conf"...<br> DEBUG: recovery file is:<br> standby_mode = 'on'<br> primary_conninfo = 'user=highgo connect_timeout=2 host=192.168.80.222 port=5866 application_name=192.168.80.221'<br> recovery_target_timeline = 'latest'</p> 
+<p><br> DEBUG: is_server_available(): ping status for "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2" is PQPING_NO_RESPONSE<br> WARNING: unable to ping "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2"<br> DETAIL: PQping() returned "PQPING_NO_RESPONSE"<br> NOTICE: starting server using "/opt/HighGo5.6.5-cluster/bin/pg_ctl  -w -D '/opt/HighGo5.6.5-cluster/data' start"<br> DEBUG: executing:<br>   /opt/HighGo5.6.5-cluster/bin/pg_ctl  -w -D '/opt/HighGo5.6.5-cluster/data' start<br> DEBUG: result of command was 0 (13)<br> DEBUG: local_command(): output returned was:<br> 等待服务器进程启动 ....2020-06-25 09:41:54.523 CST [5308] WARNING:  01000: gdb version should large than 7.10</p> 
+<p><br> DEBUG: update_node_record_status():<br>     UPDATE repmgr.nodes      SET type = 'standby',          upstream_node_id = 2,          active = TRUE    WHERE node_id = 1<br> DEBUG: is_server_available(): ping status for "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2" is PQPING_REJECT<br> WARNING: unable to ping "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2"<br> DETAIL: PQping() returned "PQPING_REJECT"<br> INFO: waiting for node 1 to respond to pings; 1 of max 60 attempts<br> DEBUG: is_server_available(): ping status for "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2" is PQPING_REJECT<br> WARNING: unable to ping "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2"<br> DETAIL: PQping() returned "PQPING_REJECT"<br> DEBUG: sleeping 1 second waiting for node 1 to respond to pings; 2 of max 60 attempts<br> DEBUG: is_server_available(): ping status for "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2" is PQPING_REJECT<br> WARNING: unable to ping "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2"<br> DETAIL: PQping() returned "PQPING_REJECT"<br> DEBUG: sleeping 1 second waiting for node 1 to respond to pings; 3 of max 60 attempts<br> DEBUG: is_server_available(): ping status for "host=192.168.80.221 user=highgo dbname=highgo password=highgo@123 port=5866 connect_timeout=2" is PQPING_OK<br> INFO: demoted primary is pingable<br> INFO: node 1 has attached to its upstream node<br> DEBUG: _create_event(): event is "node_rejoin" for node 1<br> DEBUG: get_recovery_type(): SELECT pg_catalog.pg_is_in_recovery()<br> DEBUG: _create_event():<br>    INSERT INTO repmgr.events (              node_id,              event,              successful,              details             )       VALUES ($1, $2, $3, $4)    RETURNING event_timestamp<br> DEBUG: _create_event(): Event timestamp is "2020-06-30 10:15:47.522104+08"<br> NOTICE: NODE REJOIN successful<br> DETAIL: node 1 is now attached to node 2<br>  <br> 重新查询集群状态，集群状态正常。</p> 
+<p>[highgo@localhost HighGo5.6.5-cluster]$ repmgr cluster show<br> ID | Name           | Role    | Status               | Upstream       | Location | Priority | Replication lag | Last replayed LSN<br> ----+----------------+---------+----------------------+----------------+----------+----------+-----------------+-------------------<br> 1  | 192.168.80.221 | standby |   running            |  192.168.80.221 | default  | 100      | 0 MB           | 2/D4013F28            <br> 2  | 192.168.80.222 | primary |   running            |                 | default  | 100      | n/a            | none      <br> 3  | 192.168.80.236 | standby |   running            | 192.168.80.221  | default  | 100      | 0 MB           | 2/D4013F28    <br>  <br>  <br> 文章知识点与官方知识档案匹配，可进一步学习相关知识<br> ————————————————<br> 版权声明：本文为CSDN博主「瀚高PG实验室」的原创文章，遵循CC 4.0 BY-SA版权协议，转载请附上原文出处链接及本声明。<br> 原文链接：https://blog.csdn.net/pg_hgdb/article/details/122317296</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/b409b56ce425b049ef131435022c644a/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Python:基于Python爬虫技术的抢票程序及其实现</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/7917ea489d18fb9baa260e8726404358/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Android Studio 修改代码不生效</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

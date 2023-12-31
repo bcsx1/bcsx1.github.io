@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>光照贴图的参数化 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="光照贴图的参数化" />
+<meta property="og:description" content="正如Jon在上一篇文章中所解释的那样，我们在《见证者》中使用了预先计算的全局照明，而我的首要任务之一就是开发该系统。
+我开发了一些有趣的技术来计算自动参数化，以一种可以轻松映射到 GPU 的方式制定照明计算，并通过使用辐照度缓存来加速它们以较低频率执行。 这些东西都不是非常前沿的，但我遇到了一些通常在文献中被忽视的有趣问题，并提出了一些我认为值得分享的创造性解决方案。 然而，回想起来，我认为我也犯了一些错误，但我希望诚实地对待这些错误可以帮助我在未来避免这些错误。
+在第一篇文章中，我将描述我已经实现的光照贴图参数化算法，在接下来的几篇文章中，我将介绍我们的照明系统的其他细节，例如我们使用半立方体执行最终聚集的方法以及我们的辐照度缓存的实现。
+为了使用预先计算的照明，我们需要一种将这些照明计算映射到表面的方法。 一种可能性是按顶点存储它们，但在许多情况下，这不能提供足够的分辨率，并且照明的插值使网格的三角剖分相当明显。 许多游戏通过用高纹理和法线贴图细节来补偿光照细节的缺乏来解决这个问题，但这与Jon想要实现的图形风格不太相符。 因此，我们决定创建对象的完整参数化，以便将预先计算的光照存储到光照贴图纹理中。
+NSDT工具推荐： Three.js AI纹理开发包 - YOLO合成数据生成器 - GLTF/GLB在线编辑 - 3D模型格式在线转换 - 可编程3D场景编辑器 - REVIT导出3D模型插件 - 3D模型语义搜索引擎 手动创建这些参数化是可能的，但这很耗时，我宁愿让我们的艺术家做一些更有趣的事情。 因此，我们决定自动创建参数化。 然而，迄今为止我所犯的最大错误是没有更仔细地研究实现这一目标的可用解决方案。 我已经有了一些实现的部分，并且我高估了将它们组合在一起并产生可靠结果所需的工作量。 在与 GDC 的一些朋友谈论此事时，其中一位问我为什么不使用微软的 UVAtlas 工具，令我沮丧和尴尬的是，我唯一的答案是我没有想到这一点。 我认为这证明了在像我们这样的小团队中对我们的发展持开放态度是多么有价值。
+现在我已经解决了这个问题，让我们谈谈技术。 我们仅使用光照贴图来表示间接照明和静态区域灯的直接照明。 因此，我们的期望是光照贴图将相当平滑，并且接缝不会成为大问题。 因此，我们决定不投资保证无缝参数化的解决方案，而是使用相当传统的方法：我们首先将输入几何图形划分为具有磁盘拓扑的图表，单独对它们进行参数化，最后将它们打包到矩形纹理中。
+1、分割 将网格划分为图表（charts）是迄今为止该过程中最复杂的步骤。 过去我尝试过使用层次聚类，但没有取得太大成功，所以这一次我决定使用类似于 Lloyd 算法的迭代聚类算法，与多图表几何图像 (MCGI) 论文中使用的算法相同。
+与 Lloyd 的聚类算法一样，MCGI 算法在图表增长和重新播种阶段之间进行迭代。 图表的增长由基于法线偏差和面质心之间的距离的度量引导。 在每次图表增长迭代之后，都会选择图表最中心面的新种子，并重复该过程，直到种子位置不再改变。
+我的 MCGI 算法实现效果还算不错，但并不总能产生良好的结果。 可以调整种子的数量和位置以获得所需的输出，但这需要一定量的用户干预，而这是不希望的。
+部分问题在于，在这种情况下“好”的含义非常主观。 它通常意味着形状优美的图表，非常适合表面，产生几乎没有失真的参数化，具有相当直和凸的边界，并且大小大致相等。
+为了使算法适应我们的目的，我做了两件事，修改了引导方法，以便自动选择初始种子数量，并使用指标组合来更好地控制结果。
+为了选择初始种子数量，我只需将种子一一插入，并增长相应的图表，直到满足阈值。 此时，我选择一个尚未分配给任何图表的任意面并重复该过程。 当没有面留下时，所有种子并行地重新开始生长过程。
+消除对初始条件的敏感性的常见策略是使用最远点启发式。 然而，我没有这样做，而是发现一种行之有效的方法是从已选择的图表中挑选最差的候选面孔作为下一个种子。
+该算法的第二个重要变化是使用一组不同的指标。 MCGI 论文提出了一种将法向偏差与面部质心之间的距离结合起来的度量。 我发现使用绝对距离使得算法非常依赖于网格的镶嵌，并且测量距质心的距离有利于具有低纵横比的三角形。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/0861d6fea3de3b03c5b35647a602cae2/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-27T09:19:12+08:00" />
+<meta property="article:modified_time" content="2023-12-27T09:19:12+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">光照贴图的参数化</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>正如Jon在<a href="http://the-witness.net/news/?p=50" rel="nofollow" title="上一篇文章">上一篇文章</a>中所解释的那样，我们在《见证者》中使用了预先计算的全局照明，而我的首要任务之一就是开发该系统。</p> 
+<p>我开发了一些有趣的技术来计算自动参数化，以一种可以轻松映射到 GPU 的方式制定照明计算，并通过使用辐照度缓存来加速它们以较低频率执行。 这些东西都不是非常前沿的，但我遇到了一些通常在文献中被忽视的有趣问题，并提出了一些我认为值得分享的创造性解决方案。 然而，回想起来，我认为我也犯了一些错误，但我希望诚实地对待这些错误可以帮助我在未来避免这些错误。</p> 
+<p>在第一篇文章中，我将描述我已经实现的光照贴图参数化算法，在接下来的几篇文章中，我将介绍我们的照明系统的其他细节，例如我们使用半立方体执行最终聚集的方法以及我们的辐照度缓存的实现。</p> 
+<p>为了使用预先计算的照明，我们需要一种将这些照明计算映射到表面的方法。 一种可能性是按顶点存储它们，但在许多情况下，这不能提供足够的分辨率，并且照明的插值使网格的三角剖分相当明显。 许多游戏通过用高纹理和法线贴图细节来补偿光照细节的缺乏来解决这个问题，但这与Jon想要实现的图形风格不太相符。 因此，我们决定创建对象的完整参数化，以便将预先计算的光照存储到光照贴图纹理中。</p> 
+<p style="text-align:center;"><img alt="" src="https://images2.imgbox.com/ac/22/ftXMbut8_o.png"></p> 
+<blockquote> 
+ <p><strong>NSDT工具推荐</strong>： <a href="https://tools.nsdt.cloud/DreamTexture?s=7878" rel="nofollow" title="Three.js AI纹理开发包">Three.js AI纹理开发包</a> - <a href="https://tools.nsdt.cloud/UnrealSynth?s=7878" rel="nofollow" title="YOLO合成数据生成器">YOLO合成数据生成器</a> - <a href="https://gltf.nsdt.cloud/?s=7878" rel="nofollow" title="GLTF/GLB在线编辑">GLTF/GLB在线编辑</a> - <a href="https://3dconvert.nsdt.cloud/?s=7878" rel="nofollow" title="3D模型格式在线转换">3D模型格式在线转换</a> - <a href="https://studio.nsdt.cloud/?s=7878" rel="nofollow" title="可编程3D场景编辑器">可编程3D场景编辑器</a> - <a href="https://3dconvert.nsdt.cloud/conv/plugin?s=7878" rel="nofollow" title="REVIT导出3D模型插件">REVIT导出3D模型插件</a> - <a href="https://tools.nsdt.cloud/3DSEE?s=7878" rel="nofollow" title="3D模型语义搜索引擎">3D模型语义搜索引擎</a> </p> 
+</blockquote> 
+<p>手动创建这些参数化是可能的，但这很耗时，我宁愿让我们的艺术家做一些更有趣的事情。 因此，我们决定自动创建参数化。 然而，迄今为止我所犯的最大错误是没有更仔细地研究实现这一目标的可用解决方案。 我已经有了一些实现的部分，并且我高估了将它们组合在一起并产生可靠结果所需的工作量。 在与 GDC 的一些朋友谈论此事时，其中一位问我为什么不使用微软的<a href="http://msdn.microsoft.com/en-us/library/ee422528%28VS.85%29.aspx" rel="nofollow" title=" UVAtlas "> UVAtlas </a>工具，令我沮丧和尴尬的是，我唯一的答案是我没有想到这一点。 我认为这证明了在像我们这样的小团队中对我们的发展持开放态度是多么有价值。</p> 
+<p>现在我已经解决了这个问题，让我们谈谈技术。 我们仅使用光照贴图来表示间接照明和静态区域灯的直接照明。 因此，我们的期望是光照贴图将相当平滑，并且接缝不会成为大问题。 因此，我们决定不投资保证无缝参数化的解决方案，而是使用相当传统的方法：我们首先将输入几何图形划分为具有磁盘拓扑的图表，单独对它们进行参数化，最后将它们打包到矩形纹理中。</p> 
+<h3 id="1%E3%80%81%E5%88%86%E5%89%B2">1、分割</h3> 
+<p>将网格划分为图表（charts）是迄今为止该过程中最复杂的步骤。 过去我尝试过使用层次聚类，但没有取得太大成功，所以这一次我决定使用类似于 Lloyd 算法的迭代聚类算法，与<a href="http://research.microsoft.com/en-us/um/people/hoppe/proj/mcgim/" rel="nofollow" title="多图表几何图像 (MCGI) 论文">多图表几何图像 (MCGI) 论文</a>中使用的算法相同。</p> 
+<p>与 Lloyd 的聚类算法一样，MCGI 算法在图表增长和重新播种阶段之间进行迭代。 图表的增长由基于法线偏差和面质心之间的距离的度量引导。 在每次图表增长迭代之后，都会选择图表最中心面的新种子，并重复该过程，直到种子位置不再改变。</p> 
+<p>我的 MCGI 算法实现效果还算不错，但并不总能产生良好的结果。 可以调整种子的数量和位置以获得所需的输出，但这需要一定量的用户干预，而这是不希望的。</p> 
+<p>部分问题在于，在这种情况下“好”的含义非常主观。 它通常意味着形状优美的图表，非常适合表面，产生几乎没有失真的参数化，具有相当直和凸的边界，并且大小大致相等。</p> 
+<p>为了使算法适应我们的目的，我做了两件事，修改了引导方法，以便自动选择初始种子数量，并使用指标组合来更好地控制结果。</p> 
+<p>为了选择初始种子数量，我只需将种子一一插入，并增长相应的图表，直到满足阈值。 此时，我选择一个尚未分配给任何图表的任意面并重复该过程。 当没有面留下时，所有种子并行地重新开始生长过程。</p> 
+<p>消除对初始条件的敏感性的常见策略是使用最远点启发式。 然而，我没有这样做，而是发现一种行之有效的方法是从已选择的图表中挑选最差的候选面孔作为下一个种子。</p> 
+<p>该算法的第二个重要变化是使用一组不同的指标。 MCGI 论文提出了一种将法向偏差与面部质心之间的距离结合起来的度量。 我发现使用绝对距离使得算法非常依赖于网格的镶嵌，并且测量距质心的距离有利于具有低纵横比的三角形。</p> 
+<p>我没有使用面之间的距离，而是只考虑了法线偏差，并将其与类似于 D 图表中提出的其他指标相结合：准可开发网格分割，并且考虑了圆度和直线度。</p> 
+<p>这些指标也有自己的问题，我必须以各种方式调整它们。 最重要的问题是它们以不受欢迎的方式限制了图表的增长。 例如，为了鼓励图表凸性，你可以将高因子与相应的度量相关联，但这会导致大量几乎凸的图表，一旦发现凸配置，就无法将其他面添加到图表中。 因此，我不使用这些指标来限制增长，而是仅使用它们来支持凸图或直线边界； 这使得图表可以自由生长，但仍然保留尽可能最凸和最直的形状。</p> 
+<p>在许多情况下有帮助的技巧是吸收艺术家的一些意见，但不会给他们带来任何额外的负担。 一种简单的方法是考虑网格的现有参数化。 我们的对象已经具有用于纹理的参数化，并且艺术家倾向于将纹理接缝放置在不容易看到的位置。 将图表的边界与现有的接缝对齐不仅减少了接缝的总数，而且还导致图表以更好地匹配艺术家手动完成的方式演变。</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="168" src="https://images2.imgbox.com/67/da/mml3Yk5c_o.png" width="300"></p> 
+<p>我独立考虑了纹理和正常接缝。 由于我们的参数化用于照明，因此我更严格地遵循法线接缝并与其角度成比例，不这样做会导致拐角显得不太明确或更模糊。 这也有助于该过程在具有许多硬边缘的架构网格中更快地收敛。</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="168" src="https://images2.imgbox.com/22/29/Jx7fz2gu_o.png" width="300"></p> 
+<p>最后，我没有施加任何图表拓扑限制。 我特别希望只要指标低于所需的阈值，图表就会围绕网格中的孔生长。 我很想使用更好的代理拟合指标而不是正常偏差指标，但这会生成必须切割的圆柱形或圆锥形图表，而我不想处理这个问题。 关闭另一侧的洞相当容易，只需检测边界并关闭所有边界，但最长的一个。</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="168" src="https://images2.imgbox.com/9c/a6/t4j85TH0_o.png" width="300"></p> 
+<h3 id="2%E3%80%81%E5%8F%82%E6%95%B0%E5%8C%96">2、参数化</h3> 
+<p>对于图表参数化算法，我们只需使用<a href="http://alice.loria.fr/index.php/publications.html?Paper=lscm@2002" rel="nofollow" title="最小二乘保形映射">最小二乘保形映射</a>，因为我已经有一个可用的实现。 我的实现基于 SIGGRAPH 2007 网格参数化<a href="http://www.inf.usi.ch/hormann/parameterization/CourseNotes.pdf" rel="nofollow" title="课程笔记">课程笔记</a>中的算法描述，我发现它比原始论文中的更容易理解。 特别有用的是关于数值优化的章节，尽管如果我必须再次编写一个稀疏矩阵求解器，我可能会使用 <a href="http://alice.loria.fr/index.php/software/4-library/23-opennl.html" rel="nofollow" title="OpenNL">OpenNL</a>，因为它现在已经在自由 BSD 许可证下发布。</p> 
+<p>LSCM 并不是最好的参数化算法。 它在大多数情况下工作得很好，尽管在一些罕见的情况下它会导致小的自我重叠。 这发生在两种情况下：</p> 
+<ul><li>输入中的零面积三角形有时会在参数化中翻转。</li><li>具有复杂边界的图表，在参数化时会自相交。</li></ul> 
+<p>第一种情况是由输入网格中的 T 形接头引起的，这些 T 形接头被检测为孔并填充有退化三角形。 在实践中，参数化中的小重叠并不是真正的问题，因此我们不修复输入，而是计划将这些问题报告给导出器中的美工人员，并让他修复它们（如果事实证明这会导致伪影）。</p> 
+<p>在第二种情况下，增加聚类过程中使用的凸性度量的权重使我们能够防止这些错误。 所以，我并没有真正采取任何措施来解决这个问题，但到目前为止这还不是一个问题。</p> 
+<p>即使在那之后，我们仍然存在一些有问题的案例。 我注意到 Blender 中的实现没有遇到同样的问题，并且可以更优雅地处理这些情况。 因此，我询问了 Brecht Van Lommel，他建议使用基于 LSCM 的 ABF 公式的替代矩阵权重，这似乎消除了剩余的问题。</p> 
+<p>虽然 LSCM 非常容易实现，但它绝对不是最好的参数化方法。 如果我要实现更好的东西，我可能会考虑 <a href="http://alice.loria.fr/index.php/publications.html?Paper=LinABF@2007" rel="nofollow" title="LinABF">LinABF</a> 或<a href="http://mgarland.org/files/papers/param.pdf" rel="nofollow" title="拟合引导梯度场">拟合引导梯度场</a>。 然而，由于单个图表的参数化是目前最快的步骤，因此考虑更昂贵的变形分析方法可能是有意义的。</p> 
+<h3 id="3%E3%80%81%E6%89%93%E5%8C%85">3、打包</h3> 
+<p>我们的打包（packing）算法相当简单。 与许多其他实现一样，我们首先按参数区域对图表进行排序，旋转它们以将图表与其最适合的矩形对齐，然后将它们一一引入到图集中。 理想情况下，我应该测试所有 4 个可能的方向，但目前我只是随机选择其中一个方向。</p> 
+<p>我没有使用类似俄罗斯方块的方案来找到每个图表的最佳位置，而是使用了一种更强力的方法，其中考虑了所有可能的位置。 我使用保守的光栅化器来实现这一点，该光栅化器标记图表所触及的所有纹素，再加上一个用于填充的额外纹素。 随着新图表的插入，我逐渐增加纹理范围。 如果找到当前范围内的位置，则自动接受图表，否则将评估度量以确定增加地图集范围最少的位置。 由于我使用贪婪算法，最小化面积会导致地图集具有非常高的纵横比。 因此，我反而最小化了结合范围和周长的度量，并产生了大部分方形地图集。</p> 
+<p>以下是一些结果示例：</p> 
+<p></p> 
+<p class="img-center"><img alt="" height="452" src="https://images2.imgbox.com/dc/68/KHuEV5nx_o.png" width="448"></p> 
+<p></p> 
+<p class="img-center"><img alt="" height="421" src="https://images2.imgbox.com/3d/a5/jPBBuZZC_o.png" width="435"></p> 
+<p>一旦我们使用光照贴图压缩，将图表与 DXT 块边界对齐以防止渗色伪影可能是有意义的。</p> 
+<h3 id="4%E3%80%81%E6%9C%AA%E6%9D%A5%E7%9A%84%E6%94%B9%E8%BF%9B">4、未来的改进</h3> 
+<p>这是我认为有很大改进空间的领域之一，但与此同时，花费更多时间来改进结果并没有太多！。 尽管尚未在生产中进行测试，但我认为我们当前的解决方案运行得相当好。 如果有更大的图表，失真更少或接缝数量更少，那就太好了，我肯定会很乐意做这件事。 然而，这并不会让游戏运行得更快或者看起来更好。 我们计划在某个时候发布这些算法的源代码，所以我希望随着其他人采用它并改进它以满足他们的需求，实现会逐渐变得更好。</p> 
+<p>也就是说，如果我认为有一个领域值得投资，那就是信号专用参数化的使用。 关于该主题的研究论文（<a href="http://research.microsoft.com/en-us/um/people/hoppe/proj/ssp/" rel="nofollow" title="信号专用参数化">信号专用参数化</a>和<a href="http://research.microsoft.com/en-us/um/people/hoppe/proj/ssplinear/" rel="nofollow" title="分段线性重建的信号专用参数化">分段线性重建的信号专用参数化</a>）在我们的设置中可能有点过分了，而且我不确定它们是否能很好地处理我们的低分辨率网格。</p> 
+<p>《半条命 2》通过使用艺术家为每个表面指定的采样率来实现这一点，但我认为使用类似于<a href="http://www.bungie.net/images/Inside/publications/presentations/Lightmap_Compression_2008_02_22.pptx" rel="nofollow" title=" Bungie 提出的方法"> Bungie 提出的方法</a>自动实现这一点是值得的，该方法看起来相当简单，并且提供了更复杂的方法所获得的大部分收益给我们。</p> 
+<p>我的期望是，除了一些小的调整和轻微的调整以处理将来可能出现的问题案例之外，当前的实施不会发生重大变化。 如果有人对此类算法有任何经验，我很想听听。 我特别想知道你是否会采取不同的做法，或者是否有任何我可能忽略的优化或改进，而你认为值得考虑。</p> 
+<hr> 
+<p>原文链接：<a href="http://www.bimant.com/blog/lightmap-parameterization/" rel="nofollow" title="光照贴图参数化 - BimAnt">光照贴图参数化 - BimAnt</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/30b6f4822d0e8e257793b18ab479d8df/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Java八股文面试全套真题【含答案】- RocketMQ篇</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e768587a26c85491a21b69125a004fd1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">JavaScript：快速排序、冒泡排序、归并排序</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

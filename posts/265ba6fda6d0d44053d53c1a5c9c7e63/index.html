@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Hbase原理理解 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Hbase原理理解" />
+<meta property="og:description" content="注：本博客乃是自己对于Hbase的一部分理解，所参考的资料，会列在本文的末尾处。
+先来上一张随处可见的图：
+Hbase即分布式的数据库，其底层基于HDFS，提供了随机访问的存储和检索数据的功能。
+对于HDFS来说，实现随机访问的代价太高了，因为hdfs使用的更好情况是，基于文件的顺序读写；但是，其本身的实时性能也并不是很高。
+HBase的文件存储是基于HDFS，其底层的运算采用的是MapReduce，这里，其实可以用spark的高性能来提高效率，其实，对于如今的hadoop来说，最优异的，或者说最有价值的还是HDFS，其中的运算框架，完全可以用性能更加优良的运算框架来实现，比如说spark以及flink等。
+闲话少说，还是继续讲HBase。
+综述：使用zookeeper来对集群进行管理，使用HDFS来作为底层存储，而基本架构则是通过由zookeeper选择出来的HMaster来实现对集群的管理，多个HRegionServer负责对数据的管理。（架构核心：HMaster和HRegionServer）。
+HRegionServer对应于集群中的一个节点，类似于HDFS中的datanode，其管理多个HRegion，而一个HRegion代表一张表中的部分数据；而数据划分的依据则是根据rowkey来划分一定的范围，归于哪个HRegion。（重点：HRegion，RowKey）。
+单说一下HMaster：其并不存储任何数据，而只是存储数据到HRegionServer的映射关系，通俗来说就是元数据（想起来Hive中也提供了元数据的概念，好像很多地方都用到了这个东西）。
+再来一张图，大家可以看到这张图是从别人那边粘来的，这张图很详细的介绍了HBase的基础架构，接下来的讲述都是针对于本图的。
+我觉得，对于这张图，大家一定要注意其中的彼此的数量关系，图中就画的很清楚。
+1：HLog：在数据写入的过程中，为了避免突然的内存崩溃等问题，导致数据丢失，会依靠这种WriteAheadLog机制，在数据写入这内存的时候，同时会写入日志中，如果崩溃了的话，还是能够恢复的。
+这里，几个问题说下：
+HLog肯定会越写越大，这样的话，一定会有把磁盘撑爆的那一天的，而实际上，在不断写入的过程中，HBase会通过HLog过期的方式，譬如说，当memstore已经刷新到磁盘中后，这一部分的写入日志就可以清除掉了，而这时候也存在个问题，如果HLog的内容丢失，会不会对于后期的数据恢复有影响？个人觉得，这里不仅是写入磁盘了，更重要的是写入到了HDFS系统中，所以，恢复的时候，可能不仅仅是通过HLog，同时还有HDFS存下来的数据，比如HFile作为保障吧！ 注：这里面有一个我当时天资愚钝，很长时间没想通的问题，大家能够看到是一个HRegionServer对应一份HLog，也就是说，如果本台机器崩溃之后，其他机器怎么可能读取到本机的HLog呢？其实，这个HLog是存储在HDFS系统内的，图中的箭头表明了这个方向。
+2：HRegion：HBase的表示基于列，或者说是基于列族的，但实际上，数据也是一行一行的，每一行都有绝对唯一的rowkey，当随着存储数据的不断增加，最初写入的HRegion会不断变大，达到一定的大小，就会拆分为两个HRegion，换句话说，这就是HBase的默认分表，到底多大会划分，可以自行配置
+3：Store：这是HBase整个存储的核心，大家可以看到其中有一个MemStore，这个就是内存存储，写入的时候都会写入到这里，随着占用内存越来越大，会刷到磁盘中（很多地方都是这么用的，譬如说MapReduce中的spill阶段，也是把数据先写入内存，然后达到百分之八十的占用后，会spill到磁盘之中），这里，我觉得应该也是有控制的，为了提高性能，肯定是内存写入到一定程度，就开始向磁盘中存储，这时候，就会生成StoreFile，而同样，storeFile的数据会越来越多，这时候，就会进行compact操作，多个storeFile生成一个文件（其实这里有一个疑问，compact的过程中，有没有排序？数据写入内存的时候，有没有排序呢？），而按照上图，实际上在磁盘上生成的文件叫做HFile，这才是数据写入的最小单元；这里还有一点东西，列族，实际上，对于每一个Store，就是一个列族，有多少个Store，就有多少个列族。
+注：memStore的数据刷盘，有笔记说，刷盘的时间内，该region的数据是拒绝访问的，此部分暂时未能理解（参考资料2）
+查阅了大神的笔记（末尾参考笔记2），提到这一点：写入到memstore中的数据都是预先按照rowkey的值进行排序的，这样有利于后续数据查查；所以，肯定是有排序的。
+HBase读数据和写入数据的流程：
+写入数据：写过Java相关代码，其实client是通过访问zk来先行获取HMaster的地址，然后向机器请求元数据，然后才获取到具体的表地址的；然后，client会直接向该机器发出请求，请求数据写入的；而且，会有缓存，这样方便第二次读取了。读出数据：大致相同，先根据zookeeper去获取一个连接，然后进行数据的读取。 2：使用场景：
+想要了解一个东西，必须要知道其使用场景，不然等于白学，原理要掌握，代码要会写，问题要能够解决，知道在哪儿用，怎么用，才算真正掌握了。
+场景1：我们比较一下HBase和关系型数据库，先不说大小，因为mysql也可以做成集群了；但是mysql比较苦逼的一点是，不支持表结构的更改，但是hbase因为有列族这个概念，其下堪称是可以无限添加列，完美解决了这个问题。
+场景2：记录非常稀疏的情况，这里，因为RDBMS的行有多少列全都是固定的，无论有无数据都会占据存储空间，而对于HBase对于那些空的列，并不会被存储，这的确也是个好处。
+场景3：多版本的数据，这个的确很妙，因为hbase只支持数据的不断添加，而实际上，前面的并不会删除，大家可以想象，如果去删除前面的数据，这部分的性能消耗会是多高，相当于随机处理了；所以，其做到的就是，让你每次查询数据的时候，只会查询到最新插入的数据，这就相当于是变相的删除了，而同时，你还可以完美查询多个版本的数据，一举两得。
+场景4：HBase的横向无缝扩展，其实这个东西，我觉得对于分布式来说，没有这个优点，那还叫分布式吗？
+表的设计问题：
+3：HBase设计
+毫无疑问，表需要设计，尤其是其中的rowkey，作为绝对唯一的值，更需要谨慎涉及，其实可以采用MD5的串，或者时间戳，或者UUID的串，这些值基本，或者绝对不会重复的。
+4：HBase的各种操作方式：
+如果真想把HBase用起来，这部分非常重要。
+暂时手里没有代码，先把用法贴在这里：
+可以用MapReduce来操作HBase，实现数据的读出和写入可以用Spark来操作HBase，实现数据的读出和写入 个人见解：其实HBase最核心的理论基础应该还是在谷歌的那一篇论文里，具体叫什么忘记了，但是基于其开发出很多的类似HBase的东东，大家都可以看一下，最好是了解其中的核心原理，才是最重要的。
+参考资料：
+http://blog.csdn.net/carl810224/article/details/51970039/：本文写的很好，但是并没有讲到底层的与HDFS牵涉到的细节，也没有但具体讲解HFile，但总体来说很不错。
+http://blog.csdn.net/xgjianstart/article/details/53290155：这篇文章非常好，讲的东西比较深刻。
+https://www.cnblogs.com/qiaoyihang/p/6246424.html：这篇是我学习HBase的启蒙文章，介绍的非常详尽；强烈建议本文。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/265ba6fda6d0d44053d53c1a5c9c7e63/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2018-02-26T23:01:28+08:00" />
+<meta property="article:modified_time" content="2018-02-26T23:01:28+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Hbase原理理解</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>注：本博客乃是自己对于Hbase的一部分理解，所参考的资料，会列在本文的末尾处。</p> 
+<p><img src="https://images2.imgbox.com/93/fe/ndcr7cgZ_o.png" alt=""><br></p> 
+<p>先来上一张随处可见的图：</p> 
+<p>Hbase即分布式的数据库，其底层基于HDFS，提供了随机访问的存储和检索数据的功能。</p> 
+<p>对于HDFS来说，实现随机访问的代价太高了，因为hdfs使用的更好情况是，基于文件的顺序读写；但是，其本身的实时性能也并不是很高。</p> 
+<p>HBase的文件存储是基于HDFS，其底层的运算采用的是MapReduce，这里，其实可以用spark的高性能来提高效率，其实，对于如今的hadoop来说，最优异的，或者说最有价值的还是HDFS，其中的运算框架，完全可以用性能更加优良的运算框架来实现，比如说spark以及flink等。</p> 
+<p>闲话少说，还是继续讲HBase。</p> 
+<p>综述：使用zookeeper来对集群进行管理，使用HDFS来作为底层存储，而基本架构则是通过由zookeeper选择出来的HMaster来实现对集群的管理，多个HRegionServer负责对数据的管理。（架构核心：HMaster和HRegionServer）。</p> 
+<p>HRegionServer对应于集群中的一个节点，类似于HDFS中的datanode，其管理多个HRegion，而一个HRegion代表一张表中的部分数据；而数据划分的依据则是根据rowkey来划分一定的范围，归于哪个HRegion。（重点：HRegion，RowKey）。</p> 
+<p>单说一下HMaster：其并不存储任何数据，而只是存储数据到HRegionServer的映射关系，通俗来说就是元数据（想起来Hive中也提供了元数据的概念，好像很多地方都用到了这个东西）。</p> 
+<p></p> 
+<div> 
+ <img src="https://images2.imgbox.com/64/9a/MEdp5cDJ_o.png" alt=""> 
+ <br> 
+</div> 
+<br> 
+<p>再来一张图，大家可以看到这张图是从别人那边粘来的，这张图很详细的介绍了HBase的基础架构，接下来的讲述都是针对于本图的。</p> 
+<p>我觉得，对于这张图，大家一定要注意其中的彼此的数量关系，图中就画的很清楚。</p> 
+<p>1：HLog：在数据写入的过程中，为了避免突然的内存崩溃等问题，导致数据丢失，会依靠这种WriteAheadLog机制，在数据写入这内存的时候，同时会写入日志中，如果崩溃了的话，还是能够恢复的。</p> 
+<p>这里，几个问题说下：</p> 
+<ol><li>HLog肯定会越写越大，这样的话，一定会有把磁盘撑爆的那一天的，而实际上，在不断写入的过程中，HBase会通过HLog过期的方式，譬如说，当memstore已经刷新到磁盘中后，这一部分的写入日志就可以清除掉了，而这时候也存在个问题，如果HLog的内容丢失，会不会对于后期的数据恢复有影响？个人觉得，这里不仅是写入磁盘了，更重要的是写入到了HDFS系统中，所以，恢复的时候，可能不仅仅是通过HLog，同时还有HDFS存下来的数据，比如HFile作为保障吧！</li></ol> 
+<p>注：这里面有一个我当时天资愚钝，很长时间没想通的问题，大家能够看到是一个HRegionServer对应一份HLog，也就是说，如果本台机器崩溃之后，其他机器怎么可能读取到本机的HLog呢？其实，这个HLog是存储在HDFS系统内的，图中的箭头表明了这个方向。</p> 
+<p>2：HRegion：HBase的表示基于列，或者说是基于列族的，但实际上，数据也是一行一行的，每一行都有绝对唯一的rowkey，当随着存储数据的不断增加，最初写入的HRegion会不断变大，达到一定的大小，就会拆分为两个HRegion，换句话说，这就是HBase的默认分表，到底多大会划分，可以自行配置</p> 
+<p>3：Store：这是HBase整个存储的核心，大家可以看到其中有一个MemStore，这个就是内存存储，写入的时候都会写入到这里，随着占用内存越来越大，会刷到磁盘中（很多地方都是这么用的，譬如说MapReduce中的spill阶段，也是把数据先写入内存，然后达到百分之八十的占用后，会spill到磁盘之中），这里，我觉得应该也是有控制的，为了提高性能，肯定是内存写入到一定程度，就开始向磁盘中存储，这时候，就会生成StoreFile，而同样，storeFile的数据会越来越多，这时候，就会进行compact操作，多个storeFile生成一个文件（其实这里有一个疑问，compact的过程中，有没有排序？数据写入内存的时候，有没有排序呢？），而按照上图，实际上在磁盘上生成的文件叫做HFile，这才是数据写入的最小单元；这里还有一点东西，列族，实际上，对于每一个Store，就是一个列族，有多少个Store，就有多少个列族。</p> 
+<p>注：memStore的数据刷盘，有笔记说，刷盘的时间内，该region的数据是拒绝访问的，此部分暂时未能理解（参考资料2）</p> 
+<p><span style="color:rgb(85,85,85);font-family:'Microsoft Yahei', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:15px;text-indent:30px;background-color:rgb(255,255,255);">查阅了大神的笔记（末尾参考笔记2），提到这一点：写入到memstore中的数据都是预先按照rowkey的值进行排序的，这样有利于后续数据查查；所以，肯定是有排序的。</span><br></p> 
+<p>HBase读数据和写入数据的流程：</p> 
+<ol><li>写入数据：写过Java相关代码，其实client是通过访问zk来先行获取HMaster的地址，然后向机器请求元数据，然后才获取到具体的表地址的；然后，client会直接向该机器发出请求，请求数据写入的；而且，会有缓存，这样方便第二次读取了。</li><li>读出数据：大致相同，先根据zookeeper去获取一个连接，然后进行数据的读取。</li></ol> 
+<p><span style="background-color:rgb(255,102,102);">2：使用场景：</span></p> 
+<p>想要了解一个东西，必须要知道其使用场景，不然等于白学，原理要掌握，代码要会写，问题要能够解决，知道在哪儿用，怎么用，才算真正掌握了。</p> 
+<p>场景1：我们比较一下HBase和关系型数据库，先不说大小，因为mysql也可以做成集群了；但是mysql比较苦逼的一点是，不支持表结构的更改，但是hbase因为有列族这个概念，其下堪称是可以无限添加列，完美解决了这个问题。</p> 
+<p>场景2：记录非常稀疏的情况，这里，因为RDBMS的行有多少列全都是固定的，无论有无数据都会占据存储空间，而对于HBase对于那些空的列，并不会被存储，这的确也是个好处。</p> 
+<p>场景3：多版本的数据，这个的确很妙，因为hbase只支持数据的不断添加，而实际上，前面的并不会删除，大家可以想象，如果去删除前面的数据，这部分的性能消耗会是多高，相当于随机处理了；所以，其做到的就是，让你每次查询数据的时候，只会查询到最新插入的数据，这就相当于是变相的删除了，而同时，你还可以完美查询多个版本的数据，一举两得。</p> 
+<p>场景4：HBase的横向无缝扩展，其实这个东西，我觉得对于分布式来说，没有这个优点，那还叫分布式吗？</p> 
+<p>表的设计问题：</p> 
+<p><span style="background-color:rgb(255,0,0);">3：HBase设计</span></p> 
+<p><span style="background-color:rgb(255,255,255);">毫无疑问，表需要设计，尤其是其中的rowkey，作为绝对唯一的值，更需要谨慎涉及，其实可以采用MD5的串，或者时间戳，或者UUID的串，这些值基本，或者绝对不会重复的。</span></p> 
+<p><span style="background-color:rgb(255,0,0);">4：HBase的各种操作方式：</span></p> 
+<p><span style="background-color:rgb(255,255,255);">如果真想把HBase用起来，这部分非常重要。</span></p> 
+<p><span style="background-color:rgb(255,255,255);">暂时手里没有代码，先把用法贴在这里：</span></p> 
+<ol><li>可以用MapReduce来操作HBase，实现数据的读出和写入</li><li>可以用Spark来操作HBase，实现数据的读出和写入</li></ol> 
+<p>个人见解：其实HBase最核心的理论基础应该还是在谷歌的那一篇论文里，具体叫什么忘记了，但是基于其开发出很多的类似HBase的东东，大家都可以看一下，最好是了解其中的核心原理，才是最重要的。</p> 
+<p><span style="color:#000000;background-color:rgb(255,0,0);">参考资料：</span></p> 
+<p>http://blog.csdn.net/carl810224/article/details/51970039/：本文写的很好，但是并没有讲到底层的与HDFS牵涉到的细节，也没有但具体讲解HFile，但总体来说很不错。</p> 
+<p>http://blog.csdn.net/xgjianstart/article/details/53290155：这篇文章非常好，讲的东西比较深刻。<br></p> 
+<p>https://www.cnblogs.com/qiaoyihang/p/6246424.html：这篇是我学习HBase的启蒙文章，介绍的非常详尽；强烈建议本文。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3b9fae38d37926807d8ccd0ef9e03cc9/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">C&#43;&#43;中bitset用法</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/68cdbffedc4b8d0f93a3b7f8de4ae504/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">如果有一个500G的超大文件，里面都是数值，如何对这些数值排序？</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

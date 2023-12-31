@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>关于softlockup和rcu stall错误分析 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="关于softlockup和rcu stall错误分析" />
+<meta property="og:description" content="原理： 软锁需要开启CONFIG_LOCKUP_DETECTOR内核选项，源码kernel/watchdog.c。 情况宋宝华的博文：Linux内核为什么会发生soft lockup？-CSDN博客 watchdog_timer_fn ：per_cpu 定时器回调 判断(softlockup_completion) 已经completion ？ yes:	stop_one_cpu_nowait //借用stop_machine 内核线程来工作(migration/X)，工作函数softlockup_fn cpu_stop_queue_work //将cpu_stop_work 插入， wake_up_q //并唤醒 wake_q_head关联的stop_machine内核线程(migration/X) no: 检测是否超过20s ？ 工作函数：softlockup_fn static int softlockup_fn(void *data) { __this_cpu_write(soft_lockup_hrtimer_cnt, __this_cpu_read(hrtimer_interrupts)); __touch_watchdog(); complete(this_cpu_ptr(&amp;softlockup_completion)); //complete return 0; } 文章提到：在开启 CONFIG_PREEMPT=y 的时候，且没有关闭本地irq的时候，在内核中断el1_irq：
+SYM_CODE_START_LOCAL_NOALIGN(el1_irq) kernel_entry 1 gic_prio_irq_setup pmr=x20, tmp=x1 enable_da_f mov x0, sp bl enter_el1_irq_or_nmi irq_handler #ifdef CONFIG_PREEMPTION ldr x24, [tsk, #TSK_TI_PREEMPT] // get preempt count alternative_if ARM64_HAS_IRQ_PRIO_MASKING /* * DA_F were cleared at start of handling." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/abe0865053c3be530ce70f5a96f6feed/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-29T14:13:18+08:00" />
+<meta property="article:modified_time" content="2023-12-29T14:13:18+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">关于softlockup和rcu stall错误分析</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h5>原理：</h5> 
+<p>软锁需要开启CONFIG_LOCKUP_DETECTOR内核选项，源码kernel/watchdog.c。 </p> 
+<p>情况宋宝华的博文：<a href="https://blog.csdn.net/21cnbao/article/details/108250786" title="Linux内核为什么会发生soft lockup？-CSDN博客">Linux内核为什么会发生soft lockup？-CSDN博客</a> </p> 
+<pre><code>watchdog_timer_fn ：per_cpu 定时器回调
+    判断(softlockup_completion) 已经completion ？ 
+	yes:	stop_one_cpu_nowait   //借用stop_machine 内核线程来工作(migration/X)，工作函数softlockup_fn
+			cpu_stop_queue_work   //将cpu_stop_work 插入，
+			wake_up_q   //并唤醒 wake_q_head关联的stop_machine内核线程(migration/X)
+			
+	no:
+		检测是否超过20s ？
+
+工作函数：softlockup_fn
+static int softlockup_fn(void *data)
+{
+        __this_cpu_write(soft_lockup_hrtimer_cnt,
+                         __this_cpu_read(hrtimer_interrupts));
+        __touch_watchdog();
+        complete(this_cpu_ptr(&amp;softlockup_completion)); //complete
+
+        return 0;
+}
+			</code></pre> 
+<p></p> 
+<p>文章提到：在开启 CONFIG_PREEMPT=y 的时候，且没有关闭本地irq的时候，在内核中断el1_irq：</p> 
+<pre><code>SYM_CODE_START_LOCAL_NOALIGN(el1_irq)
+        kernel_entry 1
+        gic_prio_irq_setup pmr=x20, tmp=x1
+        enable_da_f
+
+        mov     x0, sp
+        bl      enter_el1_irq_or_nmi
+
+        irq_handler
+
+#ifdef CONFIG_PREEMPTION
+        ldr     x24, [tsk, #TSK_TI_PREEMPT]     // get preempt count
+alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+        /*
+         * DA_F were cleared at start of handling. If anything is set in DAIF,
+         * we come back from an NMI, so skip preemption
+         */
+        mrs     x0, daif
+        orr     x24, x24, x0
+alternative_else_nop_endif
+        cbnz    x24, 1f                         // preempt count != 0 || NMI return path
+        bl      arm64_preempt_schedule_irq      // irq en/disable is done inside
+1:
+#endif
+
+        mov     x0, sp
+        bl      exit_el1_irq_or_nmi
+
+        kernel_exit 1
+SYM_CODE_END(el1_irq)
+</code></pre> 
+<p>当发生中断时，会执行el1_irq来处理中断，来读取当前任务的thread_info.preempt_count  判断thread_info.preempt_count是否为0，如果为0 则调用arm64_preempt_schedule_irq 进行抢占式调度。 参考本人的实验：<a href="https://blog.csdn.net/gjioui123/article/details/133858464" title="深入理解Linux内核之内核抢占-CSDN博客">深入理解Linux内核之内核抢占-CSDN博客</a></p> 
+<p>下面看下抢占式调度：</p> 
+<pre><code>arm64_preempt_schedule_irq
+
+    -&gt;preempt_schedule_irq
+
+        -&gt;__schedule(true) //调用主调度器进行抢占式调度
+
+
+
+需要满足可抢占条件：
+asmlinkage __visible void __sched preempt_schedule_irq(void)
+{
+	enum ctx_state prev_state;
+
+	/* Catch callers which need to be fixed */
+	BUG_ON(preempt_count() || !irqs_disabled());
+
+	prev_state = exception_enter();
+
+	do {
+		preempt_disable();
+		local_irq_enable();
+		__schedule(true);
+		local_irq_disable();
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
+
+	exception_exit(prev_state);
+}</code></pre> 
+<p>打开抢占的时候</p> 
+<p>开启抢占：</p> 
+<pre><code>preempt_enable
+-&gt;if (unlikely(preempt_count_dec_and_test())) \   //抢占计数器减一  为0
+        __preempt_schedule(); \               
+   -&gt;preempt_schedule  //kernel/sched/core.c
+    -&gt; __schedule(true)  //调用主调度器进行抢占式调度</code></pre> 
+<p>在打开抢占PREEMPT的内核中，while循环将不会有任何问题。如果使用关闭抢占，比如通过自旋锁的方式会如何呢？ </p> 
+<h5>打开本地irq的自旋锁：</h5> 
+<p>lock_up_module.c</p> 
+<pre><code>#include &lt;linux/init.h&gt;
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/kthread.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/spinlock.h&gt;
+ 
+MODULE_LICENSE("GPL");
+ 
+static int hog_thread(void *data) {
+  static DEFINE_SPINLOCK(lock);
+  unsigned long flags;
+
+  printk(KERN_INFO "Hogging a CPU now task %s  %d \n",current-&gt;comm,smp_processoo
+r_id());
+  //spin_lock_irqsave(&amp;lock, flags);
+  spin_lock(&amp;lock);
+  while (1)
+    ;
+  spin_unlock(&amp;lock);
+  //spin_unlock_irqrestore(&amp;lock,flags);
+  /* unreached */
+  printk(KERN_INFO "Hogging a CPU end %d \n",smp_processor_id());
+  return 0;
+}
+
+ 
+static int __init hog_init(void) {
+  kthread_run(&amp;hog_thread, NULL, "hog");
+  return 0;
+}
+ 
+module_init(hog_init);
+MODULE_LICENSE("GPL v2"); // 表示模块代码接受的软件许可协议
+MODULE_AUTHOR("www");     // 描述模块的作者信息
+MODULE_DESCRIPTION("soft lock up module"); // 对模块的简单介绍
+MODULE_ALIAS("soft_lock_up_module");       // 给模块设置一个别名</code></pre> 
+<p>上面的代码，即时内核开启 CONFIG_PREEMPT 报rcu错误和softlockup错误：该rcu是self-detected自我检测print_cpu_stall</p> 
+<pre><code>[ 4085.374398] rcu: INFO: rcu_preempt self-detected stall on CPU
+[ 4085.381455] rcu: 	0-....: (20972 ticks this GP) idle=39e/1/0x4000000000000002 softirq=9507/9507 fqs=8514 
+[ 4085.393648] 	(t=21003 jiffies g=14621 q=9063)
+[ 4085.399292] Task dump for CPU 0:
+[ 4085.403795] task:softlockup_thre state:R  running task     stack:    0 pid: 1878 ppid:     2 flags:0x0000022a
+[ 4085.416336] Call trace:
+[ 4085.420054]  dump_backtrace+0x0/0x1b4
+[ 4085.424940]  show_stack+0x24/0x80
+[ 4085.429504]  sched_show_task+0x150/0x17c
+[ 4085.434698]  dump_cpu_task+0x50/0x60
+                print_cpu_stall
+                check_cpu_stall
+                rcu_pending
+[ 4085.439509]  rcu_dump_cpu_stacks+0xb8/0xf8
+[ 4085.444882]  rcu_sched_clock_irq+0xb34/0xe54
+[ 4085.450446]  update_process_times+0x6c/0xb0
+[ 4085.455890]  tick_sched_handle+0x3c/0x60
+[ 4085.461074]  tick_sched_timer+0x58/0xb0
+[ 4085.466149]  __hrtimer_run_queues+0x18c/0x3cc
+[ 4085.471751]  hrtimer_interrupt+0xf4/0x29c
+[ 4085.476990]  arch_timer_handler_phys+0x40/0x50
+[ 4085.482685]  handle_percpu_devid_irq+0x94/0x290
+[ 4085.488461]  __handle_domain_irq+0x88/0xec
+[ 4085.493818]  gic_handle_irq+0xcc/0x14c
+[ 4085.498826]  el1_irq+0xc4/0x180
+[ 4085.503218]  task+0x7c/0x98 [soft_lock_up_module]
+[ 4085.509172]  kthread+0x164/0x16c
+[ 4085.513668]  ret_from_fork+0x10/0x3c
+
+[  240.615578] watchdog: BUG: soft lockup - CPU#2 stuck for 23s! [hog:1473]
+[  240.623623] Modules linked in: hard_lock_up_module(O) ip6table_filter ip6_tables iptable_filter ip_tables x_tables spidev drm fuse cdc_ncm cdc_ether crct10dif_ce ax88179_178a usbnet rtc_ds1307 ipv6
+[  240.645338] CPU: 2 PID: 1473 Comm: hog Tainted: G           O      5.10.0-with-dc-g1c56f5c219bc-dirty #38
+[  240.657609] Hardware name: PHYTIUM LTD D2000/D2000, BIOS  
+[  240.664479] pstate: 60000005 (nZCv daif -PAN -UAO -TCO BTYPE=--)
+[  240.671887] pc : hog_thread+0x4c/0xfff0 [hard_lock_up_module]
+[  240.678995] lr : hog_thread+0x4c/0xfff0 [hard_lock_up_module]
+[  240.686111] sp : ffff80001654fe30
+[  240.690804] x29: ffff80001654fe30 x28: 0000000000000000 
+[  240.697494] x27: ffff001f809c1fc8 x26: ffff800012828688 
+[  240.704200] x25: ffff8000115d1840 x24: 0000000000000000 
+[  240.710921] x23: ffff800009680010 x22: ffff8000166efa78 
+[  240.717621] x21: ffff001f8d0bc800 x20: ffff001f809c1f80 
+[  240.724303] x19: ffff800011a20000 x18: 0000000000000030 
+[  240.731006] x17: 0000000000000000 x16: 0000000000000000 
+[  240.737702] x15: 0000000000000001 x14: ffff80009654fb37 
+[  240.744392] x13: 0000000000000a00 x12: ffff80001116f000 
+[  240.751092] x11: 0000000000000001 x10: 0000000000000a00 
+[  240.757761] x9 : ffff80000968005c x8 : ffff001f8d0bd260 
+[  240.764474] x7 : 0000000000000000 x6 : 0000000000000000 
+[  240.771192] x5 : 0000000000000000 x4 : 0000000000000000 
+[  240.777910] x3 : ffff8000096a03c0 x2 : 0000000000000001 
+[  240.784617] x1 : 0000000000000000 x0 : 0000000000000000 
+[  240.791329] Call trace:
+[  240.795153]  hog_thread+0x4c/0xfff0 [hard_lock_up_module]
+[  240.801947]  kthread+0x164/0x16c
+[  240.806562]  ret_from_fork+0x10/0x3c
+</code></pre> 
+<p><a href="https://blog.csdn.net/weixin_45030965/article/details/133278953" title="Linux 内核分析 rcu_sched self-detected stall on CPU_小立爱学习的博客-CSDN博客">Linux 内核分析 rcu_sched self-detected stall on CPU_小立爱学习的博客-CSDN博客</a></p> 
+<p>spin_lock最终会调用preempt_disable：关闭抢占，此时CONFIG_PREEMPT=y。不满足preempt_schedule_irq抢占，导致无法进程调度。</p> 
+<pre><code>static inline void __raw_spin_lock(raw_spinlock_t *lock)
+{
+	preempt_disable();
+	spin_acquire(&amp;lock-&gt;dep_map, 0, 0, _RET_IP_);
+	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
+}</code></pre> 
+<p></p> 
+<h5>关闭本地irq的自旋锁： </h5> 
+<p> demo驱动：</p> 
+<pre><code>#include &lt;linux/init.h&gt;
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/kthread.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/spinlock.h&gt;
+ 
+MODULE_LICENSE("GPL");
+ 
+static int hog_thread(void *data) {
+  static DEFINE_SPINLOCK(lock);
+  unsigned long flags;
+
+  printk(KERN_INFO "Hogging a CPU now task %s  %d \n",current-&gt;comm,smp_processoo
+r_id());
+  spin_lock_irqsave(&amp;lock, flags);
+  //spin_lock(&amp;lock);
+  while (1)
+    ;
+  //spin_unlock(&amp;lock);
+  spin_unlock_irqrestore(&amp;lock,flags);
+  /* unreached */
+  printk(KERN_INFO "Hogging a CPU end %d \n",smp_processor_id());
+  return 0;
+}
+
+ 
+static int __init hog_init(void) {
+  kthread_run(&amp;hog_thread, NULL, "hog");
+  return 0;
+}
+ 
+module_init(hog_init);
+MODULE_LICENSE("GPL v2"); // 表示模块代码接受的软件许可协议
+MODULE_AUTHOR("www");     // 描述模块的作者信息
+MODULE_DESCRIPTION("soft lock up module"); // 对模块的简单介绍
+MODULE_ALIAS("soft_lock_up_module");       // 给模块设置一个别名</code></pre> 
+<p> 内核日志：此时rcu是 依靠其它cpu检查print_other_cpu_stall。因为本地irq关闭了，softlockup也检测不到了。在print_other_cpu_stall中加入dump_stack以观察其调用栈：</p> 
+<pre><code>[   38.779118] hard_lock_up_module: loading out-of-tree module taints kernel.
+[   38.786519] hot init task insmod 6 
+[   38.786524] Hogging a CPU now task hog  1   //内核线程在1号cpu
+
+[   59.787816] CPU: 5 PID: 0 Comm: swapper/5 Tainted: G           O      5.10.0-with-dc-g1c56f5c219bc-dirty #39
+[   59.797713] Hardware name: PHYTIUM LTD D2000/D2000, BIOS  
+[   59.803229] Call trace:
+[   59.805689]  dump_backtrace+0x0/0x1b4
+[   59.809369]  show_stack+0x24/0x80
+[   59.812701]  dump_stack+0xd0/0x12c
+                print_other_cpu_stall
+                check_cpu_stall
+                rcu_pending         
+[   59.816120]  rcu_sched_clock_irq+0x5f0/0xe64
+[   59.820413]  update_process_times+0x6c/0xb0
+[   59.824618]  tick_sched_handle+0x38/0x74
+[   59.828560]  tick_sched_timer+0x58/0xb0
+[   59.832413]  __hrtimer_run_queues+0x18c/0x3cc
+[   59.836791]  hrtimer_interrupt+0xf4/0x29c
+[   59.840823]  arch_timer_handler_phys+0x40/0x50
+[   59.845291]  handle_percpu_devid_irq+0x94/0x290
+[   59.849845]  __handle_domain_irq+0x88/0xec
+[   59.853962]  gic_handle_irq+0xcc/0x14c
+[   59.857729]  el1_irq+0xc4/0x180
+[   59.860884]  arch_cpu_idle+0x18/0x30
+[   59.864478]  default_idle_call+0x4c/0x1e4
+[   59.868508]  do_idle+0x238/0x2b0
+[   59.871751]  cpu_startup_entry+0x30/0x7c
+[   59.875694]  secondary_start_kernel+0x144/0x190   //这里是加了dump_stack的输出
+
+[   59.881517] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+[   59.888999] rcu: 	1-...0: (1 ticks this GP) idle=f4e/1/0x4000000000000000 softirq=2189/2189 fqs=2625 
+[   59.900852] 	(detected by 5, t=5252 jiffies, g=1753, q=152)
+
+//此处被5号cpu检测到。检测到1号cpu的rcu问题
+
+</code></pre> 
+<pre><code>//kernel/sched/core.c
+void sched_show_task(struct task_struct *p)
+{
+        unsigned long free = 0;
+        int ppid;
+
+        if (!try_get_task_stack(p))
+                return;
+
+        pr_info("task:%-15.15s state:%c", p-&gt;comm, task_state_to_char(p));
+
+        if (p-&gt;state == TASK_RUNNING)
+                pr_cont("  running task    ");
+#ifdef CONFIG_DEBUG_STACK_USAGE
+        free = stack_not_used(p);
+#endif
+        ppid = 0;
+        rcu_read_lock();
+        if (pid_alive(p))
+                ppid = task_pid_nr(rcu_dereference(p-&gt;real_parent));
+        rcu_read_unlock();
+        pr_cont(" stack:%5lu pid:%5d ppid:%6d flags:0x%08lx\n",
+                free, task_pid_nr(p), ppid,
+                (unsigned long)task_thread_info(p)-&gt;flags);
+
+        print_worker_info(KERN_INFO, p);
+        show_stack(p, NULL, KERN_INFO);
+        put_task_stack(p);
+}
+EXPORT_SYMBOL_GPL(sched_show_task);
+
+
+
+这里调用：kernel/rcu/tree_stall.h
+
+static void rcu_check_gp_kthread_starvation(void)
+{
+        struct task_struct *gpk = rcu_state.gp_kthread;
+        unsigned long j;
+
+        if (rcu_is_gp_kthread_starving(&amp;j)) {
+                pr_err("%s kthread starved for %ld jiffies! g%ld f%#x %s(%d) -&gt;state=%#lx -&gt;cpu=%d\n",
+                       rcu_state.name, j,
+                       (long)rcu_seq_current(&amp;rcu_state.gp_seq),
+                       data_race(rcu_state.gp_flags),
+                       gp_state_getname(rcu_state.gp_state), rcu_state.gp_state,
+                       gpk ? gpk-&gt;state : ~0, gpk ? task_cpu(gpk) : -1);
+                if (gpk) {
+                        pr_err("\tUnless %s kthread gets sufficient CPU time, OOM is now expected behavior.\n", rcu_state.name);
+                        pr_err("RCU grace-period kthread stack dump:\n");
+                        sched_show_task(gpk); //调用这个打印rcu_sched 内核线程
+                        wake_up_process(gpk);
+                }
+        }
+}
+
+
+</code></pre> 
+<p></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/ccb0caff6b8478e58de46bac53a25db3/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">＜router-view＞ can no longer be used directly inside ＜transition＞ or ＜keep-alive＞</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/607961bd4e24a8baab3486d3dc6c99c3/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">分享一个电子元器件数据手册查询的网站</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

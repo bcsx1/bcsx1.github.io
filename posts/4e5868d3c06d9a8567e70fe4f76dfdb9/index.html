@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Redis系列--数据过期清除策略&amp;缓存淘汰策略 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Redis系列--数据过期清除策略&amp;缓存淘汰策略" />
+<meta property="og:description" content="一、过期策略 一、前言 Redis 所有的数据结构都可以设置过期时间，时间一到，就会自动删除。可以想象里面有一个专门删除过期数据的线程，数据已过期就立马删除。这个时候可以思考一下，会不会因为同一时间太多的 key 过期，以至于线程忙不过来。同时因为 Redis 是单线程的，删除的时间也会占用线程的处理时间，如果删除的太过于繁忙，会不会导致线上读写指令出现卡顿。
+二、立即删除 它会在设置键的过期时间的同时，创建一个定时器， 当键到了过期时间，定时器会立即对键进行删除。 这个策略能够保证过期键的尽快删除，快速释放内存空间。
+1、优点： 立即删除能保证内存中数据的最大新鲜度，因为它保证过期键值会在过期后马上被删除，其所占用的内存也会随之释放。对内存来说是非常友好的。
+2、缺点： 立即删除对cpu是最不友好的。因为删除操作会占用cpu的时间，如果刚好碰上了cpu很忙的时候，比如正在做交集或排序等计算的时候，就会给cpu造成额外的压力。
+3、总结：立即删除对cpu不友好，但是对内存友好，实际性质就是用处理器性能换区内存空间。 三、惰性删除 数据到达过期时间，不做处理。等下次访问该数据时，如果未过期，返回数据 ；发现已过期，删除，返回不存在。
+开启惰性删除：lazyfree-lazy-eviction=yes
+1、优点 ： 对于cpu来说是非常友好的，减少了cpu资源的占有。
+2、缺点： 如果一个键已经过期，而这个键又仍然保留在redis中，那么只要这个过期键不被删除，它所占用的内存就不会释放。因此对于内存是很不友好的。
+在使用惰性删除策略时，如果数据库中有非常多的过期键，而这些过期键又恰好没有被访问到的话，那么它们也许永远也不会被删除(除非用户手动执行FLUSHDB)，我们甚至可以将这种情况看作是一种内存泄漏–无用的垃圾数据占用了大量的内存，而服务器却不会自己去释放它们，这对于运行状态非常依赖于内存的Redis服务器来说,肯定不是一个好消息
+四、定期删除 定期删除策略是前两种策略的折中：
+定期删除策略每隔一段时间执行一次删除过期键操作并通过限制删除操作执行时长和频率来减少删除操作对CPU时间的影响。
+1、过期key的集合 redis 会将每个设置了过期时间的 key 放入到一个独立的字典中，以后会定时遍历这个 字典来删除到期的 key。除了定时遍历之外，它还会使用惰性策略来删除过期的 key。定期删除是集中处理，惰性删除是零散处理。
+2、定时扫描策略 Redis 默认会每秒进行十次过期扫描，过期扫描不会遍历过期字典中所有的 key，而是 采用了一种简单的贪心策略。
+1、从过期字典中随机 20 个 key；
+2、删除这 20 个 key 中已经过期的 key；
+3、如果过期的 key 比率超过 1/4，那就重复步骤 1；
+于此同时为了保证过期扫描不会出现循环过度，导致线程卡死现象，算法还增加了扫描时间的上限，默认不会超过 25ms。
+而这就会出现一种需要特别注意的情况：
+设想一个大型的 Redis 实例中所有的 key 在同一时间过期了。Redis 会持续扫描过期字典 (循环多次)，直到过期字典中过期的 key 变得稀 疏，才会停止 (循环次数明显下降)。这就会导致线上读写请求出现明显的卡顿现象。导致这 种卡顿的另外一种原因是内存管理器需要频繁回收内存页，这也会产生一定的 CPU 消耗。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/4e5868d3c06d9a8567e70fe4f76dfdb9/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-06-28T19:04:06+08:00" />
+<meta property="article:modified_time" content="2023-06-28T19:04:06+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Redis系列--数据过期清除策略&amp;缓存淘汰策略</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>一、过期策略</h2> 
+<h3>一、前言</h3> 
+<blockquote> 
+ <p>Redis 所有的数据结构都可以设置过期时间，时间一到，就会自动删除。可以想象里面有一个专门删除过期数据的线程，数据已过期就立马删除。这个时候可以思考一下，会不会因为同一时间太多的 key 过期，以至于线程忙不过来。同时因为 Redis 是单线程的，删除的时间也会占用线程的处理时间，如果删除的太过于繁忙，会不会导致线上读写指令出现卡顿。</p> 
+</blockquote> 
+<h3>二、立即删除</h3> 
+<blockquote> 
+ <p>它会在设置键的过期时间的同时，创建一个定时器， 当键到了过期时间，定时器会立即对键进行删除。 这个策略能够保证过期键的尽快删除，快速释放内存空间。</p> 
+</blockquote> 
+<h4>1、优点：</h4> 
+<p>        立即删除能保证内存中数据的最大新鲜度，因为它保证过期键值会在过期后马上被删除，其所占用的内存也会随之释放。对内存来说是非常友好的。</p> 
+<h4>2、缺点：</h4> 
+<p>        立即删除对cpu是最不友好的。因为删除操作会占用cpu的时间，如果刚好碰上了cpu很忙的时候，比如正在做交集或排序等计算的时候，就会给cpu造成额外的压力。</p> 
+<h4>3、总结：立即删除对cpu不友好，但是对内存友好，实际性质就是用处理器性能换区内存空间。</h4> 
+<h3>三、惰性删除</h3> 
+<blockquote> 
+ <p><span style="background-color:#f3f4fa;">数据到达过期时间，不做处理。等下次访问该数据时，如果未过期，返回数据 ；发现已过期，删除，返回不存在。</span></p> 
+ <p><span style="color:#fe2c24;"><span style="background-color:#f3f4fa;">开启惰性删除：lazyfree-lazy-eviction=yes</span></span></p> 
+</blockquote> 
+<h4>1、优点 ：</h4> 
+<p>        对于cpu来说是非常友好的，减少了cpu资源的占有。</p> 
+<h4>2、缺点：</h4> 
+<p>        如果一个键已经过期，而这个键又仍然保留在redis中，那么只要这个过期键不被删除，它所占用的内存就不会释放。因此对于内存是很不友好的。</p> 
+<blockquote> 
+ <p>在使用惰性删除策略时，如果数据库中有非常多的过期键，而<span style="color:#0000ff;">这些过期键又恰好没有被访问到的话</span>，那么它们也许永远也不会被删除(除非用户手动执行FLUSHDB)，我们甚至可以将这种情况看作是一种内存泄漏–无用的垃圾数据占用了大量的内存，而服务器却不会自己去释放它们，这对于运行状态非常依赖于内存的Redis服务器来说,肯定不是一个好消息</p> 
+</blockquote> 
+<h3>四、定期删除 </h3> 
+<blockquote> 
+ <p><span style="background-color:#f3f4fa;">定期删除策略是前两种策略的折中：</span></p> 
+ <p><span style="background-color:#f3f4fa;">定期删除策略每隔一段时间执行一次删除过期键操作并通过限制删除操作执行时长和频率来减少删除操作对CPU时间的影响。</span></p> 
+</blockquote> 
+<h4> 1、过期key的集合</h4> 
+<blockquote> 
+ <p>redis 会将每个设置了过期时间的 key 放入到一个独立的字典中，以后会定时遍历这个 字典来删除到期的 key。除了定时遍历之外，它还会使用惰性策略来删除过期的 key。定期删除是集中处理，惰性删除是零散处理。</p> 
+</blockquote> 
+<h4>2、定时扫描策略</h4> 
+<blockquote> 
+ <p>Redis 默认会<span style="color:#fe2c24;">每秒进行十次过期</span>扫描，过期扫描<span style="color:#fe2c24;">不会遍历过期字典中所有的 key</span>，而是 采用了一种简单的贪心策略。</p> 
+ <p>1、从过期字典中随机 20 个 key；</p> 
+ <p>2、删除这 20 个 key 中已经过期的 key；</p> 
+ <p>3、如果过期的 key 比率超过 1/4，那就重复步骤 1；</p> 
+ <p>于此同时为了保证过期扫描不会出现循环过度，导致线程卡死现象，算法还增加了扫描时间的上限，默认不会超过 25ms。</p> 
+</blockquote> 
+<p><span style="color:#fe2c24;">而这就会出现一种需要特别注意的情况：</span></p> 
+<blockquote> 
+ <p>        设想一个大型的 Redis 实例中所有的 key 在同一时间过期了。Redis 会持续扫描过期字典 (循环多次)，直到过期字典中过期的 key 变得稀 疏，才会停止 (循环次数明显下降)。这就会导致线上读写请求出现明显的卡顿现象。导致这 种卡顿的另外一种原因是内存管理器需要频繁回收内存页，这也会产生一定的 CPU 消耗。</p> 
+ <p>        即使算法还增加了扫描时间的上限，也是会出现卡顿现象。假如有 101 个客户端同时将请求发过来了，然后前 100 个请求的执行时间都是 25ms，那么第 101 个指令需要等待多久才能执行？2500ms，这个就是客户端的卡顿时间，是由服务器不间断的小卡顿积少成多导致的（假如每次都达到了扫描上线25ms）。</p> 
+ <p>    <span style="color:#fe2c24;">    所以开发的时候就需要特别注意，避免大量key在同一时间过期。可以给key在固定的过期时间上+随机范围的时间</span></p> 
+</blockquote> 
+<h4>3、定期删除注意事项：</h4> 
+<ul><li>如果删除操作执行次数过多、执行时间太长，就会导致和定时删除同样的问题：占用大量cpu资源去进行删除操作</li><li>如果删除操作次数太少、执行时间短，就会导致和惰性删除同样的问题：内存资源被持续占用，得不到释放。</li></ul> 
+<p>所以定时删除最关键的就在于执行时长和频率的设置，可在redis的配置文件中配置</p> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/c3/33/Fc10gcqj_o.jpg"></p> 
+<p> 对于hz参数，官方不建议超过100，否则会把cpu造成比较大的压力</p> 
+<h2>二、缓存淘汰策略</h2> 
+<blockquote> 
+ <p>1、当 Redis 内存超出物理内存限制时，内存的数据会开始和磁盘产生频繁的交换，交换会让 Redis 的性能急剧下降，对于访问量比较频繁的 Redis 来说，这样龟速的存取效率 基本上等于不可用。</p> 
+ <p>2、一般生产上的redis内存都会设置一个内存上限（maxmemory），如果有许多没有加过期时间的数据，长期下来就会把redis内存打满，出现OOM异常。</p> 
+ <p>3、定期删除是使用简单的贪心算法，会出现一些没有被抽查到的数据，而惰性删除也会出现一些长时间没有访问得数据，这就会导致大量过期的key堆积在内存中，导致redis内存空间紧张或者很快耗尽。所以必须要有一个兜底方案。这个方案就是缓存淘汰策略。</p> 
+</blockquote> 
+<h3>一、八种缓存淘汰策略</h3> 
+<p class="img-center"><img alt="" src="https://images2.imgbox.com/23/f3/Xf1KLoB8_o.jpg"></p> 
+<blockquote> 
+ <p>1、<span style="color:#fe2c24;">noeviction：</span>不会继续服务写请求 (DEL 请求可以继续服务)，读请求可以继续进行。这样 可以保证不会丢失数据，但是会让线上的业务不能持续进行。<span style="color:#fe2c24;">这是默认的淘汰策略。 </span></p> 
+ <p>2、<span style="color:#fe2c24;">volatile-lru：</span>尝试淘汰设置了过期时间的 key，最少使用的 key 优先被淘汰。没有设置过 期时间的 key： 不会被淘汰，这样可以保证需要持久化的数据不会突然丢失。</p> 
+ <p>3、<span style="color:#fe2c24;">allkeys-lru：</span> 区别于 volatile-lru，这个策略要淘汰的 key 对象是全体的 key 集合，而不 只是过期的 key 集合。这意味着没有设置过期时间的 key 也会被淘汰。</p> 
+ <p>4、<span style="color:#fe2c24;">volatile-ttl：</span> 跟上面一样，除了淘汰的策略不是 LRU，而是 key 的剩余寿命 ttl 的值，ttl 越小越优先被淘汰。</p> 
+ <p>5、<span style="color:#fe2c24;">volatile-random：</span>对所有设置了过期时间的key随机淘汰。</p> 
+ <p>6、<span style="color:#fe2c24;">allkeys-random：</span>对所有key随机淘汰</p> 
+ <p>7、<span style="color:#fe2c24;">volatile-lfu：</span>对设置了过期时间的key使用lfu算法进行删除</p> 
+ <p>8、<span style="color:#fe2c24;">allkeys-lfu：</span>对所有key使用lfu算法进行删除</p> 
+ <p>总结：volatile-xxx： 策略只会针对带过期时间的 key 进行淘汰，allkeys-xxx 策略会对所有的 key 进行淘汰。如果你只是拿 Redis 做缓存，那应该使用 allkeys-xxx，客户端写缓存时 不必携带过期时间。如果你还想同时使用 Redis 的持久化功能，那就使用 volatile-xxx 策略，这样可以保留没有设置过期时间的 key，它们是永久的 key 不会被 LRU 算法淘 汰。</p> 
+</blockquote> 
+<h3>二、LRU和LFU</h3> 
+<h4>1、区别：</h4> 
+<blockquote> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;">LRU：最近<span style="color:#ff0000;">最少使用</span>页面置换算法，淘汰最长时间未被使用的页面，看页面最后一次被使用到发生调度的时间长短，首先淘汰最长时间未被使用的页面。</span></span></p> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;">LFU：最近<span style="color:#ff0000;">最不常用</span>页面置换算法，淘汰一定时期内被访问次数最少的页，看一定时间段内页面被使用的频率，淘汰一定时期内被访问次数最少的页</span></span></p> 
+ <p></p> 
+ <p></p> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;"><span style="color:#0000ff;"><strong>举个栗子</strong></span></span></span></p> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;"><span style="color:#0000ff;">某次</span>时期Time为10分钟,如果每分钟进行一次调页,主存块为3,若所需页面走向为2 1 2 1 2 3 4</span></span></p> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;">假设到页面4时会发生缺页中断</span></span></p> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;">若按LRU算法,应换页面1(1页面最久未被使用)，但按LFU算法应换页面3(十分钟内,页面3只使用了一次)</span></span></p> 
+ <p><span style="color:#000000;"><span style="background-color:#f3f4fa;">可见LRU关键是看页面最后一次被使用到发生调度的时间长短,而LFU关键是看一定时间段内页面被使用的频率!</span></span></p> 
+</blockquote> 
+<h4>2、手写LRU算法 </h4> 
+<p>底层shuju</p> 
+<p>1、使用LinkedHashMap实现</p> 
+<blockquote> 
+ <pre>/**
+ * @Description :
+ * @Author : huangcong
+ * @Date : 2023/6/28 9:48
+ **/
+public class LinkedHashMapLru&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+
+    private Integer initialCapacity;
+
+    public LinkedHashMapLru(Integer initialCapacity) {
+        super(initialCapacity, 0.75F, Boolean.FALSE);
+        this.initialCapacity = initialCapacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return super.size() &gt; initialCapacity;
+    }
+
+    public Object getValue(Object key) {
+        Object v = super.get(key);
+        if (Objects.isNull(v)) {
+            return -1;
+        }
+        return v;
+    }
+
+    public static void main(String[] args) {
+        LinkedHashMapLru&lt;Object, Object&gt; hashMapLru = new LinkedHashMapLru&lt;&gt;(3);
+        hashMapLru.put(1, "a");
+        hashMapLru.put(2, "b");
+        hashMapLru.put(3, "c");
+        System.out.println(hashMapLru.entrySet());
+
+        // key存在变更其数据
+        hashMapLru.put(3, "l");
+        System.out.println(hashMapLru.entrySet());
+
+        // 当缓存容量达到上限时，它应该在写入新数据之前删除最久未使用的数据值
+        hashMapLru.put(4, "d");
+        System.out.println(hashMapLru.entrySet());
+
+        hashMapLru.put(5, "f");
+        System.out.println(hashMapLru.entrySet());
+
+        // 获取数据 get(key) - 如果关键字 (key) 存在于缓存中，则获取关键字的值（总是正数），否则返回 -1
+        Object value =hashMapLru.getValue(1);
+        System.out.println(value);
+    }
+}
+</pre> 
+</blockquote> 
+<p>2、其他方式实现</p> 
+<blockquote> 
+ <pre>/**
+ * @Description : 构造一个node节点，承载数据
+ * @Author : hc
+ * @Date : 2023/6/28 12:14
+ **/
+public class Node&lt;K, V&gt; {
+
+    K key;
+
+    V value;
+
+    Node&lt;K, V&gt; pre;
+
+    Node&lt;K, V&gt; next;
+
+    public Node() {
+    }
+
+    public Node(K key, V value) {
+        this.key = key;
+        this.value = value;
+        this.pre = this.next = null;
+    }
+
+    public void setKey(K key) {
+        this.key = key;
+    }
+
+    public void setValue(V value) {
+        this.value = value;
+    }
+}
+</pre> 
+</blockquote> 
+<blockquote> 
+ <pre>/**
+ * @Description :双向链表
+ * @Author : hc
+ * @Date : 2023/6/28 12:23
+ **/
+public class LruCache &lt;K,V&gt;{
+
+    Node&lt;K,V&gt; head;
+    Node&lt;K,V&gt; tail;
+
+    public LruCache() {
+        head = new Node&lt;&gt;();
+        tail = new Node&lt;&gt;();
+        head.next = tail;
+        tail.pre = head;
+    }
+
+    // 头插法，靠近头部的是最新的数据
+    public void add(Node&lt;K,V&gt; node){
+        node.next = head.next;
+        node.pre = head;
+        head.next.pre = node;
+        head.next = node;
+    }
+
+    public void delete(Node&lt;K,V&gt; node){
+        node.next.pre =node.pre;
+        node.pre.next = node.next;
+        node.next = null;
+        node.pre = null;
+    }
+
+    public Node getNode(){
+        return tail.pre;
+    }
+
+    // 打印链表
+    public String getCache(){
+        StringBuffer stringBuffer = new StringBuffer();
+        Node&lt;K, V&gt; node = head.next;
+        while (node != tail){
+            stringBuffer.append(node.key+"="+node.value + "\r\n");
+            node = node.next;
+        }
+        return stringBuffer.toString();
+    }
+}
+</pre> 
+</blockquote> 
+<blockquote> 
+ <pre>/**
+ * @Description :
+ * hash表：通过hash函数计算出hash值，然后（hash值 % 数组大小）得到对应数组中的位置
+ * @Author : hc
+ * @Date : 2023/6/28 16:23
+ **/
+public class Lru {
+
+    private Integer cacheSize; // 规定容器大小
+    private Map&lt;Integer,Node&lt;Integer,Integer&gt;&gt; map; // hash表，方便查找
+    private LruCache&lt;Integer,Integer&gt; doubleLinkedMap;// 双向链表，方便插入以及删除
+
+    public Lru(Integer cacheSize) {
+    this.cacheSize = cacheSize;
+    map = new HashMap&lt;&gt;();
+    doubleLinkedMap = new LruCache&lt;&gt;();
+    }
+
+    public int get(Integer key){
+        if (!map.containsKey(key)){
+            return -1;
+        }
+        Node&lt;Integer, Integer&gt; node = map.get(key);
+        doubleLinkedMap.delete(node);
+        doubleLinkedMap.add(node);
+        return node.value;
+    }
+
+    public Integer put(Integer key,Integer value){
+        // 如果哈希表中有，替换节点的value值
+        if (map.containsKey(key)){
+            Node&lt;Integer, Integer&gt; node = map.get(key);
+            node.setValue(value);
+            doubleLinkedMap.delete(node);
+            doubleLinkedMap.add(node);
+            return key;
+        }
+        Node&lt;Integer, Integer&gt; node = new Node&lt;&gt;(key, value);
+        // 如果hash没有，且容器中数据已经达到了规定大小，删除最后一个数据，在头部添加一个最新数据
+        if (map.size() &gt;= cacheSize){
+            Node lastNode = doubleLinkedMap.getNode();
+            doubleLinkedMap.delete(lastNode);
+            doubleLinkedMap.add(node);
+            map.remove(key);
+            map.put(key,node);
+            return key;
+        }
+        // 如果hash没有，且容器中数据未达到了规定大小，直接在头部添加一个最新数据
+        doubleLinkedMap.add(node);
+        map.put(key,node);
+        return key;
+    }
+
+    // 删除节点
+    public Integer delete(Integer key){
+        if (!map.containsKey(key)){
+            return -1;
+        }
+        Node&lt;Integer, Integer&gt; node = map.get(key);
+        doubleLinkedMap.delete(node);
+        map.remove(key);
+        return key;
+    }
+
+    public static void main(String[] args) {
+        Lru lru = new Lru(3);
+        lru.put(1,1);
+        lru.put(2,2);
+        lru.put(3,3);
+        System.out.println(lru.doubleLinkedMap.getCache());
+
+        lru.put(2,4);
+        System.out.println(lru.doubleLinkedMap.getCache());
+
+        lru.put(4,4);
+        System.out.println(lru.doubleLinkedMap.getCache());
+
+        int i = lru.get(3);
+        System.out.println(i);
+        System.out.println(lru.doubleLinkedMap.getCache());
+    }
+}
+</pre> 
+ <p> </p> 
+</blockquote> 
+<blockquote> 
+ <p>运行结果：</p> 
+ <p>3=3<br> 2=2<br> 1=1</p> 
+ <p></p> 
+ <p>2=4<br> 3=3<br> 1=1</p> 
+ <p></p> 
+ <p>4=4<br> 2=4<br> 3=3</p> 
+ <p></p> 
+ <p>3<br> 3=3<br> 4=4<br> 2=4</p> 
+</blockquote>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/86b471191b56ccc306509e7a8ae4aff7/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">JavaFx教程_编程入门自学教程_菜鸟教程-免费教程分享</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/c596a1e1e4cae7ad651124af462e28e1/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Pinia的使用、Pinia的持久化</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

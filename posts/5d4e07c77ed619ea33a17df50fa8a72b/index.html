@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ElasticSearch  Query_string &#43; match_phrase 在千亿级检索中的思考 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ElasticSearch  Query_string &#43; match_phrase 在千亿级检索中的思考" />
+<meta property="og:description" content="在舆情分析的应用场景中，数据规模通常在千亿以上。使用Elasticsearch 去构建搜索引擎，做相关的分析，面临着非常多的挑战。 先介绍一下，在舆情分析场景中，要用到的是 match phrase语法，针对文章做精准的句子匹配! 在这篇文章中： 1.我会先讲一下我们面临的挑战; 2.接着我会带着问题，分析一下 match phrase语法的检索过程； 3. 偏向底层的原理。 4.根据检索原理，考虑可以做哪些优化； 5.以及针对我们面临的挑战，我的一些优化方法。 目标 探索ES在千亿规模数据的检索场景下，句子精准匹配的性能优化方案。在实时交互的场景中，应对这么多的检索，达到注重3秒内的目标。本文会先讲一下，在舆情分析场景下使用ES做检索面临的诸多挑战。接着会对ES的检索原理做一个深度的拆解。
+挑战背景 数据规模大，通常舆情分析，至少要在三个月的范围内做检索。加入将互联网上现有的所有的媒体数据拿到，是非常多的。例如微博、抖音、facebook、推特、等等。日均数据量假如都放在es中，可能少说也有N T（至少要在2T）。 假如在这样的数据规模中，三个月的数据就是 90 * N T 。通常我们会有一些数据是在一年范围内，甚至两年范围内做检索。那就是 365 * 2 * N T。这个规模去做实时交互，且想在个位数的秒级别中获取结果，需要非常多的计算资源。通常，一个es实例，可以高效的运行2T的数据。超过就性能会有下降。因为买不起机器，我们单台机器负载8T的数据。
+要用到句子的精准匹配。通常在舆情检索场景中，用的并不是es的相关性检索，而是句子的精准匹配。这就不得不去使用ES中的 match_phrase 语法。去做句子的精准匹配。熟悉es的同学，应该会知道，es最擅长的是做term查询，其次是match 搜索，然后才是 match_phrase。 这就相当于是做的 like %中国%的检索。
+检索条件复杂，检索的关键词多。通常要用很多的must 和must not，查询语句中包含多个操作符、子句和过滤器。也就是在一波检索中，可能要输出100&#43;的检索词。所以这就不得不去使用 query string 搜索语法，且匹配的模式用 phrase（和match_phrase）一样的逻辑。
+要命中全量的数据。在问答系统中，就像百度谷歌，只需要要返回与问题最相关的答案即可，通常在舆情场景下，要命中全量的数据。因为用户通常想要这个条件命中了多少条结果。
+要有非常多的聚合分析。es聚合分析的性能并不高。因为它需要大量的CPU和磁盘的IO。在数据规模远超机器规模的情况下。整体的检索效果会非常的差。我有去考虑够其他类型的擅长做OLAP类型的数据库，例如CK，奈何它做句子匹配不太行。
+在非结构化的数据中做检索。通常是在文章中做检索，而不是在某个字段中做检索。这回让检索变得格外的难。在做聚合分析的时候，像CK这样的数据库完全用不上。
+实时交互。尽可能在3-5s内返回结果。以上问题，在实时交互的要求下，都变得格外严重。
+总结一下：
+说了这么多，就是资源不足。任何问题都可以通过加资源解决。问题是资源非常昂贵，所以我们要做的是，在有限的资源条件下，做无限的优化。
+ES的 match_phrase的检索原理 先看看为什么match_phrase慢。
+match_phrase 查询是 Elasticsearch 中的一种查询类型，它用于精确匹配包含一组特定词汇的文档。具体来说，match_phrase 查询会找到那些包含特定词组、并且词组中的单词以正确的顺序出现在文档中的文档。 es组织数据的方式只有一种，那就是切分词语，然后保存在倒排表中。理论上来说，性能最佳的一定是，根据一个词语，这个词语尽可能的短。然后做term查询。因为它只需要 match_phrase 查询的过程分析 Query Parsing：将用户输入的查询字符串解析为相应的查询语法。在解析的过程中，Elasticsearch会根据匹配类型、搜索字段、匹配条件等信息，生成相应的查询语句。例如，对于 match phrase 查询，Elasticsearch会生成一个 MatchPhraseQuery 对象，并将查询字符串作为参数传递给该对象。将查询语句解析成内部查询对象（Query Object），并进行语法和语义检查。在这个阶段，Elasticsearch会使用查询解析器（Query Parser）将查询语句解析成查询对象。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5d4e07c77ed619ea33a17df50fa8a72b/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-03-20T08:10:05+08:00" />
+<meta property="article:modified_time" content="2023-03-20T08:10:05+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ElasticSearch  Query_string &#43; match_phrase 在千亿级检索中的思考</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <div class="kdocs-document"> 
+ <div class="kdocs-line-container" style="display:flex;"> 
+  <div class="kdocs-img" style="flex-direction:column;max-width:100%;display:flex;width:740px;justify-content:center;align-items:center;height:auto;"> 
+   <div class="kdocs-img" style="padding-top:42.837837%;height:0;"> 
+    <img src="https://images2.imgbox.com/68/ca/Vu32pvg7_o.jpg" style="margin-left:;display:block;width:740px;margin-top:-42.837837%;height:auto;"> 
+   </div> 
+  </div> 
+ </div> 
+ <blockquote class="kdocs-blockquote" style="">
+   在舆情分析的应用场景中，数据规模通常在千亿以上。使用Elasticsearch 去构建搜索引擎，做相关的分析，面临着非常多的挑战。 
+  <br> 先介绍一下，在舆情分析场景中，要用到的是 match phrase语法，针对文章做精准的句子匹配! 
+  <br> 在这篇文章中： 
+  <br>1.我会先讲一下我们面临的挑战; 
+  <br>2.接着我会带着问题，分析一下 match phrase语法的检索过程； 
+  <br>3. 偏向底层的原理。 
+  <br>4.根据检索原理，考虑可以做哪些优化； 
+  <br>5.以及针对我们面临的挑战，我的一些优化方法。 
+ </blockquote> 
+ <h2 style="">目标</h2> 
+ <p style=""> 探索ES在千亿规模数据的检索场景下，句子精准匹配的性能优化方案。在实时交互的场景中，应对这么多的检索，达到注重3秒内的目标。本文会先讲一下，在舆情分析场景下使用ES做检索面临的诸多挑战。接着会对ES的检索原理做一个深度的拆解。</p> 
+ <h2 style="">挑战背景</h2> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">数据规模大</span>，通常舆情分析，至少要在三个月的范围内做检索。加入将互联网上现有的所有的媒体数据拿到，是非常多的。例如微博、抖音、facebook、推特、等等。日均数据量假如都放在es中，可能少说也有N T（至少要在2T）。 假如在这样的数据规模中，三个月的数据就是 90 * N T 。通常我们会有一些数据是在一年范围内，甚至两年范围内做检索。那就是 365 * 2 * N T。这个规模去做实时交互，且想在个位数的秒级别中获取结果，需要非常多的计算资源。通常，一个es实例，可以高效的运行2T的数据。超过就性能会有下降。因为买不起机器，我们单台机器负载8T的数据。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">要用到句子的精准匹配</span>。通常在舆情检索场景中，用的并不是es的相关性检索，而是句子的精准匹配。这就不得不去使用ES中的 match_phrase 语法。去做句子的精准匹配。熟悉es的同学，应该会知道，es最擅长的是做term查询，其次是match 搜索，然后才是 match_phrase。 这就相当于是做的 like %中国%的检索。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">检索条件复杂，检索的关键词多</span>。通常要用很多的must 和must not，查询语句中包含多个操作符、子句和过滤器。也就是在一波检索中，可能要输出100+的检索词。所以这就不得不去使用 query string 搜索语法，且匹配的模式用 phrase（和match_phrase）一样的逻辑。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">要命中全量的数据</span>。在问答系统中，就像百度谷歌，只需要要返回与问题最相关的答案即可，通常在舆情场景下，要命中全量的数据。因为用户通常想要这个条件命中了多少条结果。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">要有非常多的聚合分析</span>。es聚合分析的性能并不高。因为它需要大量的CPU和磁盘的IO。在数据规模远超机器规模的情况下。整体的检索效果会非常的差。我有去考虑够其他类型的擅长做OLAP类型的数据库，例如CK，奈何它做句子匹配不太行。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">在非结构化的数据中做检索</span>。通常是在文章中做检索，而不是在某个字段中做检索。这回让检索变得格外的难。在做聚合分析的时候，像CK这样的数据库完全用不上。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">实时交互</span>。尽可能在3-5s内返回结果。以上问题，在实时交互的要求下，都变得格外严重。</p></li></ul> 
+ <p style=""></p> 
+ <p style="">总结一下：</p> 
+ <p style=""> 说了这么多，就是资源不足。任何问题都可以通过加资源解决。问题是资源非常昂贵，所以我们要做的是，在有限的资源条件下，做无限的优化。</p> 
+ <p style=""></p> 
+ <h2 style="">ES的 match_phrase的检索原理</h2> 
+ <p style="">先看看为什么match_phrase慢。</p> 
+ <blockquote class="kdocs-blockquote" style="">
+   match_phrase 查询是 Elasticsearch 中的一种查询类型，它用于精确匹配包含一组特定词汇的文档。具体来说，match_phrase 查询会找到那些包含特定词组、并且词组中的单词以正确的顺序出现在文档中的文档。 
+  <br>es组织数据的方式只有一种，那就是切分词语，然后保存在倒排表中。理论上来说，性能最佳的一定是，根据一个词语，这个词语尽可能的短。然后做term查询。因为它只需要 
+ </blockquote> 
+ <p style=""></p> 
+ <h3 style="text-align:null;">match_phrase 查询的过程分析</h3> 
+ <p style="text-align:null;"></p> 
+ <ol start="1"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:null;"><p>Query Parsing：将用户输入的查询字符串解析为相应的查询语法。在解析的过程中，Elasticsearch会根据匹配类型、搜索字段、匹配条件等信息，生成相应的查询语句。例如，对于 match phrase 查询，Elasticsearch会生成一个 MatchPhraseQuery 对象，并将查询字符串作为参数传递给该对象。将查询语句解析成内部查询对象（Query Object），并进行语法和语义检查。在这个阶段，Elasticsearch会使用查询解析器（Query Parser）将查询语句解析成查询对象。</p></li></ol> 
+ <ol start="2"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:null;"><p>Query Optimization：对内部查询对象进行优化，以提高查询性能。这个阶段包括优化查询逻辑、合并重复查询、减少查询范围等操作。在优化阶段，Elasticsearch会使用查询优化器（Query Optimizer）对查询对象进行优化。</p></li></ol> 
+ <ol start="3"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:null;"><p>Query Execution：执行查询操作，将查询对象转换成对倒排索引（Inverted Index）进行搜索的操作。在执行查询阶段，Elasticsearch会使用倒排索引（Inverted Index）来查找符合查询条件的文档。具体地，Elasticsearch会使用以下文件进行查询操作：</p></li></ol> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.tim</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.tip</span>文件：这两个文件保存了词项的位置信息，用于在倒排索引中定位词项所在的文档。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.doc</span>文件：这个文件保存了文档ID和词项的位置信息，用于在倒排索引中定位词项所在的文档。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.pos</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.pay</span>文件：这两个文件保存了词项在文档中的位置信息和附加信息，用于在倒排索引中计算相关性得分。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.liv</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.del</span>文件：这两个文件用于表示文档是否存在和是否被标记为删除。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.fdt</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.fdx</span>文件：这两个文件用于存储文档的内容和结构信息。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.nvd</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.nvm</span>文件：这两个文件保存了词项的文档频率、逆文档频率和文档长度等信息，用于在计算相关性得分时进行加权。</p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:null;"><p><span class="kdocs-bold" style="font-weight:bold;">.tvx</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.tvd</span>文件：这两个文件用于提供快速访问文档中字段的信息。</p></li></ul> 
+ <p style="text-align:null;">在查询执行阶段，Elasticsearch会使用以上文件进行查询操作，从而找到符合查询条件的文档ID。为了提高查询性能，Elasticsearch还会使用一些技术，如布尔运算优化、term lookup optimization等。</p> 
+ <ol start="4"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:null;"><p>Scoring：根据相关性得分对文档进行排序，得出最终的搜索结果。在计算相关性得分阶段，Elasticsearch会使用BM25算法或TF-IDF算法等机器学习模型来计算相关性得分。同时，Elasticsearch还会使用查询向量（Query Vector）和文档向量（Document Vector）等技术来计算相关性得分。在计算相关性得分时，Elasticsearch会使用<span class="kdocs-bold" style="font-weight:bold;">.nvd</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.nvm</span>文件中保存的词项相关性得分信息。<span class="kdocs-bold" style="font-weight:bold;">.nvd</span>文件中保存的是词项的文档频率和逆文档频率信息，<span class="kdocs-bold" style="font-weight:bold;">.nvm</span>文件中保存的是每个文档的长度和平方和等信息。这些信息会被用于计算查询词项的相关性得分。得分高的文档会排在搜索结果的前面。计算查询结果的相关性得分（Relevance Score），并按照相关性得分进行排序。</p></li></ol> 
+ <ol start="5"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:left;"><p>删除文档处理：Elasticsearch 会根据<span class="kdocs-bold" style="font-weight:bold;">.liv</span>文件和<span class="kdocs-bold" style="font-weight:bold;">.del</span>文件中的信息，处理被标记为删除的文档。<span class="kdocs-bold" style="font-weight:bold;">.liv</span>文件用于表示哪些文档是存在的（live），哪些文档已经被标记为删除（deleted）。<span class="kdocs-bold" style="font-weight:bold;">.del</span>文件则是用于存储已经被标记为删除的文档的信息。在搜索时，Elasticsearch会使用<span class="kdocs-bold" style="font-weight:bold;">.liv</span>文件来跳过已经被标记为删除的文档，确保这些文档不会被包含在搜索结果中。</p></li></ol> 
+ <ol start="6"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:left;"><p>缓存处理：为了提高搜索性能，Elasticsearch会将一些查询结果缓存到内存中，以便快速响应后续的查询请求。缓存处理包括两个方面，一是根据查询语句生成查询缓存（Query Cache），二是根据文档ID生成过滤缓存（Filter Cache）。查询缓存用于缓存查询语句匹配到的文档ID，过滤缓存用于缓存文档ID的过滤结果。这些缓存会被存储到内存中或者磁盘中，以便后续查询时使用。</p></li></ol> 
+ <ol start="7"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;text-align:left;"><p>结果返回：最后，Elasticsearch将匹配的文档ID返回给用户，并根据需要返回文档的内容。返回的文档内容从<span class="kdocs-bold" style="font-weight:bold;">.fdt</span>文件中读取。<span class="kdocs-bold" style="font-weight:bold;">.tvx</span>和<span class="kdocs-bold" style="font-weight:bold;">.tvd</span>文件用于提供快速访问文档中字段的信息，以便在返回结果时能够快速获取相应的字段值。</p></li></ol> 
+ <p style=""></p> 
+ <h3 style="">match_phrase 查询的源码解析-在es中的源码</h3> 
+ <p style="text-align:null;">在 Elasticsearch 中，处理 match_phrase 查询的源码主要分布在以下几个文件中：</p> 
+ <ol start="1"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>org.elasticsearch.index.query.MatchPhraseQueryBuilder：这个类定义了 match_phrase 查询的查询语句结构。它继承自 org.elasticsearch.index.query.MatchQueryBuilder 类，实现了查询的解析、构建和执行等操作。</p></li></ol> 
+ <ol start="2"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>org.elasticsearch.index.query.MatchPhraseQueryParser：这个类用于解析 match_phrase 查询语句，生成 MatchPhraseQueryBuilder 对象。它实现了 org.elasticsearch.index.query.QueryParser 接口，可以通过 Elasticsearch 的查询解析器来调用。</p></li></ol> 
+ <ol start="3"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>org.elasticsearch.index.mapper.TextFieldMapper：这个类用于定义文本字段的映射规则。它实现了 org.elasticsearch.index.mapper.Mapper 接口，并且包含了诸如解析文本、分词、建立倒排索引等操作的实现。</p></li></ol> 
+ <ol start="4"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>org.elasticsearch.index.search.MatchPhraseQuery：这个类是 match_phrase 查询的实现类。它继承自 org.apache.lucene.search.MultiTermQuery 类，实现了查询的匹配和评分等操作。</p></li></ol> 
+ <p style="text-align:null;">这些文件的源码可以在 Elasticsearch 的 Github 仓库中找到。具体来说，你可以前往以下链接找到这些文件：</p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>MatchPhraseQueryBuilder：<a class="kdocs-link" style="color:#0A6CFF;" href="https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/query/MatchPhraseQueryBuilder.java" target="_blank" rel="noopener noreferrer"><span class="kdocs-bold" style="font-weight:bold;"><span class="kdocs-underline" style="text-decoration:underline;">https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/query/MatchPhraseQueryBuilder.java</span></span></a></p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>MatchPhraseQueryParser：<a class="kdocs-link" style="color:#0A6CFF;" href="https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/query/MatchPhraseQueryParser.java" target="_blank" rel="noopener noreferrer"><span class="kdocs-bold" style="font-weight:bold;"><span class="kdocs-underline" style="text-decoration:underline;">https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/query/MatchPhraseQueryParser.java</span></span></a></p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>TextFieldMapper：<a class="kdocs-link" style="color:#0A6CFF;" href="https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java" target="_blank" rel="noopener noreferrer"><span class="kdocs-bold" style="font-weight:bold;"><span class="kdocs-underline" style="text-decoration:underline;">https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java</span></span></a></p></li></ul> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>MatchPhraseQuery：<a class="kdocs-link" style="color:#0A6CFF;" href="https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/search/MatchPhraseQuery.java" target="_blank" rel="noopener noreferrer"><span class="kdocs-bold" style="font-weight:bold;"><span class="kdocs-underline" style="text-decoration:underline;">https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/index/search/MatchPhraseQuery.java</span></span></a></p></li></ul> 
+ <p style="text-align:null;">请注意，以上文件是 Elasticsearch 7.x 版本中的源码，如果你使用的是其他版本的 Elasticsearch，可能需要到对应版本的仓库中查找相应的文件。</p> 
+ <p style="text-align:null;"></p> 
+ <h3 style="text-align:null;">match_phrase 查询的源码解析-在lucene中</h3> 
+ <ol start="1"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>Lucene Query Syntax：match_phrase 查询是基于 Lucene Query Syntax 的一种查询类型。Lucene Query Syntax 是一种用于构建查询表达式的语法，它支持诸如 AND、OR、NOT、*、? 等查询操作符，并且可以使用括号、引号等来调整查询的优先级和逻辑。这个语法不仅可以在 Elasticsearch 中使用，也可以在其他基于 Lucene 的搜索引擎中使用，如 Solr、Amazon CloudSearch 等。</p></li></ol> 
+ <ol start="2"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>Elasticsearch REST API：Elasticsearch 提供了 REST API 接口来管理和操作 Elasticsearch 集群。你可以使用 REST API 来执行 match_phrase 查询，例如使用 HTTP POST 方法来向 /{index}/_search 请求发送一个 JSON 查询语句，其中包含 match_phrase 查询条件。Elasticsearch REST API 还提供了一些参数和选项，用于控制查询的行为和结果格式。</p></li></ol> 
+ <ol start="3"><li style="margin-left:1.4em;list-style-type:decimal;text-indent:0;"><p>Elasticsearch Java API：Elasticsearch Java API 是 Elasticsearch 官方提供的 Java 客户端库，它提供了一组 Java 接口和类，用于连接和操作 Elasticsearch 集群。你可以使用 Java API 来执行 match_phrase 查询，例如使用 MatchPhraseQueryBuilder 类来构建查询语句，然后使用 SearchRequest 类来执行查询，并处理返回的查询结果。</p></li></ol> 
+ <p style="text-align:null;">以上这些工具和库都涉及到 match_phrase 查询的使用和实现，可以帮助你更加深入地了解和应用 match_phrase 查询。你可以查阅 Elasticsearch 的官方文档和相关教程，学习如何使用和优化 match_phrase 查询。</p> 
+ <p style="text-align:null;"></p> 
+ <h2 style="">我能想到的优化方案</h2> 
+ <p style="">构建一个不错规模的集群，这就需要<span class="kdocs-bold" style="font-weight:bold;">合理规划集群规模</span>。充分的资源，一定能够解决这些问题。</p> 
+ <p style="">在挑战背景中，已经列出来的问题，从问题的本质出发，去尝试解决问题。</p> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;text-align:left;"><p><span class="kdocs-bold" style="font-weight:bold;">数据剪枝</span>。在这样的规模下，在资源有限的情况下。应该从数据剪枝的角度出发，去减少数据量，降规模。整体的方向，是使用异构来减少原数据的存储，把es只当做索引引擎，而不是取数据的地方。降低单词检索的数据范围，调整数据组织方式，例如按照时间去分区数据。降低搜索命中的数据，搜索条件应该尽可能的精简。</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">分段请求</span>：数据规模大，且交互方式是实时交互，用户期望在3-5秒内得到相应。从数据规格大的角度出发，只能想想如何减少数据规模。这其实就是数据剪枝的思路。 如果是为了交互，可以设计一个交互模式，将扫描全量数据的思路，变成扫描部分数据的思路。这样就可以把检索 A B C三个月的逻辑，拆分成，检索A月的数据，将结果提前返回，此时能尽可能的满足 3-5s内得到响应的需求。假如A月已经满足了用户的查看需求，那么BC就不用检索了。在乐观的情况下，检索3个月，就变成了检索一个月。这样数据规模就只有三分之一了。 这个思路下的难题是，排序，如果想基于全局的排序，应该怎么做。假如是基于时间的排序，不用担心。假如需要根据点赞量，转发量排序，就不行了。<span class="kdocs-color" style="color:#C21C13;"><span class="kdocs-bold" style="font-weight:bold;">分段请求的好处</span></span>：分段匹配：可以将长句子切分成多个段落，分别进行匹配，最后将结果合并。这种方式可以有效降低内存消耗，同时还可以利用多线程并发处理，提高查询性能</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">尝试跳过打分过程，也及时去掉相关性的计算</span>。在Elasticsearch中可以通过设置相关参数来跳过打分的过程，从而加快查询速度。具体来说，可以使用bool查询的<span class="kdocs-bold" style="font-weight:bold;">constant_score</span>过滤器来跳过打分过程，该过滤器将所有符合条件的文档赋予一个固定的分值，不再计算相关性得分。使用该过滤器可以在一些特定场景下提升查询性能，如过滤掉某些不符合条件的文档等。同时，也可以通过修改查询参数中的boost值来影响相关性得分，从而控制文档在查询结果中的排名。</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>要命中全量的数据。应该用<span class="kdocs-bold" style="font-weight:bold;">异步的方式</span>，将count值单独返回。其实很多分析类的请求，是可以朝着异步或者离线的方向寻找出路的。大量的聚合分析，会花费大量的资源，很难在5s内得到响应。</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p><span class="kdocs-bold" style="font-weight:bold;">优化分词器</span>，分词器选择：对于长句子的匹配，可以选择适合的分词器，如N-gram分词器、Edge N-gram分词器等，将长句子切分成若干短语进行匹配，从而减小内存消耗和查询时间。</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>还需要继续整理。我始终觉得在很多个关键词匹配的过程中，<span class="kdocs-bold" style="font-weight:bold;">倒排链的合并过程</span>可以优化。这一块后续会研究，等有成果了，再分享出来。</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>在缓存利用率方向，做探索，把最需要的东西放在缓存里边。</p></li></ul> 
+ <p style=""></p> 
+ <ul><li style="margin-left:1.4em;list-style-type:disc;text-indent:0;"><p>底层IO的研究。最近也在研究，等有成果了，再补充分享。</p></li></ul> 
+ <p style=""></p> 
+</div>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/e653237073c0a5036cbd5c11cb8e6333/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">CSS基础之渐变</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2ce4edf2f7828c4aaf6805a30b5233cb/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Next.js入门｜一文带你梳理清楚 Next.js 的功能</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【JESD204系列】三、JESD204B标准分层 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【JESD204系列】三、JESD204B标准分层" />
+<meta property="og:description" content="JESD204B 作为一种分层规范，在规范中共定义了四个层，分别为应用层，传输层，数据链路层和物理层。各层分别执行各自的对应的功能，最终通过四个层的联合，将数据高速无误的进行传输。
+【JESD204系列】三、JESD204标准分层 文章目录 1. 简介2. 分层简介2.1 应用层（Application Layer）2.2 传输层（Transport Layer）2.3 数据链路层（Data Link Layer）2.4 物理层（Physical Layer） 3. 总结3.1 数据帧输出路径3.2 发送端和接收端的逻辑功能 1. 简介 JESD204B与PCIE类似，其标准是一种分层规范，规范中的各层都有自己的功能要完成。如下图所示为JESD204B的分层框图。
+下面就一一介绍各层完成的基本功能。
+2. 分层简介 2.1 应用层（Application Layer） 应用层本身并不包含在协议标准之内，而是为了实现用户特殊配置，以及将原始数据映射成为规范格式之外的格式，而添加的一个层。对于需要以不同于N’（样本传输位数）的大小传输的数据，使用单独设计的应用层可以对其进行更加灵活且具有针对性的配置，将多个样本重新包装，从而降低通道速率，提高链路整体效率。值得注意的一点是，发送端和接收端的配置必须相同，才能进行正确的数据传输和接收。
+2.2 传输层（Transport Layer） 传输层根据给定器件已定义的链路配置参数，决定如何包装来自ADC的数据，即LMFS参数配置，四个字母代表最主要的四个参数，收发两端协商好之后（ADC会将参数发给FPGA，双方会进行校验），就按规则进行组包和解包。 这些参数在初始通道对齐序列(ILAS)期间从ADC传输到FPGA。这些设置通过串行端口接口(SPI)配置，其设置ADC和FPGA上的寄存器值来定义链路配置参数。根据这些参数产生一个校验和并将其传输给接收器，以便接收器(FPGA)能够验证链路配置参数是否正确接收。通过链路传输的这些参数不是用于配置接收器，而是仅用于验证链路参数匹配。若检测到错误，FPGA将通过JESD204B规范的错误报告中定义的中断报告此错误。
+数据在发送过程中首先要经过传输层，对于发送端来说，传输层要完成的任务是基于用户选择的链路参数，对转换器设备采样得到的原始数据进行打包组帧，从而映射成宽度为8bit 的特定格式数据，并根据链路参数中的相关参数，对数据进行控制位和尾位的添加，以满足映射后数据的格式要求。因此对接收端来说，传输层负责的主要功能就是对收到的数据进行对应的解帧处理，恢复成原始的数据。此外，根据协议规范，在传输层和数据链路层之间，还要有可选的加扰模块，按照特定算法对映射后的数据进行加扰。因此，相应的在接收端需要一个解扰模块，对发送端输出的数据流进行对应的解扰，使之恢复为未加扰的数据。用下图来大概说明一下传输层的作用，8个ADC通过一定的方式组合在4条链路中进行传输。
+在传输层，一组样本或部分样本被分组成F个八位字节的帧。“帧”数据结构是指一组连续的八位字节(8b/10b 编码器的输出都是一个八位字节)，其中每个八位字节的位置都以帧对齐信号作为参考。“多帧”数据结构是指一组连续的帧，其中每个多帧的位置都以多帧对齐信号作为参考。在许多应用中，帧时钟将具有与采样时钟相同的频率。JESD204 协议允许在每个帧周期内每个转换器传输多个采样，S 必须总是整数，这样可以最小化SERDES 电路和敏感模拟部件之间的串扰。每个采样作为一组N’比特发送，由N 个数据比特，可选控制比特和可选尾部比特组成。在帧的结尾处的附加尾比特是必需的，这样可以在每个帧周期中填充每个通道使比特总数为整数个八位字节。
+数据映射相关链路配置参数的意义与取值范围如表1 所示。
+参数名含义取值范围M每个设备中的转换器数1-256L每个转换器链路的通道数1-32F每个帧中的字节数1-256S每帧中每个转换器的采样点数1-32N转换器分辨1-32N’每个采样的总比特数1-32K每个多帧中帧的数量1-32CF每个链路每个帧周期的控制字数量0-32CS每个采样的控制比特数0-3HD高数据密度模式使能0-1 表1. 链路配置参数含义及取值范围 2.3 数据链路层（Data Link Layer） 数据链路层主要是完成链路建立和数据编码，该层的主要功能即为建立传输链路，对数据进行传输。数据链路层层接受并行成帧数据（包含ADC样本、控制位和结束位），并输出8B/10B字，后者在物理层中进行串行化且可以加扰。传输过程包含以下几个环节，即代码组同步（CGS），初始通道对齐序列（ILAS），用户数据传输（DATA），每阶段具体功能下面将进行具体说明。在本层中还包含8B/10B 编码模块，功能是将打包形成的8bit 数据采取8B/10B 编码的处理，使传输保持直流平衡，从而使CDR（Clock Data Recovery）电路的设计更加简单。并且通过使用8B/10B 编码方式的几种控制字符，如字符/K/、/A/等，实现对多通道的同步对齐和检测。因此，接收端需要对应的8B/10B 解码模块，对发送端生成的10bit 编码数据恢复为8bit 数据，且通过其中包含的控制字符，实现检错和对齐等功能。
+数据链路层通过链路建立过程同步JESD204B链路。链路建立包括三个不同阶段：代码组同步（CGS）、初始通道同步（ILS）、传输用户数据。
+1.代码组同步（CGS）
+根据JESD204B 协议规定，代码组同步是链路建立的第一个步骤，并且不进行加扰，代码组同步主要有以下几个步骤，值得注意的是，以下步骤对于单发射端-单接收端和多发射端-多接收端两种情况均适用。首先，接收端通过拉低SYNC 信号发起同步请求，进入代码组同步（Code Group Synchronization，CGS）阶段。发射端开始发送连续的/K/=/K28.5/字符，各接收器（FPGA）必须利用时钟和数据恢复（CDR）技术，在ADC传来的输入数据流中找到K28.5字符。一旦在所有链路通道上检测到某一数量的连续K28.5字符，接收器模块就会解除置位送至发送器模块的SYNC~ 信号。在发送端捕获到SYNC~ 的变化后，JESD204A和JESD204B的处理会略有不同。在JESD204A中，发送模块捕捉SYNC~ 信号的变化，经过固定数量的帧时钟之后，ILAS就会启动。在JESD204B中，发送模块捕捉SYNC~ 信号的变化，并在下一个本地多帧时钟（LMFC）边界上启动ILAS。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/70b3332d9e5c213e92f9c4856341fa45/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-03-07T13:48:30+08:00" />
+<meta property="article:modified_time" content="2023-03-07T13:48:30+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【JESD204系列】三、JESD204B标准分层</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p><font color="#999AAA">  JESD204B 作为一种分层规范，在规范中共定义了四个层，分别为应用层，传输层，数据链路层和物理层。各层分别执行各自的对应的功能，最终通过四个层的联合，将数据高速无误的进行传输。</font></p> 
+<font size="6"> 【JESD204系列】三、JESD204标准分层 </font> 
+<hr color="#000000" size="1“"> 
+<p></p> 
+<div class="toc"> 
+ <h4>文章目录</h4> 
+ <ul><li><a href="#1%09_15" rel="nofollow">1. 简介</a></li><li><a href="#2__28" rel="nofollow">2. 分层简介</a></li><li><ul><li><a href="#21_Application_Layer_29" rel="nofollow">2.1 应用层（Application Layer）</a></li><li><a href="#22_Transport_Layer_32" rel="nofollow">2.2 传输层（Transport Layer）</a></li><li><a href="#23_Data_Link_Layer_58" rel="nofollow">2.3 数据链路层（Data Link Layer）</a></li><li><a href="#24_Physical_Layer_99" rel="nofollow">2.4 物理层（Physical Layer）</a></li></ul> 
+  </li><li><a href="#3__121" rel="nofollow">3. 总结</a></li><li><ul><li><a href="#31__122" rel="nofollow">3.1 数据帧输出路径</a></li><li><a href="#32__127" rel="nofollow">3.2 发送端和接收端的逻辑功能</a></li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<hr color="#000000" size='1"'> 
+<h2><a id="1%09_15"></a>1. 简介</h2> 
+<p>JESD204B与PCIE类似，其标准是一种分层规范，规范中的各层都有自己的功能要完成。如下图所示为JESD204B的分层框图。<br> <img src="https://images2.imgbox.com/71/fb/sqyjvBTn_o.png" alt="JESD204B的分层框图"><br> <img src="https://images2.imgbox.com/4f/e6/t0dYrmKZ_o.png" alt="JESD204B的分层框图" width="1000"></p> 
+<p>下面就一一介绍各层完成的基本功能。</p> 
+<hr color="#000000" size='1"'> 
+<h2><a id="2__28"></a>2. 分层简介</h2> 
+<h3><a id="21_Application_Layer_29"></a>2.1 应用层（Application Layer）</h3> 
+<p>应用层本身并不包含在协议标准之内，而是为了实现用户特殊配置，以及将原始数据映射成为规范格式之外的格式，而添加的一个层。对于需要以不同于N’（样本传输位数）的大小传输的数据，使用单独设计的应用层可以对其进行更加灵活且具有针对性的配置，将多个样本重新包装，从而降低通道速率，提高链路整体效率。值得注意的一点是，发送端和接收端的配置必须相同，才能进行正确的数据传输和接收。</p> 
+<h3><a id="22_Transport_Layer_32"></a>2.2 传输层（Transport Layer）</h3> 
+<p>传输层<strong>根据给定器件已定义的链路配置参数，决定如何包装来自ADC的数据，即LMFS参数配置</strong>，四个字母代表最主要的四个参数，收发两端协商好之后（ADC会将参数发给FPGA，双方会进行校验），<strong>就按规则进行组包和解包。</strong> 这些参数在初始通道对齐序列(ILAS)期间从ADC传输到FPGA。这些设置通过串行端口接口(SPI)配置，其设置ADC和FPGA上的寄存器值来定义链路配置参数。根据这些参数产生一个校验和并将其传输给接收器，以便接收器(FPGA)能够验证链路配置参数是否正确接收。通过链路传输的这些参数不是用于配置接收器，而是仅用于验证链路参数匹配。若检测到错误，FPGA将通过JESD204B规范的错误报告中定义的中断报告此错误。<br> 数据在发送过程中首先要经过传输层，对于发送端来说，传输层要完成的任务是基于用户选择的链路参数，对转换器设备采样得到的原始数据进行打包组帧，从而映射成宽度为8bit 的特定格式数据，并根据链路参数中的相关参数，对数据进行控制位和尾位的添加，以满足映射后数据的格式要求。因此对接收端来说，传输层负责的主要功能就是对收到的数据进行对应的解帧处理，恢复成原始的数据。此外，根据协议规范，在传输层和数据链路层之间，还要有可选的加扰模块，按照特定算法对映射后的数据进行加扰。因此，相应的在接收端需要一个解扰模块，对发送端输出的数据流进行对应的解扰，使之恢复为未加扰的数据。用下图来大概说明一下传输层的作用，8个ADC通过一定的方式组合在4条链路中进行传输。<br> <img src="https://images2.imgbox.com/34/42/Zkr3VVc8_o.png" alt="8个ADC通过一定的方式组合在4条链路中进行传输"><br> 在传输层，一组样本或部分样本被分组成F个八位字节的帧。“帧”数据结构是指一组连续的八位字节(8b/10b 编码器的输出都是一个八位字节)，其中每个八位字节的位置都以帧对齐信号作为参考。“多帧”数据结构是指一组连续的帧，其中每个多帧的位置都以多帧对齐信号作为参考。在许多应用中，帧时钟将具有与采样时钟相同的频率。JESD204 协议允许在每个帧周期内每个转换器传输多个采样，S 必须总是整数，这样可以最小化SERDES 电路和敏感模拟部件之间的串扰。每个采样作为一组N’比特发送，由N 个数据比特，可选控制比特和可选尾部比特组成。在帧的结尾处的附加尾比特是必需的，这样可以在每个帧周期中填充每个通道使比特总数为整数个八位字节。</p> 
+<p>数据映射相关链路配置参数的意义与取值范围如表1 所示。</p> 
+<table><thead><tr><th>参数名</th><th>含义</th><th>取值范围</th></tr></thead><tbody><tr><td>M</td><td>每个设备中的转换器数</td><td>1-256</td></tr><tr><td>L</td><td>每个转换器链路的通道数</td><td>1-32</td></tr><tr><td>F</td><td>每个帧中的字节数</td><td>1-256</td></tr><tr><td>S</td><td>每帧中每个转换器的采样点数</td><td>1-32</td></tr><tr><td>N</td><td>转换器分辨</td><td>1-32</td></tr><tr><td>N’</td><td>每个采样的总比特数</td><td>1-32</td></tr><tr><td>K</td><td>每个多帧中帧的数量</td><td>1-32</td></tr><tr><td>CF</td><td>每个链路每个帧周期的控制字数量</td><td>0-32</td></tr><tr><td>CS</td><td>每个采样的控制比特数</td><td>0-3</td></tr><tr><td>HD</td><td>高数据密度模式使能</td><td>0-1</td></tr></tbody></table> 
+<center> 
+ <b><font size="3">表1. 链路配置参数含义及取值范围</font></b> 
+</center> 
+<h3><a id="23_Data_Link_Layer_58"></a>2.3 数据链路层（Data Link Layer）</h3> 
+<p>数据链路层主要是完成链路建立和数据编码，该层的主要功能即为建立传输链路，对数据进行传输。数据链路层层接受并行成帧数据（包含ADC样本、控制位和结束位），并输出8B/10B字，后者在物理层中进行串行化且可以加扰。传输过程包含以下几个环节，即代码组同步（CGS），初始通道对齐序列（ILAS），用户数据传输（DATA），每阶段具体功能下面将进行具体说明。在本层中还包含8B/10B 编码模块，功能是将打包形成的8bit 数据采取8B/10B 编码的处理，使传输保持直流平衡，从而使CDR（Clock Data Recovery）电路的设计更加简单。并且通过使用8B/10B 编码方式的几种控制字符，如字符/K/、/A/等，实现对多通道的同步对齐和检测。因此，接收端需要对应的8B/10B 解码模块，对发送端生成的10bit 编码数据恢复为8bit 数据，且通过其中包含的控制字符，实现检错和对齐等功能。</p> 
+<p>数据链路层通过链路建立过程同步JESD204B链路。链路建立包括三个不同阶段：代码组同步（CGS）、初始通道同步（ILS）、传输用户数据。</p> 
+<p><img src="https://images2.imgbox.com/a5/82/W08eCdBR_o.png" alt="在这里插入图片描述"></p> 
+<p><strong>1.代码组同步（CGS）</strong></p> 
+<p>根据JESD204B 协议规定，代码组同步是链路建立的第一个步骤，并且不进行加扰，代码组同步主要有以下几个步骤，值得注意的是，以下步骤对于单发射端-单接收端和多发射端-多接收端两种情况均适用。首先，接收端通过拉低SYNC 信号发起同步请求，进入代码组同步（Code Group Synchronization，CGS）阶段。发射端开始发送连续的/K/=/K28.5/字符，各接收器（FPGA）必须利用时钟和数据恢复（CDR）技术，在ADC传来的输入数据流中找到<strong>K28.5字符</strong>。一旦在所有链路通道上检测到某一数量的连续K28.5字符，接收器模块就会解除置位送至发送器模块的SYNC~ 信号。在发送端捕获到SYNC~ 的变化后，JESD204A和JESD204B的处理会略有不同。在JESD204A中，发送模块捕捉SYNC~ 信号的变化，经过固定数量的帧时钟之后，ILAS就会启动。<strong>在JESD204B中，发送模块捕捉SYNC~ 信号的变化，并在下一个本地多帧时钟（LMFC）边界上启动ILAS。</strong></p> 
+<p><img src="https://images2.imgbox.com/98/9d/tIXhopdJ_o.jpg" alt="代码组同步（CGS）"></p> 
+<p><strong>2.初始通道对齐序列（ILAS）</strong></p> 
+<p>在开始传输用户数据之前，要先对通道进行初始化对齐，方法是通过发送ILAS（Initial Lane Alignment Sequence）。<strong>ILAS的主要作用是对齐链路的所有通道，验证链路参数，以及确定帧和多帧边界在接收器的输入数据流中的位置。</strong> 由于ILAS 中包含了链路配置信息，接受端需要以此信息对链路进行配置，包括是否使用可选的加扰功能。因此JESD204B 协议规定，ILAS 不能进行加扰。</p> 
+<p>ILAS由4个或更多多帧组成。多帧以/R/字符开始，以/A/字符结束。第二个多帧包含/R/和/Q/字符，随后是链路参数。/Q/字符表示之后的数据是链路配置参数。如果接收器需要，ILAS可以添加其它多帧。最后一个ILAS多帧的最后一个/A/字符出现后，用户数据开始。<br> <img src="https://images2.imgbox.com/88/7d/3On9RG8r_o.jpg" alt="初始通道对齐序列（ILAS）"></p> 
+<p><strong>3.用户数据</strong></p> 
+<p>在这一阶段，用户数据根据发送器(ADC)中定义并转发到接收器(FPGA)的链路参数，以流形式从发送器传输到接收器。达到用户数据阶段后，如果需要，通过数据链路中的字符替换可以监视并纠正帧和通道对齐。</p> 
+<p><img src="https://images2.imgbox.com/a4/eb/lyvzUrIS_o.jpg" alt="用户数据"><br> 如下图所示，为整个链路层数据链路建立的图示。实际上链路层除了要理解协议之外，还有理解对齐过程中各信号的时序关系，包括SYNC~ 、 LMFC，后面有时间再专门梳理指示信号和同步时钟的关系。</p> 
+<p><img src="https://images2.imgbox.com/c2/87/pRX8RZEr_o.png" alt="整个链路层数据链路建立的图示"></p> 
+<table><thead><tr><th>字符简写</th><th>字符</th><th>编码前数值</th><th>RD=-1时编码结果</th><th>RD=+1时编码结果</th><th>功能说明</th></tr></thead><tbody><tr><td>/R/</td><td>/K28.0/</td><td>000_11100</td><td>001111_0100</td><td>110000_1011</td><td>多帧开始</td></tr><tr><td>/A/</td><td>/K28.3/</td><td>011_11100</td><td>001111_0011</td><td>110000_1100</td><td>通道对齐</td></tr><tr><td>/Q/</td><td>/K28.4/</td><td>100_11100</td><td>001111_0010</td><td>110000_1101</td><td>链路配置数据开始</td></tr><tr><td>/K/</td><td>/K28.5/</td><td>101_11100</td><td>001111_1010</td><td>110000_0101</td><td>组同步</td></tr><tr><td>/F/</td><td>/K28.7/</td><td>111_11100</td><td>001111_1000</td><td>110000_0111</td><td>帧同步</td></tr></tbody></table> 
+<p>由于不同通道之间可能存在的延迟，这些特殊的通道控制字符可能无法同时传输到接收端，因此使用字符/A/进行同步。每个接收端在收到数据时，将数据存储在缓存中，并且使用一个标志位（READY）来告知其它接收器，自己当前已经接收到有效信息。当所有接收器的标志位都有效时，它们就将收到的数据同时送到下一步的逻辑功能中去，从而实现不同通道间的数据对齐。</p> 
+<h3><a id="24_Physical_Layer_99"></a>2.4 物理层（Physical Layer）</h3> 
+<p>物理层由串化/解串器，CML 驱动器，接收机以及CDR 电路组成。在发送端，通过串化器将多位的并行数据转化为串行数据，按照通道速率发送至接收端。在接收端通过解串器，将收到的串行数据转换为并行数据。由于数据传输速率非常高，这些模块常常采用定制单元设计。</p> 
+<p><img src="https://images2.imgbox.com/2a/f9/fIKL8V93_o.png" alt="在这里插入图片描述" width="1000"> </p> 
+<center> 
+ <b><font size="3">物理层(TX)</font></b> 
+</center> 
+<p></p> 
+<p><img src="https://images2.imgbox.com/44/29/yJx7H2sX_o.png" alt="物理层（RX）" width="1000"></p> 
+<center> 
+ <b><font size="3">物理层(RX)</font></b> 
+</center> 
+<p>JESD204和JESD204A均支持最高3.125 Gbps的速度。JESD204B规范支持三种可能的速度等级。速度等级1支持最高3.125 Gbps的速度，基于OIF-SxI5-0.10规范。速度等级2支持最高6.375 Gbps的速度，基于CEI-6G-SR规范。速度等级3支持最高12.5 Gbps的速度，基于CEI-11G-SR规范。表2概要显示了三种速度等级对应的一些物理层规格。JESD204的物理层实际上就是SerDes结构。在物理层主要是要关注电气特性，通过眼图来测量信号完整性。</p> 
+<table><thead><tr><th>参数</th><th>OIF-Sx15-01.0</th><th>CEI-6G-SR</th><th>CEI-6G-SR</th></tr></thead><tbody><tr><td>线路速率(Gbps)</td><td>≤3.125</td><td>≤6.375</td><td>≤12.5</td></tr><tr><td>输出差分电压(mVppd)</td><td>500 (最小值) 1000 (最大值)</td><td>400 (最小值) 750 (最大值)</td><td>360 (最小值) 770 (最大值)</td></tr><tr><td>输出上升/下降时间(ps)</td><td>&gt;50</td><td>&gt;30</td><td>&gt;24</td></tr><tr><td>输出总抖动(pp UI)</td><td>0.35</td><td>0.30</td><td>0.30</td></tr></tbody></table> 
+<center> 
+ <b><font size="3">表2. JESD204B物理层规范</font></b> 
+</center> 
+<hr color="#000000" size='1"'> 
+<h2><a id="3__121"></a>3. 总结</h2> 
+<h3><a id="31__122"></a>3.1 数据帧输出路径</h3> 
+<p>为了说明数据从转换器中取出，直到被经过8B/10B 编码生成10bit 数据之间的一系列过程，下面以14 位转换器的采样数据为例进行说明。下图为14bit 数据传输的输出路径。<br> <img src="https://images2.imgbox.com/65/f4/Gbcnd7ou_o.png" alt="14bit 数据的输出路径"><br> 对于14 位的数据，根据JESD204B 协议要求，处理后的数据位数应为8 的倍数，因此将被14bit 的数据组合成两个8bit 的字节。将原始数据按顺序排列后，为了满足格式位数要求，还添加了两个尾位，从而实现两个8bit 的数据格式。其中尾位并没有实际的意义，可以全为0 或者使用伪随机数列，或者根据应用情景，使用控制位来代替尾位。然后是一个可选择的加扰过程，基于多项式1 + 𝑥14 + 𝑥15对数据进行加扰，避免频谱尖峰现象。一般根据实际应用情况决定是否使用对数据进行加扰。然后这两个8bit 字节经过8B/10B 编码模块，输出两个宽度为10bit 的编码后数据。然后经过物理层的处理，输出一连串的串行数据，此时发送端的功能完成。之后在接收端进行发送端的逆过程，对数据进行还原。</p> 
+<h3><a id="32__127"></a>3.2 发送端和接收端的逻辑功能</h3> 
+<p>对于发送端来说，首先在根据SYSREF 信号产生帧和多帧的信号。在JESD204B 规范中，帧的长度是以8bit 字节为单位的，一个单帧包含的8bit 字节数由链路配置参数中的F决定。大多数情况下为了简化设计，多帧的字节数一般都设计为4 的整数倍。发送端控制模块在检测到SYNC 信号有效时，进入代码组同步阶段，开始发送一连串的字符/K/=8’hBC。当SYNC 无效时，在下一个本地多帧时钟的上升沿到来时，进入ILAS 阶段，发送4 个初始化多帧。发送结束后，进入用户数据阶段，开始发送用户数据，并根据链路配置决定是否进行加扰及字符替换，最后将数据通过物理层的接口进行输出。发送端的逻辑功能框图如下图所示。<br> <img src="https://images2.imgbox.com/f5/79/EaEBYAga_o.png" alt="发送端的逻辑功能框图"></p> 
+<p>对于接收端来说，首先要将串行接收接口接收到的数据，还原成10bit 的并行数据，然后经过8B/10B 解码模块进行解码。如果在解码过程中发现错误，则通过控制模块再次使能SYNC~信号，来实现报错或者重新发起同步。在经过8B/10B 解码后，要通过字符替换模块，将数据中被替换过的字符再次进行替换，还原出原本数据。数据在发送时若进行了加扰处理，那么就要使用接收端的解扰模块进行解扰。和发送端一样，接收端的解扰模块也是可选的。经过上述一系列的操作之后，接受数据将被还原成最初的帧格式。最后根据发送端的组帧格式，进行相对应的解帧，从而还原出原始数据。接收端的逻辑功能框图如下图所示。<br> <img src="https://images2.imgbox.com/f6/f0/7gvPqPmi_o.png" alt="接收端的逻辑功能框图"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/7c67638b6b44495e00dc3588e5fc7847/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">递归——汉诺塔问题（结合代码理解，终于懂了）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b4beb27a2576913d4f91528a74109b5d/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">LocalDateTime获取当天、本周、本月的开始和结束时间</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

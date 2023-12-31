@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>ffmpeg的avformat_find_stream_info分析过程（十一） - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="ffmpeg的avformat_find_stream_info分析过程（十一）" />
+<meta property="og:description" content="概要 /* 读取媒体文件的包来获取流信息。这个方法对于没有头部的文件格式也是有用的，例如MPEG。 * 对于MPEG-2这种帧模型重复的类型，这个方法也会计算真实帧率。 * * 该逻辑文件地址不被这个方法更改。 * 检查的数据包可能会被缓冲以用于以后处理。 * * @参数 ic 媒体文件句柄（格式上下文） * @参数 options ... * @成功返回值大于0 * @注意：这个方法不保证打开所有的编解码器，所以非空的options参数将会返回一个完全合理的行为。 * * 为了让用户决定什么样的信息是他们需要的，我们不会浪费时间去获取用户不需要的东西。 */ nt avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options); av_log(ic, AV_LOG_DEBUG, &#34;Rapid Before avformat_find_stream_info() pos: %&#34;PRId64&#34; bytes read:%&#34;PRId64&#34; seeks:%d nb_streams:%d\n&#34;, avio_tell(ic-&gt;pb), ic-&gt;pb-&gt;bytes_read, ic-&gt;pb-&gt;seek_count, ic-&gt;nb_streams); avio_tell(ic-&gt;pb)为当前指针的位置，ic-&gt;pb-&gt;bytes_read为已经读取的数据，ic-&gt;pb-&gt;seek_count已经seek的次数，ic-&gt;nb_streams流的track数
+为什么当前读取指针的位置和bytes_read这个不一致呢？因为解析header过程（mp4为例），会把moov的内容读取完，并进行moov解析，接着会seek到mdat的结束位置，而mdat内容并不读取
+基本概念 编解码器、数据帧、媒体流和容器是数字媒体处理系统的四个基本概念。
+首先需要统一术语：
+容器／文件（Conainer/File）：即特定格式的多媒体文件。
+媒体流（Stream）：指时间轴上的一段连续数据，如一段声音数据，一段视频数据或一段字幕数据，可以是压缩的，也可以是非压缩的，压缩的数据需要关联特定的编解码器。
+数据帧／数据包（Frame/Packet）：通常，一个媒体流由大量的数据帧组成，对于压缩数据，帧对应着编解码器的最小处理单元。通常，分属于不同媒体流的数据帧交错复用于容器之中，参见交错。
+编解码器：编解码器以帧为单位实现压缩数据和原始数据之间的相互转换。
+在FFMPEG中，使用AVFormatContext、AVStream、AVCodecContext、AVCodec及AVPacket等结构来抽象这些基本要素。
+（这里的箭头是包含关系，不是继承关系）
+AVFormatContext typedef struct AVCodecContext { / ** *扩展数据，如 mov 格式中 audio trak 中 aac 格式中 esds 的附加解码信息。 * MJPEG：Huffman表 * RV10其他标志 * MPEG4：全球头（也可以是在比特流或这里） *分配的内存应该是FF_INPUT_BUFFER_PADDING_SIZE字节较大 *，比extradata_size避免比特流器，如果它与读prolems。 * extradata按字节的内容必须不依赖于架构或CPU的字节顺序。 * - 编码：设置/分配/释放由libavcodec的。 * - 解码：由用户设置/分配/释放。 * / uint8_t *extradata; int extradata_size; / ** *这是时间的基本单位，在条件（以秒为单位） *帧时间戳派代表出席了会议。对于固定fps的内容， *基应该1/framerate和时间戳的增量应该 *相同的1。 * - 编码：必须由用户设置。 * - 解码：libavcodec的设置。 * / AVRational time_base; /*视频* / / ** * / ** *图片宽度/高度。 * - 编码：必须由用户设置。 * - 解码：libavcodec的设置。 *请注意：兼容性，它是可能的，而不是设置此 * coded_width/高解码之前。 * / int width, height; // 指向相应的解码器，如：ff_h264_decoder struct AVCodec *codec; //指向具体相应的解码器的 context，如 MOVContext void *priv_data; ." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/bbcb0cd2175057279ed27e4c1798ad91/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2021-06-10T17:21:16+08:00" />
+<meta property="article:modified_time" content="2021-06-10T17:21:16+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">ffmpeg的avformat_find_stream_info分析过程（十一）</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <h2>概要</h2> 
+<h2><img alt="" height="483" src="https://images2.imgbox.com/ee/ae/8Il1jz85_o.png" width="1160"></h2> 
+<p><img alt="" height="568" src="https://images2.imgbox.com/b0/dc/sn7bh0E3_o.png" width="541"></p> 
+<pre><code>/* 读取媒体文件的包来获取流信息。这个方法对于没有头部的文件格式也是有用的，例如MPEG。 
+* 对于MPEG-2这种帧模型重复的类型，这个方法也会计算真实帧率。 
+* 
+* 该逻辑文件地址不被这个方法更改。 
+* 检查的数据包可能会被缓冲以用于以后处理。 
+*  
+* @参数 ic 媒体文件句柄（格式上下文） 
+* @参数 options ... 
+* @成功返回值大于0 
+* @注意：这个方法不保证打开所有的编解码器，所以非空的options参数将会返回一个完全合理的行为。  
+* 
+* 为了让用户决定什么样的信息是他们需要的，我们不会浪费时间去获取用户不需要的东西。 
+*/  
+nt avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options);  </code></pre> 
+<pre><code>av_log(ic, AV_LOG_DEBUG, "Rapid Before avformat_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d nb_streams:%d\n",
+               avio_tell(ic-&gt;pb), ic-&gt;pb-&gt;bytes_read, ic-&gt;pb-&gt;seek_count, ic-&gt;nb_streams);</code></pre> 
+<p>avio_tell(ic-&gt;pb)为当前指针的位置，ic-&gt;pb-&gt;bytes_read为已经读取的数据，ic-&gt;pb-&gt;seek_count已经seek的次数，ic-&gt;nb_streams流的track数</p> 
+<p>为什么当前读取指针的位置和bytes_read这个不一致呢？因为解析header过程（mp4为例），会把moov的内容读取完，并进行moov解析，接着会seek到mdat的结束位置，而mdat内容并不读取</p> 
+<h2>基本概念</h2> 
+<p>   编解码器、数据帧、媒体流和容器是数字媒体处理系统的四个基本概念。<br> 首先需要统一术语：<br>     容器／文件（Conainer/File）：即特定格式的多媒体文件。<br>     媒体流（Stream）：指时间轴上的一段连续数据，如一段声音数据，一段视频数据或一段字幕数据，可以是压缩的，也可以是非压缩的，压缩的数据需要关联特定的编解码器。<br>     数据帧／数据包（Frame/Packet）：通常，一个媒体流由大量的数据帧组成，对于压缩数据，帧对应着编解码器的最小处理单元。通常，分属于不同媒体流的数据帧交错复用于容器之中，参见交错。<br>     编解码器：编解码器以帧为单位实现压缩数据和原始数据之间的相互转换。<br> 在FFMPEG中，使用AVFormatContext、AVStream、AVCodecContext、AVCodec及AVPacket等结构来抽象这些基本要素。</p> 
+<p><img alt="" height="378" src="https://images2.imgbox.com/e0/6b/cAahw7PA_o.png" width="568"></p> 
+<p>（这里的箭头是包含关系，不是继承关系）</p> 
+<h3>AVFormatContext</h3> 
+<pre><code>typedef struct AVCodecContext {
+ / **
+     *扩展数据，如 mov 格式中 audio trak 中 aac 格式中 esds 的附加解码信息。
+     * MJPEG：Huffman表
+     * RV10其他标志
+     * MPEG4：全球头（也可以是在比特流或这里）
+     *分配的内存应该是FF_INPUT_BUFFER_PADDING_SIZE字节较大
+     *，比extradata_size避免比特流器，如果它与读prolems。
+     * extradata按字节的内容必须不依赖于架构或CPU的字节顺序。
+     * - 编码：设置/分配/释放由libavcodec的。
+     * - 解码：由用户设置/分配/释放。
+     * /
+    uint8_t *extradata;
+    int extradata_size;
+   / **
+     *这是时间的基本单位，在条件（以秒为单位）
+     *帧时间戳派代表出席了会议。对于固定fps的内容，
+     *基应该1/framerate和时间戳的增量应该
+     *相同的1。
+     * - 编码：必须由用户设置。
+     * - 解码：libavcodec的设置。
+     * /
+    AVRational time_base;
+ /*视频* /
+    / **
+     *
+    / **
+     *图片宽度/高度。
+     * - 编码：必须由用户设置。
+     * - 解码：libavcodec的设置。
+     *请注意：兼容性，它是可能的，而不是设置此
+     * coded_width/高解码之前。
+     * /
+    int width, height;
+ // 指向相应的解码器，如：ff_h264_decoder
+    struct AVCodec *codec;
+//指向具体相应的解码器的 context，如 MOVContext
+    void *priv_data;
+    ......
+    / *仅音频* /
+    int sample_rate; ///&lt;
+    int sample_rate; ///&lt; 每秒采样
+    int channels; ///&lt; 音频通道数
+    / **
+     *音频采样格式
+     * - 编码：由用户设置。
+     * - 解码：libavcodec的设置。
+     * /
+    enum SampleFormat sample_fmt; ///&lt; 样本格式
+ 
+    / *下面的数据不应该被初始化。* /
+    / **
+     *
+    / **
+     *每包样品，初始化时调用“init”。
+     * /
+    int frame_size;
+    int frame_number; ///&lt;音频或视频帧数量
+    char codec_name[32];
+    enum AVMediaType codec_type; /* 看到AVMEDIA_TYPE_xxx */
+    enum CodecID codec_id; /* see CODEC_ID_xxx */
+ / **
+     *
+    enum CodecID codec_id; /* see CODEC_ID_xxx */
+ / **
+     *的fourcc（LSB在前，所以“的ABCD” - &gt;（“D”&lt;&lt; 24）（“C”&lt;&lt; 16）（“B”&lt;&lt; 8）+“A”）。
+     *这是用来解决一些编码错误。
+     *分路器应设置什么是编解码器用于识别领域中。
+     *如果有分路器等多个领域，在一个容器，然后选择一个
+     *最大化使用的编解码器有关的信息。
+     *如果在容器中的编解码器标记字段然后32位大分路器应该
+     *重新映射到一个表或其他结构的32位编号。也可选择新
+     * extra_codec_tag+大小可以添加，但必须证明这是一个明显的优势
+     *第一。
+     * - 编码：由用户设置，如果没有则默认基础上codec_id将使用。
+     * - 解码：由用户设置，将被转换成在初始化libavcodec的大写。
+     * /
+    unsigned int codec_tag;
+    ......
+    / **
+     *在解码器的帧重排序缓冲区的大小。
+     *对于MPEG-2，这是IPB1或0低延时IP。
+     * - 编码：libavcodec的设置。
+     * - 解码：libavcodec的设置。
+     * /
+    int has_b_frames;
+ 
+   / **
+     *每包的字节数，如果常量和已知或0
+     *
+     *用于一些WAV的音频编解码器。
+     * /
+    int block_align;
+    / **
+     *从分路器位每个样品/像素（huffyuv需要）。
+     * - 编码：libavcodec的设置。
+     * - 解码：由用户设置。
+     * /
+     int bits_per_coded_sample;
+     .....
+} AVCodecContext;</code></pre> 
+<p>    如果是单纯使用libavcodec，这部分信息需要调用者进行初始化；如果是使用整个FFMPEG库，这部分信息在调用avformat_open_input和avformat_find_stream_info的过程中根据文件的头信息及媒体流内的头部信息完成初始化。其中几个主要域的释义如下：<br>     extradata/extradata_size：这个buffer中存放了解码器可能会用到的额外信息，在av_read_frame中填充。一般来说，首先，某种具体格式的demuxer在读取格式头信息的时候会填充extradata，其次，如果demuxer没有做这个事情，比如可能在头部压根儿就没有相关的编解码信息，则相应的parser会继续从已经解复用出来的媒体流中继续寻找。在没有找到任何额外信息的情况下，这个buffer指针为空。<br>     time_base：时间基<br>     width/height：视频的宽和高。<br>     sample_rate/channels：音频的采样率和信道数目。<br>     sample_fmt：音频的原始采样格式。<br>         codec_name/codec_type/codec_id/codec_tag：编解码器的信息。</p> 
+<h3><br> AVStream</h3> 
+<p><br>    该结构体描述一个媒体流，定义如下：</p> 
+<pre><code>typedef struct AVStream {
+    int index; /** &lt;在AVFormatContext流的索引* /
+    int id; /**&lt;
+    int id; /**&lt; 特定格式的流ID */
+    AVCodecContext *codec; /**&lt; codec context */
+    / **
+     *
+    AVCodecContext *codec; /**&lt; codec context */
+    / **
+     *流的实时帧率基地。
+     *这是所有时间戳可以最低帧率
+     *准确代表（它是所有的最小公倍数
+     *流的帧率）。请注意，这个值只是一个猜测！
+     *例如，如果时间基数为1/90000和所有帧
+     *约3600或1800计时器刻度，，然后r_frame_rate将是50/1。
+     * /
+    AVRational r_frame_rate;
+   / **
+     *这是时间的基本单位，在条件（以秒为单位）
+     *帧时间戳派代表出席了会议。对于固定fps的内容，
+     *时基应该是1/framerate的时间戳的增量应为1。
+     * /
+    AVRational time_base;
+    ......
+    / **
+     *解码流量的第一帧，在流量时-base分。
+     *如果你是绝对100％的把握，设定值
+     *它真的是第一帧点。
+     *这可能是未定义（AV_NOPTS_VALUE）的。
+     *@注意的业余头不弱者受制与正确的START_TIME的业余
+     *分路器必须不设定此。
+     * /
+    int64_t start_time;
+    / **
+     *解码：时间流流时基。
+     *如果源文件中没有指定的时间，但不指定
+     *比特率，这个值将被从码率和文件大小的估计。
+     * /
+    int64_t duration;
+#if LIBAVFORMAT_VERSION_INT &lt; (53&lt;&lt;16)
+    char language[4]; /** ISO 639-2/B 3-letter languagecode (empty string if undefined) */
+#endif
+  /* av_read_frame（）支持* /
+    enum AVStreamParseType need_parsing;
+    struct AVCodecParserContext *parser;
+    .....
+   /*
+    enum AVStreamParseType need_parsing;
+    struct AVCodecParserContext *parser;
+    .....
+   /*函数av_seek_frame（）支持* /
+    AVIndexEntry *index_entries; / **&lt;
+    AVIndexEntry *index_entries; / **&lt;仅用于如果格式不notsupport寻求本身。* /
+    int nb_index_entries;
+    unsigned int index_entries_allocated_size;
+    int64_t nb_frames; ///&lt;
+    int nb_index_entries;
+    unsigned int index_entries_allocated_size;
+    int64_t nb_frames; ///&lt; 在此流的帧，如果已知或0
+    ......
+    //*
+    ......
+    //*平均帧率
+    AVRational avg_frame_rate;
+    ......
+} AVStream;</code></pre> 
+<p><br> 主要域的释义如下，其中大部分域的值可以由avformat_open_input根据文件头的信息确定，缺少的信息需要通过调用avformat_find_stream_info读帧及软解码进一步获取：<br>     index/id：index对应流的索引，这个数字是自动生成的，根据index可以从AVFormatContext::streams表中索引找到该流；而id则是流的标识，依赖于具体的容器格式。比如对于MPEG TS格式，id就是pid。<br>     time_base：流的时间基准，是一个实数，该流中媒体数据的pts和dts都将以这个时间基准为粒度。通常，使用av_rescale/av_rescale_q可以实现不同时间基准的转换。<br>     start_time：流的起始时间，以流的时间基准为单位，通常是该流中第一个帧的pts。<br>     duration：流的总时间，以流的时间基准为单位。<br>     need_parsing：对该流parsing过程的控制域。<br>     nb_frames：流内的帧数目。<br>     r_frame_rate/framerate/avg_frame_rate：帧率相关。<br>     codec：指向该流对应的AVCodecContext结构，调用avformat_open_input时生成。<br>     parser：指向该流对应的AVCodecParserContext结构，调用avformat_find_stream_info时生成。</p> 
+<h3><br> AVFormatContext</h3> 
+<p><br>         这个结构体描述了一个媒体文件或媒体流的构成和基本信息，定义如下：<br>         </p> 
+<pre><code>typedef struct AVFormatContext{
+            constAVClass *av_class; /**&lt;由avformat_alloc_context设置的。* /
+            / *
+            / *只能是iFormat的，或在同一时间oformat，不是两个。* /
+            structAVInputFormat *iformat;
+            structAVOutputFormat *oformat;
+            void*priv_data;
+            ByteIOContext*pb;
+            unsignedint nb_streams;
+            AVStream*streams[MAX_STREAMS];
+            charfilename[1024]; / **&lt;
+            structAVInputFormat *iformat;
+            structAVOutputFormat *oformat;
+            void*priv_data;
+            ByteIOContext*pb;
+            unsignedint nb_streams;
+            AVStream*streams[MAX_STREAMS];
+            charfilename[1024]; / **&lt;输入或输出的文件名*/
+            / *
+            / *流信息* /
+            int64_ttimestamp;
+        #if LIBAVFORMAT_VERSION_INT&lt; (53&lt;&lt;16)
+            chartitle[512];
+            charauthor[512];
+            charcopyright[512];
+            charcomment[512];
+            charalbum[512];
+            intyear; /**&lt; ID3 year, 0 if none */
+            inttrack; /**&lt; track number, 0 if none */
+            chargenre[32]; /**&lt; ID3 genre */
+        #endif
+            intctx_flags; /** &lt;
+            int64_ttimestamp;
+        #if LIBAVFORMAT_VERSION_INT&lt; (53&lt;&lt;16)
+            chartitle[512];
+            charauthor[512];
+            charcopyright[512];
+            charcomment[512];
+            charalbum[512];
+            intyear; /**&lt; ID3 year, 0 if none */
+            inttrack; /**&lt; track number, 0 if none */
+            chargenre[32]; /**&lt; ID3 genre */
+        #endif
+            intctx_flags; /** &lt;格式特定的标志，看到AVFMTCTX_xx* /
+            /*
+            /*分处理的私人数据（不直接修改）。* /
+            / **
+            / **此缓冲区只需要当数据包已经被缓冲，但
+               不解码，例如，在MPEG编解码器的参数
+               流。 * /
+            structAVPacketList *packet_buffer;
+            / **
+            structAVPacketList *packet_buffer;
+            / **解码元件的第一帧的位置，在
+               AV_TIME_BASE分数秒。从来没有设置这个值直接：
+               推导的AVStream值。 * /
+            int64_tstart_time;
+            / **
+            int64_tstart_time;
+            / **解码流的时间，在AV_TIME_BASE分数
+               秒。只设置这个值，如果你知道没有个人流
+               工期，也不要设置任何他们。这是从推导
+               AVStream值如果没有设置。
+            int64_tduration;
+            / **解码：总的文件大小，如果未知0* /
+            int64_tfile_size;
+            / **
+            int64_tfile_size;
+            / **解码：在比特/秒的总流率，如果不
+               可用。从来没有直接设置它如果得到file_size和
+               时间是已知的如FFmpeg的自动计算。 * /
+            intbit_rate;
+            /*av_read_frame
+            intbit_rate;
+            /*av_read_frame（）支持* /
+            AVStream*cur_st;
+        #if LIBAVFORMAT_VERSION_INT&lt; (53&lt;&lt;16)
+            constuint8_t *cur_ptr_deprecated;
+            intcur_len_deprecated;
+            AVPacketcur_pkt_deprecated;
+        #endif
+            /*av_seek_frame()
+            AVStream*cur_st;
+        #if LIBAVFORMAT_VERSION_INT&lt; (53&lt;&lt;16)
+            constuint8_t *cur_ptr_deprecated;
+            intcur_len_deprecated;
+            AVPacketcur_pkt_deprecated;
+        #endif
+            /*av_seek_frame() 支持 */
+            int64_tdata_offset; /**
+            int64_tdata_offset; /** 第一包抵消 */
+            intindex_built;
+            intmux_rate;
+            unsignedint packet_size;
+            intpreload;
+            intmax_delay;
+        #define AVFMT_NOOUTPUTLOOP -1
+        #defineAVFMT_INFINITEOUTPUTLOOP 0
+            /**
+            intindex_built;
+            intmux_rate;
+            unsignedint packet_size;
+            intpreload;
+            intmax_delay;
+        #define AVFMT_NOOUTPUTLOOP -1
+        #defineAVFMT_INFINITEOUTPUTLOOP 0
+            /** 次循环输出的格式支持它的数量 */
+            intloop_output;
+            intflags;
+        #define AVFMT_FLAG_GENPTS0x0001 ///&lt;
+            intloop_output;
+            intflags;
+        #define AVFMT_FLAG_GENPTS0x0001 ///&lt; 生成失踪分，即使它需要解析未来框架。
+        #define AVFMT_FLAG_IGNIDX0x0002 ///&lt; 忽略指数。
+        #define AVFMT_FLAG_NONBLOCK0x0004 ///&lt;从输入中读取数据包时，不要阻止。
+        #define AVFMT_FLAG_IGNDTS0x0008 ///&lt; 忽略帧的DTS包含DTS与PTS
+        #define AVFMT_FLAG_NOFILLIN0x0010 ///&lt;
+        #define AVFMT_FLAG_NOFILLIN0x0010 ///&lt;不要从任何其他值推断值，只是返回存储在容器中
+        #define AVFMT_FLAG_NOPARSE0x0020 ///&lt; 不要使用AVParsers，你还必须设置为FILLIN帧代码的工作，没有解析AVFMT_FLAG_NOFILLIN - &gt;无帧。也在寻求框架不能工作，如果找到帧边界的解析已被禁用
+        #define AVFMT_FLAG_RTP_HINT0x0040 ///&lt;暗示到输出文件添加的RTP
+            intloop_input;
+           /**
+            intloop_input;
+           /**解码：对探测数据的大小;编码：未使用。* /
+            unsignedint probesize;
+            / **
+             
+            unsignedint probesize;
+            / **
+             在此期间，输入*最大时间（在AV_TIME_BASE单位）应
+             *进行分析在avformat_find_stream_info（）。
+             */
+            intmax_analyze_duration;
+            constuint8_t *key;
+            intkeylen;
+            unsignedint nb_programs;
+            AVProgram**programs;
+           / **
+             *强迫影片codec_id。
+             *Demuxing：由用户设置。
+             */
+            enumCodecID video_codec_id;
+            / **
+             *强迫音频codec_id。
+             *Demuxing：由用户设置。
+             */
+            enumCodecID audio_codec_id;
+            / **
+             *强制的：字幕codec_id。
+             *Demuxing：由用户设置。
+             */
+            enumCodecID subtitle_codec_id;
+            / **
+             *以字节为单位的最高限额为每个数据流的索引使用的内存。
+             *如果该指数超过此大小，条目将被丢弃
+             *需要保持一个较小的规模。这可能会导致较慢或更少
+             *准确的寻求（分路器）。
+             *分路器内存中的一个完整的指数是强制性的将忽略
+             *此。
+             *混流：未使用
+             *demuxing：由用户设置* /
+            unsignedint max_index_size;
+           / **
+             *
+            unsignedint max_index_size;
+           / **
+             *以字节为单位的最高限额使用帧缓冲内存
+             *从实时捕获设备获得。* /
+            unsignedint max_picture_buffer;
+            unsignedint nb_chapters;
+            AVChapter**chapters;
+            / **
+             *
+            unsignedint max_picture_buffer;
+            unsignedint nb_chapters;
+            AVChapter**chapters;
+            / **
+             *标志启用调试。* /
+            intdebug;
+        #define FF_FDEBUG_TS 0x0001
+            / **
+             *
+            intdebug;
+        #define FF_FDEBUG_TS 0x0001
+            / **
+             *原始数据包从分路器之前，解析和解码。
+             *此缓冲区用于缓冲数据包，直到编解码器可以
+             *确定，因为不知道不能做解析
+             *编解码器。* /
+            structAVPacketList *raw_packet_buffer;
+            structAVPacketList *raw_packet_buffer_end;
+            structAVPacketList *packet_buffer_end;
+            AVMetadata*metadata;
+            / **
+             *
+            structAVPacketList *raw_packet_buffer;
+            structAVPacketList *raw_packet_buffer_end;
+            structAVPacketList *packet_buffer_end;
+            AVMetadata*metadata;
+            / **
+             *剩余的大小可为raw_packet_buffer，以字节为单位。
+             *不属于公共API* /
+        #define RAW_PACKET_BUFFER_SIZE2500000
+            intraw_packet_buffer_remaining_size;
+            / **
+             *
+        #define RAW_PACKET_BUFFER_SIZE2500000
+            intraw_packet_buffer_remaining_size;
+            / **
+             *在现实世界中的时间流的开始时间，以微秒
+             *自Unix纪元（1970年1月1日起00:00）。也就是说，pts= 0
+             
+             在这个现实世界的时间*流被抓获。
+             *- 编码：由用户设置。
+             *- 解码：未使用。 * /
+            int64_tstart_time_realtime;
+        } AVFormatContext; </code></pre> 
+<h2>代码分析</h2> 
+<p>avformat_find_stream_info这个函数比较长，循环比较多，这里就按循环来分析</p> 
+<h3>第一个循环</h3> 
+<pre><code>for (i = 0; i &lt; ic-&gt;nb_streams; i++) {
+        const AVCodec *codec;
+        AVDictionary *thread_opt = NULL;
+        st = ic-&gt;streams[i];
+        avctx = st-&gt;internal-&gt;avctx;
+
+        if (st-&gt;codecpar-&gt;codec_type == AVMEDIA_TYPE_VIDEO ||
+            st-&gt;codecpar-&gt;codec_type == AVMEDIA_TYPE_SUBTITLE) {
+/*            if (!st-&gt;time_base.num)
+                st-&gt;time_base = */
+            if (!avctx-&gt;time_base.num)
+                avctx-&gt;time_base = st-&gt;time_base;
+        }
+
+        /* 检查是当前codec_id否等于编解码器ID，如果不等，则赋值 */
+1、初始化解码器id
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+        if (st-&gt;codec-&gt;codec_id != st-&gt;internal-&gt;orig_codec_id) {
+            st-&gt;codecpar-&gt;codec_id   = st-&gt;codec-&gt;codec_id;
+            st-&gt;codecpar-&gt;codec_type = st-&gt;codec-&gt;codec_type;
+            st-&gt;internal-&gt;orig_codec_id = st-&gt;codec-&gt;codec_id;
+        }
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+        // 仅用于拆分的东西，如果解析器paser为空，那么会初始化解析器
+        if (!st-&gt;parser &amp;&amp; !(ic-&gt;flags &amp; AVFMT_FLAG_NOPARSE) &amp;&amp; st-&gt;request_probe &lt;= 0) {
+            st-&gt;parser = av_parser_init(st-&gt;codecpar-&gt;codec_id);//2、初始化解析器
+            if (st-&gt;parser) {
+                if (st-&gt;need_parsing == AVSTREAM_PARSE_HEADERS) {
+                    st-&gt;parser-&gt;flags |= PARSER_FLAG_COMPLETE_FRAMES;
+                } else if (st-&gt;need_parsing == AVSTREAM_PARSE_FULL_RAW) {
+                    st-&gt;parser-&gt;flags |= PARSER_FLAG_USE_CODEC_TS;
+                }
+            } else if (st-&gt;need_parsing) {
+                av_log(ic, AV_LOG_VERBOSE, "parser not found for codec "
+                       "%s, packets or times may be invalid.\n",
+                       avcodec_get_name(st-&gt;codecpar-&gt;codec_id));
+            }
+        }
+
+        if (st-&gt;codecpar-&gt;codec_id != st-&gt;internal-&gt;orig_codec_id)
+            st-&gt;internal-&gt;orig_codec_id = st-&gt;codecpar-&gt;codec_id;
+//3、从read_hearder获取到的parameters，赋值给codecpar
+        ret = avcodec_parameters_to_context(avctx, st-&gt;codecpar);
+        if (ret &lt; 0)
+            goto find_stream_info_err;
+        if (st-&gt;request_probe &lt;= 0)
+            st-&gt;internal-&gt;avctx_inited = 1;
+//4、通过codec_id查找decoder
+        codec = find_probe_decoder(ic, st, st-&gt;codecpar-&gt;codec_id);
+
+        /* Force thread count to 1 since the H.264 decoder will not extract
+         * SPS and PPS to extradata during multi-threaded decoding. */
+        av_dict_set(options ? &amp;options[i] : &amp;thread_opt, "threads", "1", 0);
+
+        if (ic-&gt;codec_whitelist)
+            av_dict_set(options ? &amp;options[i] : &amp;thread_opt, "codec_whitelist", ic-&gt;codec_whitelist, 0);
+//5、如果是字幕流，并且ctx的codec还没赋值，则通过open2来获取
+        /* Ensure that subtitle_header is properly set. */
+        if (st-&gt;codecpar-&gt;codec_type == AVMEDIA_TYPE_SUBTITLE
+            &amp;&amp; codec &amp;&amp; !avctx-&gt;codec) {
+            if (avcodec_open2(avctx, codec, options ? &amp;options[i] : &amp;thread_opt) &lt; 0)
+                av_log(ic, AV_LOG_WARNING,
+                       "Failed to open codec in %s\n",__FUNCTION__);
+        }
+//6、是否有足够的解码器参数，尝试打开解码器，如果没有足够的参数，则通过open2来获取
+        // Try to just open decoders, in case this is enough to get parameters.
+        if (!has_codec_parameters(st, NULL) &amp;&amp; st-&gt;request_probe &lt;= 0) {
+            if (codec &amp;&amp; !avctx-&gt;codec)
+                if (avcodec_open2(avctx, codec, options ? &amp;options[i] : &amp;thread_opt) &lt; 0)
+                    av_log(ic, AV_LOG_WARNING,
+                           "Failed to open codec in %s\n",__FUNCTION__);
+        }
+        if (!options)
+            av_dict_free(&amp;thread_opt);
+    }</code></pre> 
+<p>第一个循环主要做了下面的事</p> 
+<p>1、初始化解码器id<br> 2、初始化解析器<br> 3、在read_hearder获取到ctx的parameters，赋值给codecpar<br> 4、通过codec_id查找decoder<br> 5、如果是字幕流，并且ctx的codec还没赋值，则通过open2来获取<br> 6、是否有足够的解码器参数，尝试打开解码器，如果没有足够的参数，则通过avcodec_open2来调用avctx-&gt;codec-&gt;init(avctx)进行初始化</p> 
+<p>AVCodecParser解析器结构体，他主要定义了codec_id和解析器回调函数相关操作的指针 </p> 
+<pre><code>typedef struct AVCodecParser {
+    int codec_ids[5]; /* several codec IDs are permitted */
+    int priv_data_size;
+    int (*parser_init)(AVCodecParserContext *s);
+    /* This callback never returns an error, a negative value means that
+     * the frame start was in a previous packet. */
+    int (*parser_parse)(AVCodecParserContext *s,
+                        AVCodecContext *avctx,
+                        const uint8_t **poutbuf, int *poutbuf_size,
+                        const uint8_t *buf, int buf_size);
+    void (*parser_close)(AVCodecParserContext *s);
+    int (*split)(AVCodecContext *avctx, const uint8_t *buf, int buf_size);
+    struct AVCodecParser *next;
+} AVCodecParser;</code></pre> 
+<h4>av_parser_init</h4> 
+<p>通过codec_id对解析器函数指针parser_parse/parser_close/split进行初始化 </p> 
+<pre><code>AVCodecParserContext *av_parser_init(int codec_id)
+{
+    AVCodecParserContext *s = NULL;
+    AVCodecParser *parser;
+    int ret;
+
+    if (codec_id == AV_CODEC_ID_NONE)
+        return NULL;
+//遍历所有的codec_id解析器，初始化parser函数指针,其中codec_id定义在avcodec.h
+//比如hevc_parse对应的文件是hevc_parser.c
+    for (parser = av_first_parser; parser; parser = parser-&gt;next) {
+        if (parser-&gt;codec_ids[0] == codec_id ||
+            parser-&gt;codec_ids[1] == codec_id ||
+            parser-&gt;codec_ids[2] == codec_id ||
+            parser-&gt;codec_ids[3] == codec_id ||
+            parser-&gt;codec_ids[4] == codec_id)
+            goto found;
+    }
+    return NULL;
+
+found:
+    s = av_mallocz(sizeof(AVCodecParserContext));
+    if (!s)
+        goto err_out;
+    s-&gt;parser = parser;
+    s-&gt;priv_data = av_mallocz(parser-&gt;priv_data_size);
+    if (!s-&gt;priv_data)
+        goto err_out;
+    s-&gt;fetch_timestamp=1;
+    s-&gt;pict_type = AV_PICTURE_TYPE_I;
+    if (parser-&gt;parser_init) {//hevc_parser.c由于hevc_parser没有parser_init，所以这个条件不符合，跳过；和h264就有parser_init,会进行init
+        ret = parser-&gt;parser_init(s);//h264_parser.c
+        if (ret != 0)
+            goto err_out;
+    }
+    s-&gt;key_frame            = -1;
+#if FF_API_CONVERGENCE_DURATION
+FF_DISABLE_DEPRECATION_WARNINGS
+    s-&gt;convergence_duration = 0;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+    s-&gt;dts_sync_point       = INT_MIN;
+    s-&gt;dts_ref_dts_delta    = INT_MIN;
+    s-&gt;pts_dts_delta        = INT_MIN;
+    s-&gt;format               = -1;
+
+    return s;
+
+err_out:
+    if (s)
+        av_freep(&amp;s-&gt;priv_data);
+    av_free(s);
+    return NULL;
+}</code></pre> 
+<p>parser_parse是函数指针，指向对应解码器的parser_parse ,这里是H265,即指向的是hevc_parser.c下的hevc_parse</p> 
+<pre><code>AVCodecParser ff_hevc_parser = {
+    .codec_ids      = { AV_CODEC_ID_HEVC },
+    .priv_data_size = sizeof(HEVCParserContext),
+    .parser_parse   = hevc_parse,
+    .parser_close   = hevc_parser_close,
+    .split          = hevc_split,
+};
+</code></pre> 
+<p><img alt="" height="273" src="https://images2.imgbox.com/eb/9d/kQ3Ft1Ud_o.jpg" width="851"></p> 
+<p><img alt="" height="883" src="https://images2.imgbox.com/d5/e9/rKM1ptVg_o.png" width="367"></p> 
+<p>找到对应的codec_id后，就初始化解析器指针</p> 
+<p>然而priv_data是什么数据？</p> 
+<p>s-&gt;priv_data = av_mallocz(parser-&gt;priv_data_size);</p> 
+<p>HEVCParserContext *ctx = s-&gt;priv_data;</p> 
+<p>由此可知，priv_data属于HEVCParserContext</p> 
+<p>定义如下</p> 
+<pre><code>.priv_data_size = sizeof(HEVCParserContext),</code></pre> 
+<pre><code>typedef struct HEVCParserContext {
+    ParseContext pc;//解析器的上下文
+
+    H2645Packet pkt;//NAL单元
+    HEVCParamSets ps;//vps/sps/pps
+    HEVCSEIContext sei;//sei流媒体的辅助参数
+    SliceHeader sh;//SliceHeader
+
+    int parsed_extradata;
+
+    int poc;
+    int pocTid0;
+} HEVCParserContext;
+//将输入数据包拆分为未转义的NAL单元
+typedef struct H2645Packet {
+    H2645NAL *nals;
+    int nb_nals;
+    int nals_allocated;
+} H2645Packet;
+
+typedef struct HEVCParamSets {
+    AVBufferRef *vps_list[HEVC_MAX_VPS_COUNT];
+    AVBufferRef *sps_list[HEVC_MAX_SPS_COUNT];
+    AVBufferRef *pps_list[HEVC_MAX_PPS_COUNT];
+
+    /* currently active parameter sets */
+    const HEVCVPS *vps;
+    const HEVCSPS *sps;
+    const HEVCPPS *pps;
+} HEVCParamSets;
+
+typedef struct HEVCSEIContext {
+    HEVCSEIPictureHash picture_hash;
+    HEVCSEIFramePacking frame_packing;
+    HEVCSEIDisplayOrientation display_orientation;
+    HEVCSEIPictureTiming picture_timing;
+    HEVCSEIA53Caption a53_caption;
+    HEVCSEIMasteringDisplay mastering_display;
+    HEVCSEIContentLight content_light;
+    int active_seq_parameter_set_id;
+    HEVCSEIAlternativeTransfer alternative_transfer;
+} HEVCSEIContext;
+</code></pre> 
+<p>av_parser_init总结：</p> 
+<p>主要工作根据codec_id查找解析器，并初始化parser_parse函数指针。针对hevc解析器由于没有定义init函数指针，并没有调用parser-&gt;parser_init；而h264就有定义init，从而会调用parser-&gt;parser_init</p> 
+<p>关于parser解析器工作流程，由于这部分比较重要，再另写一篇文章来解释</p> 
+<h4>avcodec_parameters_to_context</h4> 
+<p>将AVCodecParameters（解析器）结构体中码流参数拷贝到AVCodecContext（解码）结构体中，并且重新拷贝一份extradata内容，涉及到的视频的关键参数有format, width, height, codec_type等</p> 
+<p>即将解析器的参数拷贝到解码上下文中</p> 
+<pre><code>int avcodec_parameters_to_context(AVCodecContext *codec,
+                                  const AVCodecParameters *par)
+{
+    codec-&gt;codec_type = par-&gt;codec_type;
+    codec-&gt;codec_id   = par-&gt;codec_id;
+    codec-&gt;codec_tag  = par-&gt;codec_tag;
+
+    codec-&gt;bit_rate              = par-&gt;bit_rate;
+    codec-&gt;bits_per_coded_sample = par-&gt;bits_per_coded_sample;
+    codec-&gt;bits_per_raw_sample   = par-&gt;bits_per_raw_sample;
+    codec-&gt;profile               = par-&gt;profile;
+    codec-&gt;level                 = par-&gt;level;
+
+    switch (par-&gt;codec_type) {
+    case AVMEDIA_TYPE_VIDEO:
+        codec-&gt;pix_fmt                = par-&gt;format;
+        codec-&gt;width                  = par-&gt;width;
+        codec-&gt;height                 = par-&gt;height;
+        codec-&gt;field_order            = par-&gt;field_order;
+        codec-&gt;color_range            = par-&gt;color_range;
+        codec-&gt;color_primaries        = par-&gt;color_primaries;
+        codec-&gt;color_trc              = par-&gt;color_trc;
+        codec-&gt;colorspace             = par-&gt;color_space;
+        codec-&gt;chroma_sample_location = par-&gt;chroma_location;
+        codec-&gt;sample_aspect_ratio    = par-&gt;sample_aspect_ratio;
+        codec-&gt;has_b_frames           = par-&gt;video_delay;
+        break;
+    case AVMEDIA_TYPE_AUDIO:
+        codec-&gt;sample_fmt       = par-&gt;format;
+        codec-&gt;channel_layout   = par-&gt;channel_layout;
+        codec-&gt;channels         = par-&gt;channels;
+        codec-&gt;sample_rate      = par-&gt;sample_rate;
+        codec-&gt;block_align      = par-&gt;block_align;
+        codec-&gt;frame_size       = par-&gt;frame_size;
+        codec-&gt;delay            =
+        codec-&gt;initial_padding  = par-&gt;initial_padding;
+        codec-&gt;trailing_padding = par-&gt;trailing_padding;
+        codec-&gt;seek_preroll     = par-&gt;seek_preroll;
+        break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        codec-&gt;width  = par-&gt;width;
+        codec-&gt;height = par-&gt;height;
+        break;
+    }
+
+    if (par-&gt;extradata) {
+        av_freep(&amp;codec-&gt;extradata);
+        codec-&gt;extradata = av_mallocz(par-&gt;extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!codec-&gt;extradata)
+            return AVERROR(ENOMEM);
+        memcpy(codec-&gt;extradata, par-&gt;extradata, par-&gt;extradata_size);
+        codec-&gt;extradata_size = par-&gt;extradata_size;
+    }
+
+    return 0;
+}</code></pre> 
+<p>这部分代码很简单，容易看懂，但是却很重要，是解码是否成功的参数依据。</p> 
+<h4>find_probe_decoder</h4> 
+<p>顾名思义，查找解码器</p> 
+<pre><code>AVCodec *find_probe_decoder(AVFormatContext *s, const AVStream *st, enum AVCodecID codec_id)
+{
+    const AVCodec *codec;
+#if CONFIG_H264_DECODER
+    //如果是h264 直接查找
+    if (codec_id == AV_CODEC_ID_H264)
+        return avcodec_find_decoder_by_name("h264");
+#endif
+    //如果本身有解码器就用 否则通过id查找解码器
+    codec = find_decoder(s, st, codec_id);
+
+    return codec;
+}</code></pre> 
+<p>调用find_decoder函数进一步查找：</p> 
+<pre><code>static const AVCodec *find_decoder(AVFormatContext *s, const AVStream *st, enum AVCodecID codec_id)
+{
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+    if (st-&gt;codec-&gt;codec)
+        return st-&gt;codec-&gt;codec;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+
+    switch (st-&gt;codecpar-&gt;codec_type) {
+    case AVMEDIA_TYPE_VIDEO:
+        if (s-&gt;video_codec)    return s-&gt;video_codec;
+        break;
+    case AVMEDIA_TYPE_AUDIO:
+        if (s-&gt;audio_codec)    return s-&gt;audio_codec;
+        break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        if (s-&gt;subtitle_codec) return s-&gt;subtitle_codec;
+        break;
+    }
+
+    return avcodec_find_decoder(codec_id);
+}</code></pre> 
+<p><br> 如果解码器类型已经存在就根据解码器类型返回对应的解码器，否则就根据id进行查找。</p> 
+<h4>avcodec_open2</h4> 
+<p>该函数用于初始化一个视音频编解码器的AVCodecContext。由于这函数比较重要，后面另外做具体分析，这里只做简单分析</p> 
+<p>参数定义</p> 
+<p>用中文简单转述一下avcodec_open2()各个参数的含义：</p> 
+<pre><code>avctx：需要初始化的AVCodecContext。
+codec：输入的AVCodec
+options：一些选项。例如使用libx264编码的时候，“preset”，“tune”等都可以通过该参数设置。</code></pre> 
+<pre><code>//检查输入参数是否符合【编码器】要求
+    if (av_codec_is_encoder(avctx-&gt;codec)) {
+        int i;
+        //如果包含采样率参数（表明是音频），检查采样率是否符合要求
+        if (avctx-&gt;codec-&gt;sample_fmts) {
+        	//遍历编码器支持的所有采样率
+            for (i = 0; avctx-&gt;codec-&gt;sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
+            	//如果设置的采样率==编码器支持的采样率，跳出循环。
+                if (avctx-&gt;sample_fmt == avctx-&gt;codec-&gt;sample_fmts[i])
+                    break;
+                if (avctx-&gt;channels == 1 &amp;&amp;
+                    av_get_planar_sample_fmt(avctx-&gt;sample_fmt) ==
+                    av_get_planar_sample_fmt(avctx-&gt;codec-&gt;sample_fmts[i])) {
+                    avctx-&gt;sample_fmt = avctx-&gt;codec-&gt;sample_fmts[i];
+                    break;
+                }
+            }
+            //再检查一下采样率取值是否正确
+            //注意，此时的i值没有变化
+            if (avctx-&gt;codec-&gt;sample_fmts[i] == AV_SAMPLE_FMT_NONE) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%d", avctx-&gt;sample_fmt);
+                av_log(avctx, AV_LOG_ERROR, "Specified sample format %s is invalid or not supported\n",
+                       (char *)av_x_if_null(av_get_sample_fmt_name(avctx-&gt;sample_fmt), buf));
+                ret = AVERROR(EINVAL);
+                goto free_and_end;
+            }
+        }
+        //检查像素格式
+        if (avctx-&gt;codec-&gt;pix_fmts) {
+            for (i = 0; avctx-&gt;codec-&gt;pix_fmts[i] != AV_PIX_FMT_NONE; i++)
+                if (avctx-&gt;pix_fmt == avctx-&gt;codec-&gt;pix_fmts[i])
+                    break;
+            if (avctx-&gt;codec-&gt;pix_fmts[i] == AV_PIX_FMT_NONE
+                &amp;&amp; !((avctx-&gt;codec_id == AV_CODEC_ID_MJPEG || avctx-&gt;codec_id == AV_CODEC_ID_LJPEG)
+                     &amp;&amp; avctx-&gt;strict_std_compliance &lt;= FF_COMPLIANCE_UNOFFICIAL)) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%d", avctx-&gt;pix_fmt);
+                av_log(avctx, AV_LOG_ERROR, "Specified pixel format %s is invalid or not supported\n",
+                       (char *)av_x_if_null(av_get_pix_fmt_name(avctx-&gt;pix_fmt), buf));
+                ret = AVERROR(EINVAL);
+                goto free_and_end;
+            }
+            if (avctx-&gt;codec-&gt;pix_fmts[i] == AV_PIX_FMT_YUVJ420P ||
+                avctx-&gt;codec-&gt;pix_fmts[i] == AV_PIX_FMT_YUVJ411P ||
+                avctx-&gt;codec-&gt;pix_fmts[i] == AV_PIX_FMT_YUVJ422P ||
+                avctx-&gt;codec-&gt;pix_fmts[i] == AV_PIX_FMT_YUVJ440P ||
+                avctx-&gt;codec-&gt;pix_fmts[i] == AV_PIX_FMT_YUVJ444P)
+                avctx-&gt;color_range = AVCOL_RANGE_JPEG;
+        }
+        //检查采样率
+        if (avctx-&gt;codec-&gt;supported_samplerates) {
+            for (i = 0; avctx-&gt;codec-&gt;supported_samplerates[i] != 0; i++)
+                if (avctx-&gt;sample_rate == avctx-&gt;codec-&gt;supported_samplerates[i])
+                    break;
+            if (avctx-&gt;codec-&gt;supported_samplerates[i] == 0) {
+                av_log(avctx, AV_LOG_ERROR, "Specified sample rate %d is not supported\n",
+                       avctx-&gt;sample_rate);
+                ret = AVERROR(EINVAL);
+                goto free_and_end;
+            }
+        }
+        //检查声道布局
+        if (avctx-&gt;codec-&gt;channel_layouts) {
+            if (!avctx-&gt;channel_layout) {
+                av_log(avctx, AV_LOG_WARNING, "Channel layout not specified\n");
+            } else {
+                for (i = 0; avctx-&gt;codec-&gt;channel_layouts[i] != 0; i++)
+                    if (avctx-&gt;channel_layout == avctx-&gt;codec-&gt;channel_layouts[i])
+                        break;
+                if (avctx-&gt;codec-&gt;channel_layouts[i] == 0) {
+                    char buf[512];
+                    av_get_channel_layout_string(buf, sizeof(buf), -1, avctx-&gt;channel_layout);
+                    av_log(avctx, AV_LOG_ERROR, "Specified channel layout '%s' is not supported\n", buf);
+                    ret = AVERROR(EINVAL);
+                    goto free_and_end;
+                }
+            }
+        }
+        //检查声道数
+        if (avctx-&gt;channel_layout &amp;&amp; avctx-&gt;channels) {
+            int channels = av_get_channel_layout_nb_channels(avctx-&gt;channel_layout);
+            if (channels != avctx-&gt;channels) {
+                char buf[512];
+                av_get_channel_layout_string(buf, sizeof(buf), -1, avctx-&gt;channel_layout);
+                av_log(avctx, AV_LOG_ERROR,
+                       "Channel layout '%s' with %d channels does not match number of specified channels %d\n",
+                       buf, channels, avctx-&gt;channels);
+                ret = AVERROR(EINVAL);
+                goto free_and_end;
+            }
+        } else if (avctx-&gt;channel_layout) {
+            avctx-&gt;channels = av_get_channel_layout_nb_channels(avctx-&gt;channel_layout);
+        }
+        //检查宽高
+        if(avctx-&gt;codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (avctx-&gt;width &lt;= 0 || avctx-&gt;height &lt;= 0) {
+                av_log(avctx, AV_LOG_ERROR, "dimensions not set\n");
+                ret = AVERROR(EINVAL);
+                goto free_and_end;
+            }
+        }
+        //检查码率
+        if (   (avctx-&gt;codec_type == AVMEDIA_TYPE_VIDEO || avctx-&gt;codec_type == AVMEDIA_TYPE_AUDIO)
+            &amp;&amp; avctx-&gt;bit_rate&gt;0 &amp;&amp; avctx-&gt;bit_rate&lt;1000) {
+            av_log(avctx, AV_LOG_WARNING, "Bitrate %d is extremely low, maybe you mean %dk\n", avctx-&gt;bit_rate, avctx-&gt;bit_rate);
+        }
+ 
+        if (!avctx-&gt;rc_initial_buffer_occupancy)
+            avctx-&gt;rc_initial_buffer_occupancy = avctx-&gt;rc_buffer_size * 3 / 4;
+    }
+ 
+    avctx-&gt;pts_correction_num_faulty_pts =
+    avctx-&gt;pts_correction_num_faulty_dts = 0;
+    avctx-&gt;pts_correction_last_pts =
+    avctx-&gt;pts_correction_last_dts = INT64_MIN;
+    //关键：
+    //一切检查都无误之后，调用编解码器初始化函数
+    if (   avctx-&gt;codec-&gt;init &amp;&amp; (!(avctx-&gt;active_thread_type&amp;FF_THREAD_FRAME)
+        || avctx-&gt;internal-&gt;frame_thread_encoder)) {
+        ret = avctx-&gt;codec-&gt;init(avctx);
+        if (ret &lt; 0) {
+            goto free_and_end;
+        }
+    }
+
+</code></pre> 
+<p>avcodec_open2()的源代码量是非常长的，但是它的调用关系非常简单——它只调用了一个关键的函数，即AVCodec的init()，后文将会对这个函数进行分析。<br> 我们可以简单梳理一下avcodec_open2()所做的工作，如下所列：<br> （1）为各种结构体分配内存（通过各种av_malloc()实现）。<br> （2）将输入的AVDictionary形式的选项设置到AVCodecContext。<br> （3）其他一些零零碎碎的检查，比如说检查编解码器是否处于“实验”阶段。<br> （4）如果是编码器，检查输入参数是否符合编码器的要求<br> （5）调用AVCodec的init()初始化具体的解码器。</p> 
+<h3>第二个循环</h3> 
+<p>近段时间比较忙，后面再……<br>  </p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/8112c28b8cd3b80d2cb108be30a9789b/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">跨界融合，共创智能汽车研发新生态（技术大会诚邀您的莅临）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/2c2ef575c3dd5c83569d7fd90ff5590d/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">《嵌入式Linux》vi编辑器</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

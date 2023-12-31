@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>200w的数据量能够占多大内存？发生了OOM如何进行JVM调优？ - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="200w的数据量能够占多大内存？发生了OOM如何进行JVM调优？" />
+<meta property="og:description" content="由OOM牵扯出的JVM分析与调优案例 案例介绍200w数据能占多大的内存OOM异常点分析定位异常点代码层面优化的过程JVM优化逻辑梳理 案例介绍 A平台是一个数据转换和转发平台，需要从数据库读取200w数据，进行数据转换（包括数据清理），将转换后的数据转成json格式，转换后的json格式转成字节数组，然后转发到其他平台。起初这个平台在数据量不大的时候没有任何问题，但是当读取200w数据时就会出现OOM。
+200w数据能占多大的内存 当出现OOM的时候，我们会想到是什么导致的OOM。我们首先计算一下200w数据能够占有多大的内存空间。经过计算一个对象将近有4KB的大小。（5个String （每个字符串的长度很长） 2个Long 一个Integer 一个Boolean）。对象内存的计算方法：对象内存=对象头&#43;实例数据&#43;填充数据。未开启指针压缩的对象头一般是12B（数组16B）。
+举个例子：如何计算内存（可以通过Instrumentation接口来测试）
+String str=“abcdefg”，这个占用多少字节？首先String的构造（int hash和一个char数组）对象=对象头（12）&#43;实例化数据（4（int）&#43;4（char指针））&#43;填充（4）=24（原来是20 不满足，填充了4个字节）。所以String对象占用24字节，那么空字符串占用=24&#43;char[]数组（16（对象头））=40。
+那么str的内存=40&#43;7乘2（char 占两个）=54 &#43;2（填充）=56
+HashMap的内存计算=table数组&#43;table数组中每个元素entry的内存。ArrayLsit的计算方式同理
+由于扩容，List和map中未使用的空间依然很大。
+由此经过数据库读取的200w数据转化成List 的内存大小为 4KB*200w约等于8GB（mybatis返回的List的实现其实是ArrayList，这里没有算入）。 OOM异常点分析 查看日志发现，后台打印出频繁的Full GC，并且GC后的可使用内存并没有发生变化。经过多次Full GC之后 OOM。此时并不知道什么原因，我将虚拟内存增大至25G，在12min后终于执行成功。
+这么长时间，这么大内存。运维手持40米砍刀走来。。。。
+定位异常点 首先8G的内存是经过多次转换的，从数据转换到json的List，每个对象都是new出来的强引用，GC无法回收，随着对象的不断增加，Full GC频繁，因此造成8G数据内存吃下25G的内存容量（个人分析）。通过jamp jstate命令分析，dump转储内存快照，用Mat进行可视化，发现List太长。
+代码层面优化的过程 数据库读取使用limit来限制读取的数据量（分批次读取数据，30w为一组）
+但是出现了 java.lang.ArrayIndexOutOfBoundsException：-1” 的异常，这里分析原因是每个对象转换成json也是存在一个数组中，这个数组的下标是int类型，由此推断超过了int的范围。（不知道为什么一次性读取确成功了，而分批次却出现这个问题）省去转换成json这一步（写入txt文件）
+直接写入文件中（txt文件可以存储几亿行数据，满足需求），由系统命令压缩（gzip），然后变成字节数组（让下游服务修改了逻辑 - -！）。提升时间效率（优化数据库查询）
+数据库Limit读取是可以优化的点，因为Limit 100000 ，需要扫描定位到1000000行数据，如果数据量达到千万级，每次查询均需要扫描，性能会大大降低。使用cursor（游标），cursor适用于顺序且不支持跳页，也就是说每次查询的最后一条记录，自动作为下一次的起始记录，这样省去了扫描操作。通过游标读取，每30w数据量写入文件一次。读取完成后进行一次System.gc()。 经过此次优化流程可以将内存将至12G 时间稳定在6min中
+我以为结束了，但是我查看了GC日志，YoungGC依旧频繁，Full GC依旧存在，虽然没有那么频繁，但是每次有5s左右的停顿。这仍不能满足我们的要求。
+JVM优化 查看日志显示，Yong GC仍然频繁，并且平均8次左右触发一次Full GC。经过分析：一次Full GC相当于Young GC 、Old GC和元空间GC同时进行，耗费的时间可想而知。而且频繁的Young GC 也表明新生代的内存在不断的收集中。经过7、8次Yong GC之后通过动态对象年龄判断会直接进入老年代，由于对象的不可清除，导致老年代内存增加，担保失败（HandlePromotionFailure）而导致Full GC。
+经过计算，30w数据量大约在1.2G。这里需要调整老年代、 eden、 s0和s1的内存。由于对象是一直存活的，并且尽可能减少的Full GC的次数。最终将虚拟机调整至5G，老年代：新生代=7:3 、eden：s0=5:1。
+调整后的虚拟机内存至5G，总的处理时间为4min。
+关于参数的调整：List属于大对象一开始就会进入老年代，而在List进行数据转换的时候依然会产生很多内存的消耗，所以我这里调整了一下eden和survivor的比例。并且增大老年代的比例。
+关于从25G降至12G再降低至6G，时间从12min降到6min再降低至4min，为何内存降低竟有如此效果？
+25G到12G是因为改变了代码逻辑，所以时间降低。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8414ec2faa0f32a9bea8f22867a1684d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-11-10T10:25:35+08:00" />
+<meta property="article:modified_time" content="2020-11-10T10:25:35+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">200w的数据量能够占多大内存？发生了OOM如何进行JVM调优？</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>由OOM牵扯出的JVM分析与调优案例</h4> 
+ <ul><li><ul><li><a href="#_4" rel="nofollow">案例介绍</a></li><li><a href="#200w_6" rel="nofollow">200w数据能占多大的内存</a></li><li><a href="#OOM_16" rel="nofollow">OOM异常点分析</a></li><li><a href="#_19" rel="nofollow">定位异常点</a></li><li><a href="#_21" rel="nofollow">代码层面优化的过程</a></li><li><a href="#JVM_32" rel="nofollow">JVM优化</a></li><li><a href="#_42" rel="nofollow">逻辑梳理</a></li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<h3><a id="_4"></a>案例介绍</h3> 
+<p>A平台是一个数据转换和转发平台，需要从数据库读取200w数据，进行数据转换（包括数据清理），将转换后的数据转成json格式，转换后的json格式转成字节数组，然后转发到其他平台。起初这个平台在数据量不大的时候没有任何问题，但是当读取200w数据时就会出现OOM。</p> 
+<h3><a id="200w_6"></a>200w数据能占多大的内存</h3> 
+<p>当出现OOM的时候，我们会想到是什么导致的OOM。我们首先计算一下200w数据能够占有多大的内存空间。经过计算一个对象将近有4KB的大小。（5个String （每个字符串的长度很长） 2个Long 一个Integer 一个Boolean）。对象内存的计算方法：对象内存=对象头+实例数据+填充数据。未开启指针压缩的对象头一般是12B（数组16B）。<br> <strong>举个例子：如何计算内存（可以通过Instrumentation接口来测试）</strong><br> String str=“abcdefg”，这个占用多少字节？首先String的构造（int hash和一个char数组）对象=对象头（12）+实例化数据（4（int）+4（char指针））+填充（4）=24（原来是20 不满足，填充了4个字节）。所以String对象占用24字节，那么空字符串占用=24+char[]数组（16（对象头））=40。<br> 那么str的内存=40+7乘2（char 占两个）=54 +2（填充）=56</p> 
+<p><a href="https://my.oschina.net/u/227422/blog/366683" rel="nofollow">HashMap的内存计算</a>=table数组+table数组中每个元素entry的内存。ArrayLsit的计算方式同理<br> 由于扩容，List和map中未使用的空间依然很大。</p> 
+<ul><li>由此经过数据库读取的200w数据转化成List 的内存大小为 4KB*200w约等于8GB（mybatis返回的List的实现其实是ArrayList，这里没有算入）。</li></ul> 
+<h3><a id="OOM_16"></a>OOM异常点分析</h3> 
+<p>查看日志发现，后台打印出频繁的Full GC，并且GC后的可使用内存并没有发生变化。经过多次Full GC之后 OOM。此时并不知道什么原因，我将虚拟内存增大至25G，在12min后终于执行成功。<br> 这么长时间，这么大内存。运维手持40米砍刀走来。。。。</p> 
+<h3><a id="_19"></a>定位异常点</h3> 
+<p>首先8G的内存是经过多次转换的，从数据转换到json的List，每个对象都是new出来的强引用，GC无法回收，随着对象的不断增加，Full GC频繁，因此造成8G数据内存吃下25G的内存容量（个人分析）。通过jamp jstate命令分析，dump转储内存快照，用Mat进行可视化，发现List太长。</p> 
+<h3><a id="_21"></a>代码层面优化的过程</h3> 
+<ul><li>数据库读取使用limit来限制读取的数据量（<strong>分批次读取数据</strong>，30w为一组）<br> 但是出现了 <strong>java.lang.ArrayIndexOutOfBoundsException：-1”</strong> 的异常，这里分析原因是每个对象转换成json也是存在一个数组中，这个数组的下标是int类型，由此推断超过了int的范围。（不知道为什么一次性读取确成功了，而分批次却出现这个问题）</li><li>省去转换成json这一步（<strong>写入txt文件</strong>）<br> 直接写入文件中（txt文件可以存储几亿行数据，满足需求），由系统命令压缩（gzip），然后变成字节数组（让下游服务修改了逻辑 - -！）。</li><li>提升时间效率（<strong>优化数据库查询</strong>）<br> 数据库Limit读取是可以优化的点，因为Limit 100000 ，需要扫描定位到1000000行数据，如果数据量达到千万级，每次查询均需要扫描，性能会大大降低。使用cursor（游标），cursor适用于顺序且不支持跳页，也就是说每次查询的最后一条记录，自动作为下一次的起始记录，这样省去了扫描操作。通过游标读取，每30w数据量写入文件一次。读取完成后进行一次<code>System.gc()</code>。</li></ul> 
+<p><strong>经过此次优化流程可以将内存将至12G 时间稳定在6min中</strong></p> 
+<p>我以为结束了，但是我查看了GC日志，YoungGC依旧频繁，Full GC依旧存在，虽然没有那么频繁，但是每次有5s左右的停顿。这仍不能满足我们的要求。</p> 
+<h3><a id="JVM_32"></a>JVM优化</h3> 
+<p>查看日志显示，Yong GC仍然频繁，并且平均8次左右触发一次Full GC。经过分析：一次Full GC相当于Young GC 、Old GC和元空间GC同时进行，耗费的时间可想而知。而且频繁的Young GC 也表明新生代的内存在不断的收集中。经过7、8次Yong GC之后通过<strong>动态对象年龄判断</strong>会直接进入老年代，由于对象的不可清除，导致老年代内存增加，担保失败（HandlePromotionFailure）而导致Full GC。<br> 经过计算，30w数据量大约在1.2G。这里需要调整老年代、 eden、 s0和s1的内存。由于对象是一直存活的，并且尽可能减少的Full GC的次数。最终将虚拟机调整至5G，老年代：新生代=7:3 、eden：s0=5:1。<br> 调整后的虚拟机内存至5G，总的处理时间为4min。<br> 关于参数的调整：List属于大对象一开始就会进入老年代，而在List进行数据转换的时候依然会产生很多内存的消耗，所以我这里调整了一下eden和survivor的比例。并且增大老年代的比例。</p> 
+<p><strong>关于从25G降至12G再降低至6G，时间从12min降到6min再降低至4min，为何内存降低竟有如此效果？</strong><br> 25G到12G是因为改变了代码逻辑，所以时间降低。<br> 12G到6G。根据日志看，其实12G和6G区别在于Young GC的次数，显然12G的Yong GC次数较多，而Full GC的次数大致相同。我推断：由于12G的新生代内存较大，所以Yong GC的时间较长。而将内存将至6G，并且调节老年代的比例、eden和survivor的比例，使得新生代内存降低。同时List是属于大对象，一开始就会进入老年代，所以12G和6G的 Full GC次数大致相同。</p> 
+<h3><a id="_42"></a>逻辑梳理</h3> 
+<p>OOM定位到GC日志异常，dump GC日志使用MAT软件分析。优化代码逻辑（批次从数据库读取、写入文件），稳定以后再根据GC日志进行JVM调整。<br> 整个定位到优化的流程，使得我对jvm调优有一些经验，另外开始关注代码本身</p> 
+<ul><li>对于List数据结构很多由ArrayLit实现（mybaits返回的Lsit就是ArrayList实现），由于ArrayLsit的1.5倍扩容，在数据量不大的情况下不会有什么问题。但是当数据量上去了以后，ArrayList所占用的内存将变的很大，并且空间使用效率也不高，1.5倍扩容后也会存在很多未使用的空间。大流量情况下尽量对ArrayList指定大小。</li><li>数据处理可以放入文件中，然后使用系统内部的gzip命令进行压缩，唯一的缺点就是可能要修改下游逻辑</li><li>数据库的Limit在数据量增大的情况下，由于会全表扫描，也会降低性能</li><li>根据不同的需求对JVM进行调优</li></ul> 
+<p><a href="http://www.codetc.com/article-330-1.html" rel="nofollow">Limit性能优化以及分页数据性能优化</a><br> <a href="https://juejin.im/post/6844904025524011016" rel="nofollow">几百万的数据放入内容会把系统撑爆吗</a><br> <a href="https://juejin.im/post/6844904022101475342" rel="nofollow">一个对象占用多大内存</a><br> <a href="https://juejin.im/post/6844903669251440653" rel="nofollow">Full GC 和 Minor GC</a><br> <a href="https://blog.csdn.net/FateRuler/article/details/81191527">Minor GC与Full GC分别在什么时候发生？</a><br> <a href="https://juejin.im/post/6844904111406759950" rel="nofollow">JVM从入门到入土之实战JVM调优(一)</a></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/2e112ef74c88fcc97884edf498ec53ad/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Ant design pro常用(9):Tabs的使用</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/3b31515857b849b48323e898f672e905/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">计算机与代数---如何计算pow---方法和实现</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>go 进阶 限流相关: 一. time/rate限速器 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="go 进阶 限流相关: 一. time/rate限速器" />
+<meta property="og:description" content="目录 一. 限流与time/rate基础WaitN实现超时取消示例ReserveN预定令牌示例使用示例 二. time/rate 底层原理相关Limiter 与 Reservation 结构消费令牌底层原理1. reserveN()方法逻辑2. advance()根据当前时间和上次更新时间计算桶中剩余的令牌数逻辑3. durationFromTokens()根据令牌数量tokens计算出产生该数量的令牌需要的时长4. tokensFromDuration()获取指定期间内产生的令牌数量 Wait 阻塞获取令牌CancelAt()取消令牌消费操作 三. 总结复习限流算法time/rate 总结 一. 限流与time/rate基础 golang内部基于令牌桶算法提供了一个限流器time/rate位于golang.org/x/time/rate在golang中,可以使用channel或者使用time/rate包实现并发控制, time/rate包是一个提供令牌桶算法的包，它可以实现对事件发生的速率进行限制和平滑,使用time/rate控制并发比使用channel控制并发的优点在于 time/rate只需要调用NewLimiter()函数,设置并发限制规则创建Limiter对象，然后在每个goroutine中调用Wait或者Allow方法来获取令牌即可,简单方便,channel需要创建一个缓冲区,然后在每个goroutine中通过向channel的缓冲区存放或获取数据来控制并发time/rate可以更灵活地控制并发的速率,可以根据令牌桶的容量和填充速度来调整并发的上限和平均值,而channel只能根据缓冲区的大小来控制并发的上限,不能控制平均值time/rate可以更容易地处理并发的异常情况，例如超时或者取消:提供了WaitN、Reserve、Context等方法来支持超时或者取消的场景,而channel需要额外的逻辑来处理超时或者取消，例如使用select语句或者context包 WaitN方法和Reserve方法都可以获取n个令牌,它们以后什么不同 WaitN方法会阻塞当前goroutine,直到获取到n个令牌,或者超时或者取消,它接收一个context参数,用于控制超时或者取消的行为,如果获取成功,它会返回nil,否则返回一个错误Reserve方法会预定n个令牌,返回一个Reservation对象用于表示预定的结果,Reservation对象提供了Delay方法,用于获取预定的延迟时间,以及Cancel方法用于取消预定。如果预定成功它会返回一个非nil的Reservation对象否则返回nil一般来说如果想要同步地等待令牌,或者不关心延迟时间,你可以使用WaitN方法,如果想要异步地等待令牌,或者想要知道延迟时间,你可以使用Reserve方法 time/rate常用的API概述: NewLimiter(r Limit, b int) *Limiter: 创建一个新的限流器，r表示每秒可以向令牌桶中产生多少令牌，b表示最大容量Limit() Limit: 返回限流器的最大事件频率Burst() int: 返回限流器的最大突发大小,即一次可以消费的最大令牌数1Allow() bool: 相当于AllowN(time.Now(), 1),表示是否可以消费一个令牌,可以返回true并消费一个令牌AllowN(t time.Time, n int) bool: 表示是否可以消费n个令牌,可以则返回true并消费n个令牌Reserve() Reservation: 相当于ReserveN(time.Now(), 1),表示预订一个令牌,并返回一个Reservation对象,该对象可以用来获取需要等待的时间或者取消预订ReserveN(t time.Time, n int) Reservation: 表示预订n个令牌,并返回一个Reservation对象Wait(ctx context.Context) (err error): 相当于WaitN(ctx, 1),表示等待直到可以消费一个令牌,或者通过ctx被取消WaitN(ctx context.Context, n int) (err error): 表示等待直到可以消费n个令牌,或者通过ctx被取消 预订的令牌时,返回的Reservation结构体上常用的API: Cancel(): 取消预订,将令牌归还给限流器CancelAt(t time.Time): 在指定的时间取消预订,将令牌归还给限流器Delay(): 返回需要等待的时间,相当于DelayFrom(time.Now())DelayFrom(t time." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/c55dc937338b8874d45ad2cdbcb35159/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-07-11T14:12:37+08:00" />
+<meta property="article:modified_time" content="2023-07-11T14:12:37+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">go 进阶 限流相关: 一. time/rate限速器</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>目录</h4> 
+ <ul><li><a href="#_timerate_1" rel="nofollow">一. 限流与time/rate基础</a></li><li><ul><li><a href="#WaitN_89" rel="nofollow">WaitN实现超时取消示例</a></li><li><a href="#ReserveN_170" rel="nofollow">ReserveN预定令牌示例</a></li><li><a href="#_209" rel="nofollow">使用示例</a></li></ul> 
+  </li><li><a href="#_timerate__383" rel="nofollow">二. time/rate 底层原理相关</a></li><li><ul><li><a href="#Limiter__Reservation__384" rel="nofollow">Limiter 与 Reservation 结构</a></li><li><a href="#_418" rel="nofollow">消费令牌底层原理</a></li><li><ul><li><a href="#1_reserveN_431" rel="nofollow">1. reserveN()方法逻辑</a></li><li><a href="#2_advance_498" rel="nofollow">2. advance()根据当前时间和上次更新时间计算桶中剩余的令牌数逻辑</a></li><li><a href="#3_durationFromTokenstokens_516" rel="nofollow">3. durationFromTokens()根据令牌数量tokens计算出产生该数量的令牌需要的时长</a></li><li><a href="#4_tokensFromDuration_527" rel="nofollow">4. tokensFromDuration()获取指定期间内产生的令牌数量</a></li></ul> 
+   </li><li><a href="#Wait__538" rel="nofollow">Wait 阻塞获取令牌</a></li><li><a href="#CancelAt_631" rel="nofollow">CancelAt()取消令牌消费操作</a></li></ul> 
+  </li><li><a href="#__688" rel="nofollow">三. 总结</a></li><li><ul><li><a href="#_689" rel="nofollow">复习限流算法</a></li><li><a href="#timerate__702" rel="nofollow">time/rate 总结</a></li></ul> 
+ </li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_timerate_1"></a>一. 限流与time/rate基础</h2> 
+<ol><li>golang内部基于令牌桶算法提供了一个限流器time/rate位于golang.org/x/time/rate</li><li>在golang中,可以使用channel或者使用time/rate包实现并发控制, time/rate包是一个提供令牌桶算法的包，它可以实现对事件发生的速率进行限制和平滑,使用time/rate控制并发比使用channel控制并发的优点在于</li></ol> 
+<blockquote> 
+ <ol><li>time/rate只需要调用NewLimiter()函数,设置并发限制规则创建Limiter对象，然后在每个goroutine中调用Wait或者Allow方法来获取令牌即可,简单方便,channel需要创建一个缓冲区,然后在每个goroutine中通过向channel的缓冲区存放或获取数据来控制并发</li><li>time/rate可以更灵活地控制并发的速率,可以根据令牌桶的容量和填充速度来调整并发的上限和平均值,而channel只能根据缓冲区的大小来控制并发的上限,不能控制平均值</li><li>time/rate可以更容易地处理并发的异常情况，例如超时或者取消:提供了WaitN、Reserve、Context等方法来支持超时或者取消的场景,而channel需要额外的逻辑来处理超时或者取消，例如使用select语句或者context包</li></ol> 
+</blockquote> 
+<ol start="3"><li>WaitN方法和Reserve方法都可以获取n个令牌,它们以后什么不同</li></ol> 
+<blockquote> 
+ <ol><li>WaitN方法会阻塞当前goroutine,直到获取到n个令牌,或者超时或者取消,它接收一个context参数,用于控制超时或者取消的行为,如果获取成功,它会返回nil,否则返回一个错误</li><li>Reserve方法会预定n个令牌,返回一个Reservation对象用于表示预定的结果,Reservation对象提供了Delay方法,用于获取预定的延迟时间,以及Cancel方法用于取消预定。如果预定成功它会返回一个非nil的Reservation对象否则返回nil</li><li>一般来说如果想要同步地等待令牌,或者不关心延迟时间,你可以使用WaitN方法,如果想要异步地等待令牌,或者想要知道延迟时间,你可以使用Reserve方法</li></ol> 
+</blockquote> 
+<ol start="4"><li>time/rate常用的API概述:</li></ol> 
+<blockquote> 
+ <ol><li>NewLimiter(r Limit, b int) *Limiter: 创建一个新的限流器，r表示每秒可以向令牌桶中产生多少令牌，b表示最大容量</li><li>Limit() Limit: 返回限流器的最大事件频率</li><li>Burst() int: 返回限流器的最大突发大小,即一次可以消费的最大令牌数1</li><li>Allow() bool: 相当于AllowN(time.Now(), 1),表示是否可以消费一个令牌,可以返回true并消费一个令牌</li><li>AllowN(t time.Time, n int) bool: 表示是否可以消费n个令牌,可以则返回true并消费n个令牌</li><li>Reserve() Reservation: 相当于ReserveN(time.Now(), 1),表示预订一个令牌,并返回一个Reservation对象,该对象可以用来获取需要等待的时间或者取消预订</li><li>ReserveN(t time.Time, n int) Reservation: 表示预订n个令牌,并返回一个Reservation对象</li><li>Wait(ctx context.Context) (err error): 相当于WaitN(ctx, 1),表示等待直到可以消费一个令牌,或者通过ctx被取消</li><li>WaitN(ctx context.Context, n int) (err error): 表示等待直到可以消费n个令牌,或者通过ctx被取消</li></ol> 
+</blockquote> 
+<ol start="5"><li>预订的令牌时,返回的Reservation结构体上常用的API:</li></ol> 
+<blockquote> 
+ <ol><li>Cancel(): 取消预订,将令牌归还给限流器</li><li>CancelAt(t time.Time): 在指定的时间取消预订,将令牌归还给限流器</li><li>Delay(): 返回需要等待的时间,相当于DelayFrom(time.Now())</li><li>DelayFrom(t time.Time): 返回从指定的时间开始需要等待的时间</li><li>OK()：返回预订是否有效,如果预订的令牌数超过了限流器的突发大小(也就是最大个数),预定无效返回false</li></ol> 
+</blockquote> 
+<ol start="6"><li>time/rate基础使用示例</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">import</span> <span class="token punctuation">(</span>
+	<span class="token string">"context"</span>
+	<span class="token string">"fmt"</span>
+	<span class="token string">"github.com/gin-gonic/gin"</span>
+	<span class="token string">"golang.org/x/time/rate"</span>
+	<span class="token string">"log"</span>
+	<span class="token string">"time"</span>
+<span class="token punctuation">)</span>
+
+<span class="token keyword">func</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">//1.初始化 limiter 每秒10个令牌，令牌桶容量为20</span>
+	<span class="token comment">//第一个参数r Limit代表每秒可以向桶中产生多少令牌,Limit 实际上是 float64 的别名</span>
+	<span class="token comment">//第二个参数b int代表桶的容量大小,当前为20,如果桶中有20个令牌,</span>
+	<span class="token comment">//可以立即获取20个令牌,不需要等待直接执行,也就是最大并发数</span>
+	limiter <span class="token operator">:=</span> rate<span class="token punctuation">.</span><span class="token function">NewLimiter</span><span class="token punctuation">(</span>rate<span class="token punctuation">.</span><span class="token function">Every</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span>Millisecond<span class="token operator">*</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">20</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//2.获取1个令牌,获取到返回true,否则false</span>
+	bo <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">Allow</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token keyword">if</span> bo <span class="token punctuation">{<!-- --></span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span><span class="token string">"获取令牌成功"</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//2.获取指定时间内指定个数令牌,获取到返回true,</span>
+	<span class="token comment">//实际上方的Allow()内部调用的就是AllowN()</span>
+	limiter<span class="token punctuation">.</span><span class="token function">AllowN</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//3.阻塞直到获取足够的令牌或者上下文取消</span>
+	ctx<span class="token punctuation">,</span> <span class="token boolean">_</span> <span class="token operator">:=</span> context<span class="token punctuation">.</span><span class="token function">WithTimeout</span><span class="token punctuation">(</span>context<span class="token punctuation">.</span><span class="token function">Background</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> time<span class="token punctuation">.</span>Second<span class="token operator">*</span><span class="token number">10</span><span class="token punctuation">)</span>
+	limiter<span class="token punctuation">.</span><span class="token function">Wait</span><span class="token punctuation">(</span>ctx<span class="token punctuation">)</span>
+	err <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">WaitN</span><span class="token punctuation">(</span>ctx<span class="token punctuation">,</span> <span class="token number">20</span><span class="token punctuation">)</span>
+	<span class="token keyword">if</span> err <span class="token operator">!=</span> <span class="token boolean">nil</span> <span class="token punctuation">{<!-- --></span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span><span class="token string">"error"</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//4.可以理解为预定一个令牌,当调用Reserve后不管是否存在有效令牌都会返回一个Reservation指针对象</span>
+	<span class="token comment">//接下来可以通过返回的Reservation进行指定操作</span>
+	reservation <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">Reserve</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token keyword">if</span> <span class="token number">0</span> <span class="token operator">==</span> reservation<span class="token punctuation">.</span><span class="token function">Delay</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span><span class="token string">"获取令牌成功"</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//5.指定实际内预定指定个数令牌</span>
+	<span class="token comment">//上面Reserve()内部实际就是调用的ReserveN()</span>
+	limiter<span class="token punctuation">.</span><span class="token function">ReserveN</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//6.修改令牌生成速率</span>
+	limiter<span class="token punctuation">.</span><span class="token function">SetLimit</span><span class="token punctuation">(</span>rate<span class="token punctuation">.</span><span class="token function">Every</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span>Millisecond <span class="token operator">*</span> <span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+	limiter<span class="token punctuation">.</span><span class="token function">SetLimitAt</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> rate<span class="token punctuation">.</span><span class="token function">Every</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span>Millisecond<span class="token operator">*</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//7.修改令牌桶大小,也就是生成令牌的最大数量限制</span>
+	limiter<span class="token punctuation">.</span><span class="token function">SetBurst</span><span class="token punctuation">(</span><span class="token number">50</span><span class="token punctuation">)</span>
+	limiter<span class="token punctuation">.</span><span class="token function">SetBurstAt</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">50</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//8.获取限流的速率即结构体中limit的值,每秒允许处理的事件数量,即每秒处理事件的频率</span>
+	l <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">Limit</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	fmt<span class="token punctuation">.</span><span class="token function">Printf</span><span class="token punctuation">(</span><span class="token string">"每秒允许处理的事件数量,即每秒处理事件的频率为: %v"</span><span class="token punctuation">,</span> l<span class="token punctuation">)</span>
+	<span class="token comment">//9.返回桶的最大容量</span>
+	limiter<span class="token punctuation">.</span><span class="token function">Burst</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="WaitN_89"></a>WaitN实现超时取消示例</h3> 
+<ol><li>time/rate基于WaitN方法实现超时控制:限制每秒只允许10个请求,最大允许请求数为20,当超过20个后,超过部分等待30秒,如果30秒还获取不到则拒绝,示例中写明中文注释,写明哪里是拒绝执行的,哪里是放行执行的</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">package</span> main
+
+<span class="token keyword">import</span> <span class="token punctuation">(</span>
+	<span class="token string">"context"</span>
+	<span class="token string">"fmt"</span>
+	<span class="token string">"golang.org/x/time/rate"</span>
+	<span class="token string">"time"</span>
+<span class="token punctuation">)</span>
+
+<span class="token keyword">func</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 创建一个每秒允许10个请求，最大允许请求数为20的限速器</span>
+	limiter <span class="token operator">:=</span> rate<span class="token punctuation">.</span><span class="token function">NewLimiter</span><span class="token punctuation">(</span><span class="token number">10</span><span class="token punctuation">,</span> <span class="token number">20</span><span class="token punctuation">)</span>
+	<span class="token comment">// 模拟100个请求</span>
+	<span class="token keyword">for</span> i <span class="token operator">:=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> <span class="token number">100</span><span class="token punctuation">;</span> i<span class="token operator">++</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 创建一个带有30秒超时时间的context</span>
+		ctx<span class="token punctuation">,</span> cancel <span class="token operator">:=</span> context<span class="token punctuation">.</span><span class="token function">WithTimeout</span><span class="token punctuation">(</span>context<span class="token punctuation">.</span><span class="token function">Background</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">30</span><span class="token operator">*</span>time<span class="token punctuation">.</span>Second<span class="token punctuation">)</span>
+		<span class="token keyword">defer</span> <span class="token function">cancel</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+		<span class="token comment">// 等待获取一个令牌,(如果当前获取的令牌数超过了最大限制,或者通过context超时取消了,返回错误)</span>
+		err <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">WaitN</span><span class="token punctuation">(</span>ctx<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+		<span class="token keyword">if</span> err <span class="token operator">!=</span> <span class="token boolean">nil</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// 处理错误，表示拒绝执行</span>
+			fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span>i<span class="token punctuation">,</span> <span class="token string">"rejected:"</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span> 
+			<span class="token keyword">continue</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">// 没有错误，表示放行执行</span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span>i<span class="token punctuation">,</span> <span class="token string">"accepted"</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol start="2"><li>time/rate基于WaitN方法实现超时控制:</li></ol> 
+<blockquote> 
+ <ol><li>限制每秒只允许10个请求,最大允许请求数为20,</li><li>当请求超过20个后,判断当前是否有正在阻塞等待的请求,如果有判断阻塞等待的请求数是否超过5个,如果阻塞等待请求超过5个直接拒绝请求</li><li>如果没有阻塞等待请求,或者阻塞等待请求没有超过5个,阻塞等待30秒,如果30秒未执行,响应超时</li></ol> 
+</blockquote> 
+<pre><code class="prism language-go"><span class="token keyword">package</span> main
+
+<span class="token keyword">import</span> <span class="token punctuation">(</span>
+	<span class="token string">"context"</span>
+	<span class="token string">"fmt"</span>
+	<span class="token string">"golang.org/x/time/rate"</span>
+	<span class="token string">"sync/atomic"</span>
+	<span class="token string">"time"</span>
+<span class="token punctuation">)</span>
+
+<span class="token keyword">func</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 创建一个每秒允许10个请求，最大允许请求数为20的限速器</span>
+	limiter <span class="token operator">:=</span> rate<span class="token punctuation">.</span><span class="token function">NewLimiter</span><span class="token punctuation">(</span><span class="token number">10</span><span class="token punctuation">,</span> <span class="token number">20</span><span class="token punctuation">)</span>
+	<span class="token comment">// 创建一个原子计数器，用于记录阻塞等待的请求数</span>
+	<span class="token keyword">var</span> waiting <span class="token builtin">int64</span> <span class="token operator">=</span> <span class="token number">0</span>
+	<span class="token comment">// 模拟100个请求</span>
+	<span class="token keyword">for</span> i <span class="token operator">:=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> <span class="token number">100</span><span class="token punctuation">;</span> i<span class="token operator">++</span> <span class="token punctuation">{<!-- --></span>
+
+		<span class="token keyword">if</span> atomic<span class="token punctuation">.</span><span class="token function">LoadInt64</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>waiting<span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">5</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// 如果阻塞等待的请求数超过5个，直接拒绝执行</span>
+			fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span>i<span class="token punctuation">,</span> <span class="token string">"rejected: too many waiting requests"</span><span class="token punctuation">)</span> 
+			<span class="token keyword">continue</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">// 增加计数器</span>
+		atomic<span class="token punctuation">.</span><span class="token function">AddInt64</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>waiting<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+		
+		<span class="token comment">// 创建一个带有30秒超时时间的context</span>
+		ctx<span class="token punctuation">,</span> cancel <span class="token operator">:=</span> context<span class="token punctuation">.</span><span class="token function">WithTimeout</span><span class="token punctuation">(</span>context<span class="token punctuation">.</span><span class="token function">Background</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">30</span><span class="token operator">*</span>time<span class="token punctuation">.</span>Second<span class="token punctuation">)</span>
+		<span class="token keyword">defer</span> <span class="token function">cancel</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+		
+		<span class="token comment">// 尝试获取一个令牌，(如果当前获取的令牌数超过了最大限制,或者通过context超时取消了,返回错误)</span>
+		err <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">WaitN</span><span class="token punctuation">(</span>ctx<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+		<span class="token keyword">if</span> err <span class="token operator">!=</span> <span class="token boolean">nil</span> <span class="token punctuation">{<!-- --></span>
+			<span class="token comment">// 处理错误，表示拒绝执行</span>
+			fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span>i<span class="token punctuation">,</span> <span class="token string">"rejected:"</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+			<span class="token keyword">continue</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">//当获取到令牌,减少计数器(获取到令牌就累减计数器,总觉得有点问题)</span>
+		atomic<span class="token punctuation">.</span><span class="token function">AddInt64</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>waiting<span class="token punctuation">,</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span>
+		<span class="token comment">// 没有错误，表示放行执行</span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span>i<span class="token punctuation">,</span> <span class="token string">"accepted"</span><span class="token punctuation">)</span> 
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="ReserveN_170"></a>ReserveN预定令牌示例</h3> 
+<ol><li>在执行Limiter下的Reserve()或ReserveN()方法时会返回一个Reservation,Reservation下的方法使用示例,注意ReserveN只能预订最大限制以内的,如果ReserveN预定数量超过了最大限制</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">func</span> <span class="token function">test</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">//1.初始化 limiter 每秒10个令牌，令牌桶容量为20</span>
+	limiter <span class="token operator">:=</span> rate<span class="token punctuation">.</span><span class="token function">NewLimiter</span><span class="token punctuation">(</span>rate<span class="token punctuation">.</span><span class="token function">Every</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span>Millisecond<span class="token operator">*</span><span class="token number">100</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">20</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//2.可以理解为预定一个令牌,当调用Reserve后不管是否存在有效令牌都会返回一个Reservation指针对象</span>
+	<span class="token comment">//接下来可以通过返回的Reservation进行指定操作</span>
+	reservation <span class="token operator">:=</span> limiter<span class="token punctuation">.</span><span class="token function">Reserve</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token keyword">if</span> <span class="token operator">!</span>reservation <span class="token punctuation">.</span><span class="token function">OK</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 预定失败，表示超过了最大突发数</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//获取到Reservation后</span>
+
+	<span class="token comment">//3.Delay():如果ReserveN预订超过最大限制,Delay()方法会返回一个非零的值</span>
+	<span class="token comment">//返回需要阻塞等待多长时间才能拿到令牌,如果为0说明不用阻塞等待</span>
+	<span class="token keyword">if</span> <span class="token number">0</span> <span class="token operator">==</span> reservation<span class="token punctuation">.</span><span class="token function">Delay</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span><span class="token string">"获取令牌成功"</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//4.上面Delay()内部就是调用的该方法,如果返回0，表示有足够的令牌,</span>
+	<span class="token comment">//如果返回InfDuration，表示到截至时间时仍然没有足够的令牌</span>
+	reservation<span class="token punctuation">.</span><span class="token function">DelayFrom</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+
+	<span class="token comment">//5.返回限流器limiter是否可以在最大等待时间内提供请求数量的令牌。</span>
+	<span class="token comment">//如果Ok为false，则Delay返回InfDuration，Cancel不执行任何操作</span>
+	<span class="token keyword">if</span> reservation<span class="token punctuation">.</span><span class="token function">OK</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		fmt<span class="token punctuation">.</span><span class="token function">Println</span><span class="token punctuation">(</span><span class="token string">"获取令牌成功"</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//6.用于取消预约令牌操作,如果有需要还原的令牌,</span>
+	<span class="token comment">//则将需要还原的令牌重新放入到令牌桶中,注意并不是无脑还原</span>
+	reservation<span class="token punctuation">.</span><span class="token function">Cancel</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token comment">//上方的Cancel()内部就是调用的CancelAt()这个方法</span>
+	reservation<span class="token punctuation">.</span><span class="token function">CancelAt</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="_209"></a>使用示例</h3> 
+<ol><li>需求: 根据调用服务或者接口限流</li></ol> 
+<blockquote> 
+ <ol><li>指定服务或接口有限流要求,获取到限流规则</li><li>编写限流逻辑,创建限流结构,限流容器,获取限流limit方法</li><li>提供限流中间件,获取到请求后获取限流limit,如果超出阈值熔断</li></ol> 
+</blockquote> 
+<ol start="2"><li>限流逻辑</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">import</span> <span class="token punctuation">(</span>
+	<span class="token string">"golang.org/x/time/rate"</span>
+	<span class="token string">"sync"</span>
+<span class="token punctuation">)</span>
+
+<span class="token comment">// 1.针对服务(或者针对接口)限流,封装限流结构</span>
+<span class="token keyword">type</span> FlowLimiterItem <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+	ServiceName <span class="token builtin">string</span>        <span class="token comment">//需要限流的服务或接口标识</span>
+	Limter      <span class="token operator">*</span>rate<span class="token punctuation">.</span>Limiter <span class="token comment">//限流limit</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">// 1.封装限流容器(不同服务或者不同接口的限流上下文存储到该容器中)</span>
+<span class="token keyword">type</span> FlowLimiter <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+	FlowLmiterMap   <span class="token keyword">map</span><span class="token punctuation">[</span><span class="token builtin">string</span><span class="token punctuation">]</span><span class="token operator">*</span>FlowLimiterItem
+	FlowLmiterSlice <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token operator">*</span>FlowLimiterItem
+	Locker          sync<span class="token punctuation">.</span>RWMutex
+<span class="token punctuation">}</span>
+
+<span class="token comment">// 3.提供初始化限流容器函数</span>
+<span class="token keyword">func</span> <span class="token function">NewFlowLimiter</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span>FlowLimiter <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span> <span class="token operator">&amp;</span>FlowLimiter<span class="token punctuation">{<!-- --></span>
+		FlowLmiterMap<span class="token punctuation">:</span>   <span class="token keyword">map</span><span class="token punctuation">[</span><span class="token builtin">string</span><span class="token punctuation">]</span><span class="token operator">*</span>FlowLimiterItem<span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span><span class="token punctuation">,</span>
+		FlowLmiterSlice<span class="token punctuation">:</span> <span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token operator">*</span>FlowLimiterItem<span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span><span class="token punctuation">,</span>
+		Locker<span class="token punctuation">:</span>          sync<span class="token punctuation">.</span>RWMutex<span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span><span class="token punctuation">,</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">//4.服务启动时初始化限流容器</span>
+<span class="token keyword">var</span> FlowLimiterHandler <span class="token operator">*</span>FlowLimiter
+
+<span class="token keyword">func</span> <span class="token function">init</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	FlowLimiterHandler <span class="token operator">=</span> <span class="token function">NewFlowLimiter</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">//5.获取指定服务或接口限流limit方法</span>
+<span class="token comment">//serverName:服务或接口标识</span>
+<span class="token comment">//qps:该服务或接口限流qps</span>
+<span class="token keyword">func</span> <span class="token punctuation">(</span>counter <span class="token operator">*</span>FlowLimiter<span class="token punctuation">)</span> <span class="token function">GetLimiter</span><span class="token punctuation">(</span>serverName <span class="token builtin">string</span><span class="token punctuation">,</span> qps <span class="token builtin">float64</span><span class="token punctuation">)</span> <span class="token punctuation">(</span><span class="token operator">*</span>rate<span class="token punctuation">.</span>Limiter<span class="token punctuation">,</span> <span class="token builtin">error</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+
+	<span class="token comment">//1.通过服务或接口标识在限流容器中获取</span>
+	<span class="token keyword">for</span> <span class="token boolean">_</span><span class="token punctuation">,</span> item <span class="token operator">:=</span> <span class="token keyword">range</span> counter<span class="token punctuation">.</span>FlowLmiterSlice <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">if</span> item<span class="token punctuation">.</span>ServiceName <span class="token operator">==</span> serverName <span class="token punctuation">{<!-- --></span>
+			<span class="token keyword">return</span> item<span class="token punctuation">.</span>Limter<span class="token punctuation">,</span> <span class="token boolean">nil</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//2.如果容器中不存在说明第一次执行,需要创建限流limit</span>
+	newLimiter <span class="token operator">:=</span> rate<span class="token punctuation">.</span><span class="token function">NewLimiter</span><span class="token punctuation">(</span>rate<span class="token punctuation">.</span><span class="token function">Limit</span><span class="token punctuation">(</span>qps<span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token function">int</span><span class="token punctuation">(</span>qps<span class="token operator">*</span><span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+	<span class="token comment">//封装限流结构添加到限流容器中</span>
+	item <span class="token operator">:=</span> <span class="token operator">&amp;</span>FlowLimiterItem<span class="token punctuation">{<!-- --></span>
+		ServiceName<span class="token punctuation">:</span> serverName<span class="token punctuation">,</span>
+		Limter<span class="token punctuation">:</span>      newLimiter<span class="token punctuation">,</span>
+	<span class="token punctuation">}</span>
+	counter<span class="token punctuation">.</span>FlowLmiterSlice <span class="token operator">=</span> <span class="token function">append</span><span class="token punctuation">(</span>counter<span class="token punctuation">.</span>FlowLmiterSlice<span class="token punctuation">,</span> item<span class="token punctuation">)</span>
+	counter<span class="token punctuation">.</span>Locker<span class="token punctuation">.</span><span class="token function">Lock</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token keyword">defer</span> counter<span class="token punctuation">.</span>Locker<span class="token punctuation">.</span><span class="token function">Unlock</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	counter<span class="token punctuation">.</span>FlowLmiterMap<span class="token punctuation">[</span>serverName<span class="token punctuation">]</span> <span class="token operator">=</span> item
+	<span class="token keyword">return</span> newLimiter<span class="token punctuation">,</span> <span class="token boolean">nil</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol start="3"><li>编写限流中间件</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">import</span> <span class="token punctuation">(</span>
+	<span class="token string">"fmt"</span>
+	<span class="token string">"github.com/e421083458/go_gateway/dao"</span>
+	<span class="token string">"github.com/e421083458/go_gateway/middleware"</span>
+	<span class="token string">"github.com/e421083458/go_gateway/public"</span>
+	<span class="token string">"github.com/gin-gonic/gin"</span>
+	<span class="token string">"github.com/pkg/errors"</span>
+<span class="token punctuation">)</span>
+
+<span class="token keyword">func</span> <span class="token function">HTTPFlowLimitMiddleware</span><span class="token punctuation">(</span><span class="token punctuation">)</span> gin<span class="token punctuation">.</span>HandlerFunc <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span> <span class="token keyword">func</span><span class="token punctuation">(</span>c <span class="token operator">*</span>gin<span class="token punctuation">.</span>Context<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">//1.获取请求参数</span>
+		serverInterface<span class="token punctuation">,</span> ok <span class="token operator">:=</span> c<span class="token punctuation">.</span><span class="token function">Get</span><span class="token punctuation">(</span><span class="token string">"service"</span><span class="token punctuation">)</span>
+		<span class="token keyword">if</span> <span class="token operator">!</span>ok <span class="token punctuation">{<!-- --></span>
+			middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">2001</span><span class="token punctuation">,</span> errors<span class="token punctuation">.</span><span class="token function">New</span><span class="token punctuation">(</span><span class="token string">"service not found"</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+			c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+			<span class="token keyword">return</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">//2.根据请求数据拿查询限流配置</span>
+		serviceDetail <span class="token operator">:=</span> serverInterface<span class="token punctuation">.</span><span class="token punctuation">(</span><span class="token operator">*</span>dao<span class="token punctuation">.</span>ServiceDetail<span class="token punctuation">)</span>
+
+		<span class="token comment">//3.根据配置判断限流规则</span>
+		<span class="token keyword">if</span> serviceDetail<span class="token punctuation">.</span>AccessControl<span class="token punctuation">.</span>ServiceFlowLimit <span class="token operator">!=</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span>
+
+			<span class="token comment">//4.获取限流limit</span>
+			serviceLimiter<span class="token punctuation">,</span> err <span class="token operator">:=</span> public<span class="token punctuation">.</span>FlowLimiterHandler<span class="token punctuation">.</span><span class="token function">GetLimiter</span><span class="token punctuation">(</span>
+				public<span class="token punctuation">.</span>FlowServicePrefix<span class="token operator">+</span>serviceDetail<span class="token punctuation">.</span>Info<span class="token punctuation">.</span>ServiceName<span class="token punctuation">,</span>
+				<span class="token function">float64</span><span class="token punctuation">(</span>serviceDetail<span class="token punctuation">.</span>AccessControl<span class="token punctuation">.</span>ServiceFlowLimit<span class="token punctuation">)</span><span class="token punctuation">)</span>
+			<span class="token keyword">if</span> err <span class="token operator">!=</span> <span class="token boolean">nil</span> <span class="token punctuation">{<!-- --></span>
+				middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">5001</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+				c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+				<span class="token keyword">return</span>
+			<span class="token punctuation">}</span>
+
+			<span class="token comment">//5.判断限流是否超过阈值,超过返回false,进入if进行异常响应</span>
+			<span class="token keyword">if</span> <span class="token operator">!</span>serviceLimiter<span class="token punctuation">.</span><span class="token function">Allow</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">5002</span><span class="token punctuation">,</span> errors<span class="token punctuation">.</span><span class="token function">New</span><span class="token punctuation">(</span>fmt<span class="token punctuation">.</span><span class="token function">Sprintf</span><span class="token punctuation">(</span><span class="token string">"service flow limit %v"</span><span class="token punctuation">,</span> serviceDetail<span class="token punctuation">.</span>AccessControl<span class="token punctuation">.</span>ServiceFlowLimit<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+				c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+				<span class="token keyword">return</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+
+		<span class="token keyword">if</span> serviceDetail<span class="token punctuation">.</span>AccessControl<span class="token punctuation">.</span>ClientIPFlowLimit <span class="token operator">&gt;</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span>
+			clientLimiter<span class="token punctuation">,</span> err <span class="token operator">:=</span> public<span class="token punctuation">.</span>FlowLimiterHandler<span class="token punctuation">.</span><span class="token function">GetLimiter</span><span class="token punctuation">(</span>
+				public<span class="token punctuation">.</span>FlowServicePrefix<span class="token operator">+</span>serviceDetail<span class="token punctuation">.</span>Info<span class="token punctuation">.</span>ServiceName<span class="token operator">+</span><span class="token string">"_"</span><span class="token operator">+</span>c<span class="token punctuation">.</span><span class="token function">ClientIP</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+				<span class="token function">float64</span><span class="token punctuation">(</span>serviceDetail<span class="token punctuation">.</span>AccessControl<span class="token punctuation">.</span>ClientIPFlowLimit<span class="token punctuation">)</span><span class="token punctuation">)</span>
+			<span class="token keyword">if</span> err <span class="token operator">!=</span> <span class="token boolean">nil</span> <span class="token punctuation">{<!-- --></span>
+				middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">5003</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+				c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+				<span class="token keyword">return</span>
+			<span class="token punctuation">}</span>
+			<span class="token keyword">if</span> <span class="token operator">!</span>clientLimiter<span class="token punctuation">.</span><span class="token function">Allow</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">5002</span><span class="token punctuation">,</span> errors<span class="token punctuation">.</span><span class="token function">New</span><span class="token punctuation">(</span>fmt<span class="token punctuation">.</span><span class="token function">Sprintf</span><span class="token punctuation">(</span><span class="token string">"%v flow limit %v"</span><span class="token punctuation">,</span> c<span class="token punctuation">.</span><span class="token function">ClientIP</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> serviceDetail<span class="token punctuation">.</span>AccessControl<span class="token punctuation">.</span>ClientIPFlowLimit<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+				c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+				<span class="token keyword">return</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+
+		<span class="token comment">//6.中间件放行</span>
+		c<span class="token punctuation">.</span><span class="token function">Next</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol start="4"><li>该方式也可以再提取出一个针对租户限流的中间件</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">import</span> <span class="token punctuation">(</span>
+	<span class="token string">"fmt"</span>
+	<span class="token string">"github.com/e421083458/go_gateway/dao"</span>
+	<span class="token string">"github.com/e421083458/go_gateway/middleware"</span>
+	<span class="token string">"github.com/e421083458/go_gateway/public"</span>
+	<span class="token string">"github.com/gin-gonic/gin"</span>
+	<span class="token string">"github.com/pkg/errors"</span>
+<span class="token punctuation">)</span>
+
+<span class="token keyword">func</span> <span class="token function">HTTPJwtFlowLimitMiddleware</span><span class="token punctuation">(</span><span class="token punctuation">)</span> gin<span class="token punctuation">.</span>HandlerFunc <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span> <span class="token keyword">func</span><span class="token punctuation">(</span>c <span class="token operator">*</span>gin<span class="token punctuation">.</span>Context<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">//1.获取请求</span>
+		appInterface<span class="token punctuation">,</span> ok <span class="token operator">:=</span> c<span class="token punctuation">.</span><span class="token function">Get</span><span class="token punctuation">(</span><span class="token string">"app"</span><span class="token punctuation">)</span>
+		<span class="token keyword">if</span> <span class="token operator">!</span>ok <span class="token punctuation">{<!-- --></span>
+			c<span class="token punctuation">.</span><span class="token function">Next</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+			<span class="token keyword">return</span>
+		<span class="token punctuation">}</span>
+		<span class="token comment">//2.通过请求查询该app用户下的限流配置</span>
+		appInfo <span class="token operator">:=</span> appInterface<span class="token punctuation">.</span><span class="token punctuation">(</span><span class="token operator">*</span>dao<span class="token punctuation">.</span>App<span class="token punctuation">)</span>
+		<span class="token comment">//3.判断是否开启限流</span>
+		<span class="token keyword">if</span> appInfo<span class="token punctuation">.</span>Qps <span class="token operator">&gt;</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span>
+			clientLimiter<span class="token punctuation">,</span> err <span class="token operator">:=</span> public<span class="token punctuation">.</span>FlowLimiterHandler<span class="token punctuation">.</span><span class="token function">GetLimiter</span><span class="token punctuation">(</span>
+				public<span class="token punctuation">.</span>FlowAppPrefix<span class="token operator">+</span>appInfo<span class="token punctuation">.</span>AppID<span class="token operator">+</span><span class="token string">"_"</span><span class="token operator">+</span>c<span class="token punctuation">.</span><span class="token function">ClientIP</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+				<span class="token function">float64</span><span class="token punctuation">(</span>appInfo<span class="token punctuation">.</span>Qps<span class="token punctuation">)</span><span class="token punctuation">)</span>
+			<span class="token keyword">if</span> err <span class="token operator">!=</span> <span class="token boolean">nil</span> <span class="token punctuation">{<!-- --></span>
+				middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">5001</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span>
+				c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+				<span class="token keyword">return</span>
+			<span class="token punctuation">}</span>
+			<span class="token comment">//4.判断是否到达限流阈值</span>
+			<span class="token keyword">if</span> <span class="token operator">!</span>clientLimiter<span class="token punctuation">.</span><span class="token function">Allow</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+				middleware<span class="token punctuation">.</span><span class="token function">ResponseError</span><span class="token punctuation">(</span>c<span class="token punctuation">,</span> <span class="token number">5002</span><span class="token punctuation">,</span> errors<span class="token punctuation">.</span><span class="token function">New</span><span class="token punctuation">(</span>fmt<span class="token punctuation">.</span><span class="token function">Sprintf</span><span class="token punctuation">(</span><span class="token string">"%v flow limit %v"</span><span class="token punctuation">,</span> c<span class="token punctuation">.</span><span class="token function">ClientIP</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> appInfo<span class="token punctuation">.</span>Qps<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+				c<span class="token punctuation">.</span><span class="token function">Abort</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+				<span class="token keyword">return</span>
+			<span class="token punctuation">}</span>
+		<span class="token punctuation">}</span>
+		c<span class="token punctuation">.</span><span class="token function">Next</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h2><a id="_timerate__383"></a>二. time/rate 底层原理相关</h2> 
+<h3><a id="Limiter__Reservation__384"></a>Limiter 与 Reservation 结构</h3> 
+<ol><li>在调用NewLimiter()创建限流器时会返回一个Limiter结构体变量,查看内部组成:</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">type</span> Limiter <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">//每秒允许处理的事件数量,即每秒处理事件的频率</span>
+	limit Limit  
+	<span class="token comment">//令牌桶的最大数量,如果burst为0,则除非limit == Inf,否则不允许处理任何事件</span>
+	burst <span class="token builtin">int</span>   
+
+	mu     sync<span class="token punctuation">.</span>Mutex
+	<span class="token comment">//令牌桶中可用的令牌数量</span>
+	tokens <span class="token builtin">float64</span>  
+	<span class="token comment">//记录上次limiter的tokens被更新的时间</span>
+	last time<span class="token punctuation">.</span>Time
+	<span class="token comment">//lastEvent记录速率受限制(桶中没有令牌)的时间点,该时间点可能是过去的</span>
+	<span class="token comment">//也可能是将来的(Reservation预定的结束时间点)</span>
+	<span class="token comment">//如果没有预约令牌的话,该时间等于last，是过去的</span>
+	<span class="token comment">//如果有预约令牌的话,该时间等于最新的预约的截至时间</span>
+	lastEvent time<span class="token punctuation">.</span>Time  
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol start="2"><li>当调用Reserve()预定令牌时,会返回一个Reservation结构体变量</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">type</span> Reservation <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">//到截止时间是否可以获取足够的令牌</span>
+	ok        <span class="token builtin">bool</span> 
+	lim       <span class="token operator">*</span>Limiter
+	<span class="token comment">//需要获取的令牌数量</span>
+	tokens    <span class="token builtin">int</span>   
+	<span class="token comment">//需要等待的时间点(本次预约需要等待到的指定时间点才有足够预约的令牌)</span>
+	timeToAct time<span class="token punctuation">.</span>Time  
+	limit Limit
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="_418"></a>消费令牌底层原理</h3> 
+<ol><li>在rate中默认提供了Allow()消费一个令牌,Wait()阻塞等待消费一个令牌, Reserve()预定一个令牌,实际底层对应调用的是WaitN(), AllowN(), ReserveN()消费指定个数令牌的方法</li><li>所有消费令牌的方法内部都会调用reserveN和advance方法,<strong>reserveN可以理解为预约令牌的逻辑,由于可以预约,当桶中令牌不够时,预定过后桶中令牌有可能为负数</strong></li><li>以Allow()消费一个令牌为例,内部会调用AllowN(), AllowN内部会调用reserveN(),reserveN内部会调用advance()</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">func</span> <span class="token punctuation">(</span>lim <span class="token operator">*</span>Limiter<span class="token punctuation">)</span> <span class="token function">Allow</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token builtin">bool</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span> lim<span class="token punctuation">.</span><span class="token function">AllowN</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword">func</span> <span class="token punctuation">(</span>lim <span class="token operator">*</span>Limiter<span class="token punctuation">)</span> <span class="token function">AllowN</span><span class="token punctuation">(</span>t time<span class="token punctuation">.</span>Time<span class="token punctuation">,</span> n <span class="token builtin">int</span><span class="token punctuation">)</span> <span class="token builtin">bool</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">return</span> lim<span class="token punctuation">.</span><span class="token function">reserveN</span><span class="token punctuation">(</span>t<span class="token punctuation">,</span> n<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">.</span>ok
+<span class="token punctuation">}</span>
+</code></pre> 
+<h4><a id="1_reserveN_431"></a>1. reserveN()方法逻辑</h4> 
+<ol><li>reserveN是 AllowN, ReserveN及 WaitN的辅助方法,主要用于判断在maxFutureReserve指定时间内是否有足够的令牌</li></ol> 
+<pre><code class="prism language-go"><span class="token comment">// @param n 要消费的token数量</span>
+<span class="token comment">// @param maxFutureReserve 愿意等待的最长时间</span>
+<span class="token keyword">func</span> <span class="token punctuation">(</span>lim <span class="token operator">*</span>Limiter<span class="token punctuation">)</span> <span class="token function">reserveN</span><span class="token punctuation">(</span>t time<span class="token punctuation">.</span>Time<span class="token punctuation">,</span> n <span class="token builtin">int</span><span class="token punctuation">,</span> maxFutureReserve time<span class="token punctuation">.</span>Duration<span class="token punctuation">)</span> Reservation <span class="token punctuation">{<!-- --></span>
+	lim<span class="token punctuation">.</span>mu<span class="token punctuation">.</span><span class="token function">Lock</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">//加锁，保证数据的一致性</span>
+	<span class="token keyword">defer</span> lim<span class="token punctuation">.</span>mu<span class="token punctuation">.</span><span class="token function">Unlock</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">//解锁，释放资源</span>
+
+	<span class="token keyword">if</span> lim<span class="token punctuation">.</span>limit <span class="token operator">==</span> Inf <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果速率限制是无限的，表示不需要限流</span>
+		<span class="token keyword">return</span> Reservation<span class="token punctuation">{<!-- --></span> <span class="token comment">//返回一个预约结果，包括是否允许、令牌数、执行时间等信息</span>
+			ok<span class="token punctuation">:</span>        <span class="token boolean">true</span><span class="token punctuation">,</span> <span class="token comment">//允许通过</span>
+			lim<span class="token punctuation">:</span>       lim<span class="token punctuation">,</span> <span class="token comment">//关联的限流器</span>
+			tokens<span class="token punctuation">:</span>    n<span class="token punctuation">,</span> <span class="token comment">//请求的令牌数</span>
+			timeToAct<span class="token punctuation">:</span> t<span class="token punctuation">,</span> <span class="token comment">//执行时间为当前时间</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> lim<span class="token punctuation">.</span>limit <span class="token operator">==</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果速率限制是零，表示不允许任何事件</span>
+		<span class="token keyword">var</span> ok <span class="token builtin">bool</span> 
+		<span class="token keyword">if</span> lim<span class="token punctuation">.</span>burst <span class="token operator">&gt;=</span> n <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果桶中有足够的令牌，表示可以通过</span>
+			ok <span class="token operator">=</span> <span class="token boolean">true</span> 
+			lim<span class="token punctuation">.</span>burst <span class="token operator">-=</span> n <span class="token comment">//更新桶中的令牌数，减去请求的令牌数</span>
+		<span class="token punctuation">}</span>
+		<span class="token keyword">return</span> Reservation<span class="token punctuation">{<!-- --></span> <span class="token comment">//返回一个预约结果，包括是否允许、令牌数、执行时间等信息</span>
+			ok<span class="token punctuation">:</span>        ok<span class="token punctuation">,</span> <span class="token comment">//是否允许通过</span>
+			lim<span class="token punctuation">:</span>       lim<span class="token punctuation">,</span> <span class="token comment">//关联的限流器</span>
+			tokens<span class="token punctuation">:</span>    lim<span class="token punctuation">.</span>burst<span class="token punctuation">,</span> <span class="token comment">//桶中剩余的令牌数</span>
+			timeToAct<span class="token punctuation">:</span> t<span class="token punctuation">,</span> <span class="token comment">//执行时间为当前时间</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+
+	t<span class="token punctuation">,</span> tokens <span class="token operator">:=</span> lim<span class="token punctuation">.</span><span class="token function">advance</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> <span class="token comment">//根据当前时间和上次更新时间计算桶中剩余的令牌数</span>
+
+	tokens <span class="token operator">-=</span> <span class="token function">float64</span><span class="token punctuation">(</span>n<span class="token punctuation">)</span> <span class="token comment">//计算请求后桶中剩余的令牌数，可能为负数</span>
+
+	<span class="token keyword">var</span> waitDuration time<span class="token punctuation">.</span>Duration 
+	<span class="token keyword">if</span> tokens <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果剩余的令牌数小于零，表示需要等待一段时间才能通过</span>
+		waitDuration <span class="token operator">=</span> lim<span class="token punctuation">.</span>limit<span class="token punctuation">.</span><span class="token function">durationFromTokens</span><span class="token punctuation">(</span><span class="token operator">-</span>tokens<span class="token punctuation">)</span> <span class="token comment">//根据速率限制计算需要等待的时间间隔</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//判断是否允许通过，需要满足两个条件：请求的令牌数不超过桶的容量，等待的时间间隔不超过最大允许的未来预约时间</span>
+	ok <span class="token operator">:=</span> n <span class="token operator">&lt;=</span> lim<span class="token punctuation">.</span>burst <span class="token operator">&amp;&amp;</span> waitDuration <span class="token operator">&lt;=</span> maxFutureReserve 
+
+	r <span class="token operator">:=</span> Reservation<span class="token punctuation">{<!-- --></span> <span class="token comment">//准备一个预约结果，包括是否允许、关联的限流器、速率限制等信息</span>
+		ok<span class="token punctuation">:</span>    ok<span class="token punctuation">,</span> 
+		lim<span class="token punctuation">:</span>   lim<span class="token punctuation">,</span> 
+		limit<span class="token punctuation">:</span> lim<span class="token punctuation">.</span>limit<span class="token punctuation">,</span> 
+	<span class="token punctuation">}</span>
+	<span class="token keyword">if</span> ok <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果允许通过，还需要设置以下信息：</span>
+		r<span class="token punctuation">.</span>tokens <span class="token operator">=</span> n <span class="token comment">//请求的令牌数</span>
+		r<span class="token punctuation">.</span>timeToAct <span class="token operator">=</span> t<span class="token punctuation">.</span><span class="token function">Add</span><span class="token punctuation">(</span>waitDuration<span class="token punctuation">)</span> <span class="token comment">//执行时间为当前时间加上等待时间间隔</span>
+
+		<span class="token comment">// Update state</span>
+		lim<span class="token punctuation">.</span>last <span class="token operator">=</span> t <span class="token comment">//更新限流器中的上次更新时间为当前时间</span>
+		lim<span class="token punctuation">.</span>tokens <span class="token operator">=</span> tokens <span class="token comment">//更新限流器中的剩余令牌数为请求后的值</span>
+		lim<span class="token punctuation">.</span>lastEvent <span class="token operator">=</span> r<span class="token punctuation">.</span>timeToAct <span class="token comment">//更新限流器中的最近事件时间为执行时间</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> r <span class="token comment">//返回预约结果</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol start="2"><li>对reserveN的流程总结</li></ol> 
+<blockquote> 
+ <ol><li>调用NewLimiter()创建限流器时会返回一个Limiter结构体变量,内部存在一个limit每秒允许处理的事件数量,与burst最大通过数量属性</li><li>在调用reserveN()消费令牌时,首先会加锁,判断limit是否等于MaxFloat64,如果是说明无限的速率限制桶中一直拥有足够的令牌,直接返回true</li><li>如果limit等于0,判断当前获取的令牌数量是否超过了burst最大并发限制,如果超过了返回false,没超过返回true</li><li>如果limit不等于MaxFloat64并且不等于0,调用advance()计算当前可以使用的令牌数量,也就是(上次剩余令牌数+上次消费令牌时间到当前时间所生成的令牌,如果大于最大并发限制,的更新为最大并发限制)</li><li>如果advance()拿到当前可消费的令牌数量小于0,说明超过并发限制,调用durationFromTokens()计算等待生成令牌时间</li><li>封装Reservation,如果当前要消费的令牌数量小于允许可消费的令牌数量则Reservation中的ok为true表示允许消费,否则为false</li><li>最后解锁,返回预约结果</li></ol> 
+</blockquote> 
+<h4><a id="2_advance_498"></a>2. advance()根据当前时间和上次更新时间计算桶中剩余的令牌数逻辑</h4> 
+<ol><li>该方法的作用是更新令牌桶的状态,计算出令牌桶未更新的时间(elapsed),根据elapsed算出需要向桶中加入的令牌数delta，然后算出桶中可用的令牌数newTokens</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">func</span> <span class="token punctuation">(</span>lim <span class="token operator">*</span>Limiter<span class="token punctuation">)</span> <span class="token function">advance</span><span class="token punctuation">(</span>t time<span class="token punctuation">.</span>Time<span class="token punctuation">)</span> <span class="token punctuation">(</span>newT time<span class="token punctuation">.</span>Time<span class="token punctuation">,</span> newTokens <span class="token builtin">float64</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	last <span class="token operator">:=</span> lim<span class="token punctuation">.</span>last <span class="token comment">//获取限流器中的上次更新时间</span>
+	<span class="token keyword">if</span> t<span class="token punctuation">.</span><span class="token function">Before</span><span class="token punctuation">(</span>last<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果当前时间早于上次更新时间，表示时间回退了</span>
+		last <span class="token operator">=</span> t <span class="token comment">//使用当前时间作为上次更新时间</span>
+	<span class="token punctuation">}</span>
+
+	elapsed <span class="token operator">:=</span> t<span class="token punctuation">.</span><span class="token function">Sub</span><span class="token punctuation">(</span>last<span class="token punctuation">)</span> <span class="token comment">//计算当前时间和上次更新时间的差值，单位纳秒</span>
+	delta <span class="token operator">:=</span> lim<span class="token punctuation">.</span>limit<span class="token punctuation">.</span><span class="token function">tokensFromDuration</span><span class="token punctuation">(</span>elapsed<span class="token punctuation">)</span> <span class="token comment">//根据速率限制计算在这段时间内应该增加的令牌数</span>
+	tokens <span class="token operator">:=</span> lim<span class="token punctuation">.</span>tokens <span class="token operator">+</span> delta <span class="token comment">//计算桶中新的令牌数，等于原来的令牌数加上增加的令牌数</span>
+	<span class="token keyword">if</span> burst <span class="token operator">:=</span> <span class="token function">float64</span><span class="token punctuation">(</span>lim<span class="token punctuation">.</span>burst<span class="token punctuation">)</span><span class="token punctuation">;</span> tokens <span class="token operator">&gt;</span> burst <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果新的令牌数超过了桶的容量</span>
+		tokens <span class="token operator">=</span> burst <span class="token comment">//将新的令牌数设置为桶的容量，即不能超过最大值</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> t<span class="token punctuation">,</span> tokens <span class="token comment">//返回当前时间和新的令牌数</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h4><a id="3_durationFromTokenstokens_516"></a>3. durationFromTokens()根据令牌数量tokens计算出产生该数量的令牌需要的时长</h4> 
+<ol><li>durationFromTokens()计算出生成N 个新的 Token 一共需要多久</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">func</span> <span class="token punctuation">(</span>limit Limit<span class="token punctuation">)</span> <span class="token function">durationFromTokens</span><span class="token punctuation">(</span>tokens <span class="token builtin">float64</span><span class="token punctuation">)</span> time<span class="token punctuation">.</span>Duration <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> limit <span class="token operator">&lt;=</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果速率限制小于等于零，表示不需要任何时间</span>
+		<span class="token keyword">return</span> InfDuration <span class="token comment">//返回一个无限大的时间间隔</span>
+	<span class="token punctuation">}</span>
+	seconds <span class="token operator">:=</span> tokens <span class="token operator">/</span> <span class="token function">float64</span><span class="token punctuation">(</span>limit<span class="token punctuation">)</span> <span class="token comment">//计算生成令牌数所需的秒数，等于令牌数除以速率限制</span>
+	<span class="token keyword">return</span> time<span class="token punctuation">.</span><span class="token function">Duration</span><span class="token punctuation">(</span><span class="token function">float64</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span>Second<span class="token punctuation">)</span> <span class="token operator">*</span> seconds<span class="token punctuation">)</span> <span class="token comment">//返回对应的时间间隔，单位纳秒</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h4><a id="4_tokensFromDuration_527"></a>4. tokensFromDuration()获取指定期间内产生的令牌数量</h4> 
+<ol><li>tokensFromDuration()给定一段时长,计算这段时间一共可以生成多少个 Token</li></ol> 
+<pre><code class="prism language-go"><span class="token keyword">func</span> <span class="token punctuation">(</span>limit Limit<span class="token punctuation">)</span> <span class="token function">tokensFromDuration</span><span class="token punctuation">(</span>d time<span class="token punctuation">.</span>Duration<span class="token punctuation">)</span> <span class="token builtin">float64</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> limit <span class="token operator">&lt;=</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果速率限制小于等于零，表示不生成任何令牌</span>
+		<span class="token keyword">return</span> <span class="token number">0</span>
+	<span class="token punctuation">}</span>
+	 <span class="token comment">//返回时间间隔的秒数乘以速率限制，即在这段时间内生成的令牌数</span>
+	<span class="token keyword">return</span> d<span class="token punctuation">.</span><span class="token function">Seconds</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token function">float64</span><span class="token punctuation">(</span>limit<span class="token punctuation">)</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="Wait__538"></a>Wait 阻塞获取令牌</h3> 
+<ol><li>在Wait阻塞消费令牌函数中,首先会封装一个返回定时器通道的函数,然后调用Limiter的wait()方法, 查看该方法:</li></ol> 
+<blockquote> 
+ <ol><li>首先获取到当前限速器配置的最大并发数burst 与limit限流速率,如果当前一次性申请的令牌数超过最大并发数,并且限流速率不是MaxFloat64报错</li><li>通过select-case监听context的Done取消,如果取消了返回异常</li><li>将Context取消时间,设置为等待时间</li><li>通过当前时间, 当前消费令牌数量,通过Context取消时间设置的等待时间,调用reserveN()进行预订</li><li>在reserveN()预订令牌方法中,会根据传入的等待时间计算这个时间段内是否存在或可以生产出指定数量的令牌,并且会返回生产这些令牌所需要的时间</li><li>如果存在或者可以生产出需要的令牌reserveN()返回的Reservation中ok为true,调用DelayFrom()方法计算获取令牌需要的延迟时间,DelayFrom()返回0说明不需要等待直接返回</li><li>DelayFrom()如果返回大于0,执行Wait()函数中封装的返回定时器通道的函数,拿到定时器通道,通过select-case监听Context的Done取消消息和这个定时器通道,当定时器通道返回说明令牌生成完毕函数返回,Wait阻塞开始向下执行</li></ol> 
+</blockquote> 
+<pre><code class="prism language-go"><span class="token comment">// WaitN 会阻塞当前 goroutine 直到可以获取 n 个令牌，或者 ctx 被取消</span>
+<span class="token comment">// 如果 n 超过了 limiter 的 burst 值，并且 limit 不是 Inf，WaitN 会返回一个错误</span>
+<span class="token comment">// 如果 ctx 已经被取消，WaitN 也会返回一个错误</span>
+<span class="token keyword">func</span> <span class="token punctuation">(</span>lim <span class="token operator">*</span>Limiter<span class="token punctuation">)</span> <span class="token function">WaitN</span><span class="token punctuation">(</span>ctx context<span class="token punctuation">.</span>Context<span class="token punctuation">,</span> n <span class="token builtin">int</span><span class="token punctuation">)</span> <span class="token punctuation">(</span>err <span class="token builtin">error</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">// 这是真正的定时器生成器</span>
+	<span class="token comment">// newTimer 是一个函数，它接受一个时间间隔 d 作为参数，</span>
+	<span class="token comment">//返回一个定时器的通道，一个停止定时器的函数，和一个空函数(只在测试时有作用)</span>
+	newTimer <span class="token operator">:=</span> <span class="token keyword">func</span><span class="token punctuation">(</span>d time<span class="token punctuation">.</span>Duration<span class="token punctuation">)</span> <span class="token punctuation">(</span><span class="token operator">&lt;-</span><span class="token keyword">chan</span> time<span class="token punctuation">.</span>Time<span class="token punctuation">,</span> <span class="token keyword">func</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token builtin">bool</span><span class="token punctuation">,</span> <span class="token keyword">func</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 创建一个定时器，它会在 d 时间后发送当前时间到 timer.C 通道</span>
+		timer <span class="token operator">:=</span> time<span class="token punctuation">.</span><span class="token function">NewTimer</span><span class="token punctuation">(</span>d<span class="token punctuation">)</span> 
+		<span class="token comment">// 返回定时器的通道，停止定时器的函数，和空函数</span>
+		<span class="token keyword">return</span> timer<span class="token punctuation">.</span>C<span class="token punctuation">,</span> timer<span class="token punctuation">.</span>Stop<span class="token punctuation">,</span> <span class="token keyword">func</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span><span class="token punctuation">}</span> 
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 调用 lim.wait 方法，传入 ctx, n, 当前时间，和 newTimer 函数</span>
+	<span class="token keyword">return</span> lim<span class="token punctuation">.</span><span class="token function">wait</span><span class="token punctuation">(</span>ctx<span class="token punctuation">,</span> n<span class="token punctuation">,</span> time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span> newTimer<span class="token punctuation">)</span> 
+<span class="token punctuation">}</span>
+
+
+<span class="token comment">// wait 是 WaitN 的内部实现</span>
+<span class="token keyword">func</span> <span class="token punctuation">(</span>lim <span class="token operator">*</span>Limiter<span class="token punctuation">)</span> <span class="token function">wait</span><span class="token punctuation">(</span>ctx context<span class="token punctuation">.</span>Context<span class="token punctuation">,</span> n <span class="token builtin">int</span><span class="token punctuation">,</span> t time<span class="token punctuation">.</span>Time<span class="token punctuation">,</span> newTimer <span class="token keyword">func</span><span class="token punctuation">(</span>d time<span class="token punctuation">.</span>Duration<span class="token punctuation">)</span> <span class="token punctuation">(</span><span class="token operator">&lt;-</span><span class="token keyword">chan</span> time<span class="token punctuation">.</span>Time<span class="token punctuation">,</span> <span class="token keyword">func</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token builtin">bool</span><span class="token punctuation">,</span> <span class="token keyword">func</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token builtin">error</span> <span class="token punctuation">{<!-- --></span>
+	lim<span class="token punctuation">.</span>mu<span class="token punctuation">.</span><span class="token function">Lock</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+	burst <span class="token operator">:=</span> lim<span class="token punctuation">.</span>burst <span class="token comment">// 获取最大并发限制</span>
+	limit <span class="token operator">:=</span> lim<span class="token punctuation">.</span>limit <span class="token comment">// 获取限流速率</span>
+	lim<span class="token punctuation">.</span>mu<span class="token punctuation">.</span><span class="token function">Unlock</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+	<span class="token keyword">if</span> n <span class="token operator">&gt;</span> burst <span class="token operator">&amp;&amp;</span> limit <span class="token operator">!=</span> Inf <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果 n 超过了 burst 值，并且 limit 不是 Inf，返回一个错误</span>
+		<span class="token keyword">return</span> fmt<span class="token punctuation">.</span><span class="token function">Errorf</span><span class="token punctuation">(</span><span class="token string">"rate: Wait(n=%d) exceeds limiter's burst %d"</span><span class="token punctuation">,</span> n<span class="token punctuation">,</span> burst<span class="token punctuation">)</span> 
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 检查 ctx 是否已经被取消</span>
+	<span class="token keyword">select</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">case</span> <span class="token operator">&lt;-</span>ctx<span class="token punctuation">.</span><span class="token function">Done</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+		<span class="token keyword">return</span> ctx<span class="token punctuation">.</span><span class="token function">Err</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">// 如果 ctx 已经被取消，返回一个错误</span>
+	<span class="token keyword">default</span><span class="token punctuation">:</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 确定等待限制</span>
+	waitLimit <span class="token operator">:=</span> InfDuration <span class="token comment">// 初始化等待限制为无穷大</span>
+	<span class="token keyword">if</span> deadline<span class="token punctuation">,</span> ok <span class="token operator">:=</span> ctx<span class="token punctuation">.</span><span class="token function">Deadline</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> ok <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果 ctx 有截止时间，等待限制为截止时间减去当前时间</span>
+		waitLimit <span class="token operator">=</span> deadline<span class="token punctuation">.</span><span class="token function">Sub</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> 
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 预约</span>
+	<span class="token comment">// 调用 lim.reserveN 方法，传入当前时间t，n，和等待限制，返回一个预约对象 r</span>
+	r <span class="token operator">:=</span> lim<span class="token punctuation">.</span><span class="token function">reserveN</span><span class="token punctuation">(</span>t<span class="token punctuation">,</span> n<span class="token punctuation">,</span> waitLimit<span class="token punctuation">)</span> 
+	<span class="token keyword">if</span> <span class="token operator">!</span>r<span class="token punctuation">.</span>ok <span class="token punctuation">{<!-- --></span>
+		<span class="token comment">// 如果 r 不 ok，说明预约失败，返回一个错误</span>
+		<span class="token keyword">return</span> fmt<span class="token punctuation">.</span><span class="token function">Errorf</span><span class="token punctuation">(</span><span class="token string">"rate: Wait(n=%d) would exceed context deadline"</span><span class="token punctuation">,</span> n<span class="token punctuation">)</span> 
+	<span class="token punctuation">}</span>
+	<span class="token comment">//判断是否需要等待</span>
+	delay <span class="token operator">:=</span> r<span class="token punctuation">.</span><span class="token function">DelayFrom</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> <span class="token comment">// 获取 r 的延迟时间</span>
+	<span class="token keyword">if</span> delay <span class="token operator">==</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span> <span class="token boolean">nil</span> <span class="token comment">// 如果延迟时间为 0直接返回 nil</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// 调用 newTimer 函数，传入延迟时间，返回一个定时器的通道，</span>
+	<span class="token comment">//一个停止定时器的函数，和一个空函数（只在测试时有作用）</span>
+	ch<span class="token punctuation">,</span> stop<span class="token punctuation">,</span> advance <span class="token operator">:=</span> <span class="token function">newTimer</span><span class="token punctuation">(</span>delay<span class="token punctuation">)</span> 
+	<span class="token keyword">defer</span> <span class="token function">stop</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">// 延迟执行停止定时器的函数</span>
+	<span class="token function">advance</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">// 只在测试时有作用</span>
+	<span class="token keyword">select</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">case</span> <span class="token operator">&lt;-</span>ch<span class="token punctuation">:</span>
+		<span class="token comment">// 如果定时器的通道收到消息，说明延迟时间到了，我们可以继续，返回 nil</span>
+		<span class="token keyword">return</span> <span class="token boolean">nil</span> 
+	<span class="token keyword">case</span> <span class="token operator">&lt;-</span>ctx<span class="token punctuation">.</span><span class="token function">Done</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+		<span class="token comment">// ctx 被取消了,取消预约</span>
+		r<span class="token punctuation">.</span><span class="token function">Cancel</span><span class="token punctuation">(</span><span class="token punctuation">)</span> 
+		<span class="token keyword">return</span> ctx<span class="token punctuation">.</span><span class="token function">Err</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">// 返回 ctx 的错误</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">// DelayFrom 返回 r 的延迟时间，即从 t 到 r.timeToAct 的时间间隔。</span>
+<span class="token comment">// 如果 r 不 ok，说明预约失败，返回无穷大的延迟时间。</span>
+<span class="token comment">// 如果 r.timeToAct 在 t 之前，说明预约已经可以执行，返回 0 的延迟时间。</span>
+<span class="token keyword">func</span> <span class="token punctuation">(</span>r <span class="token operator">*</span>Reservation<span class="token punctuation">)</span> <span class="token function">DelayFrom</span><span class="token punctuation">(</span>t time<span class="token punctuation">.</span>Time<span class="token punctuation">)</span> time<span class="token punctuation">.</span>Duration <span class="token punctuation">{<!-- --></span>
+	<span class="token keyword">if</span> <span class="token operator">!</span>r<span class="token punctuation">.</span>ok <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span> InfDuration <span class="token comment">// 如果 r 不 ok，返回无穷大的延迟时间</span>
+	<span class="token punctuation">}</span>
+	delay <span class="token operator">:=</span> r<span class="token punctuation">.</span>timeToAct<span class="token punctuation">.</span><span class="token function">Sub</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> <span class="token comment">// 计算 r.timeToAct 和 t 的时间差，赋值给 delay</span>
+	<span class="token keyword">if</span> delay <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span>
+		<span class="token keyword">return</span> <span class="token number">0</span> <span class="token comment">// 如果 delay 小于 0，说明 r.timeToAct 在 t 之前，返回 0 的延迟时间</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> delay <span class="token comment">// 否则，返回 delay</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<h3><a id="CancelAt_631"></a>CancelAt()取消令牌消费操作</h3> 
+<pre><code class="prism language-go"><span class="token keyword">func</span> <span class="token punctuation">(</span>r <span class="token operator">*</span>Reservation<span class="token punctuation">)</span> <span class="token function">Cancel</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	r<span class="token punctuation">.</span><span class="token function">CancelAt</span><span class="token punctuation">(</span>time<span class="token punctuation">.</span><span class="token function">Now</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+	<span class="token keyword">return</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">func</span> <span class="token punctuation">(</span>r <span class="token operator">*</span>Reservation<span class="token punctuation">)</span> <span class="token function">CancelAt</span><span class="token punctuation">(</span>t time<span class="token punctuation">.</span>Time<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+	<span class="token comment">//如果预约结果不允许通过，表示没有消耗令牌，无需取消</span>
+	<span class="token keyword">if</span> <span class="token operator">!</span>r<span class="token punctuation">.</span>ok <span class="token punctuation">{<!-- --></span> 
+		<span class="token keyword">return</span>
+	<span class="token punctuation">}</span>
+
+	r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>mu<span class="token punctuation">.</span><span class="token function">Lock</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">//加锁，保证数据的一致性</span>
+	<span class="token keyword">defer</span> r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>mu<span class="token punctuation">.</span><span class="token function">Unlock</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token comment">//解锁，释放资源</span>
+
+	<span class="token comment">//如果速率限制是无限的，或者请求的令牌数是零，或者执行时间早于取消时间，表示无需取消</span>
+	<span class="token keyword">if</span> r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>limit <span class="token operator">==</span> Inf <span class="token operator">||</span> r<span class="token punctuation">.</span>tokens <span class="token operator">==</span> <span class="token number">0</span> <span class="token operator">||</span> r<span class="token punctuation">.</span>timeToAct<span class="token punctuation">.</span><span class="token function">Before</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> 
+		<span class="token keyword">return</span>
+	<span class="token punctuation">}</span>
+
+	<span class="token comment">//计算需要恢复的令牌数，等于请求的令牌数减去在预约结果之后被预约的令牌数</span>
+	<span class="token comment">//这里的r.lim.lastEvent可能是本次Reservation的结束时间</span>
+	<span class="token comment">//也可能是后来的Reservation的结束时间</span>
+	<span class="token comment">//所以要把本次结束时间点(r.timeToAct)之后产生的令牌数减去</span>
+	restoreTokens <span class="token operator">:=</span> <span class="token function">float64</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>tokens<span class="token punctuation">)</span> <span class="token operator">-</span> r<span class="token punctuation">.</span>limit<span class="token punctuation">.</span><span class="token function">tokensFromDuration</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>lastEvent<span class="token punctuation">.</span><span class="token function">Sub</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>timeToAct<span class="token punctuation">)</span><span class="token punctuation">)</span> 
+	<span class="token keyword">if</span> restoreTokens <span class="token operator">&lt;=</span> <span class="token number">0</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果需要恢复的令牌数小于等于零，表示无需取消</span>
+		<span class="token keyword">return</span>
+	<span class="token punctuation">}</span>
+	t<span class="token punctuation">,</span> tokens <span class="token operator">:=</span> r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span><span class="token function">advance</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> <span class="token comment">//根据当前时间和上次更新时间计算桶中剩余的令牌数</span>
+
+	tokens <span class="token operator">+=</span> restoreTokens <span class="token comment">//计算桶中新的令牌数，等于原来的令牌数加上恢复的令牌数</span>
+	<span class="token keyword">if</span> burst <span class="token operator">:=</span> <span class="token function">float64</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>burst<span class="token punctuation">)</span><span class="token punctuation">;</span> tokens <span class="token operator">&gt;</span> burst <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果新的令牌数超过了桶的容量</span>
+		tokens <span class="token operator">=</span> burst <span class="token comment">//将新的令牌数设置为桶的容量，即不能超过最大值</span>
+	<span class="token punctuation">}</span>
+	<span class="token comment">// update state</span>
+	r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>last <span class="token operator">=</span> t <span class="token comment">//更新限流器中的上次更新时间为当前时间</span>
+	r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>tokens <span class="token operator">=</span> tokens <span class="token comment">//更新限流器中的剩余令牌数为新的令牌数</span>
+	<span class="token comment">//如果预约结果的执行时间等于限流器中的最近事件时间，表示需要调整最近事件时间</span>
+	<span class="token keyword">if</span> r<span class="token punctuation">.</span>timeToAct <span class="token operator">==</span> r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>lastEvent <span class="token punctuation">{<!-- --></span> 
+		<span class="token comment">//计算预约结果之前的最近事件时间，等于执行时间减去生成请求令牌数所需的时间间隔</span>
+		prevEvent <span class="token operator">:=</span> r<span class="token punctuation">.</span>timeToAct<span class="token punctuation">.</span><span class="token function">Add</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>limit<span class="token punctuation">.</span><span class="token function">durationFromTokens</span><span class="token punctuation">(</span><span class="token function">float64</span><span class="token punctuation">(</span><span class="token operator">-</span>r<span class="token punctuation">.</span>tokens<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span> 
+		<span class="token keyword">if</span> <span class="token operator">!</span>prevEvent<span class="token punctuation">.</span><span class="token function">Before</span><span class="token punctuation">(</span>t<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span> <span class="token comment">//如果预约结果之前的最近事件时间不早于当前时间，表示有效</span>
+			r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>lastEvent <span class="token operator">=</span> prevEvent <span class="token comment">//更新限流器中的最近事件时间为预约结果之前的最近事件时间</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+<ol><li>可以调用Cancel()取消令牌消费操作,该函数中会调用CancelAt(),首先要了解Reservation中的几个字段</li></ol> 
+<blockquote> 
+ <ol><li>r.tokens指的是本次消费的token数，</li><li>r.timeToAcr指的是Token桶可以满足本次消费数目的时刻，也就是消费的时刻+等待的时长</li><li>r.lim.lastEvent指的是最近一次消费的timeToAct的值</li></ol> 
+</blockquote> 
+<ol start="2"><li>在CancelAt()中最重要的逻辑:通过r.limit.tokensFromDuration方法得出从该次消费到当前时间一共又消费了多少Token数目,然后"r.tokens本次消费的令牌数" 减去 "从该次消费到当前时间一共又消费的令牌数"得出要归还的令牌</li></ol> 
+<pre><code class="prism language-go">restoreTokens <span class="token operator">:=</span> <span class="token function">float64</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>tokens<span class="token punctuation">)</span> <span class="token operator">-</span> r<span class="token punctuation">.</span>limit<span class="token punctuation">.</span><span class="token function">tokensFromDuration</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>lim<span class="token punctuation">.</span>lastEvent<span class="token punctuation">.</span><span class="token function">Sub</span><span class="token punctuation">(</span>r<span class="token punctuation">.</span>timeToAct<span class="token punctuation">)</span><span class="token punctuation">)</span>，
+</code></pre> 
+<ol start="3"><li>然后更新Reservation中的上次token更新时间,剩余令牌数等信息</li></ol> 
+<h2><a id="__688"></a>三. 总结</h2> 
+<h3><a id="_689"></a>复习限流算法</h3> 
+<ol><li>先说一下几个限流相关算法的优缺点</li><li>计数器: 只需要维护一个计数器变量,实现简单,性能消耗较小,缺点无法控制速率,无法解决瞬时高并发问题</li><li>令牌桶:</li></ol> 
+<blockquote> 
+ <ol><li>固定速率,向桶中添加令牌,桶容量是有限的,接收到请求后首先获取桶中的令牌进行消费</li><li>缺点: 需要维护令牌生成速率与桶容量实现稍微有点复杂,通过桶容量一定程度上解决了瞬时并发问题,但是没有彻底解决</li></ol> 
+</blockquote> 
+<ol start="4"><li>漏桶</li></ol> 
+<blockquote> 
+ <ol><li>可以以任意速率流入水滴到漏桶中,但是按照固定速率流出水滴, 如果桶是空的，则不需流出水滴,；如果流入水滴超出了桶的容量，则流入的水滴溢出了执行服务降级</li><li>令牌桶是按照固定速率往桶中添加令牌,请求是否被处理需要看桶中令牌是否足够,当令牌数减为零时则拒绝新的请求；漏桶则是按照常量固定速率流出请求,请求到达后端,流入请求速率任意请求有客户端发送到桶中,当流入的请求数累积到漏桶容量时,则新流入的请求被拒绝</li><li>缺点: 与令牌桶相同</li></ol> 
+</blockquote> 
+<ol start="5"><li>滑动窗口</li></ol> 
+<blockquote> 
+ <ol><li>滑动窗口出现的原因: 假设通过计数器实现限流,限制每秒钟最高允许10个请求通过,每请求一次计数器+1,当请求超过10,并且与第一次请求的时间间隔不超过一秒钟,说明请求过多,服务熔断降级,如果与第一次请求间隔超过一秒钟,说明还在范围内重置计数器(思考问题临界问题:假设在第1秒时接收到9个请求,都在执行中,到2秒计数器重置进入新的计算阶段又进来9个请求,当前实际就承载了18个请求,超过阈值)</li><li>滑动窗口算法计数器: 解决传统计数器临界问题: 假设每分钟允许向后台请求60次,可以将这60次请求分为6份,每秒钟允许请求10次,每个时间段都有自己的计数器,记录这个时间段内发生的请求数量,通过滑动进行判断,每过一个时间段,就把最早的时间段和它的计数器删掉,然后加入一个新的时间段和计数器,进而解决临界问题</li></ol> 
+</blockquote> 
+<h3><a id="timerate__702"></a>time/rate 总结</h3> 
+<ol><li>time/rate 基于令牌桶算法实现的限流组件,允许一定程度的突发,同时保证了请求的平均速率,内部基于锁,channel,保证了并发安全,牺牲了一点性能但是保证了令牌的精确性</li><li>了解time/rate限流首先要了解Limiter与Reservation两个结构体,在调用NewLimiter()函数创建限流器时会返回一个Limiter 结构体变量,内部有一个limit 属性表示每秒处理的频率也就是限流速率, burst 最大并发数,mu 锁, tokens 当前令牌桶中可用的令牌数…</li><li>在实现限流时底层都会调用到一个reserveN()函数,会根据传入的等待时间,计算这段时间内能否生成需要的令牌数,封装Reservation,在Reservation 中存在,tokens本次消费的令牌数,ok 到截止时间是否能够生成指定的令牌数属性,timeToAct 获取指定令牌需要等待的时间属性</li><li>消费令牌原理:</li></ol> 
+<blockquote> 
+ <ol><li>rate中提供了Allow()消费一个令牌,Wait()阻塞等待消费一个令牌, Reserve()预定一个令牌,内部实际都会调用到调用reserveN和advance方法,reserveN()用于判断在指定时间内是否有足够的令牌</li><li>首先判断当前消费的令牌数是否超过了最大限制,如果超过了,直接报错,判断limit限流速率如果不等于MaxFloat64并且不等于0,调用advance()计算当前可以使用的令牌数量,也就是(上次剩余令牌数+上次消费令牌时间到当前时间所生成的令牌,如果大于最大并发限制,的更新为最大并发限制)</li><li>如果advance()拿到当前可消费的令牌数量小于0,说明超过并发限制,调用durationFromTokens()计算等待生成令牌时间<br> 封装Reservation,如果当前要消费的令牌数量小于允许可消费的令牌数量则Reservation中的ok为true表示允许消费,否则为false,最后解锁,返回预约结果</li></ol> 
+</blockquote> 
+<ol start="5"><li>Wait 阻塞获取令牌原理,在Wait阻塞消费令牌函数中,首先会封装一个返回定时器通道的函数,然后调用Limiter的wait()方法,</li></ol> 
+<blockquote> 
+ <ol><li>在wait()方法中,会通过select-case监听context的Done取消,如果取消了返回异常,并获取context的取消时间,作为等待时间调用reserveN()进行预订</li><li>在reserveN()预订令牌方法中,会根据传入的等待时间计算这个时间段内是否存在或可以生产出指定数量的令牌,并且会返回生产这些令牌所需要的时间</li><li>如果存在或指定等待时间内可以生产出需要的令牌reserveN()返回的Reservation中ok为true,调用DelayFrom()方法计算获取令牌需要的等待时间,DelayFrom()返回0说明不需要等待直接返回,大于0,执行Wait()函数中封装的返回定时器通道的函数,拿到定时器通道,通过select-case监听Context的Done取消消息和这个定时器通道,当定时器通道返回说明令牌生成完毕函数返回,Wait阻塞开始向下执行</li></ol> 
+</blockquote> 
+<ol start="6"><li>Cancel()取消令牌消费操作: Cancel()函数内部会调用CancelAt(),该函数中最重要的逻辑:通过r.limit.tokensFromDuration方法得出从该次消费到当前时间一共又消费了多少Token数目,然后"r.tokens本次消费的令牌数" 减去 "从该次消费到当前时间一共又消费的令牌数"得出要归还的令牌,然后更新Reservation中的上次token更新时间,剩余令牌数等信息</li></ol>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/e55b615e35b4cfc60e2313e57ba0b3a2/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">javascript中将对象转为字符串</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/3c2c93e04b947f8ebe4f0f868b54f1d9/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">慢慢整理一下用到的游戏相关工具</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

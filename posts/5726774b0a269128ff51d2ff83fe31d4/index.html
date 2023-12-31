@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>记一次关于 Mysql 中 text 类型和索引问题引起的慢查询的定位及优化 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="记一次关于 Mysql 中 text 类型和索引问题引起的慢查询的定位及优化" />
+<meta property="og:description" content="最近有用户反馈产品有些页面加载比较慢，刚好我在学习 Mysql 相关知识，所以先从 Mysql 慢查询日志开始定位：
+step1：通过慢查询日志定位具体 SQL 首先通过 SHOW VARIABLES like 查看当前 Mysql 服务器关于慢查询的具体配置信息：
+slow_query_log = ON # 慢查询日志处于开启状态，所以可以直接查询 slow_query_type = 1 # 根据运行时间将 SQL 语句中记录到 slow log 中，而不考虑逻辑 IO 次数 long_query_time = 5.000000 # 凡是超过 5 秒以上的 SQL 都会记录到 slow log 中 log_output = TABLE # slow log 记录到 mysql.slow_log 表中 log_queries_not_using_indexes = OFF # 没有使用索引的 SQL 不会记录到 slow_log 中，刚好我们只关心查询时间慢的 SQL 确认了 Mysql 服务器对慢查询的配置满足需求，我们不需要再修改任何配置，直接抓取对应时间点的慢查询日志：
+-- 查看7月1日从9点半到10点半的slow log，并找出每条慢查询SQL的最长查询时间以及查询次数，并按照查询时间排序 SELECT db, start_time, max(query_time) AS max_query_time, CONVERT (sql_text USING utf8) AS sqlText, -- sql_text 是 blob 类型，我们需要 CONVERT 到 varchar 来识别具体 SQL count(1) AS count FROM mysql." />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/5726774b0a269128ff51d2ff83fe31d4/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2019-07-04T12:49:42+08:00" />
+<meta property="article:modified_time" content="2019-07-04T12:49:42+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">记一次关于 Mysql 中 text 类型和索引问题引起的慢查询的定位及优化</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-dracula">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>最近有用户反馈产品有些页面加载比较慢，刚好我在学习 <a href="https://zhuanlan.zhihu.com/c_1106160451045519360" rel="nofollow">Mysql 相关知识</a>，所以先从 Mysql 慢查询日志开始定位：</p> 
+<h4><a id="step1_SQL_3"></a>step1：通过慢查询日志定位具体 SQL</h4> 
+<p>首先通过 SHOW VARIABLES like 查看当前 Mysql 服务器关于慢查询的具体配置信息：</p> 
+<pre><code>slow_query_log = ON                  # 慢查询日志处于开启状态，所以可以直接查询
+slow_query_type = 1                  # 根据运行时间将 SQL 语句中记录到 slow log 中，而不考虑逻辑 IO 次数
+long_query_time = 5.000000           # 凡是超过 5 秒以上的 SQL 都会记录到 slow log 中
+log_output = TABLE                   # slow log 记录到 mysql.slow_log 表中
+log_queries_not_using_indexes = OFF  # 没有使用索引的 SQL 不会记录到 slow_log 中，刚好我们只关心查询时间慢的 SQL
+</code></pre> 
+<p>确认了 Mysql 服务器对慢查询的配置满足需求，我们不需要再修改任何配置，直接抓取对应时间点的慢查询日志：</p> 
+<pre><code>-- 查看7月1日从9点半到10点半的slow log，并找出每条慢查询SQL的最长查询时间以及查询次数，并按照查询时间排序
+SELECT
+	db,
+	start_time,
+	max(query_time) AS max_query_time,
+	CONVERT (sql_text USING utf8) AS sqlText,     -- sql_text 是 blob 类型，我们需要 CONVERT 到 varchar 来识别具体 SQL
+	count(1) AS count
+FROM
+	mysql.slow_log
+WHERE
+	start_time &gt; "2019-07-01 09:30:00.000000"
+AND start_time &lt; "2019-07-01 10:30:00.000000"
+GROUP BY
+	sql_text
+ORDER BY
+	max_query_time DESC
+</code></pre> 
+<p>最终我们找到了服务器上四条不同的 slow log sql，最长查询时间分别是 9秒，8秒，7秒，6秒：</p> 
+<p><img src="https://images2.imgbox.com/07/44/LLDfhp0z_o.png" alt="image"></p> 
+<h4><a id="step2_explain__SQL__40"></a>step2：使用 explain 分析 SQL 执行计划</h4> 
+<p>刚好上周末写了一篇 <a href="https://zhuanlan.zhihu.com/p/71616887" rel="nofollow">使用 explain 优化你的 mysql 性能</a>，可以直接上手，先对第一条 SQL 作分析：</p> 
+<pre><code>mysql&gt; EXPLAIN SELECT
+	t.*, p.id AS projectId
+FROM
+	table_extract t
+LEFT JOIN data_connection dc ON dc.id = t.data_connection_id
+LEFT JOIN project p ON p.id = dc.project_id
+WHERE
+	p.id IN (
+		700201361,
+		700201360,
+		700201359,
+		700201358,
+		700201357,
+		700201356,
+		700201354,
+		700201353,
+		700201351,
+		700201350,
+		700201347
+	);
++----+-------------+-------+------------+--------+---------------------------------------------------------+---------+---------+------------------------------+------+----------+-------------+
+| id | select_type | table | partitions | type   | possible_keys                                           | key     | key_len | ref                          | rows | filtered | Extra       |
++----+-------------+-------+------------+--------+---------------------------------------------------------+---------+---------+------------------------------+------+----------+-------------+
+| 1  | SIMPLE      | t     | NULL       | ALL    | NULL                                                    | NULL    | NULL    | NULL                         | 2159 | 100.00   | NULL        |
+| 1  | SIMPLE      | dc    | NULL       | eq_ref | PRIMARY,index_data_connection_project_id,idx_project_id | PRIMARY | 4       | youdata.t.data_connection_id | 1    | 100.00   | Using where |
+| 1  | SIMPLE      | p     | NULL       | eq_ref | PRIMARY                                                 | PRIMARY | 4       | youdata.dc.project_id        | 1    | 100.00   | Using index |
++----+-------------+-------+------------+--------+---------------------------------------------------------+---------+---------+------------------------------+------+----------+-------------+
+3 行于数据集 (0.05 秒)
+</code></pre> 
+<p>通过上述输出结果没发现什么大的问题，两次关联查询都使用了 type = eq_ref，并且都使用了索引，只是对于 table_extract 这张表的查询数据库走了全表扫描，这个确实没办法，我们需要获取该表中除了索引以外的其它字段，但是这张表的数据量也只有rows=2159行，所以理论上也不会有问题，所以这条 SQL 通过 explain 没有发现什么大问题，后面会继续分析。</p> 
+<p>接下来再看第二条 SQL：</p> 
+<pre><code>mysql&gt; EXPLAIN SELECT
+	date(create_time) AS days,
+	count(create_time) AS dayView
+FROM
+	resource_operation_record
+WHERE
+	resource_type IN ('NEW_REPORT', 'COCKPIT')
+AND `action` = 'VIEW'
+AND resource_id = 4539
+AND create_time &gt; '2019-06-25 00:00:00'
+AND create_time &lt; '2019-07-01 09:45:19'
+GROUP BY
+	days;
++----+-------------+---------------------------+------------+------+-----------------+------+---------+------+---------+----------+----------------------------------------------+
+| id | select_type | table                     | partitions | type | possible_keys   | key  | key_len | ref  | rows    | filtered | Extra                                        |
++----+-------------+---------------------------+------------+------+-----------------+------+---------+------+---------+----------+----------------------------------------------+
+| 1  | SIMPLE      | resource_operation_record | NULL       | ALL  | resource_id_idx | NULL | NULL    | NULL | 1729523 | 0.02     | Using where; Using temporary; Using filesort |
++----+-------------+---------------------------+------------+------+-----------------+------+---------+------+---------+----------+----------------------------------------------+
+1 行于数据集 (0.05 秒)
+</code></pre> 
+<p>首先 possible_keys 字段告诉我们可能用到的索引 resource_id_idx，可是为什么 key 字段里没有真正用到索引呢？这应该是 Mysql 优化器认为使用索引对该查询优化空间不大，或者说可能会使性能更差。加上 Extra 字段里还有 Using filesort，Using temporary，在将近 rows = 200万 的数据里进行全表扫描，查询时间超过 5 秒再正常不过了。所以我们查看一下索引信息来定位一下为什么没有使用 resource_id_idx 索引：</p> 
+<pre><code>mysql&gt; show index from resource_operation_record;
++---------------------------+------------+-----------------+--------------+-------------+-----------+-------------+----------+--------+------+------------+---------+---------------+
+| Table                     | Non_unique | Key_name        | Seq_in_index | Column_name | Collation | Cardinality | Sub_part | Packed | Null | Index_type | Comment | Index_comment |
++---------------------------+------------+-----------------+--------------+-------------+-----------+-------------+----------+--------+------+------------+---------+---------------+
+| resource_operation_record | 0          | PRIMARY         | 1            | id          | A         | 1646744     | NULL     | NULL   |      | BTREE      |         |               |
+| resource_operation_record | 1          | creator_id_idx  | 1            | creator_id  | A         | 1169        | NULL     | NULL   | YES  | BTREE      |         |               |
+| resource_operation_record | 1          | resource_id_idx | 1            | resource_id | A         | 4228        | NULL     | NULL   | YES  | BTREE      |         |               |
++---------------------------+------------+-----------------+--------------+-------------+-----------+-------------+----------+--------+------+------------+---------+---------------+
+3 行于数据集 (0.04 秒)
+</code></pre> 
+<p>resource_operation_record 这张表上一共三个索引，id 是自增主键，这个可以先不用管。对于其它两个索引 creator_id_idx 和 resource_id_idx，首先看到 Cardinality 这个值和 id 聚集索引差距好大，Cardinality 这个值表示索引中不重复的预估值，该值很关键，它和表中总行数比值越接近 1 越好，而且优化器会根据该值选择是否使用索引优化，关于 InnoDB 索引和 Cardinality 相关内容可以看 <a href="https://zhuanlan.zhihu.com/p/65515907" rel="nofollow">InnoDB 存储引擎的索引和算法学习</a> 这篇文章。resource_id_idx 的可选择太小了，比例只有 0.0025，看来优化器不选择该索引是正常的，所以我们大部分情况下要相信 Mysql 优化器。我们也可以使用 force index(resource_id_idx) 强制使用索引来观察效果：</p> 
+<pre><code> SELECT
+	date(create_time) AS days,
+	count(create_time) AS dayView
+FROM
+	resource_operation_record
+force index(resource_id_idx)  -- 使用 force index 强制使用索引
+WHERE
+ resource_id = 4539
+AND	resource_type IN ('NEW_REPORT', 'COCKPIT')
+AND `action` = 'VIEW'
+AND create_time &gt; '2019-06-25 00:00:00'
+AND create_time &lt; '2019-07-01 09:45:19'
+GROUP BY
+	days;
++------------+---------+
+| days       | dayView |
++------------+---------+
+| 2019-06-28 | 29      |
+| 2019-06-29 | 2       |
+| 2019-06-30 | 2       |
+| 2019-07-01 | 5       |
++------------+---------+
+4 行于数据集 (1.67 秒)
+-- 查询要 1.67 秒，相同情况下，我不使用 force index 要 1.61 秒，比使用索引还要快，当然这个不同时间点查询也有关系
+-- 总之，使用索引确实没有多大提升
+</code></pre> 
+<p>再观察上述查询，我们发现 select 和 where 条件中用到了 create_time，而且这个 create_time 是数据插入的时间，理论上不会有太多重复的，尝试在 create_time 上创建索引：</p> 
+<pre><code>-- 新建索引
+ALTER TABLE `resource_operation_record` ADD INDEX `create_time_idx` USING BTREE (`create_time`);
+
+-- 查看索引信息
+show index from resource_operation_record;
++---------------------------+------------+-----------------+--------------+-------------+-----------+-------------+----------+--------+------+------------+---------+---------------+
+| Table                     | Non_unique | Key_name        | Seq_in_index | Column_name | Collation | Cardinality | Sub_part | Packed | Null | Index_type | Comment | Index_comment |
++---------------------------+------------+-----------------+--------------+-------------+-----------+-------------+----------+--------+------+------------+---------+---------------+
+| resource_operation_record | 0          | PRIMARY         | 1            | id          | A         | 1739371     | NULL     | NULL   |      | BTREE      |         |               |
+| resource_operation_record | 1          | creator_id_idx  | 1            | creator_id  | A         | 1002        | NULL     | NULL   | YES  | BTREE      |         |               |
+| resource_operation_record | 1          | resource_id_idx | 1            | resource_id | A         | 6988        | NULL     | NULL   | YES  | BTREE      |         |               |
+| resource_operation_record | 1          | create_time_idx | 1            | create_time | A         | 1246230     | NULL     | NULL   | YES  | BTREE      |         |               |
++---------------------------+------------+-----------------+--------------+-------------+-----------+-------------+----------+--------+------+------------+---------+---------------+
+4 行于数据集 (0.25 秒)
+
+-- 查看执行计划
+mysql&gt; EXPLAIN SELECT
+	date(create_time) AS days,
+	count(create_time) AS dayView
+FROM
+	resource_operation_record
+WHERE
+	resource_type IN ('NEW_REPORT', 'COCKPIT')
+AND `action` = 'VIEW'
+AND resource_id = 4539
+AND create_time &gt; '2019-06-25 00:00:00'
+AND create_time &lt; '2019-07-01 09:45:19'
+GROUP BY
+	days;
+	
++----+-------------+---------------------------+------------+-------+---------------------------------+-----------------+---------+------+--------+----------+---------------------------------------------------------------------+
+| id | select_type | table                     | partitions | type  | possible_keys                   | key             | key_len | ref  | rows   | filtered | Extra                                                               |
++----+-------------+---------------------------+------------+-------+---------------------------------+-----------------+---------+------+--------+----------+---------------------------------------------------------------------+
+| 1  | SIMPLE      | resource_operation_record | NULL       | range | resource_id_idx,create_time_idx | create_time_idx | 5       | NULL | 210240 | 0.20     | Using index condition; Using where; Using temporary; Using filesort |
++----+-------------+---------------------------+------------+-------+---------------------------------+-----------------+---------+------+--------+----------+---------------------------------------------------------------------+
+1 行于数据集 (0.19 秒)
+</code></pre> 
+<p>建立索引的基础上我们再查看执行计划和索引信息，create_time_idx 的 Cardinality 变为 1246230，选择性大于 0.7，优化器自然会选择该索引，果然 explain 出来的结果是 type = range，使用了范围索引查询，并且 extra 里增加了 Using index condition，表示会先条件过滤索引，过滤完索引后找到所有符合索引条件的数据行，随后用 WHERE 子句中的其他条件去过滤这些数据行。</p> 
+<p>最后执行查询看一下优化后的效果，相比以前 1.7 秒，速度提升了 5 倍左右，这个优化到此为止，因为这个表是对用户访问记录的统计，后面可以考虑针对时间分区进行优化。</p> 
+<pre><code>SELECT
+	date(create_time) AS days,
+	count(create_time) AS dayView
+FROM
+	resource_operation_record
+WHERE
+ resource_id = 4539
+AND	resource_type IN ('NEW_REPORT', 'COCKPIT')
+AND `action` = 'VIEW'
+AND create_time &gt; '2019-06-25 00:00:00'
+AND create_time &lt; '2019-07-01 09:45:19'
+GROUP BY
+	days;
+4 行于数据集 (0.35 秒)
+</code></pre> 
+<p>接下来还有两个慢查询 SQL，这两个慢查询 SQL 和第一个 SQL 一样通过 explain 输出结果看不出什么效果，所以接下来我们通过 profile 查看这三个 SQL 性能</p> 
+<h4><a id="step3_show_profile__215"></a>step3：使用 show profile 继续定位</h4> 
+<p>可以通过文章 <a href="https://zhuanlan.zhihu.com/p/71540276" rel="nofollow">学习如何统计 Mysql 服务器状态信息</a> 来了解如何使用 SHOW STATUS，SHOW ENGINE INNODB STATUS，SHOW PROCESSLIST，SHOW PROFILE 来查看 Mysql 服务器状态信息。</p> 
+<p>Mysql 5.1 版本开始支持 SHOW PROFILE 功能，它可以高精度的记录每个查询语句在运行过程中各个操作的执行时间，这个功能可能会影响 Mysql 查询性能，所以默认情况下是关闭的，由于我们临时定位问题，可以短暂开启该功能：</p> 
+<pre><code>-- 开启 profiling 功能
+mysql&gt; SET global profiling = ON;
+Query OK, 0 rows affected, 1 warning (0.00 sec)
+
+-- 执行第三条慢查询 SQL
+SELECT
+	t.id AS id,
+	t. NAME AS NAME,
+	data_connection_id AS dataConnectionId,
+	QUERY,
+	init_sql AS initSql,
+	t.produced AS produced,
+	t.creator_id AS creatorId,
+	t.create_time AS createTime,
+	u.nick AS creatorName
+FROM
+	custom_table AS t
+LEFT JOIN bigviz_user AS u ON t.creator_id = u.id
+WHERE
+	t.data_connection_id = 20;
+800 行于数据集 (1.1 秒)	
+	
+-- 根据 show profiles 找到对应的 Query_Id = 8，对应执行时间为 1.1 秒
+show profiles
+
+-- 具体查看每一步的耗时情况
+mysql&gt; show profile for query 8;
++----------------------+----------+
+| Status               | Duration |
++----------------------+----------+
+| starting             | 0.000222 |
+| checking permissions | 0.000030 |
+| checking permissions | 0.000027 |
+| Opening tables       | 0.000049 |
+| init                 | 0.000062 |
+| System lock          | 0.000035 |
+| optimizing           | 0.000037 |
+| statistics           | 0.000063 |
+| preparing            | 0.000048 |
+| executing            | 0.000025 |
+| Sending data         | 1.101708 |
+| end                  | 0.000090 |
+| query end            | 0.000034 |
+| closing tables       | 0.000088 |
+| freeing items        | 0.000055 |
+| logging slow query   | 0.000030 |
+| Opening tables       | 0.000159 |
+| System lock          | 0.000100 |
+| cleaning up          | 0.000041 |
++----------------------+----------+
+19 rows in set, 1 warning (0.00 sec)
+
+</code></pre> 
+<p>通过 show profile 返回数据可以发现，基本上所有的时间都花在了 “Sending data” 上，我们查看 Mysql 官方文档对 “Sending data” 的说明：</p> 
+<pre><code>The thread is reading and processing rows for a SELECT statement, and sending data to the client. 
+Because operations occurring during this state tend to perform large amounts of disk access (reads), 
+it is often the longest-running state over the lifetime of a given query.
+</code></pre> 
+<p>也就是说 “Sending data” 并不是单纯的发送数据，而是包括“收集 + 发送数据”，这个阶段一般是 query 中最耗时的阶段，那么为什么这个只有 800 行的查询会耗时这么久呢，难道这 800 行中平均每行数据量都很大？所以看一下该表定义：</p> 
+<pre><code>mysql&gt; show create table custom_table\G;
+*************************** 1. row ***************************
+       Table: custom_table
+Create Table: CREATE TABLE `custom_table` (
+  `name` varchar(2000) DEFAULT NULL,
+  `produced` varchar(255) DEFAULT 'UserDefinedSQL',
+  `query` longtext,
+  `project_id` int(11) DEFAULT NULL,
+  `data_connection_id` int(11) DEFAULT NULL,
+  `creator_id` int(11) DEFAULT NULL,
+  `create_time` datetime DEFAULT NULL,
+  `modifier_id` int(11) DEFAULT NULL,
+  `modify_time` datetime DEFAULT NULL,
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `init_sql` text COMMENT '初始化sql',
+  `rely_list` text COMMENT '表依赖关系',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=27975 DEFAULT CHARSET=utf8
+1 row in set (0.00 sec)
+</code></pre> 
+<p>上述表结构定义中发现有三个字段 query，init_sql，rely_list 都是 text 类型字段，而且 query 字段还是 longtext，从我们怀疑出发，试着在 select 查询中去掉 init_sql 和 query 的查询后再观察结果：</p> 
+<pre><code>SELECT
+	t.id AS id,
+	t. NAME AS NAME,
+	data_connection_id AS dataConnectionId,
+	t.produced AS produced,
+	t.creator_id AS creatorId,
+	t.create_time AS createTime,
+	u.nick AS creatorName
+FROM
+	custom_table AS t
+LEFT JOIN bigviz_user AS u ON t.creator_id = u.id
+WHERE
+	t.data_connection_id = 20;
+800 行于数据集 (0.04 秒)		
+</code></pre> 
+<p>天哪，从 1 秒左右变成了 0.04 秒，完全不是一个数量级的，看来 text 类型的字段对整个查询影响太大了，我们先不急追究为什么，先看如何在当前业务上优化查询，由于考虑到业务场景是前端获取 custom_table 在某个 data_connection_id 下的列表，会返回 query，init_sql 这两个字段，这个两个字段用户确实会用到，但是只有在用户点击某个 custom_table 进行编辑或者查看详情时才会用到，那我们为什么不考虑延迟获取呢？只有当用户需要查看详情时再根据主键 ID 去获取对应的信息，这个时候属于 const 查询且只有一行数据，代价非常小。</p> 
+<p>而对于第一个慢查询 SQL，直接使用 select * 去查询，这个表里面包好了多个 text 字段，而该业务需求其实只需要 id 和 used_memory(biginit) 两个字段，所以我们优化成只选择其中两个字段进行查询。</p> 
+<p>对于第四个慢查询 SQL，对应的表结构里面也包含了一个 mediumtext 字段，前端界面上用户需要根据该字段里的文本信息进行搜索，但是该场景使用很少，只有当用户切换到对应的”按照字段名称搜索“时才会用到该字段，默认情况下不会用到该字段，所以我们可以在用户切换到对应的搜索时再返回该字段，默认情况下不返回即可。</p> 
+<p>针对以上三个慢查询 SQL 我们在不改变表结构的情况下，通过修改业务处理逻辑都成功解决了问题，下面是对于 Mysql 在使用 text 和 blob 类型时以及索引查询时的一些优化建议：</p> 
+<h4><a id="step4__Mysql__text__blob__335"></a>step4: 如何优化 Mysql 中 text 和 blob 类型：</h4> 
+<h6><a id="_337"></a>什么是行溢出数据？</h6> 
+<ul><li>InnoDB 会将一些大对象数据存放在数据页之外的 BLOB 页中，然后在查询时根据指针去对应的 BLOB 页中查询。</li><li>要不要将数据放在 BLOB 页中，取决于当前页中是否可以存放下至少两行数据，对于默认是 16 KB 大小的页，这个阈值长度是 8098，大于该值的会存放在 BLOB 页中。</li><li>BLOB 不只存放 text 和 blob 类型，varchar 类型的数据也有可能被存放在 BLOB 页中，而 blob 类型和 text 类型的数据也有可能不被存放在 BLOB 页中。</li><li>对于 Compact 和 Redundant 行存储格式存放的数据，采用的是部分行溢出存储，前 768 字节还是会存放在当前数据页中的。</li><li>对于 Compressed 和 Dynamic 行存储格式存放的数据，采用的完全行溢出存储，只用 20 个字节存放指针，其余所有数据都放在行溢出数据中。</li></ul> 
+<h6><a id="_text__blob__345"></a>为什么要尽量少使用 text 和 blob 类型？</h6> 
+<ul><li>首先对于 text 和 blob 类型，在遇到使用临时表的情况时，无法使用内存临时表，只能在磁盘上创建临时表。</li><li>对于行溢出数据，InnoDB 一次只会为一个列分配一页的空间，但是当该列超过 32 个页后会一次性分配 64 个页面，存储空间有一定的浪费。</li><li>行溢出数据禁用了自适应哈希索引，如果作为 where 条件时必须完整的比较整个列。</li><li>对于 text 和 blob 字段进行排序时，只能使用部分前缀进行排序，默认是 1024 字节，可以通过 max_sort_length 进行设置。</li><li>数据量太大，会导致 InnoDB 每个数据页中存放的行数减少，从而影响对页面的缓存。</li><li>如果存放在行溢出数据中，每次会根据指针去对应的溢出页进行查询，增加页面访问次数，而且每次查询都是随机 IO，text 字段越多查询次数越多。</li></ul> 
+<h6><a id="_354"></a>如何优化查询？</h6> 
+<ul><li>如果有许多大字段，可以考虑合并这些字段到一个字段，存储一个大的 200kb 比存储 20 个 10kb 更高效，检查随机页面访问次数。</li><li>查询时尽量避免对大字段查询，尤其是获取列表时，杜绝使用 select * 查询。</li><li>可以考虑将大字段专门放在另外一张表中，只有在需要时再关联查询，增加 InnoDB 的当前表缓存命中率。</li><li>如果只需要获取大字段的部分数据，可以使用 SUBSTRING( ) 函数，这样可以避免使用磁盘临时表。</li><li>如果必须使用到磁盘临时表，可以考虑将磁盘临时表指向在基于内存的文件系统中，可以通过修改 tmpdir 参数实现。</li><li>必要时可以考虑对大字段进行压缩后再存储到表中。</li><li>尽量不要使用大字段作为 where 中的查询条件。</li></ul> 
+<h4><a id="step5__364"></a>step5: 如何正确使用索引</h4> 
+<ul><li>创建索引时尽量选择 Cardinality 值比较大的字段，你可以通过 explain 观察自己创建的索引到底有没有被使用</li><li>order by 中的排序的列如果建了索引，则可以使用直接索引进行排序，优化性能</li><li>在使用索引时对应的索引列必须独立，不能是表达式的一部分也不能是函数的参数，否则不能使用索引：</li></ul> 
+<pre><code>-- 虽然 id 上建立了索引，但是无法使用索引优化
+select id from user where id + 1 =5;
+</code></pre> 
+<ul><li>当服务器出现多个列做 AND 操作查询时，通常需要建了一个多列索引，而不是多个独立的单列索引</li><li>当不需要考虑排序和分组时，将选择性最高的列放在前面通常是最好的，因为可以很快的过滤出需要的行</li><li>如果索引包含了需要查询的所有字段值，那么就是可以使用覆盖索引查询，只需要读取索引，极大地减少了数据访问量，在 EXPLAIN 分析的 Extra 字段中可以看到 “Using index” 信息</li><li>如果查询中某个列是范围查询，那么其右边的所有列将无法使用索引优化，索引尽量将范围条件放在右边或者使用多个等值条件来代替范围查询</li><li>查询时尽量不要返回多余的列，第一可以减少网络流量，第二增加使用覆盖索引的可能性</li><li>多列索引时只有当索引的列和 ORDER BY 子句的顺序完全一致且所有列的排序方向一致时才能使用索引做排序</li><li>不要创建冗余的索引，Mysql 不仅需要单独维护索引列，并且在优化器查询时也需要逐个索引进行过滤，会影响性能，下面是创建冗余索引的几个例子：</li></ul> 
+<pre><code>- 创建了索引（A，B）再创建索引（A），那后者便是冗余索引
+- 创建索引扩展为（A，ID），其中 ID 是主键，对于 InnoDB 来说主键已经包含在二级索引中了，所以这也是冗余的
+</code></pre> 
+<ul><li>有一些索引可能服务器永远都不会用到，建议考虑删除，在 percona 版本或 marida 中可以通过 information_schea.index_statistics 查看得到索引的使用情况，在官方版本中 可以使用 performance_schema.table_io_waits_summary_by_index_usage 查看索引使用情况</li></ul> 
+<h4><a id="_388"></a>参考文献</h4> 
+<ul><li><a href="https://zhuanlan.zhihu.com/p/71616887" rel="nofollow">使用 explain 优化你的 mysql 性能</a></li><li><a href="https://zhuanlan.zhihu.com/p/71540276" rel="nofollow">学习如何统计 Mysql 服务器状态信息</a></li><li><a href="https://zhuanlan.zhihu.com/p/65515907" rel="nofollow">InnoDB 存储引擎的索引和算法学习</a></li></ul>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/27a4447e357cef8148ac93f5e023de53/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">正则表达式/i,/g,/ig,/gi,/m</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/749b81b6c2f8fdd50ae87f87662bd740/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Delete Grid Blank Rows Entered by Users When Saving</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

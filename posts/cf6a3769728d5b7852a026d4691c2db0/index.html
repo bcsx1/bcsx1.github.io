@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Redis 实现限流策略 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Redis 实现限流策略" />
+<meta property="og:description" content="除了控制流量，限流还有一个应用目的是用于控制用户行为，避免垃圾请求。
+比如在 UGC 社区，用户的发帖、回复、点赞等行为都要严格受控，一般要严格限定某行为在规定 时间内允许的次数，超过了次数那就是非法行为。对非法行为，业务必须规定适当的惩处策略。
+如何使用 Redis 来实现简单限流策略？ 接口的定义
+# 指定用户 user_id 的某个行为 action_key 在特定的时间内 period 只允许发生一定的次数 max_count def is_action_allowed(user_id, action_key, period, max_count): return True # 调用这个接口 , 一分钟内只允许最多回复 5 个帖子 can_reply = is_action_allowed(&#34;laoqian&#34;, &#34;reply&#34;, 60, 5) if can_reply: do_reply() else: raise ActionThresholdOverflow() 解决方案 这个限流需求中存在一个滑动时间窗口，想想 zset 数据结构的 score 值，是不是可以通过 score 来圈出这个时间窗口来。
+Redis sorted sets | Redis
+而且我们只需要保留这个时间窗口，窗口之外的数据都可以砍掉。那这个 zset 的 value 填什么比较合适呢？它只需要保证唯一性即可，用 uuid 会比较浪费空间，那就改用毫秒时间戳吧。
+如图所示，用一个 zset 结构记录用户的行为历史，每一个行为都会作为 zset 中的一个 key 保存下来。同一个用户同一种行为用一个 zset 记录。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/cf6a3769728d5b7852a026d4691c2db0/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-11-15T21:58:52+08:00" />
+<meta property="article:modified_time" content="2022-11-15T21:58:52+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Redis 实现限流策略</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p>除了控制流量，限流还有一个应用目的是用于控制用户行为，避免垃圾请求。</p> 
+<p>比如在 UGC 社区，用户的发帖、回复、点赞等行为都要严格受控，一般要严格限定某行为在规定 时间内允许的次数，超过了次数那就是非法行为。对非法行为，业务必须规定适当的惩处策略。</p> 
+<h2>如何使用 Redis 来实现简单限流策略？</h2> 
+<p>接口的定义</p> 
+<pre><code class="language-python"># 指定用户 user_id 的某个行为 action_key 在特定的时间内 period 只允许发生一定的次数
+max_count
+def is_action_allowed(user_id, action_key, period, max_count):
+ return True
+# 调用这个接口 , 一分钟内只允许最多回复 5 个帖子
+can_reply = is_action_allowed("laoqian", "reply", 60, 5)
+if can_reply:
+ do_reply()
+else:
+ raise ActionThresholdOverflow()</code></pre> 
+<h3>解决方案</h3> 
+<p>这个限流需求中存在一个<strong>滑动时间窗口</strong>，想想 <strong>zset </strong>数据结构的 score 值，是不是可以通过 score 来圈出这个时间窗口来。</p> 
+<p><a href="https://redis.io/docs/data-types/sorted-sets/" rel="nofollow" title="Redis sorted sets | Redis">Redis sorted sets | Redis</a></p> 
+<p>而且我们只需要保留这个时间窗口，窗口之外的数据都可以砍掉。那这个 zset 的 value 填什么比较合适呢？它只需要保证唯一性即可，用 uuid 会比较浪费空间，那就改用毫秒时间戳吧。</p> 
+<p><img alt="" height="806" src="https://images2.imgbox.com/f4/52/IvlyeTXF_o.png" width="665"></p> 
+<p> 如图所示，用一个 zset 结构记录用户的行为历史，每一个行为都会作为 zset 中的一个 key 保存下来。同一个用户同一种行为用一个 zset 记录。</p> 
+<p>为节省内存，我们只需要保留时间窗口内的行为记录，同时如果用户是冷用户，滑动时间窗口内的行为是空记录，那么这个 zset 就可以从内存中移除，不再占用空间。</p> 
+<p>通过统计滑动窗口内的行为数量与阈值 max_count 进行比较就可以得出当前的行为是否 允许。用代码表示如下：</p> 
+<pre><code class="language-java">import org.apache.shiro.util.CollectionUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Component;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+@Component
+public class SimpleRateLimiter {
+    @Resource
+    private RedisTemplate&lt;String, Object&gt; redisTemplate;
+
+    public boolean isActionAllowed(String userId, String actionKey, int period, long maxCount) {
+        String key = String.format("hist:%s:%s", userId, actionKey);
+        long nowMills = System.currentTimeMillis();
+
+        List&lt;Object&gt; objects = redisTemplate.executePipelined((RedisCallback&lt;Object&gt;) connection -&gt; {
+//            打开管道
+            connection.openPipeline();
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+            // 添加命令
+            connection.zAdd(keyBytes, nowMills
+                    , String.valueOf(nowMills).getBytes(StandardCharsets.UTF_8));
+            // 清楚无用数据
+            connection.zRemRangeByScore(keyBytes, 0, nowMills - period * 1000L);
+            // 判断规定时间内请求数量
+            connection.zCard(keyBytes);
+            // 重新设置过期时间
+            connection.expire(keyBytes, period + 1);
+            // 关闭管道 不需要close 否则拿不到返回值
+            // connection.closePipeline();
+            // 这里一定要返回null，最终pipeline的执行结果，才会返回给最外层
+            return null;
+        });
+        if (!CollectionUtils.isEmpty(objects)) {
+            return (Long) objects.get(2) &lt;= maxCount;
+        }
+        return true;
+    }
+}
+</code></pre> 
+<p>测试：</p> 
+<pre><code class="language-java">import com.hcx.common.redisdemo.SimpleRateLimiter;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+@SpringBootTest
+class MallCommonApplicationTests {
+
+    @Autowired
+    private SimpleRateLimiter limiter;
+
+    @Test
+    void contextLoads() {
+        for (int i = 0; i &lt; 20; i++) {
+            System.out.println("结果:" + limiter.isActionAllowed("laoqian", "reply", 60, 5));
+        }
+    }
+}
+/*
+结果:true
+结果:true
+结果:true
+结果:true
+结果:true
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+结果:false
+*/
+</code></pre> 
+<p>整体思路就是：<strong>每一个行为到来时，都维护一次时间窗口。将时间窗口外的记录全部清理掉，只保留窗口内的记录。</strong></p> 
+<p> zset 集合中只有 score 值非常重要，value 值没有特别的意义，只需要保证它是唯一的就可以了。 因为这几个连续的 Redis 操作都是针对同一个 key 的，使用 pipeline 可以显著提升 Redis 存取效率。</p> 
+<p>但这种方案也有缺点，因为<strong>它要记录时间窗口内所有的行为记录</strong>，如果这个量很大，比如限定 60s 内操作不得超过 100w 次这样的参数，它是不适合做这样的限流的，因为会消耗大量的存储空间。</p> 
+<h2>高级限流算法——漏斗限流</h2> 
+<p><img alt="" height="447" src="https://images2.imgbox.com/dd/d0/NtWQZrxh_o.png" width="1200"></p> 
+<p>漏斗限流是最常用的限流方法之一，顾名思义，这个算法的灵感源于漏斗（funnel）的结构。 </p> 
+<p>漏洞的容量是有限的，如果将漏嘴堵住，然后一直往里面灌水，它就会变满，直至再也 装不进去。如果将漏嘴放开，水就会往下流，流走一部分之后，就又可以继续往里面灌水。 如果漏嘴流水的速率大于灌水的速率，那么漏斗永远都装不满。</p> 
+<p>如果漏嘴流水速率小于灌水的速率，那么一旦漏斗满了，灌水就需要暂停并等待漏斗腾空。</p> 
+<p>所以，漏斗的剩余空间就代表着当前行为可以持续进行的数量，漏嘴的流水速率代表着 系统允许该行为的最大频率。</p> 
+<h3>单机版漏斗算法实现_JAVA</h3> 
+<pre><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+
+
+public class FunnelRateLimiter {
+    private final Map&lt;String, Funnel&gt; funnels = new HashMap&lt;&gt;();
+
+    public static void main(String[] args) {
+        FunnelRateLimiter limiter = new FunnelRateLimiter();
+        for (int i = 0; i &lt; 20; i++) {
+            System.out.println("次数" + (i + 1) + ": " + limiter.isActionAllowed("user", "get", 10, 1));
+        }
+    }
+
+    /**
+     * @param userId      用户ID
+     * @param actionKey   行为key
+     * @param capacity    漏斗容量
+     * @param leakingRate 漏嘴流水速率 单位mill
+     * @return 行为能否执行
+     */
+    public boolean isActionAllowed(String userId, String actionKey, int capacity, float leakingRate) {
+        String key = String.format("%s:%s", userId, actionKey);
+        Funnel funnel = funnels.get(key);
+        if (funnel == null) {
+            funnel = new Funnel(capacity, leakingRate);
+            funnels.put(key, funnel);
+        }
+        return funnel.watering(1); // 需要 1 个 quota
+    }
+
+    static class Funnel {
+        /**
+         * 漏斗容量
+         */
+        int capacity;
+        /**
+         * 漏嘴流水速率
+         */
+        float leakingRate;
+        /**
+         * 漏斗剩余空间
+         */
+        int leftQuota;
+        /**
+         * 上一次漏水时间
+         */
+        long leakingTs;
+
+        public Funnel(int capacity, float leakingRate) {
+            this.capacity = capacity;
+            this.leakingRate = leakingRate;
+            this.leftQuota = capacity;
+            this.leakingTs = System.currentTimeMillis();
+        }
+
+        /**
+         * 计算剩余空间
+         */
+        void makeSpace() {
+            long nowTs = System.currentTimeMillis();
+            long deltaTs = nowTs - leakingTs; // 距离上一次漏水过去了多久
+            int deltaQuota = (int) (deltaTs * leakingRate); // 腾出多少空间
+            if (deltaQuota &lt; 0) { // 间隔时间太长，整数数字过大溢出
+                this.leftQuota = capacity;
+                this.leakingTs = nowTs;
+                return;
+            }
+            if (deltaQuota &lt; 1) { // 腾出空间太小，最小单位是 1
+                return;
+            }
+            this.leftQuota += deltaQuota;
+            this.leakingTs = nowTs;
+            if (this.leftQuota &gt; this.capacity) {
+                this.leftQuota = this.capacity;
+            }
+        }
+
+        /**
+         * @param quota 待申请空间
+         * @return 申请是否成功
+         */
+        boolean watering(int quota) {
+            makeSpace();
+            if (this.leftQuota &gt;= quota) {
+                this.leftQuota -= quota;
+                return true;
+            }
+            return false;
+        }
+    }
+}
+/*
+次数1: true
+次数2: true
+次数3: true
+次数4: true
+次数5: true
+次数6: true
+次数7: true
+次数8: true
+次数9: true
+次数10: true
+次数11: false
+次数12: false
+次数13: false
+次数14: false
+次数15: false
+次数16: false
+次数17: false
+次数18: false
+次数19: false
+次数20: false
+*/
+</code></pre> 
+<p>Funnel 对象的 make_space 方法是漏斗算法的核心，其在每次灌水前都会被调用以触发漏水，给漏斗腾出空间来。</p> 
+<p>能腾出多少空间取决于过去了多久以及流水的速率。Funnel 对象<strong>占据的空间大小不再和行为的频率成正比，它的空间占用是一个常量</strong>。</p> 
+<blockquote> 
+ <p><strong>分布式的漏斗算法该如何实现？能不能使用 Redis 的基础数据结构来搞定？</strong></p> 
+</blockquote> 
+<p>观察 Funnel 对象的几个字段，发现可以将 Funnel 对象的内容按字段存储到一 个 hash 结构中，灌水的时候将 hash 结构的字段取出来进行逻辑运算后，再将新值回填到 hash 结构中就完成了一次行为频度的检测。</p> 
+<p>但是有个问题，<strong>无法保证整个过程的原子性</strong>。从 hash 结构中取值，然后在内存里运算，再回填到 hash 结构，这三个过程无法原子化，意味着需要进行适当的加锁控制。</p> 
+<p>而一旦加锁，就意味着会有加锁失败，加锁失败就需要选择重试或者放弃。</p> 
+<ul><li>如果重试的话，就会导致性能下降。</li><li>如果放弃的话，就会影响用户体验。</li></ul> 
+<p>同时，代码的复杂度也跟着升高很多。</p> 
+<h3>Redis-Cell——限流 Redis 模块</h3> 
+<p><a href="https://baike.baidu.com/item/%E4%BB%A4%E7%89%8C%E6%A1%B6%E7%AE%97%E6%B3%95#:~:text=%E4%BB%A4%E7%89%8C%E6%A1%B6%E7%AE%97%E6%B3%95%E6%98%AF%20%E7%BD%91%E7%BB%9C%E6%B5%81%E9%87%8F%20%E6%95%B4%E5%BD%A2%EF%BC%88Traffic%20Shaping%EF%BC%89%E5%92%8C%E9%80%9F%E7%8E%87%E9%99%90%E5%88%B6%EF%BC%88Rate%20Limiting%EF%BC%89%E4%B8%AD%E6%9C%80%E5%B8%B8%E4%BD%BF%E7%94%A8%E7%9A%84%E4%B8%80%E7%A7%8D%E7%AE%97%E6%B3%95%E3%80%82.%20%E5%85%B8%E5%9E%8B%E6%83%85%E5%86%B5%E4%B8%8B%EF%BC%8C%E4%BB%A4%E7%89%8C%E6%A1%B6%E7%AE%97%E6%B3%95%E7%94%A8%E6%9D%A5%E6%8E%A7%E5%88%B6%E5%8F%91%E9%80%81%E5%88%B0%E7%BD%91%E7%BB%9C%E4%B8%8A%E7%9A%84%E6%95%B0%E6%8D%AE%E7%9A%84%E6%95%B0%E7%9B%AE%EF%BC%8C%E5%B9%B6%E5%85%81%E8%AE%B8%E7%AA%81%E5%8F%91%E6%95%B0%E6%8D%AE%E7%9A%84%E5%8F%91%E9%80%81%E3%80%82.,%E5%A4%A7%E5%B0%8F%E5%9B%BA%E5%AE%9A%E7%9A%84%E4%BB%A4%E7%89%8C%E6%A1%B6%E5%8F%AF%E8%87%AA%E8%A1%8C%E4%BB%A5%E6%81%92%E5%AE%9A%E7%9A%84%E9%80%9F%E7%8E%87%E6%BA%90%E6%BA%90%E4%B8%8D%E6%96%AD%E5%9C%B0%E4%BA%A7%E7%94%9F%E4%BB%A4%E7%89%8C%E3%80%82.%20%E5%A6%82%E6%9E%9C%E4%BB%A4%E7%89%8C%E4%B8%8D%E8%A2%AB%E6%B6%88%E8%80%97%EF%BC%8C%E6%88%96%E8%80%85%E8%A2%AB%E6%B6%88%E8%80%97%E7%9A%84%E9%80%9F%E5%BA%A6%E5%B0%8F%E4%BA%8E%E4%BA%A7%E7%94%9F%E7%9A%84%E9%80%9F%E5%BA%A6%EF%BC%8C%E4%BB%A4%E7%89%8C%E5%B0%B1%E4%BC%9A%E4%B8%8D%E6%96%AD%E5%9C%B0%E5%A2%9E%E5%A4%9A%EF%BC%8C%E7%9B%B4%E5%88%B0%E6%8A%8A%E6%A1%B6%E5%A1%AB%E6%BB%A1%E3%80%82.%20%E5%90%8E%E9%9D%A2%E5%86%8D%E4%BA%A7%E7%94%9F%E7%9A%84%E4%BB%A4%E7%89%8C%E5%B0%B1%E4%BC%9A%E4%BB%8E%E6%A1%B6%E4%B8%AD%E6%BA%A2%E5%87%BA%E3%80%82.%20%E6%9C%80%E5%90%8E%E6%A1%B6%E4%B8%AD%E5%8F%AF%E4%BB%A5%E4%BF%9D%E5%AD%98%E7%9A%84%E6%9C%80%E5%A4%A7%E4%BB%A4%E7%89%8C%E6%95%B0%E6%B0%B8%E8%BF%9C%E4%B8%8D%E4%BC%9A%E8%B6%85%E8%BF%87%E6%A1%B6%E7%9A%84%E5%A4%A7%E5%B0%8F%E3%80%82.%20%E4%BC%A0%E9%80%81%E5%88%B0%E4%BB%A4%E7%89%8C%E6%A1%B6%E7%9A%84%E6%95%B0%E6%8D%AE%E5%8C%85%E9%9C%80%E8%A6%81%E6%B6%88%E8%80%97%E4%BB%A4%E7%89%8C%E3%80%82.%20%E4%B8%8D%E5%90%8C%E5%A4%A7%E5%B0%8F%E7%9A%84%E6%95%B0%E6%8D%AE%E5%8C%85%EF%BC%8C%E6%B6%88%E8%80%97%E7%9A%84%E4%BB%A4%E7%89%8C%E6%95%B0%E9%87%8F%E4%B8%8D%E4%B8%80%E6%A0%B7%E3%80%82.%20%E4%BB%A4%E7%89%8C%E6%A1%B6%E8%BF%99%E7%A7%8D%E6%8E%A7%E5%88%B6%E6%9C%BA%E5%88%B6%E5%9F%BA%E4%BA%8E%E4%BB%A4%E7%89%8C%E6%A1%B6%E4%B8%AD%E6%98%AF%E5%90%A6%E5%AD%98%E5%9C%A8%E4%BB%A4%E7%89%8C%E6%9D%A5%E6%8C%87%E7%A4%BA%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E5%8F%AF%E4%BB%A5%E5%8F%91%E9%80%81%E6%B5%81%E9%87%8F%E3%80%82." rel="nofollow" title="令牌桶算法_百度百科 (baidu.com)">令牌桶算法_百度百科 (baidu.com)</a></p> 
+<p>Redis 4.0 提供了一个限流 Redis 模块，它叫 redis-cell。该模块也使用了漏斗算法，并 提供了原子的限流指令。</p> 
+<p>该模块只有 1 条指令 cl.throttle，它的参数和返回值都略显复杂，接下来让我们来看看这 个指令具体该如何使用。</p> 
+<figure class="image"> 
+ <img alt="" height="264" src="https://images2.imgbox.com/ac/2b/rj5Z6VTc_o.png" width="990"> 
+ <figcaption>
+   图中capacity设置的是总容量-1 
+ </figcaption> 
+</figure> 
+<p>上面这个指令的意思是允许「用户老钱回复行为」的频率为每 60s 最多 30 次(漏水速 率)，漏斗的初始容量为 16，也就是说一开始可以连续回复 16 个帖子，然后才开始受漏水速率的影响。我们看到这个指令中漏水速率变成了 2 个参数，替代了之前的单个浮点数。用 两个参数相除的结果来表达漏水速率相对单个浮点数要更加直观一些。 </p> 
+<ul><li>&gt; cl.throttle laoqian:reply 15 30 60</li><li>1) (integer) 0 # 0 表示允许，1 表示拒绝</li><li>2) (integer) 15 # 漏斗容量 capacity</li><li>3) (integer) 14 # 漏斗剩余空间 left_quota</li><li>4) (integer) -1 # 如果拒绝了，需要多长时间后再试(漏斗有空间了，单位秒)</li><li>5) (integer) 2 # 多长时间后，漏斗完全空出来(left_quota==capacity，单位秒)</li></ul> 
+<p>在执行限流指令时，如果被拒绝了，就需要丢弃或重试。cl.throttle 指令考虑的非常周 到，连重试时间都帮你算好了，直接取返回结果数组的第四个值进行 sleep 即可，如果不想 阻塞线程，也可以异步定时任务来重试。</p> 
+<pre><code class="language-java">package com.hcx.common.redisdemo;
+
+import org.apache.shiro.util.CollectionUtils;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.util.Collections;
+import java.util.List;
+
+@Component
+public class FunnelRateLimiter {
+    /**
+     * lua 脚本
+     */
+    public static final String LUA_SCRIPT = "return redis.call('cl.throttle',KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4])";
+    @Resource
+    private RedisTemplate&lt;String, Object&gt; redisTemplate;
+
+    /**
+     * @param key        键值
+     * @param capacity   总漏斗容量-1
+     * @param operations 漏水速率
+     * @param seconds    漏水周期
+     * @param quota      待申请空间
+     * @return 申请结果
+     */
+    public boolean isActionAllowed(String key, int capacity, int operations, int seconds, int quota) {
+        try {
+            DefaultRedisScript&lt;List&gt; script = new DefaultRedisScript&lt;&gt;(LUA_SCRIPT, List.class);
+            List&lt;Long&gt; rs = redisTemplate.execute(script, Collections.singletonList(key), capacity, operations, seconds, quota);
+            if (CollectionUtils.isEmpty(rs)) return false;
+
+            System.out.println("漏斗容量：" + rs.get(1));
+            System.out.println("剩余空间：" + rs.get(2));
+            System.out.println("最少多长时间后再试：" + rs.get(3));
+            System.out.println("多长时间后漏斗为空：" + rs.get(4));
+            return rs.get(0) == 0;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+}
+/*
+漏斗容量：16
+剩余空间：15
+最少多长时间后再试：-1
+多长时间后漏斗为空：2
+结果:true
+……
+最少多长时间后再试：-1
+多长时间后漏斗为空：27
+结果:true
+漏斗容量：16
+剩余空间：1
+最少多长时间后再试：-1
+多长时间后漏斗为空：29
+结果:true
+漏斗容量：16
+剩余空间：0
+最少多长时间后再试：-1
+多长时间后漏斗为空：31
+结果:true
+漏斗容量：16
+剩余空间：0
+最少多长时间后再试：1
+多长时间后漏斗为空：31
+结果:false
+漏斗容量：16
+剩余空间：0
+最少多长时间后再试：1
+多长时间后漏斗为空：31
+结果:false
+漏斗容量：16
+剩余空间：0
+最少多长时间后再试：1
+多长时间后漏斗为空：31
+结果:false
+漏斗容量：16
+剩余空间：0
+最少多长时间后再试：1
+多长时间后漏斗为空：31
+结果:false
+*/
+
+</code></pre> 
+<p>在执行限流指令时，如果被拒绝了，就需要丢弃或重试。cl.throttle 指令考虑的非常周 到，连重试时间都帮你算好了，直接取返回结果数组的第四个值进行 sleep 即可，如果不想 阻塞线程，也可以异步定时任务来重试。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/48ff1aebd59bcc507f460656418f1def/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Ubuntu 20.04 虚拟机安装教程</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/e21e740c72db1dd21734eb8455993ce7/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Cisco Packet Tracer实验一：Telnet远程登录、交换机的基本配置实验</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

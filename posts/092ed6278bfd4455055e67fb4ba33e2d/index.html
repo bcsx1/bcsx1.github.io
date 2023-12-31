@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>【数据结构】LSM树（log-structed-merge-tree）原理及应用 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="【数据结构】LSM树（log-structed-merge-tree）原理及应用" />
+<meta property="og:description" content="目录 基本概念读写流程写入读取 CompactSize Tiered Compaction StrategyLeveled Compaction Strategy RocksDB 的压缩策略 基本概念 LSM树（log-structed-merge-tree）:
+日志结构的：系统日志是不会出错的，只需要在后面追加。所以日志结构就代指追加型结构。
+原理：把磁盘看做一个日志，在日志中存放永久性数据及其索引，每次都添加到日志的末尾。文件传输（存取）大多是顺序的，提高磁盘带宽利用率。
+LSM-tree是专门为key-value存储系统设计的，主要业务是查找和插入。
+LSM的特点是利用磁盘的顺序写，写入速度比随机写入的B-树更快。
+LSM 树的思想是使用顺序写代替随机写来提高写性能，与此同时会略微降低读性能。HBase、 Cassandra、 LevelDB、 RocksDB 以及 ClickHouse MergeTree 等流行的 NoSQL 数据库均采用 LSM 存储结构。
+LSM树(Log Structured Merged Tree)的名字往往给人一个错误的印象, 实际上LSM树并没有严格的树状结构。
+LSM 树的思想是使用顺序写代替随机写来提高写性能，与此同时会略微降低读性能。
+LSM 的高速写入能力与读缓存技术带来的高速读能力结合受到了需要处理大规模数据的开发者的青睐，成为了非常流行的存储结构。
+HBase、 Cassandra、 LevelDB、 RocksDB 以及 ClickHouse MergeTree 等流行的 NoSQL 数据库均采用 LSM 存储结构。
+读写流程 具体来说 LSM 的数据更新是日志式的，修改数据时直接追加一条新记录（为被修改数据创建一个新版本），而使用 B/B&#43; 树的数据库则需要找到数据在磁盘上的位置并在原地进行修改。
+这张经典图片来自 Flink PMC 的 Stefan Richter 在Flink Forward 2018演讲的PPT
+写入 在执行写操作时，首先写入 active memtable 和预写日志(Write Ahead Logging, WAL)。因为内存中 memtable 会断电丢失数据，因此需要将记录写入磁盘中的 WAL 保证数据不会丢失。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/092ed6278bfd4455055e67fb4ba33e2d/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-03-02T17:37:52+08:00" />
+<meta property="article:modified_time" content="2023-03-02T17:37:52+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">【数据结构】LSM树（log-structed-merge-tree）原理及应用</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-light">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p></p> 
+<div class="toc"> 
+ <h4>目录</h4> 
+ <ul><li><a href="#_2" rel="nofollow">基本概念</a></li><li><a href="#_18" rel="nofollow">读写流程</a></li><li><ul><li><a href="#_24" rel="nofollow">写入</a></li><li><a href="#_35" rel="nofollow">读取</a></li></ul> 
+  </li><li><a href="#Compact_44" rel="nofollow">Compact</a></li><li><ul><li><a href="#Size_Tiered_Compaction_Strategy_54" rel="nofollow">Size Tiered Compaction Strategy</a></li><li><a href="#Leveled_Compaction_Strategy_66" rel="nofollow">Leveled Compaction Strategy</a></li></ul> 
+  </li><li><a href="#RocksDB__88" rel="nofollow">RocksDB 的压缩策略</a></li></ul> 
+</div> 
+<p></p> 
+<h2><a id="_2"></a>基本概念</h2> 
+<p>LSM树（log-structed-merge-tree）:</p> 
+<blockquote> 
+ <p>日志结构的：系统日志是不会出错的，只需要在后面追加。所以日志结构就代指追加型结构。<br> 原理：把磁盘看做一个日志，在日志中存放永久性数据及其索引，每次都添加到日志的末尾。文件传输（存取）大多是顺序的，提高磁盘带宽利用率。<br> LSM-tree是专门为key-value存储系统设计的，主要业务是查找和插入。<br> LSM的特点是利用磁盘的顺序写，写入速度比随机写入的B-树更快。</p> 
+</blockquote> 
+<p>LSM 树的思想是使用顺序写代替随机写来提高写性能，与此同时会略微降低读性能。HBase、 Cassandra、 LevelDB、 RocksDB 以及 ClickHouse MergeTree 等流行的 NoSQL 数据库均采用 LSM 存储结构。<br> LSM树(Log Structured Merged Tree)的名字往往给人一个错误的印象, 实际上LSM树并没有严格的树状结构。</p> 
+<p><strong>LSM 树的思想是使用顺序写代替随机写来提高写性能，与此同时会略微降低读性能。</strong></p> 
+<p>LSM 的高速写入能力与读缓存技术带来的高速读能力结合受到了需要处理大规模数据的开发者的青睐，成为了非常流行的存储结构。</p> 
+<p>HBase、 Cassandra、 LevelDB、 RocksDB 以及 ClickHouse MergeTree 等流行的 NoSQL 数据库均采用 LSM 存储结构。</p> 
+<h2><a id="_18"></a>读写流程</h2> 
+<p>具体来说 LSM 的数据更新是日志式的，修改数据时直接追加一条新记录（为被修改数据创建一个新版本），而使用 B/B+ 树的数据库则需要找到数据在磁盘上的位置并在原地进行修改。</p> 
+<p><img src="https://images2.imgbox.com/66/ae/sYA4tvRp_o.png" alt="LSM架构"></p> 
+<blockquote> 
+ <p>这张经典图片来自 Flink PMC 的 Stefan Richter 在Flink Forward 2018演讲的PPT</p> 
+</blockquote> 
+<h3><a id="_24"></a>写入</h3> 
+<p>在执行写操作时，首先写入 active memtable 和预写日志(Write Ahead Logging, WAL)。因为内存中 memtable 会断电丢失数据，因此需要将记录写入磁盘中的 WAL 保证数据不会丢失。</p> 
+<p>顾名思义 MemTable是一个内存中的数据结构，它保存了落盘之前的数据。SkipList 是最流行的 Memtable 实现方式，Hbase 和 RocksDB 均默认使用 SkipList 作为 MemTable。</p> 
+<p>当 Active MemTable 写满后会被转换为不可修改的 Immutable MemTable，并创建一个新的空 Active MemTable。后台线程会将 Immutable MemTable 写入到磁盘中形成一个新的 SSTable 文件，并随后销毁 Immutable MemTable。<br> <img src="https://images2.imgbox.com/ff/c4/AAwgPJJw_o.png" alt="SSTable"><br> SSTable (Sorted String Table) 是 LSM 树在磁盘中持久化存储的数据结构，它是一个有序的键值对文件。</p> 
+<p>LSM 不会修改已存在的 SSTable, LSM 在修改数据时会直接在 MemTable 中写入新版本的数据，并等待 MemTable 落盘形成新的 SSTable。因此，虽然在同一个 SSTable 中 key 不会重复，但是不同的 SSTable 中仍会存在相同的 Key。</p> 
+<h3><a id="_35"></a>读取</h3> 
+<p>因为最新的数据总是先写入 MemTable，所以在读取数据时首先要读取 MemTable 然后从新到旧搜索 SSTable，找到的第一个版本就是该 Key 的最新版本。</p> 
+<p>根据局部性原理，刚写入的数据很有可能被马上读取。因此， MemTable 在充当写缓存之外也是一个有效的读缓存。</p> 
+<p>为了提高读取效率 SSTable 通常配有 BloomFilter 和索引来快速判断其中是否包含某个 Key 以及快速定位它的位置。</p> 
+<p>因为读取过程中需要查询多个 SSTable 文件，因此理论上 LSM 树的读取效率低于使用 B 树的数据库。为了提高读取效率，RocksDB 中内置了块缓存(Block Cache)将频繁访问磁盘块缓存在内存中。而 LevelDB 内置了 Block Cache 和 Table Cache 来缓存热点 Block 和 SSTable。</p> 
+<h2><a id="Compact_44"></a>Compact</h2> 
+<p>随着不断的写入 SSTable 数量会越来越多，数据库持有的文件句柄(FD)会越来越多，读取数据时需要搜索的 SSTable 也会越来越多。另一方面对于某个 Key 而言只有最新版本的数据是有效的，其它记录都是在白白浪费磁盘空间。因此对 SSTable 进行合并和压缩(Compact)就十分重要。</p> 
+<p>在介绍 Compact 之前， 我们先来了解 3 个重要的概念:</p> 
+<ul><li>读放大:读取数据时实际读取的数据量大于真正的数据量。例如 LSM 读取数据时需要扫描多个 SSTable.</li><li>写放大:写入数据时实际写入的数据量大于真正的数据量。例如在 LSM 树中写入时可能触发Compact操作，导致实际写入的数据量远大于该key的数据量。</li><li>空间放大:数据实际占用的磁盘空间比数据的真正大小更多。例如上文提到的 SSTable 中存储的旧版数据都是无效的。<br> Compact 策略需要在三种负面效应之间进行权衡以适应使用场景。</li></ul> 
+<h3><a id="Size_Tiered_Compaction_Strategy_54"></a>Size Tiered Compaction Strategy</h3> 
+<p>Size Tiered Compaction Strategy (STCS) 策略保证每层 SSTable 的大小相近，同时限制每一层 SSTable 的数量。当某一层 SSTable 数量达到阈值后则将它们合并为一个大的 SSTable 放入下一层。<br> <img src="https://images2.imgbox.com/8c/a4/pKbJ0WY2_o.png" alt="在这里插入图片描述"></p> 
+<p>STCS 实现简单且 SSTable 数量较少，缺点是当层数较深时容易出现巨大的 SSTable。此外，即使在压缩后同一层的 SSTable 中仍然可能存在重复的 key，一方面存在较多无效数据即空间放大较严重，另一方面读取时需要从旧到新扫描每一个 SSTable 读放大严重。通常认为与下文介绍的 Leveled Compaction Strategy 相比， STCS 的写放大较轻一些[1][2]。</p> 
+<p>STCS 是 Cassandra 的默认压缩策略[3]。Cassandra 认为在插入较多的情况下 STCS 有更好的表现。</p> 
+<p>Tiered压缩算法在RocksDB的代码里被命名为 Universal Compaction。</p> 
+<h3><a id="Leveled_Compaction_Strategy_66"></a>Leveled Compaction Strategy</h3> 
+<p>Leveled Compaction Strategy (LCS)策略也是采用分层的思想，每一层限制总文件的大小。<br> <img src="https://images2.imgbox.com/ac/74/JCSFZQr6_o.png" alt="在这里插入图片描述"></p> 
+<p>LCS 会将每一层切分成多个大小相近的SSTable, 且 SSTable 是在层内是有序的，一个key在每一层至多只有1条记录，不存在冗余记录。<br> <img src="https://images2.imgbox.com/a6/9e/VHaNAhLN_o.png" alt="在这里插入图片描述"></p> 
+<p>LCS 层内不存在冗余所以空间放大比较小。因为层内有序， 所以在读取时每一层最多读取一个 SSTable 所以读放大较小。在读取和更改较多的场景下 LCS 压缩策略有着显著优势。</p> 
+<p>当某一层的总大小超过阈值之后，LCS 会从中选择一个 SSTable 与下一层中所有和它有交集的 SSTable合并，并将合并后的 SSTable 放在下一层。请注意与所有有交集的 SSTable 合并保证了 compact 之后层内仍然是有序且无冗余的。<br> <img src="https://images2.imgbox.com/81/fe/McYpyn1o_o.png" alt="在这里插入图片描述"></p> 
+<p>LCS 下多个不相关的合并操作是可以并发执行的。</p> 
+<p>LCS 有一个变体称为 Leveled-N 策略，它将每一层分为 N 个区块，层内不再全局有序只在区块内保证有序。它是 LCS 与 STCS 的中间状态，与 LCS 相比拥有更小的写放大，与 STCS 相比拥有更小的读放大与空间放大。</p> 
+<h2><a id="RocksDB__88"></a>RocksDB 的压缩策略</h2> 
+<p>RocksDB 默认采用的是 Size Tiered 与 Leveled 混合的压缩策略。在 RocksDB 中存在一个 Active MemTable 和多个 Immutable MemTable。</p> 
+<p>MemTable 被写入磁盘后被称为 Level-0 (L0)。L0 是无序的，也就是说 L0 的 SSTable 允许存在重叠。除 L0 外的层都是全局有序的，且采用 Leveled 策略进行压缩。</p> 
+<p>当 L0 中文件个数超过阈值(level0_file_num_compaction_trigger)后会触发压缩操作，所有的 L0 文件都将被合并进 L1。<br> <img src="https://images2.imgbox.com/16/20/cvkAv9eI_o.png" alt="在这里插入图片描述"></p> 
+<p>因为 L0 是 MemTable 直接落盘后的结果，而热点 key 的更新可能存在于多个 MemTable 中，所以 L0 的 SSTable 中极易因为热点 key 而出现交集。</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/b16657b6c9c962f0bc85ce71421fe3d2/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">C&#43;&#43;类和对象</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/b4867925d2b8d7744e2db0f79d340325/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">在ubantu系统用手机通过有线或者蓝牙上网</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

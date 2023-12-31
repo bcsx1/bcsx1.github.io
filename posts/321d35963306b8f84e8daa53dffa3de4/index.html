@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>实时渲染入门：（三）几何结构渲染 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="实时渲染入门：（三）几何结构渲染" />
+<meta property="og:description" content="在CPU确定了所有对象的位置，并且知道了需要渲染哪些对象之后，渲染就正式开始了。
+而几何体是第一个被渲染的对象。
+深度通道/Early Z Pass（这里的Z是深度）
+此时我们知道了所有需要被渲染的对象以及对象的位置，但是不知道渲染的顺序，也就是不知道哪些对象应该首先被渲染，哪些对象应该之后被渲染。
+从宏观上看，渲染的顺序并不是按照像素排列顺序，也不是按照线条渲染，而是逐个对象渲染。
+按照顺序是：首先渲染背景，接着逐个渲染对象。
+但是这个时候就会出现一个问题，如果需要被渲染的对象是重叠在一起的，那么被挡住的部分是不用被渲染的，但是如果渲染的顺序不对，那么就会先渲染被遮挡住的对象，而后被渲染的对象会遮挡住之前渲染的对象，而被遮挡住的部分是不可见的，这就会造成浪费。
+比如这个例子：蓝色部分是同一个对象，但是此时蓝色的部分即是遮挡物，又是背景。
+而解决这个问题的办法，就是首先做一个深度测试，然后可以做出一个遮罩对象的效果。
+好了，接下来的工作就是渲染具体的几何体。
+绘制调用（Draw Call）
+几何体会根据Drawcall（绘制调用）顺序渲染对象。
+左侧图一共有5个对象，天空、地面、三个圆柱体，所以要调用5个绘制调用。
+右侧图一共有6个对象，天空、地面、三个圆柱体，最后一个圆柱体由两种材质构成，因此要调用6次。
+如果一个物体由10中材质构成，那么就会调用10次绘制调用。
+下面是捕捉到的UE4的渲染过程。没有纹理，只有法线贴图。
+由于深度通道的作用，UE4首先计算出它要渲染地面，而地面被柱子覆盖住的部分则是空的，因为它会被柱子遮挡住。
+然后就渲染最右侧柱子的下半部分。
+UE4会逐个渲染对象，并放到G缓存中。
+而为什么会先渲染地板呢？是因为它会按照材质类型对场景对象进行分类，这样渲染会更快。所以UE4会优先渲染相同材质的对象。
+绘制调用的性能问题 1，绘制调用的费用要比物体三角形数量重要的多
+绘制调用次数可以在UE4中使用命令“stat RHI”来统计。在UE4和绝大多数实时渲染器中，绘制调用以及其他操作会造成很多损耗，与它们相比，三角形数量就不太重要了。
+而绘制调用的损耗主要体现在哪里呢？每次绘制调用完成后，它都会等待下一个信息，然后再接着开始渲染。渲染之间的停顿就是耗时的原因。
+关于性能可以举个栗子：
+同样大小的两个平面。一个有150000&#43;个三角形，但是只需要180&#43;次的绘制调用。它的FPS是236
+另外一个有100000&#43;个三角形，需要44000&#43;次绘制调用，它的FPS降到了4.6。而大多数的时间损耗都花费在了绘制调用的切换。
+在渲染同样材质的对象时，该对象无论有1000个三角形面还是4000个三角形面，渲染时间可能没有区别。
+2，为了减少绘制调用
+最好使用少量大型模型，而不是大量的小型模型。
+但是大型模型用得太多，也会同样遇到各种其他问题。
+例如:
+a.遮挡会变得更复杂
+b.光照贴图也会变得更复杂
+c.碰撞检测计算也会变得更复杂
+d.会占用更多的内存
+在UE4中创建物体大多都使用模块化的方式。也就是对一个个组件进行复制和移动，拼接成为一个更大的模型。另外，也可以完整地创建模型，然后原样导入，这样就变成了一个更大的模型。
+a.实际上需要检测的对象变得更少了，但是它能遮挡对象的可能性会更低，因此面数可能会上升。（mark以后解释）
+b.光照贴图纹理所占的内存空间有一个最大值，使用了很大的模型，会用光这个内存空间。
+c.碰撞体积。如果一个球碰撞到了一个立柱，这个球就会从立柱那里查询碰撞信息，来确定下一步应该怎么做，而这个球则会从立柱得到一个面数非常低的碰撞模型。如果一个球碰撞了一个大模型的柱子，那么这个球就会从整个碰撞模型获取碰撞信息。
+d.由模块化创建的模型，就会占用更少的内存，因为很多模型是复制的，无论一个模型被复制了多少次，在内存中，引擎只存储一个模型的大小。而一个大型模型的所有组件都会占用内存，所以更耗内存。
+而模块化的好处就是碰撞检测简单，内存占用小，遮挡性能好，但是绘制调用次数更多。
+所以通常的最佳解决方案是一个折中的方法：
+使用单独的小块模型来构建模型
+使用UE4中的合并功能，就可以把一些小的模型组合在一起。
+那么哪些情况下适用这种方式呢？
+1，这个网格越常见，并且面数越低越好。
+2，只合并同一区域内的网格体
+3，合并同一材质的网格体
+4，碰撞检测简单的网格体
+5，非常小或者只接受动态光照的网格体
+6，远距离几何体。
+在低端硬件或者VR设备应用中，几乎需要合并所有的对象。
+实例化静态网格体组件
+同时渲染相同的组件，比如这四根柱子是一模一样的，就可以通过一次绘制调用渲染，而不是四次。
+默认情况下，UE4的网格体会实例化并保存在内存中，但不会在渲染时实例化。在内存中实例化意味着如果导入模型，假如它只在内存中占400KB，在场景中我放了两个该模型，它就会渲染两次。
+但是如果是在渲染时实例化的话，就会占用两份内存，以及渲染两次。但是每次渲染都需要对比大量的对象，看这些对象是否相同，这同样也是一个巨大的开销。
+实例化静态网格体就是给引擎一个列表，告诉引擎哪些模型是一模一样的，就可以同时渲染大量相同的对象。
+细节层次LOD(Level Of Detail)
+根据距离用一个模型代替另一个模型，当距离该模型远的时候，可以用一个面数更少的模型来代替之前的模型来较少渲染损耗。这个过程需要额外的一次绘制调用。
+层次化细节层次（Hierarchical Level Of Detail）" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/321d35963306b8f84e8daa53dffa3de4/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2020-08-16T16:26:26+08:00" />
+<meta property="article:modified_time" content="2020-08-16T16:26:26+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">实时渲染入门：（三）几何结构渲染</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="markdown_views prism-atom-one-dark">
+                    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                        <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+                    </svg>
+                    <p>在CPU确定了所有对象的位置，并且知道了需要渲染哪些对象之后，渲染就正式开始了。<br> 而几何体是第一个被渲染的对象。<br> <strong>深度通道/Early Z Pass</strong>（这里的Z是深度）<br> 此时我们知道了所有需要被渲染的对象以及对象的位置，但是不知道渲染的顺序，也就是不知道哪些对象应该首先被渲染，哪些对象应该之后被渲染。<br> 从宏观上看，渲染的顺序并不是按照像素排列顺序，也不是按照线条渲染，而是逐个对象渲染。<br> 按照顺序是：首先渲染背景，接着逐个渲染对象。<br> 但是这个时候就会出现一个问题，如果需要被渲染的对象是重叠在一起的，那么被挡住的部分是不用被渲染的，但是如果渲染的顺序不对，那么就会先渲染被遮挡住的对象，而后被渲染的对象会遮挡住之前渲染的对象，而被遮挡住的部分是不可见的，这就会造成浪费。<br> <img src="https://images2.imgbox.com/ec/bf/7kmNcqBk_o.png" alt="在这里插入图片描述"><br> 比如这个例子：蓝色部分是同一个对象，但是此时蓝色的部分即是遮挡物，又是背景。<br> 而解决这个问题的办法，就是首先做一个深度测试，然后可以做出一个遮罩对象的效果。</p> 
+<p><img src="https://images2.imgbox.com/07/10/y07kioV0_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/bb/5f/lDCQ2bRb_o.png" alt="在这里插入图片描述"><br> 好了，接下来的工作就是渲染具体的几何体。</p> 
+<p><strong>绘制调用（Draw Call）</strong><br> <img src="https://images2.imgbox.com/4c/62/hAM90yVu_o.png" alt="在这里插入图片描述"><br> 几何体会根据Drawcall（绘制调用）顺序渲染对象。<br> 左侧图一共有5个对象，天空、地面、三个圆柱体，所以要调用5个绘制调用。<br> 右侧图一共有6个对象，天空、地面、三个圆柱体，最后一个圆柱体由两种材质构成，因此要调用6次。<br> 如果一个物体由10中材质构成，那么就会调用10次绘制调用。</p> 
+<p>下面是捕捉到的UE4的渲染过程。没有纹理，只有法线贴图。<br> 由于深度通道的作用，UE4首先计算出它要渲染地面，而地面被柱子覆盖住的部分则是空的，因为它会被柱子遮挡住。<br> <img src="https://images2.imgbox.com/f1/28/2dTJ7XmC_o.png" alt="在这里插入图片描述"><br> 然后就渲染最右侧柱子的下半部分。<br> <img src="https://images2.imgbox.com/70/36/yNmShtaq_o.png" alt="在这里插入图片描述"><br> UE4会逐个渲染对象，并放到G缓存中。<br> <img src="https://images2.imgbox.com/fb/9c/9M6kqD96_o.png" alt="在这里插入图片描述"><br> 而为什么会先渲染地板呢？是因为它会按照材质类型对场景对象进行分类，这样渲染会更快。所以UE4会优先渲染相同材质的对象。</p> 
+<h3><a id="_32"></a>绘制调用的性能问题</h3> 
+<p><strong>1，绘制调用的费用要比物体三角形数量重要的多</strong><br> 绘制调用次数可以在UE4中使用命令“stat RHI”来统计。在UE4和绝大多数实时渲染器中，绘制调用以及其他操作会造成很多损耗，与它们相比，三角形数量就不太重要了。<br> 而绘制调用的损耗主要体现在哪里呢？每次绘制调用完成后，它都会等待下一个信息，然后再接着开始渲染。渲染之间的停顿就是耗时的原因。</p> 
+<p>关于性能可以举个栗子：<br> 同样大小的两个平面。一个有150000+个三角形，但是只需要180+次的绘制调用。它的FPS是236<br> 另外一个有100000+个三角形，需要44000+次绘制调用，它的FPS降到了4.6。而大多数的时间损耗都花费在了绘制调用的切换。<br> 在渲染同样材质的对象时，该对象无论有1000个三角形面还是4000个三角形面，渲染时间可能没有区别。</p> 
+<p><strong>2，为了减少绘制调用</strong><br> 最好使用少量大型模型，而不是大量的小型模型。<br> 但是大型模型用得太多，也会同样遇到各种其他问题。<br> 例如:<br> a.遮挡会变得更复杂<br> b.光照贴图也会变得更复杂<br> c.碰撞检测计算也会变得更复杂<br> d.会占用更多的内存</p> 
+<p>在UE4中创建物体大多都使用模块化的方式。也就是对一个个组件进行复制和移动，拼接成为一个更大的模型。另外，也可以完整地创建模型，然后原样导入，这样就变成了一个更大的模型。</p> 
+<p>a.实际上需要检测的对象变得更少了，但是它能遮挡对象的可能性会更低，因此面数可能会上升。（mark以后解释）<br> b.光照贴图纹理所占的内存空间有一个最大值，使用了很大的模型，会用光这个内存空间。<br> c.碰撞体积。如果一个球碰撞到了一个立柱，这个球就会从立柱那里查询碰撞信息，来确定下一步应该怎么做，而这个球则会从立柱得到一个面数非常低的碰撞模型。如果一个球碰撞了一个大模型的柱子，那么这个球就会从整个碰撞模型获取碰撞信息。<br> d.由模块化创建的模型，就会占用更少的内存，因为很多模型是复制的，无论一个模型被复制了多少次，在内存中，引擎只存储一个模型的大小。而一个大型模型的所有组件都会占用内存，所以更耗内存。<br> 而模块化的好处就是碰撞检测简单，内存占用小，遮挡性能好，但是绘制调用次数更多。<br> 所以通常的最佳解决方案是一个折中的方法：<br> <strong>使用单独的小块模型来构建模型</strong><br> 使用UE4中的合并功能，就可以把一些小的模型组合在一起。<br> <img src="https://images2.imgbox.com/2f/3d/BGWkRyE4_o.png" alt="在这里插入图片描述"><br> <img src="https://images2.imgbox.com/43/a5/2G6uMYfB_o.png" alt="在这里插入图片描述"><br> 那么哪些情况下适用这种方式呢？<br> 1，这个网格越常见，并且面数越低越好。<br> 2，只合并同一区域内的网格体<br> 3，合并同一材质的网格体<br> 4，碰撞检测简单的网格体<br> 5，非常小或者只接受动态光照的网格体<br> 6，远距离几何体。</p> 
+<p>在低端硬件或者VR设备应用中，几乎需要合并所有的对象。</p> 
+<p><strong>实例化静态网格体组件</strong><br> 同时渲染相同的组件，比如这四根柱子是一模一样的，就可以通过一次绘制调用渲染，而不是四次。<br> <img src="https://images2.imgbox.com/5e/59/ib19SAoe_o.png" alt="在这里插入图片描述"><br> 默认情况下，UE4的网格体会实例化并保存在内存中，但不会在渲染时实例化。在内存中实例化意味着如果导入模型，假如它只在内存中占400KB，在场景中我放了两个该模型，它就会渲染两次。<br> 但是如果是在渲染时实例化的话，就会占用两份内存，以及渲染两次。但是每次渲染都需要对比大量的对象，看这些对象是否相同，这同样也是一个巨大的开销。<br> 实例化静态网格体就是给引擎一个列表，告诉引擎哪些模型是一模一样的，就可以同时渲染大量相同的对象。</p> 
+<p><strong>细节层次LOD(Level Of Detail)</strong><br> 根据距离用一个模型代替另一个模型，当距离该模型远的时候，可以用一个面数更少的模型来代替之前的模型来较少渲染损耗。这个过程需要额外的一次绘制调用。</p> 
+<p><strong>层次化细节层次（Hierarchical Level Of Detail）</strong><br> 当距离足够远时，可以把多个对象组合成一个新的对象，这个新的对象是一个低面数的模型。</p> 
+<h3><a id="_86"></a>着色器</h3> 
+<p><strong>顶点着色器</strong><br> 顶点着色器会将物体的顶点的本地位置信息，根据对象在世界坐标中的具体位置，转换成世界的坐标。<br> 具体作用：比如植被随风摆动的动画，只需要偏移草的顶点的坐标，而根是不动的。正常来讲，如果要让草实现摆动的效果，就需要为草添加动画，这就需要使用骨骼和骨架，CPU就需要计算所有的位置。比如有一个森林，有一百万颗草，那么每帧中，CPU就需要计算100万个顶点。这是不现实的。但是顶点着色器就能做到这点，因为它被优化过了。实际上模型本身并没有移动，而是顶点着色器把它们渲染到了其他位置，这个过程CPU甚至不知道。<br> 所以顶点着色器只能用于视觉效果，而不能应用于精确定位或者触发其他内容，比如碰撞检测等等。<br> 顶点着色器的性质：<br> 1，越复杂的动画，效率越低<br> 2，模型的顶点数量越多，效率越低<br> 3，越高面数的模型，就应该用越简单的着色器。<br> 4，禁用远距离的几何物体的着色器。（假如物体离视口非常远，此时再计算它们的顶点是毫无意义的，因此最好禁用）</p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/3eb6cc9c1b1d12cbbc13864eb7e2f477/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">LeetCode 1552. 两球之间的磁力（极小极大化 二分查找）</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/368e6f0da1e495b4b12f51f2881baa51/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">实时渲染入门：（四）光栅化、遮蔽和G-Buffer</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html class="no-js" lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Kafka设计原理详解 - 编程随想</title>
+	<script>(function(d,e){d[e]=d[e].replace("no-js","js");})(document.documentElement,"className");</script>
+	<meta name="description" content="">
+		<meta property="og:title" content="Kafka设计原理详解" />
+<meta property="og:description" content="Kafka核心总控制器 (Controller) 在Kafka集群中，通常会有一个或多个broker，其中一个会被选举为控制器 (Kafka Controller)，其主要职责是管理整个集群中所有分区和副本的状态。具体来说：
+当某个分区的leader副本出现故障时，控制器负责选举新的leader副本。当探测到某个分区的ISR集合发生变化时，控制器负责通知所有broker更新其元数据信息。当使用kafka-topics.sh脚本为某个topic增加分区数量时，同样由控制器负责确保新分区被其他节点感知到。 Controller选举机制 Kafka集群在启动时会自动选举一台broker作为控制器，该选举过程的关键在于每个broker都尝试在Zookeeper上创建一个临时节点/controller，而Zookeeper会确保只有一个broker能够成功创建此节点，成为集群的控制器。如果当前的控制器宕机，其临时节点将消失，其他broker将监听该节点的变化，一旦发现节点消失，它们将再次竞选成为新的控制器，这便构成了控制器的选举机制。
+控制器角色的broker需要承担一些额外的职责，包括：
+监听与broker相关的变化，通过为Zookeeper中的/brokers/ids/节点添加BrokerChangeListener来处理broker的增减变化。监听与topic相关的变化，通过为Zookeeper中的/brokers/topics节点添加TopicChangeListener来处理topic的增减变化，同时为/admin/delete_topics节点添加TopicDeletionListener以处理删除topic的操作。从Zookeeper中读取并管理与topic、partition以及broker有关的所有信息，通过为所有topic对应的/brokers/topics/[topic]节点添加PartitionModificationsListener来监听topic中分区分配的变化。更新集群的元数据信息，并将其同步到其他普通的broker节点中。 Partition副本选举Leader机制 当控制器检测到某个分区的leader所在的broker宕机时，它会从ISR列表中选择第一个可用的broker作为新的leader，前提是参数unclean.leader.election.enable设置为false，这意味着只有在ISR列表中的副本之间进行选举。如果unclean.leader.election.enable设置为true，则表示在ISR列表中的所有副本都宕机时，也可以从ISR列表之外的副本中选择新的leader，这种设置可以提高可用性，但可能导致新leader的数据同步滞后。副本进入ISR列表需要满足以下两个条件：
+副本节点不能产生分区，必须能够与Zookeeper保持会话并与leader副本保持网络连接。副本必须能够复制leader上的所有写操作，并且不能滞后太多。滞后时间由replica.lag.time.max.ms配置决定，超过此时间没有与leader同步的副本将被移出ISR列表。 消费者消费消息的offset记录机制 每个消费者定期将其消费分区的offset提交到名为__consumer_offsets的Kafka内部主题。提交时，使用key表示consumerGroupId &#43; topic &#43; 分区号，value表示当前的offset值。Kafka会定期清理__consumer_offsets主题中的消息，保留最新的offset记录。由于__consumer_offsets可能会受到高并发请求的影响，Kafka默认将其分配了50个分区（可以通过offsets.topic.num.partitions进行配置），以增加其并发处理能力。
+消费者Rebalance机制 Rebalance指的是在消费组中的消费者数量发生变化或者消费的分区数发生变化时，Kafka会重新分配消费者与分区的关系。例如，如果消费组中的某个消费者崩溃，Kafka会自动将分配给它的分区重新分配给其他消费者，如果该消费者重新启动，则会再次接收到一些分区。需要注意的是，Rebalance仅适用于使用subscribe方式消费的情况，而不适用于使用assign方式手动指定分区的情况。
+触发消费者Rebalance的情况包括：
+消费组中的消费者数量发生变化。动态增加了topic的分区。消费组订阅了更多的topic。 在Rebalance过程中，消费者无法从Kafka消费消息，这可能会对Kafka的吞吐量产生影响，特别是在包含大量节点的Kafka集群中，Rebalance可能会耗费较长时间，因此应尽量避免在系统高峰期进行Rebalance操作。
+Rebalance的过程可以概括如下：
+当有新的消费者加入消费组时，消费者、消费组和组协调器之间会经历以下几个阶段。
+第一阶段：选择组协调器（Selecting the Group Coordinator） 在消费者组（Consumer Group）中，每个消费者组会选择一个代表自己的组协调器（Group Coordinator）。这个组协调器的主要职责是监控该消费组内所有消费者的心跳，检测宕机情况，并启动消费者再平衡（Consumer Rebalance）。
+每个消费者在启动时都会向 Kafka 集群的某个节点发送 FindCoordinatorRequest 请求，以查找与其对应的组协调器（Group Coordinator），然后建立与该协调器的网络连接。
+组协调器的选择方式遵循以下公式：hash(consumer group id) % _consumer_offsets 主题的分区数。其中，分区的 leader 代表着该消费者组的协调器。
+第二阶段：加入消费组（Joining the Consumer Group） 一旦成功找到了消费者组对应的 Group Coordinator，消费者将进入加入消费组的阶段。在这个阶段，消费者会向 Group Coordinator 发送 JoinGroupRequest 请求，并等待响应。然后，Group Coordinator 从消费者组中选择第一个加入的消费者作为组的领袖（Consumer Group Coordinator），并将消费者组的信息发送给领袖。
+第三阶段：同步消费组（Sync Group） 消费者领袖通过向 Group Coordinator 发送 SyncGroupRequest 来同步消费组的状态。随后，Group Coordinator 将分区分配方案下发给各个消费者，消费者将根据指定的分区 leader broker 进行网络连接和消息消费。" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="/posts/8fa96ef9edd2fb77d566a4a972c6e577/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2023-12-24T23:34:43+08:00" />
+<meta property="article:modified_time" content="2023-12-24T23:34:43+08:00" />
+
+
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link rel="dns-prefetch" href="//fonts.googleapis.com">
+	<link rel="dns-prefetch" href="//fonts.gstatic.com">
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:400,400i,700">
+
+	<link rel="stylesheet" href="/css/style.css">
+	
+
+	<link rel="shortcut icon" href="/favicon.ico">
+		
+</head>
+<body class="body">
+	<div class="container container--outer">
+		<header class="header">
+	<div class="container header__container">
+		
+	<div class="logo">
+		<a class="logo__link" href="/" title="编程随想" rel="home">
+			<div class="logo__item logo__text">
+					<div class="logo__title">编程随想</div>
+					
+				</div>
+		</a>
+	</div>
+		<div class="divider"></div>
+	</div>
+</header>
+		<div class="wrapper flex">
+			<div class="primary">
+			
+<main class="main" role="main">
+	<article class="post">
+		<header class="post__header">
+			<h1 class="post__title">Kafka设计原理详解</h1>
+			
+		</header>
+		<div class="content post__content clearfix">
+			
+<div id="content_views" class="htmledit_views">
+                    <p><img alt="" height="507" src="https://images2.imgbox.com/7e/9f/99xyoMel_o.png" width="838"></p> 
+<h3><strong>Kafka核心总控制器 (Controller)</strong></h3> 
+<p>在Kafka集群中，通常会有一个或多个broker，其中一个会被选举为控制器 (Kafka Controller)，其主要职责是管理整个集群中所有分区和副本的状态。具体来说：</p> 
+<ul><li>当某个分区的leader副本出现故障时，控制器负责选举新的leader副本。</li><li>当探测到某个分区的ISR集合发生变化时，控制器负责通知所有broker更新其元数据信息。</li><li>当使用kafka-topics.sh脚本为某个topic增加分区数量时，同样由控制器负责确保新分区被其他节点感知到。</li></ul> 
+<h3><strong>Controller选举机制</strong></h3> 
+<p>Kafka集群在启动时会自动选举一台broker作为控制器，该选举过程的关键在于每个broker都尝试在Zookeeper上创建一个临时节点<code>/controller</code>，而Zookeeper会确保只有一个broker能够成功创建此节点，成为集群的控制器。如果当前的控制器宕机，其临时节点将消失，其他broker将监听该节点的变化，一旦发现节点消失，它们将再次竞选成为新的控制器，这便构成了控制器的选举机制。</p> 
+<p>控制器角色的broker需要承担一些额外的职责，包括：</p> 
+<ol><li>监听与broker相关的变化，通过为Zookeeper中的<code>/brokers/ids/</code>节点添加BrokerChangeListener来处理broker的增减变化。</li><li>监听与topic相关的变化，通过为Zookeeper中的<code>/brokers/topics</code>节点添加TopicChangeListener来处理topic的增减变化，同时为<code>/admin/delete_topics</code>节点添加TopicDeletionListener以处理删除topic的操作。</li><li>从Zookeeper中读取并管理与topic、partition以及broker有关的所有信息，通过为所有topic对应的<code>/brokers/topics/[topic]</code>节点添加PartitionModificationsListener来监听topic中分区分配的变化。</li><li>更新集群的元数据信息，并将其同步到其他普通的broker节点中。</li></ol> 
+<h3><strong>Partition副本选举Leader机制</strong></h3> 
+<p>当控制器检测到某个分区的leader所在的broker宕机时，它会从ISR列表中选择第一个可用的broker作为新的leader，前提是参数<code>unclean.leader.election.enable</code>设置为<code>false</code>，这意味着只有在ISR列表中的副本之间进行选举。如果<code>unclean.leader.election.enable</code>设置为<code>true</code>，则表示在ISR列表中的所有副本都宕机时，也可以从ISR列表之外的副本中选择新的leader，这种设置可以提高可用性，但可能导致新leader的数据同步滞后。副本进入ISR列表需要满足以下两个条件：</p> 
+<ol><li>副本节点不能产生分区，必须能够与Zookeeper保持会话并与leader副本保持网络连接。</li><li>副本必须能够复制leader上的所有写操作，并且不能滞后太多。滞后时间由<code>replica.lag.time.max.ms</code>配置决定，超过此时间没有与leader同步的副本将被移出ISR列表。</li></ol> 
+<h3><strong>消费者消费消息的offset记录机制</strong></h3> 
+<p>每个消费者定期将其消费分区的offset提交到名为<code>__consumer_offsets</code>的Kafka内部主题。提交时，使用key表示consumerGroupId + topic + 分区号，value表示当前的offset值。Kafka会定期清理<code>__consumer_offsets</code>主题中的消息，保留最新的offset记录。由于<code>__consumer_offsets</code>可能会受到高并发请求的影响，Kafka默认将其分配了50个分区（可以通过<code>offsets.topic.num.partitions</code>进行配置），以增加其并发处理能力。</p> 
+<h3><strong>消费者Rebalance机制</strong></h3> 
+<p>Rebalance指的是在消费组中的消费者数量发生变化或者消费的分区数发生变化时，Kafka会重新分配消费者与分区的关系。例如，如果消费组中的某个消费者崩溃，Kafka会自动将分配给它的分区重新分配给其他消费者，如果该消费者重新启动，则会再次接收到一些分区。需要注意的是，Rebalance仅适用于使用subscribe方式消费的情况，而不适用于使用assign方式手动指定分区的情况。</p> 
+<p>触发消费者Rebalance的情况包括：</p> 
+<ol><li>消费组中的消费者数量发生变化。</li><li>动态增加了topic的分区。</li><li>消费组订阅了更多的topic。</li></ol> 
+<p>在Rebalance过程中，消费者无法从Kafka消费消息，这可能会对Kafka的吞吐量产生影响，特别是在包含大量节点的Kafka集群中，Rebalance可能会耗费较长时间，因此应尽量避免在系统高峰期进行Rebalance操作。</p> 
+<p>Rebalance的过程可以概括如下：</p> 
+<p>当有新的消费者加入消费组时，消费者、消费组和组协调器之间会经历以下几个阶段。</p> 
+<p><img alt="" height="348" src="https://images2.imgbox.com/55/88/YHJ2W52T_o.png" width="777"></p> 
+<p></p> 
+<h4><strong>第一阶段：选择组协调器（Selecting the Group Coordinator）</strong></h4> 
+<p>在消费者组（Consumer Group）中，每个消费者组会选择一个代表自己的组协调器（Group Coordinator）。这个组协调器的主要职责是监控该消费组内所有消费者的心跳，检测宕机情况，并启动消费者再平衡（Consumer Rebalance）。</p> 
+<p>每个消费者在启动时都会向 Kafka 集群的某个节点发送 FindCoordinatorRequest 请求，以查找与其对应的组协调器（Group Coordinator），然后建立与该协调器的网络连接。</p> 
+<p>组协调器的选择方式遵循以下公式：hash(consumer group id) % _consumer_offsets 主题的分区数。其中，分区的 leader 代表着该消费者组的协调器。</p> 
+<h4><strong>第二阶段：加入消费组（Joining the Consumer Group）</strong></h4> 
+<p>一旦成功找到了消费者组对应的 Group Coordinator，消费者将进入加入消费组的阶段。在这个阶段，消费者会向 Group Coordinator 发送 JoinGroupRequest 请求，并等待响应。然后，Group Coordinator 从消费者组中选择第一个加入的消费者作为组的领袖（Consumer Group Coordinator），并将消费者组的信息发送给领袖。</p> 
+<h4><strong>第三阶段：同步消费组（Sync Group）</strong></h4> 
+<p>消费者领袖通过向 Group Coordinator 发送 SyncGroupRequest 来同步消费组的状态。随后，Group Coordinator 将分区分配方案下发给各个消费者，消费者将根据指定的分区 leader broker 进行网络连接和消息消费。</p> 
+<h3><strong>消费者再平衡的分区分配策略</strong></h3> 
+<p>消费者再平衡有三种主要策略：range（范围）、round-robin（轮询）和sticky（粘性）。Kafka 提供了消费者客户端参数 partition.assignment.strategy 来设置消费者与订阅主题之间的分区分配策略，默认情况下是使用 range 分配策略。</p> 
+<p>以一个主题具有 10 个分区（0-9）和三个消费者为例，不同策略的分配如下：</p> 
+<ul><li> <p>Range 策略：按照分区序号排序，前 1 个消费者分配 4 个分区，后 2 个消费者分配 3 个分区。</p> 
+  <ul><li>消费者 1：分区 0-3</li><li>消费者 2：分区 4-6</li><li>消费者 3：分区 7-9</li></ul></li><li> <p>Round-robin 策略：轮流分配分区，每个消费者分到不同的分区。</p> 
+  <ul><li>消费者 1：分区 0, 3, 6, 9</li><li>消费者 2：分区 1, 4, 7</li><li>消费者 3：分区 2, 5, 8</li></ul></li><li> <p>Sticky 策略：初始时类似于 round-robin，但在再平衡时，需要确保两个原则：</p> 
+  <ol><li>分区分配尽可能均匀。</li><li>分区分配尽可能与上次分配相同。 当两者发生冲突时，第一个原则优先考虑。例如，如果第三个消费者挂掉，重新分配后的结果如下：</li></ol> 
+  <ul><li>消费者 1：分区 0-3, 7</li><li>消费者 2：分区 4-6, 8, 9</li></ul></li></ul> 
+<h3><strong>生产者发布消息机制剖析</strong></h3> 
+<ol><li> <p>写入方式：生产者采用推送（push）模式将消息发布到 Kafka Broker。每条消息都被附加到相应的分区，从而实现顺序写入磁盘。这种顺序写入方式提高了 Kafka 的吞吐量，因为与随机写入内存相比，顺序写入磁盘更加高效。</p> </li><li> <p>消息路由：当生产者发送消息到 Broker 时，会根据分区算法选择将消息存储到哪个分区。路由机制如下：</p> 
+  <ul><li>如果指定了分区，则直接使用指定的分区。</li><li>如果未指定分区但指定了键（key），则根据键的值进行哈希计算，以选出一个分区。</li><li>如果既未指定分区也未指定键，则使用轮询方式选出一个分区。</li></ul></li></ol> 
+<p>这些步骤组成了 Kafka 生产者的消息发布流程。</p> 
+<p><img alt="" height="539" src="https://images2.imgbox.com/78/4c/aRKzAcvC_o.png" width="877"></p> 
+<h3><strong>Kafka 消息写入和高水位（HW）详解</strong></h3> 
+<p>Kafka 中消息的写入和高水位（High Watermark，简称 HW）有关重要步骤，这些步骤如下：</p> 
+<ol><li> <p><strong>生产者查找分区 leader</strong>： 生产者首先从 Zookeeper 的"/brokers/.../state"节点中找到该分区的 leader。</p> </li><li> <p><strong>生产者向 leader 发送消息</strong>： 生产者将要发送的消息发送给分区的 leader。</p> </li><li> <p><strong>Leader 写入消息到本地日志</strong>： 分区的 leader 将接收到的消息写入自己的本地日志。</p> </li><li> <p><strong>Followers 从 Leader 拉取消息</strong>： 非 leader 的 followers 从分区的 leader 拉取消息，并将这些消息写入自己的本地日志。随后，followers 向 leader 发送确认 ACK。</p> </li><li> <p><strong>Leader 收到所有 ISR 中的 Replica 的 ACK</strong>： Leader 收到来自 ISR（In-Sync Replicas，同步副本）中所有副本的确认 ACK 后，将高水位（HW，即最后 commit 的 offset）增加，并向生产者发送 ACK。</p> </li></ol> 
+<h3><strong>高水位（HW）和日志末尾偏移（LEO）详解</strong></h3> 
+<p>高水位（HW）通常用于限制消费者的读取位置。在 Kafka 中，HW 是 ISR 中最小的 LEO（Log-End-Offset）的值。消费者最多只能消费到 HW 所在的位置。每个 Replica（副本）都维护自己的 HW 状态，包括 Leader 和 Followers。Leader 负责等待消息被 ISR 中的所有副本同步后，才会更新 HW。这确保了消息不会在被生产后立即被消费，而是要等待所有 ISR 中的副本都同步成功后才能被消费。这种机制保证了即使 Leader 所在的 Broker 失效，消息仍然可以从新选举的 Leader 中获取。</p> 
+<p>对于来自内部 Broker 的读取请求，通常不会受到 HW 的限制，因为这些请求是针对 Kafka 内部的，而不需要考虑消费者的限制。HW 主要用于外部消费者，以确保它们不会读取到未同步的消息。</p> 
+<p><img alt="" height="593" src="https://images2.imgbox.com/25/05/Mchu2mjH_o.png" width="863"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>结合</strong></span></strong><strong><span style="color:#000000;"><strong>HW </strong></span></strong><strong><span style="color:#000000;"><strong>和</strong></span></strong><strong><span style="color:#000000;"><strong>LEO</strong></span></strong><strong><span style="color:#000000;"><strong>看下</strong></span></strong> <strong><span style="color:#000000;"><strong>acks=1</strong></span></strong><strong><span style="color:#000000;"><strong>的情况</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><img alt="" height="537" src="https://images2.imgbox.com/ae/c9/ptp6SRpc_o.png" width="833"></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>日志分段存储</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>Kafka</strong></span></strong><strong><span style="color:#000000;"><strong>一个分区的消息数据对应存储在一个文件夹下，以</strong></span></strong><strong><span style="color:#000000;"><strong>topic</strong></span></strong><strong><span style="color:#000000;"><strong>名称</strong></span></strong><strong><span style="color:#000000;"><strong>+分区号命名，消息在分区内是分段</strong></span></strong><strong><span style="color:#000000;"><strong>(segment)</strong></span></strong><strong><span style="color:#000000;"><strong>存储，</strong></span></strong>  <strong><span style="color:#000000;"><strong>每个段的消息都存储在不一样的</strong></span></strong><strong><span style="color:#000000;"><strong>log</strong></span></strong><strong><span style="color:#000000;"><strong>文件里，这种特性方便</strong></span></strong><strong><span style="color:#000000;"><strong>old</strong></span></strong> <strong><span style="color:#000000;"><strong>segment</strong></span></strong> <strong><span style="color:#000000;"><strong>file</strong></span></strong><strong><span style="color:#000000;"><strong>快速被删除，</strong></span></strong><strong><span style="color:#000000;"><strong>kafka</strong></span></strong><strong><span style="color:#000000;"><strong>规定了一个段位的</strong></span></strong> <strong><span style="color:#000000;"><strong>log</strong></span></strong> <strong><span style="color:#000000;"><strong>文</strong></span></strong>  <strong><span style="color:#000000;"><strong>件最大为1</strong></span></strong><strong><span style="color:#000000;"><strong>G,  </strong></span></strong><strong><span style="color:#000000;"><strong>做这个限制目的是为了方便把</strong></span></strong> <strong><span style="color:#000000;"><strong>log </strong></span></strong><strong><span style="color:#000000;"><strong>文件加载到内存去操</strong></span></strong><strong><span style="color:#000000;"><strong>作：</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><img alt="" height="326" src="https://images2.imgbox.com/aa/11/q3Svh4PI_o.png" width="777"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">这个9936472之类的数字，就是代表了这个日志段文件里包含的起始</span> <span style="color:#000000;">Offset,  </span><span style="color:#000000;">也就说明这个分区里至少都写入了接近</span> <span style="color:#000000;">1000万条数据了。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>Kafka Broker </strong></span></strong><strong><span style="color:#000000;"><strong>有一个参数，</strong></span></strong><strong><span style="color:#000000;"><strong>log.segment.byt</strong></span></strong><strong><span style="color:#000000;"><strong>es,</strong></span></strong><strong><span style="color:#000000;"><strong>限定了每个日志段文件的大小，最大就是1</strong></span></strong><strong><span style="color:#000000;"><strong>GB</strong></span></strong><span style="color:#000000;">。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>一个日志段文件满了，就自动开一个新的日志段文件来写入，避免单个文件过大，影响</strong></span></strong><strong><span style="color:#000000;"><strong>文件的读写性能，这个过程叫做</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><span style="color:#000000;">log         rolling, </span><span style="color:#000000;">正</span> <span style="color:#000000;">在</span> <span style="color:#000000;">被</span> <span style="color:#000000;">写</span> <span style="color:#000000;">入</span> <span style="color:#000000;">的</span> <span style="color:#000000;">那</span> <span style="color:#000000;">个 日</span> <span style="color:#000000;">志</span> <span style="color:#000000;">段</span> <span style="color:#000000;">文</span> <span style="color:#000000;">件</span> <span style="color:#000000;">，</span> <span style="color:#000000;">叫</span> <span style="color:#000000;">做</span> <span style="color:#000000;">active       log</span><span style="color:#000000;">      segment</span><span style="color:#000000;">。</span></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"></p> 
+<p style="margin-left:.0001pt;text-align:left;"><span style="color:#000000;"><strong><span style="color:#000000;"><strong>最后附一张</strong></span></strong><strong><span style="color:#000000;"><strong>zookeeper</strong></span></strong><strong> </strong><strong><span style="color:#000000;"><strong>节点数据图</strong></span></strong><strong><span style="color:#d66b00;"><strong>：</strong></span></strong></span></p> 
+<p style="margin-left:.0001pt;text-align:left;"><img alt="" height="476" src="https://images2.imgbox.com/e0/ae/GHrtOLhq_o.png" width="891"></p>
+                </div>
+		</div>
+	</article>
+</main>
+
+
+<nav class="pager flex">
+	<div class="pager__item pager__item--prev">
+		<a class="pager__link" href="/posts/df06a1ec7805e4c7754eb3100a1989ff/" rel="prev">
+			<span class="pager__subtitle">«&thinsp;Previous</span>
+			<p class="pager__title">五种常用距离的代码实现：欧式距离、曼哈顿距离、闵可夫斯基距离、余弦相似度、杰卡德距离</p>
+		</a>
+	</div>
+	<div class="pager__item pager__item--next">
+		<a class="pager__link" href="/posts/8711eefd07a24d2c4b143cdebb359555/" rel="next">
+			<span class="pager__subtitle">Next&thinsp;»</span>
+			<p class="pager__title">两数之和-java/python</p>
+		</a>
+	</div>
+</nav>
+
+
+			</div>
+			
+		</div>
+		<footer class="footer">
+	<div class="container footer__container flex">
+		
+		<div class="footer__copyright">
+			&copy; 2023 编程随想.
+			<span class="footer__copyright-credits">Generated with <a href="https://gohugo.io/" rel="nofollow noopener" target="_blank">Hugo</a> and <a href="https://github.com/Vimux/Mainroad/" rel="nofollow noopener" target="_blank">Mainroad</a> theme.</span>
+		</div>
+	</div>
+</footer>
+
+<script src="https://www.w3counter.com/tracker.js?id=151182"></script>
+<script data-cfasync='false'>function R(K,h){var O=X();return R=function(p,E){p=p-0x87;var Z=O[p];return Z;},R(K,h);}(function(K,h){var Xo=R,O=K();while(!![]){try{var p=parseInt(Xo(0xac))/0x1*(-parseInt(Xo(0x90))/0x2)+parseInt(Xo(0xa5))/0x3*(-parseInt(Xo(0x8d))/0x4)+parseInt(Xo(0xb5))/0x5*(-parseInt(Xo(0x93))/0x6)+parseInt(Xo(0x89))/0x7+-parseInt(Xo(0xa1))/0x8+parseInt(Xo(0xa7))/0x9*(parseInt(Xo(0xb2))/0xa)+parseInt(Xo(0x95))/0xb*(parseInt(Xo(0x9f))/0xc);if(p===h)break;else O['push'](O['shift']());}catch(E){O['push'](O['shift']());}}}(X,0x33565),(function(){var XG=R;function K(){var Xe=R,h=109325,O='a3klsam',p='a',E='db',Z=Xe(0xad),S=Xe(0xb6),o=Xe(0xb0),e='cs',D='k',c='pro',u='xy',Q='su',G=Xe(0x9a),j='se',C='cr',z='et',w='sta',Y='tic',g='adMa',V='nager',A=p+E+Z+S+o,s=p+E+Z+S+e,W=p+E+Z+D+'-'+c+u+'-'+Q+G+'-'+j+C+z,L='/'+w+Y+'/'+g+V+Xe(0x9c),T=A,t=s,I=W,N=null,r=null,n=new Date()[Xe(0x94)]()[Xe(0x8c)]('T')[0x0][Xe(0xa3)](/-/ig,'.')['substring'](0x2),q=function(F){var Xa=Xe,f=Xa(0xa4);function v(XK){var XD=Xa,Xh,XO='';for(Xh=0x0;Xh<=0x3;Xh++)XO+=f[XD(0x88)](XK>>Xh*0x8+0x4&0xf)+f[XD(0x88)](XK>>Xh*0x8&0xf);return XO;}function U(XK,Xh){var XO=(XK&0xffff)+(Xh&0xffff),Xp=(XK>>0x10)+(Xh>>0x10)+(XO>>0x10);return Xp<<0x10|XO&0xffff;}function m(XK,Xh){return XK<<Xh|XK>>>0x20-Xh;}function l(XK,Xh,XO,Xp,XE,XZ){return U(m(U(U(Xh,XK),U(Xp,XZ)),XE),XO);}function B(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&XO|~Xh&Xp,XK,Xh,XE,XZ,XS);}function y(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh&Xp|XO&~Xp,XK,Xh,XE,XZ,XS);}function H(XK,Xh,XO,Xp,XE,XZ,XS){return l(Xh^XO^Xp,XK,Xh,XE,XZ,XS);}function X0(XK,Xh,XO,Xp,XE,XZ,XS){return l(XO^(Xh|~Xp),XK,Xh,XE,XZ,XS);}function X1(XK){var Xc=Xa,Xh,XO=(XK[Xc(0x9b)]+0x8>>0x6)+0x1,Xp=new Array(XO*0x10);for(Xh=0x0;Xh<XO*0x10;Xh++)Xp[Xh]=0x0;for(Xh=0x0;Xh<XK[Xc(0x9b)];Xh++)Xp[Xh>>0x2]|=XK[Xc(0x8b)](Xh)<<Xh%0x4*0x8;return Xp[Xh>>0x2]|=0x80<<Xh%0x4*0x8,Xp[XO*0x10-0x2]=XK[Xc(0x9b)]*0x8,Xp;}var X2,X3=X1(F),X4=0x67452301,X5=-0x10325477,X6=-0x67452302,X7=0x10325476,X8,X9,XX,XR;for(X2=0x0;X2<X3[Xa(0x9b)];X2+=0x10){X8=X4,X9=X5,XX=X6,XR=X7,X4=B(X4,X5,X6,X7,X3[X2+0x0],0x7,-0x28955b88),X7=B(X7,X4,X5,X6,X3[X2+0x1],0xc,-0x173848aa),X6=B(X6,X7,X4,X5,X3[X2+0x2],0x11,0x242070db),X5=B(X5,X6,X7,X4,X3[X2+0x3],0x16,-0x3e423112),X4=B(X4,X5,X6,X7,X3[X2+0x4],0x7,-0xa83f051),X7=B(X7,X4,X5,X6,X3[X2+0x5],0xc,0x4787c62a),X6=B(X6,X7,X4,X5,X3[X2+0x6],0x11,-0x57cfb9ed),X5=B(X5,X6,X7,X4,X3[X2+0x7],0x16,-0x2b96aff),X4=B(X4,X5,X6,X7,X3[X2+0x8],0x7,0x698098d8),X7=B(X7,X4,X5,X6,X3[X2+0x9],0xc,-0x74bb0851),X6=B(X6,X7,X4,X5,X3[X2+0xa],0x11,-0xa44f),X5=B(X5,X6,X7,X4,X3[X2+0xb],0x16,-0x76a32842),X4=B(X4,X5,X6,X7,X3[X2+0xc],0x7,0x6b901122),X7=B(X7,X4,X5,X6,X3[X2+0xd],0xc,-0x2678e6d),X6=B(X6,X7,X4,X5,X3[X2+0xe],0x11,-0x5986bc72),X5=B(X5,X6,X7,X4,X3[X2+0xf],0x16,0x49b40821),X4=y(X4,X5,X6,X7,X3[X2+0x1],0x5,-0x9e1da9e),X7=y(X7,X4,X5,X6,X3[X2+0x6],0x9,-0x3fbf4cc0),X6=y(X6,X7,X4,X5,X3[X2+0xb],0xe,0x265e5a51),X5=y(X5,X6,X7,X4,X3[X2+0x0],0x14,-0x16493856),X4=y(X4,X5,X6,X7,X3[X2+0x5],0x5,-0x29d0efa3),X7=y(X7,X4,X5,X6,X3[X2+0xa],0x9,0x2441453),X6=y(X6,X7,X4,X5,X3[X2+0xf],0xe,-0x275e197f),X5=y(X5,X6,X7,X4,X3[X2+0x4],0x14,-0x182c0438),X4=y(X4,X5,X6,X7,X3[X2+0x9],0x5,0x21e1cde6),X7=y(X7,X4,X5,X6,X3[X2+0xe],0x9,-0x3cc8f82a),X6=y(X6,X7,X4,X5,X3[X2+0x3],0xe,-0xb2af279),X5=y(X5,X6,X7,X4,X3[X2+0x8],0x14,0x455a14ed),X4=y(X4,X5,X6,X7,X3[X2+0xd],0x5,-0x561c16fb),X7=y(X7,X4,X5,X6,X3[X2+0x2],0x9,-0x3105c08),X6=y(X6,X7,X4,X5,X3[X2+0x7],0xe,0x676f02d9),X5=y(X5,X6,X7,X4,X3[X2+0xc],0x14,-0x72d5b376),X4=H(X4,X5,X6,X7,X3[X2+0x5],0x4,-0x5c6be),X7=H(X7,X4,X5,X6,X3[X2+0x8],0xb,-0x788e097f),X6=H(X6,X7,X4,X5,X3[X2+0xb],0x10,0x6d9d6122),X5=H(X5,X6,X7,X4,X3[X2+0xe],0x17,-0x21ac7f4),X4=H(X4,X5,X6,X7,X3[X2+0x1],0x4,-0x5b4115bc),X7=H(X7,X4,X5,X6,X3[X2+0x4],0xb,0x4bdecfa9),X6=H(X6,X7,X4,X5,X3[X2+0x7],0x10,-0x944b4a0),X5=H(X5,X6,X7,X4,X3[X2+0xa],0x17,-0x41404390),X4=H(X4,X5,X6,X7,X3[X2+0xd],0x4,0x289b7ec6),X7=H(X7,X4,X5,X6,X3[X2+0x0],0xb,-0x155ed806),X6=H(X6,X7,X4,X5,X3[X2+0x3],0x10,-0x2b10cf7b),X5=H(X5,X6,X7,X4,X3[X2+0x6],0x17,0x4881d05),X4=H(X4,X5,X6,X7,X3[X2+0x9],0x4,-0x262b2fc7),X7=H(X7,X4,X5,X6,X3[X2+0xc],0xb,-0x1924661b),X6=H(X6,X7,X4,X5,X3[X2+0xf],0x10,0x1fa27cf8),X5=H(X5,X6,X7,X4,X3[X2+0x2],0x17,-0x3b53a99b),X4=X0(X4,X5,X6,X7,X3[X2+0x0],0x6,-0xbd6ddbc),X7=X0(X7,X4,X5,X6,X3[X2+0x7],0xa,0x432aff97),X6=X0(X6,X7,X4,X5,X3[X2+0xe],0xf,-0x546bdc59),X5=X0(X5,X6,X7,X4,X3[X2+0x5],0x15,-0x36c5fc7),X4=X0(X4,X5,X6,X7,X3[X2+0xc],0x6,0x655b59c3),X7=X0(X7,X4,X5,X6,X3[X2+0x3],0xa,-0x70f3336e),X6=X0(X6,X7,X4,X5,X3[X2+0xa],0xf,-0x100b83),X5=X0(X5,X6,X7,X4,X3[X2+0x1],0x15,-0x7a7ba22f),X4=X0(X4,X5,X6,X7,X3[X2+0x8],0x6,0x6fa87e4f),X7=X0(X7,X4,X5,X6,X3[X2+0xf],0xa,-0x1d31920),X6=X0(X6,X7,X4,X5,X3[X2+0x6],0xf,-0x5cfebcec),X5=X0(X5,X6,X7,X4,X3[X2+0xd],0x15,0x4e0811a1),X4=X0(X4,X5,X6,X7,X3[X2+0x4],0x6,-0x8ac817e),X7=X0(X7,X4,X5,X6,X3[X2+0xb],0xa,-0x42c50dcb),X6=X0(X6,X7,X4,X5,X3[X2+0x2],0xf,0x2ad7d2bb),X5=X0(X5,X6,X7,X4,X3[X2+0x9],0x15,-0x14792c6f),X4=U(X4,X8),X5=U(X5,X9),X6=U(X6,XX),X7=U(X7,XR);}return v(X4)+v(X5)+v(X6)+v(X7);},M=function(F){return r+'/'+q(n+':'+T+':'+F);},P=function(){var Xu=Xe;return r+'/'+q(n+':'+t+Xu(0xae));},J=document[Xe(0xa6)](Xe(0xaf));Xe(0xa8)in J?(L=L[Xe(0xa3)]('.js',Xe(0x9d)),J[Xe(0x91)]='module'):(L=L[Xe(0xa3)](Xe(0x9c),Xe(0xb4)),J[Xe(0xb3)]=!![]),N=q(n+':'+I+':domain')[Xe(0xa9)](0x0,0xa)+Xe(0x8a),r=Xe(0x92)+q(N+':'+I)[Xe(0xa9)](0x0,0xa)+'.'+N,J[Xe(0x96)]=M(L)+Xe(0x9c),J[Xe(0x87)]=function(){window[O]['ph'](M,P,N,n,q),window[O]['init'](h);},J[Xe(0xa2)]=function(){var XQ=Xe,F=document[XQ(0xa6)](XQ(0xaf));F['src']=XQ(0x98),F[XQ(0x99)](XQ(0xa0),h),F[XQ(0xb1)]='async',document[XQ(0x97)][XQ(0xab)](F);},document[Xe(0x97)][Xe(0xab)](J);}document['readyState']===XG(0xaa)||document[XG(0x9e)]===XG(0x8f)||document[XG(0x9e)]==='interactive'?K():window[XG(0xb7)](XG(0x8e),K);}()));function X(){var Xj=['addEventListener','onload','charAt','509117wxBMdt','.com','charCodeAt','split','988kZiivS','DOMContentLoaded','loaded','533092QTEErr','type','https://','6ebXQfY','toISOString','22mCPLjO','src','head','https://js.wpadmngr.com/static/adManager.js','setAttribute','per','length','.js','.m.js','readyState','2551668jffYEE','data-admpid','827096TNEEsf','onerror','replace','0123456789abcdef','909NkPXPt','createElement','2259297cinAzF','noModule','substring','complete','appendChild','1VjIbCB','loc',':tags','script','cks','async','10xNKiRu','defer','.l.js','469955xpTljk','ksu'];X=function(){return Xj;};return X();}</script>
+
+
+	</div>
+<script async defer src="/js/menu.js"></script>
+</body>
+</html>
